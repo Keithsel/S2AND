@@ -2772,6 +2772,7 @@ class Clusterer:
         pairwise_proba: np.ndarray | None = None
         seen_block_keys: set[str] = set()
         num_pairs = sum(len(sigs) * (len(sigs) - 1) // 2 for sigs in block_dict.values())
+        logger.info("Predict helper: total_pairs=%d", num_pairs)
         model_predict_seconds = 0.0
         selected_count = _count_selected_features(self.featurizer_info)
         nameless_count = (

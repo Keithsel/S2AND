@@ -2350,6 +2350,7 @@ class Clusterer:
         partial_supervision: dict[tuple[str, str], int | float],
         runtime_context: RuntimeContext,
         restore_rust_cluster_seeds_on_exit: bool,
+        total_ram_bytes: int | None = None,
     ) -> dict[str, list[str]]:
         if len(block_dict_single_letter) == 0:
             return pred_clusters
@@ -2392,6 +2393,7 @@ class Clusterer:
                 batching_threshold=loop_batching_threshold,
                 partial_supervision=partial_supervision,
                 runtime_context=runtime_context,
+                total_ram_bytes=total_ram_bytes,
             )
             clusters_payload = incremental_result.get("clusters")
             if not isinstance(clusters_payload, dict):
@@ -2480,6 +2482,7 @@ class Clusterer:
             partial_supervision=partial_supervision,
             runtime_context=runtime_context,
             restore_rust_cluster_seeds_on_exit=restore_rust_cluster_seeds_on_exit,
+            total_ram_bytes=total_ram_bytes,
         )
         return dict(pred_clusters), None
 
@@ -3352,6 +3355,7 @@ class Clusterer:
         prevent_new_incompatibilities: bool,
         partial_supervision: dict[tuple[str, str], int | float],
         runtime_context: RuntimeContext,
+        total_ram_bytes: int | None = None,
     ) -> dict[str, list[str]]:
         # NEW!
         # First cluster the unassigned signatures, then decide which resulting unassigned
@@ -3362,6 +3366,7 @@ class Clusterer:
             dataset,
             partial_supervision=partial_supervision,
             runtime_context=runtime_context,
+            total_ram_bytes=total_ram_bytes,
         )
 
         logger.info(
@@ -3480,6 +3485,7 @@ class Clusterer:
         prevent_new_incompatibilities: bool,
         partial_supervision: dict[tuple[str, str], int | float],
         runtime_context: RuntimeContext,
+        total_ram_bytes: int | None = None,
     ) -> dict[str, list[str]]:
         original_seed_sigs = set(dataset.cluster_seeds_require.keys())
         original_cluster_ids = set(str(cid) for cid in dataset.cluster_seeds_require.values())
@@ -3506,6 +3512,7 @@ class Clusterer:
                 prevent_new_incompatibilities,
                 partial_supervision,
                 runtime_context,
+                total_ram_bytes=total_ram_bytes,
             )
             predict_times[subblock_key] = time.time() - start_predict_time
 
@@ -3747,6 +3754,7 @@ class Clusterer:
                 prevent_new_incompatibilities,
                 partial_supervision,
                 runtime_context,
+                total_ram_bytes=total_ram_bytes,
             )
             logger.info(
                 "Telemetry: phase_split_phase_b mode=subblock_local required_bytes=%d budget_bytes=%d",
@@ -3772,6 +3780,7 @@ class Clusterer:
             prevent_new_incompatibilities,
             partial_supervision,
             runtime_context,
+            total_ram_bytes=total_ram_bytes,
         )
         logger.info(
             "Telemetry: phase_split_phase_b mode=exact required_bytes=%d budget_bytes=%d",
@@ -4033,6 +4042,7 @@ class Clusterer:
             prevent_new_incompatibilities,
             partial_supervision,
             runtime_context,
+            total_ram_bytes=total_ram_bytes,
         )
         phase_b_required_bytes = len(unassigned_signature_ids) * (len(unassigned_signature_ids) - 1) // 2 * 8
         return _build_incremental_result(

@@ -656,6 +656,7 @@ class ANDData:
                 sinonym_results,
                 overwrite_blocks=(mode == "inference"),
                 allow_overwrite_pos=allow_overwrite_pos,
+                compute_block_fn=self.compute_block_fn,
             )
             logger.info(f"Sinonym overwrote {overwrite_count} signature name(s)")
             # Update paper-level author strings so co-author features use Sinonym-normalized names
@@ -2421,6 +2422,7 @@ def apply_sinonym_overwrites(
     *,
     overwrite_blocks: bool = False,
     allow_overwrite_pos: dict[str, set[int]] | None = None,
+    compute_block_fn: Callable[[str], str] = compute_block,
 ) -> int:
     """Overwrite signature name parts with Sinonym-normalized names where applicable.
 
@@ -2428,8 +2430,10 @@ def apply_sinonym_overwrites(
         signatures: signature_id -> Signature
         per_paper_results: paper_id(str) -> { position -> parsed_struct }
         overwrite_blocks: if True, also overwrite author_info_block with the new
-            block derived from normalized first/last. Use only in inference to
-            avoid changing dataset splits.
+            block derived from the normalized reconstructed author name. Use only
+            in inference to avoid changing dataset splits.
+        compute_block_fn: author-name-to-block function used when overwrite_blocks
+            is enabled and Sinonym produced both first and last names.
 
     Returns:
         Number of signatures updated.
@@ -2450,24 +2454,16 @@ def apply_sinonym_overwrites(
                 allowed = allow_overwrite_pos.get(paper_id_str, set())
                 if sig.author_info_position not in allowed:
                     continue
-            # Build the new block only when BOTH first and last are present.
-            # Otherwise, do not change the existing block value.
             new_block = None
-            try:
-                if first and last:
-                    # Match standard block computation: first-initial + last, then normalize.
-                    # TODO(s2and): When blocks are recomputed everywhere from Sinonym-aware
-                    # canonical forms, remove compatibility handling in this overwrite path.
-                    new_block = normalize_text(f"{first[:1]} {last}")
-            except Exception:
-                # Log any unexpected formatting issues; keep prior block on error
-                logger.exception(
-                    "Error computing new block for signature_id=%s (paper_id=%s, position=%s)",
-                    sig_id,
-                    sig.paper_id,
-                    sig.author_info_position,
+            if first and last:
+                normalized_author_name = _assemble_full_name(
+                    [
+                        normalize_text(first),
+                        normalize_text(middle),
+                        normalize_text(last),
+                    ]
                 )
-                new_block = None
+                new_block = compute_block_fn(normalized_author_name)
 
             # Always update first/middle/last; conditionally update block in inference
             new_sig = sig._replace(

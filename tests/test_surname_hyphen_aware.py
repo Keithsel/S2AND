@@ -148,4 +148,51 @@ def test_apply_sinonym_overwrites_block_compound_surname():
     )
     assert updated == 1
     new_sig = signatures["s1"]
-    assert new_sig.author_info_block == "q ou yang"
+    assert new_sig.author_info_block == "q yang"
+
+
+def test_sinonym_overwrite_block_uses_custom_compute_block_fn(monkeypatch):
+    signatures = {
+        "s1": _raw_signature("s1", paper_id=1, first="Bo", last="Wang"),
+    }
+    papers = {
+        "1": _raw_paper(1, "Bo Wang"),
+    }
+    sinonym_results = {
+        "1": {
+            0: {
+                "given_tokens": ["Alex"],
+                "middle_tokens": ["G"],
+                "surname_tokens": ["Wang"],
+                "original_compound_surname": None,
+            }
+        }
+    }
+
+    def _fake_sinonym_preprocess(_papers_dict, _n_jobs):
+        return sinonym_results
+
+    block_inputs = []
+
+    def custom_compute_block(author_name: str) -> str:
+        block_inputs.append(author_name)
+        return f"custom::{author_name.replace(' ', '_')}"
+
+    monkeypatch.setattr("s2and.data.sinonym_preprocess_papers_parallel", _fake_sinonym_preprocess)
+
+    dataset = ANDData(
+        signatures,
+        papers,
+        name="sinonym_custom_compute_block",
+        mode="inference",
+        load_name_counts=False,
+        preprocess=False,
+        name_tuples=set(),
+        n_jobs=1,
+        use_sinonym_overwrite=True,
+        sinonym_overwrite_min_ratio=None,
+        compute_block_fn=custom_compute_block,
+    )
+
+    assert block_inputs == ["alex g wang"]
+    assert dataset.signatures["s1"].author_info_block == "custom::alex_g_wang"

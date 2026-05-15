@@ -1039,12 +1039,18 @@ def test_finish_incremental_with_seed_links_accepts_legacy_name_tuple_forms():
             runtime_context=cast(Any, object()),
         )
 
-    exact_alias = _finish_with_name_tuples({("qi xin", "qadir")})
-    joined_legacy_alias = _finish_with_name_tuples({("qixin", "qadir")})
-    first_token_legacy_alias = _finish_with_name_tuples({("qi", "qadir")})
+    exact_name_tuples = {("qi xin", "qadir")}
+    joined_name_tuples = {("qixin", "qadir")}
+    first_token_name_tuples = {("qi", "qadir")}
+
+    exact_alias = _finish_with_name_tuples(exact_name_tuples)
+    joined_legacy_alias = _finish_with_name_tuples(joined_name_tuples)
+    first_token_legacy_alias = _finish_with_name_tuples(first_token_name_tuples)
 
     assert exact_alias == {"7": ["seed", "candidate"]}
+    assert ("qi xin", "qadir") not in joined_name_tuples
     assert joined_legacy_alias == {"7": ["seed", "candidate"]}
+    assert ("qi xin", "qadir") not in first_token_name_tuples
     assert first_token_legacy_alias == {"7": ["seed", "candidate"]}
 
 

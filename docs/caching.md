@@ -104,6 +104,10 @@ Implications:
 
 This cache is separate from `use_cache`. It is an input-artifact cache, not a featurization cache.
 
+Remote artifacts are keyed by URL plus the server validator. Current releases namespace validators as
+`etag:<value>` or `last-modified:<value>` before hashing. For compatibility, S2AND still probes the
+pre-0.50 raw-ETag filename before downloading.
+
 ## Interaction with Rust Batch Featurization
 
 Rust batch featurization can sometimes emit only the selected feature columns needed downstream.

@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import s2and.file_cache as file_cache
 
 
@@ -98,6 +100,28 @@ def test_get_from_cache_hit_checks_remote_validator_but_does_not_download(monkey
     assert head_response.closed is True
 
 
+def test_get_from_cache_hits_legacy_raw_etag_filename(monkeypatch, tmp_path):
+    url = "https://example.org/model.bin"
+    etag = "etag-123"
+    legacy_cache_path = tmp_path / file_cache.url_to_filename(url, etag)
+    legacy_cache_path.write_bytes(b"legacy cached")
+    head_response = _HeadResponse(headers={"ETag": etag})
+
+    monkeypatch.setattr(
+        file_cache.requests,
+        "head",
+        lambda request_url, *, allow_redirects=False, timeout=None: head_response,
+    )
+    monkeypatch.setattr(
+        file_cache.requests,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy cache hit should not download")),
+    )
+
+    assert file_cache.get_from_cache(url, str(tmp_path)) == str(legacy_cache_path)
+    assert head_response.closed is True
+
+
 def test_get_from_cache_downloads_new_file_when_etag_changes(monkeypatch, tmp_path):
     url = "https://example.org/model.bin"
     old_path = tmp_path / file_cache.url_to_filename(url, "etag:old")
@@ -117,6 +141,55 @@ def test_get_from_cache_downloads_new_file_when_etag_changes(monkeypatch, tmp_pa
     assert Path(cache_path).name == file_cache.url_to_filename(url, "etag:new")
     assert Path(cache_path).read_bytes() == b"new"
     assert old_path.read_bytes() == b"old"
+
+
+def test_get_from_cache_uses_last_modified_validator(monkeypatch, tmp_path):
+    url = "https://example.org/model.bin"
+    last_modified = "Wed, 21 Oct 2015 07:28:00 GMT"
+    head_response = _HeadResponse(headers={"Last-Modified": last_modified})
+    get_response = _GetResponse([b"new"])
+
+    monkeypatch.setattr(
+        file_cache.requests,
+        "head",
+        lambda request_url, *, allow_redirects=False, timeout=None: head_response,
+    )
+    monkeypatch.setattr(file_cache.requests, "get", lambda request_url, *, stream=False, timeout=None: get_response)
+
+    cache_path = file_cache.get_from_cache(url, str(tmp_path))
+
+    assert Path(cache_path).name == file_cache.url_to_filename(url, f"last-modified:{last_modified}")
+    assert Path(cache_path).read_bytes() == b"new"
+
+
+def test_get_from_cache_head_failure_preserves_oserror_contract(monkeypatch, tmp_path):
+    url = "https://example.org/model.bin"
+    head_response = _HeadResponse(status_code=503)
+
+    monkeypatch.setattr(
+        file_cache.requests,
+        "head",
+        lambda request_url, *, allow_redirects=False, timeout=None: head_response,
+    )
+
+    with pytest.raises(OSError, match="HEAD request failed"):
+        file_cache.get_from_cache(url, str(tmp_path))
+    assert head_response.closed is True
+
+
+def test_download_to_cache_removes_temp_file_on_failure(monkeypatch, tmp_path):
+    url = "https://example.org/model.bin"
+    target_path = tmp_path / file_cache.url_to_filename(url, "etag:bad")
+    get_response = _GetResponse([b"ignored"], status_code=500)
+
+    monkeypatch.setattr(file_cache.requests, "get", lambda request_url, *, stream=False, timeout=None: get_response)
+
+    with pytest.raises(file_cache.requests.HTTPError):
+        file_cache._download_to_cache(url, str(target_path))
+
+    assert not target_path.exists()
+    assert list(tmp_path.iterdir()) == []
+    assert get_response.closed is True
 
 
 def test_cached_path_returns_existing_local_file(tmp_path):

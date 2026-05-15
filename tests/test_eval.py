@@ -7,6 +7,7 @@ import numpy as np
 
 import s2and.shap_utils as shap_utils
 from s2and.eval import (
+    _shap_values_for_tree_model_preserving_booster_params,
     b3_precision_recall_fscore,
     claims_eval,
     f1_score,
@@ -455,6 +456,30 @@ def test_claims_eval_writes_distance_dump_when_available():
         assert os.path.exists(os.path.join(td, "preds_unit.json"))
         assert os.path.exists(os.path.join(td, "dists_unit.pkl"))
         assert output["total"] == 1
+
+
+def test_shap_values_restore_lightgbm_booster_params(monkeypatch):
+    class DummyBooster:
+        def __init__(self):
+            self.params = {"keep": "value"}
+
+    class DummyClassifier:
+        def __init__(self):
+            self.booster_ = DummyBooster()
+
+    classifier = DummyClassifier()
+
+    def mutate_booster_params(model, features, class_index):
+        del class_index
+        model.booster_.params["temporary"] = "shap"
+        return np.zeros_like(features)
+
+    monkeypatch.setattr(shap_utils, "_shap_values_for_tree_model", mutate_booster_params)
+
+    values = _shap_values_for_tree_model_preserving_booster_params(classifier, np.ones((2, 3)))
+
+    np.testing.assert_array_equal(values, np.zeros((2, 3)))
+    assert classifier.booster_.params == {"keep": "value"}
 
 
 if __name__ == "__main__":

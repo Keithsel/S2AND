@@ -90,7 +90,9 @@ class TestData(unittest.TestCase):
         train_pairs, val_pairs, test_pairs = self.qian_dataset.split_pairs(
             train_block_dict, val_block_dict, test_block_dict
         )
-        assert len(train_pairs) == 1000, len(val_pairs) == 500 and len(test_pairs) == 7244
+        assert len(train_pairs) == 1000
+        assert len(val_pairs) == 500
+        assert len(test_pairs) == 7244
 
     def test_blocks(self):
         original_blocks = self.dummy_dataset.get_original_blocks()

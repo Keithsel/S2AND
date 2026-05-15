@@ -1,5 +1,4 @@
 # mypy: ignore-errors
-# ruff: noqa: E402
 
 """
 Evaluate production S2AND models (SPECTER1 vs SPECTER2) on various datasets.
@@ -97,16 +96,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-import numpy as np
-
-from s2and.consts import DEFAULT_CHUNK_SIZE, FEATURIZER_VERSION, PROJECT_ROOT_PATH
-from s2and.data import ANDData
-from s2and.eval import cluster_eval
-from s2and.featurizer import FeaturizationInfo, featurize
-from s2and.model import Clusterer, PairwiseModeler
-from s2and.production_model import load_production_model
-from s2and.warnings_utils import suppress_sklearn_feature_name_warnings
-
 # specter suffix -> production model artifact
 # v1.1 was trained on specter1 features; v1.21 bundles the v1.2 SPECTER2 pairwise model.
 MODELS = {
@@ -149,13 +138,18 @@ nameless_features_to_use = [
     f for f in features_to_use if f not in {"name_similarity", "advanced_name_similarity", "name_counts"}
 ]
 
-featurization_info = FeaturizationInfo(features_to_use=features_to_use, featurizer_version=FEATURIZER_VERSION)
-nameless_featurization_info = FeaturizationInfo(
-    features_to_use=nameless_features_to_use, featurizer_version=FEATURIZER_VERSION
-)
-
 
 def main() -> None:
+    import numpy as np
+
+    from s2and.consts import DEFAULT_CHUNK_SIZE, FEATURIZER_VERSION, PROJECT_ROOT_PATH
+    from s2and.data import ANDData
+    from s2and.eval import cluster_eval
+    from s2and.featurizer import FeaturizationInfo, featurize
+    from s2and.model import Clusterer, PairwiseModeler
+    from s2and.production_model import load_production_model
+    from s2and.warnings_utils import suppress_sklearn_feature_name_warnings
+
     args = _build_parser().parse_args()
     suppress_sklearn_feature_name_warnings()
     n_jobs = args.n_jobs
@@ -177,6 +171,12 @@ def main() -> None:
     print(f"Config: dataset={args.dataset}, seed={random_seed}, n_jobs={n_jobs}, train={train_flag}")
     print(f"Datasets: {datasets}")
     print()
+
+    featurization_info = FeaturizationInfo(features_to_use=features_to_use, featurizer_version=FEATURIZER_VERSION)
+    nameless_featurization_info = FeaturizationInfo(
+        features_to_use=nameless_features_to_use,
+        featurizer_version=FEATURIZER_VERSION,
+    )
 
     results = {}
     for specter_suffix in specter_suffixes:

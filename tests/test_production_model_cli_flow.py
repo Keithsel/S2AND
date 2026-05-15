@@ -24,9 +24,7 @@ def _run_cli(args: list[str], *, repo_root: Path, timeout: int = 300) -> subproc
         timeout=timeout,
     )
     assert completed.returncode == 0, (
-        f"Command failed: {[sys.executable, *args]}\n"
-        f"stdout:\n{completed.stdout}\n"
-        f"stderr:\n{completed.stderr}"
+        f"Command failed: {[sys.executable, *args]}\n" f"stdout:\n{completed.stdout}\n" f"stderr:\n{completed.stderr}"
     )
     return completed
 
@@ -155,10 +153,6 @@ def _write_tiny_promoted_feature_bundle(feature_root: Path, target_path: Path) -
     for key, rel_path in paths.items():
         frames[key].to_parquet(feature_root / rel_path, index=False)
 
-    pd.DataFrame({"base_group_id": ["cal_base_pos"]}).to_csv(
-        feature_root / "splits" / "classic_gate_calibration_base_groups.csv",
-        index=False,
-    )
     pd.DataFrame({"base_group_id": ["cal_base_neg"]}).to_csv(
         feature_root / "splits" / "classic_gate_internal_eval_base_groups.csv",
         index=False,
@@ -204,7 +198,6 @@ def _write_tiny_promoted_feature_bundle(feature_root: Path, target_path: Path) -
         "models": {
             "classic": {
                 **paths,
-                "classic_gate_calibration_base_groups_path": "splits/classic_gate_calibration_base_groups.csv",
                 "classic_gate_internal_eval_base_groups_path": "splits/classic_gate_internal_eval_base_groups.csv",
                 "classic_gate_calibration_retrieval_limit": 25,
                 "stratified_eval_test_split": {
@@ -317,3 +310,9 @@ def test_tiny_qian_production_model_two_step_cli_flow(tmp_path: Path) -> None:
     clusterer = load_production_model(bundle_dir)
     assert clusterer.production_model_bundle_status == "complete"
     assert Path(clusterer.incremental_linker_artifact_dir) == bundle_dir / "incremental_linker"
+    artifact_metadata = json.loads((bundle_dir / "incremental_linker" / "metadata.json").read_text(encoding="utf-8"))
+    assert set(artifact_metadata["gate_config"]) == {
+        "bucketed_margin_thresholds",
+        "bucketed_score_thresholds",
+        "calibration_mode",
+    }

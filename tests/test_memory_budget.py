@@ -151,6 +151,23 @@ def test_compute_rust_batch_chunk_plan_base_chunk_pairs_zero_disables_floor():
     assert int(plan_big.chunk_pairs) == 500  # total_pairs is the only limit
 
 
+def test_compute_rust_batch_chunk_plan_respects_named_max_chunk_pairs():
+    plan = memory_budget.compute_rust_batch_chunk_plan(
+        num_features=1,
+        total_pairs=500_000,
+        total_ram_bytes=10_000_000_000,
+        base_chunk_pairs=0,
+        max_chunk_pairs=10_000,
+        detect_cgroup_fn=lambda: (None, "unavailable"),
+        detect_total_fn=lambda: (None, "unavailable"),
+        current_rss_fn=lambda _total: (10_000_000, "rss:test"),
+    )
+
+    assert int(plan.derived_chunk_pairs) > 10_000
+    assert int(plan.max_chunk_pairs) == 10_000
+    assert int(plan.chunk_pairs) == 10_000
+
+
 def test_compute_promoted_phase_a_limits_uses_top_k_largest_components():
     limits = memory_budget.compute_promoted_phase_a_limits(
         query_count=20,

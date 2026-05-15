@@ -1,6 +1,7 @@
 from lightgbm import LGBMClassifier
 
 from s2and.featurizer import FeaturizationInfo
+from s2and.incremental_linking_training.classic import DEFAULT_CLASSIC_N_JOBS, _build_classic_classifier
 from s2and.model import Clusterer
 from s2and.thread_config import resolve_n_jobs
 
@@ -43,3 +44,18 @@ def test_clusterer_n_jobs_minus_one_uses_all_cores(monkeypatch) -> None:
     assert resolve_n_jobs(-1) == 6
     assert clusterer.n_jobs == 6
     assert clusterer.classifier.get_params().get("n_jobs") == 6
+
+
+def test_resolve_n_jobs_handles_none_zero_and_negative_offsets(monkeypatch) -> None:
+    monkeypatch.setattr("s2and.thread_config.os.cpu_count", lambda: 6)
+
+    assert resolve_n_jobs(None) == 1
+    assert resolve_n_jobs(0) == 1
+    assert resolve_n_jobs(-2) == 5
+
+
+def test_classic_training_default_n_jobs_matches_production_cli() -> None:
+    classifier = _build_classic_classifier({})
+
+    assert DEFAULT_CLASSIC_N_JOBS == 20
+    assert classifier.get_params().get("n_jobs") == 20

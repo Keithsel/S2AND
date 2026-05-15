@@ -116,13 +116,14 @@ def test_load_pickle_replays_non_label_encoder_inconsistent_warning(tmp_path):
 
 
 def test_load_pickle_attaches_initial_char_name_count_feature_contract_for_legacy_model(tmp_path):
-    payload = {"clusterer": LegacyClustererWithoutFeatureContract(featurizer_version=1)}
-    pickle_path = tmp_path / "legacy_clusterer.pkl"
-    _dump_pickle(pickle_path, payload)
+    for featurizer_version in (1, 2):
+        payload = {"clusterer": LegacyClustererWithoutFeatureContract(featurizer_version=featurizer_version)}
+        pickle_path = tmp_path / f"legacy_clusterer_v{featurizer_version}.pkl"
+        _dump_pickle(pickle_path, payload)
 
-    loaded = load_pickle_with_verified_label_encoder_compat(pickle_path)
-    contract = loaded["clusterer"].feature_contract
-    assert contract["name_counts_last_first_initial_semantics"] == "initial_char"
+        loaded = load_pickle_with_verified_label_encoder_compat(pickle_path)
+        contract = loaded["clusterer"].feature_contract
+        assert contract["name_counts_last_first_initial_semantics"] == "initial_char"
 
 
 def test_load_pickle_preserves_existing_name_count_feature_contract(tmp_path):

@@ -30,6 +30,8 @@ def _attach_feature_contract_metadata(loaded: Any) -> None:
         featurizer_info = getattr(clusterer, "featurizer_info", None)
         featurizer_version = getattr(featurizer_info, "featurizer_version", None)
         if isinstance(featurizer_version, int):
+            # Packaged v1.1/v1.2 pickles predate feature_contract metadata,
+            # but their name-count artifact is keyed by last + first initial.
             contract["name_counts_last_first_initial_semantics"] = _INITIAL_NAME_COUNT_SEMANTICS
     clusterer.feature_contract = contract
 

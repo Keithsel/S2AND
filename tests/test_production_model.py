@@ -7,10 +7,44 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from s2and.data import ANDData
 from s2and.model import _ensure_lightgbm_fitted, _selected_feature_indices
 from s2and.production_bundle import finalize_production_bundle, write_pairwise_production_bundle
 from s2and.production_model import NativeLightGBMBinaryClassifier, _config_choice, load_production_model
 from s2and.serialization import load_pickle_with_verified_label_encoder_compat
+from tests.helpers import import_s2and_rust
+
+
+def _load_dummy_inference_dataset(name: str) -> ANDData:
+    return ANDData(
+        "tests/dummy/signatures.json",
+        "tests/dummy/papers.json",
+        clusters="tests/dummy/clusters.json",
+        name=name,
+        mode="inference",
+        load_name_counts=True,
+        preprocess=True,
+        n_jobs=1,
+    )
+
+
+def _prepare_prediction_clusterer(clusterer):
+    _ensure_lightgbm_fitted(clusterer.classifier)
+    _ensure_lightgbm_fitted(clusterer.nameless_classifier)
+    clusterer.n_jobs = 1
+    clusterer.use_cache = False
+    return clusterer
+
+
+def _predict_dummy_block(clusterer, *, batching_threshold: int | None) -> dict[str, list[str]]:
+    dataset = _load_dummy_inference_dataset(f"dummy-predict-{batching_threshold}")
+    block = {
+        "a sattar": [str(signature_index) for signature_index in range(9)],
+    }
+    predictions, dists = clusterer.predict(block, dataset, batching_threshold=batching_threshold)
+
+    assert dists is None
+    return predictions
 
 
 def test_native_production_bundle_loads_as_mutable_clusterer() -> None:
@@ -75,6 +109,63 @@ def test_native_pairwise_models_match_v12_pickle_fixture() -> None:
         rtol=1e-10,
         atol=1e-10,
     )
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_native_clusterer_predict_matches_v12_pickle(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+    if backend == "rust":
+        rust_available, rust_error = import_s2and_rust(required_method="from_dataset")
+        if not rust_available:
+            pytest.skip(f"Rust runtime unavailable: {rust_error!r}")
+
+    monkeypatch.setenv("S2AND_BACKEND", backend)
+
+    for batching_threshold in (None, 7):
+        native_clusterer = _prepare_prediction_clusterer(
+            load_production_model("s2and/data/production_model_v1.21", require_incremental_linker=False)
+        )
+        legacy_clusterer = _prepare_prediction_clusterer(
+            load_pickle_with_verified_label_encoder_compat("s2and/data/production_model_v1.2.pickle")["clusterer"]
+        )
+
+        assert _predict_dummy_block(native_clusterer, batching_threshold=batching_threshold) == _predict_dummy_block(
+            legacy_clusterer,
+            batching_threshold=batching_threshold,
+        )
+
+
+def test_native_clusterer_runtime_config_matches_v12_pickle() -> None:
+    native_clusterer = load_production_model("s2and/data/production_model_v1.21")
+    legacy_clusterer = load_pickle_with_verified_label_encoder_compat("s2and/data/production_model_v1.2.pickle")[
+        "clusterer"
+    ]
+
+    assert type(native_clusterer.cluster_model) is type(legacy_clusterer.cluster_model)
+    assert native_clusterer.cluster_model.linkage == legacy_clusterer.cluster_model.linkage
+    assert native_clusterer.cluster_model.eps == legacy_clusterer.cluster_model.eps
+    assert native_clusterer.featurizer_info.features_to_use == legacy_clusterer.featurizer_info.features_to_use
+    assert native_clusterer.featurizer_info.featurizer_version == legacy_clusterer.featurizer_info.featurizer_version
+    assert (
+        native_clusterer.nameless_featurizer_info.features_to_use
+        == legacy_clusterer.nameless_featurizer_info.features_to_use
+    )
+    assert (
+        native_clusterer.nameless_featurizer_info.featurizer_version
+        == legacy_clusterer.nameless_featurizer_info.featurizer_version
+    )
+    assert native_clusterer.best_params == legacy_clusterer.best_params
+    assert native_clusterer.batch_size == legacy_clusterer.batch_size
+    assert native_clusterer.dont_merge_cluster_seeds == legacy_clusterer.dont_merge_cluster_seeds
+    assert (
+        native_clusterer.use_default_constraints_as_supervision
+        == legacy_clusterer.use_default_constraints_as_supervision
+    )
+    assert native_clusterer.use_cache == legacy_clusterer.use_cache
+    assert native_clusterer.n_iter == legacy_clusterer.n_iter
+    assert native_clusterer.random_state == legacy_clusterer.random_state
+
+    assert getattr(native_clusterer, "suppress_orcid", False) == getattr(legacy_clusterer, "suppress_orcid", False)
+    assert native_clusterer._incremental_experiment_config() == legacy_clusterer._incremental_experiment_config()
 
 
 def test_pairwise_stage_finalizes_into_loadable_production_bundle(tmp_path: Path) -> None:

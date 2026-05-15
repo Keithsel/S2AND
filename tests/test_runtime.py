@@ -71,6 +71,16 @@ def test_resolve_backend_explicit_rust_raises_when_runtime_unavailable(monkeypat
         runtime.resolve_backend(emit_startup_warning=False)
 
 
+def test_load_s2and_rust_extension_propagates_native_import_errors() -> None:
+    def importer(name: str):
+        if name == "s2and_rust":
+            raise ImportError("GLIBC version mismatch")
+        raise AssertionError(f"unexpected import: {name}")
+
+    with pytest.raises(ImportError, match="GLIBC version mismatch"):
+        runtime.load_s2and_rust_extension(import_module=importer)
+
+
 def test_resolve_backend_explicit_rust_uses_capability_probe(monkeypatch: pytest.MonkeyPatch):
     _clear_runtime_env(monkeypatch)
     monkeypatch.setenv("S2AND_BACKEND", "rust")

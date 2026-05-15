@@ -29,6 +29,7 @@ def _mock_chunk_plan(chunk_pairs: int, total_pairs: int) -> memory_budget.RustBa
         stage_budget_fraction=0.25,
         stage_budget_bytes=256 * 1024 * 1024,
         base_chunk_pairs=10_000,
+        max_chunk_pairs=10_000,
         row_overhead_bytes=128,
         persistent_row_overhead_bytes=0,
         fixed_overhead_bytes=0,

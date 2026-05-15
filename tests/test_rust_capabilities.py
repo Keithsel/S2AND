@@ -287,7 +287,7 @@ def test_rust_get_build_info_contract():
 
     get_build_info = getattr(s2and_rust, "get_build_info", None)
     if not callable(get_build_info):
-        return
+        pytest.skip("s2and_rust.get_build_info unavailable")
 
     info = get_build_info()
     assert isinstance(info, dict)

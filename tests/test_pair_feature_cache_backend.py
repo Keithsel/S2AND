@@ -123,8 +123,8 @@ def test_many_pairs_featurize_reuses_persisted_pair_feature_cache(
     assert int(call_count["count"]) == first_run_call_count
 
 
-def test_pair_feature_cache_lookup_uses_exact_pair_direction() -> None:
-    assert FeaturizationInfo.feature_cache_lookup_keys(("a", "b")) == ("a___b",)
+def test_pair_feature_cache_lookup_probes_reverse_for_legacy_rows() -> None:
+    assert FeaturizationInfo.feature_cache_lookup_keys(("a", "b")) == ("a___b", "b___a")
 
 
 def test_many_pairs_featurize_with_use_cache_false_does_not_write_pair_feature_cache(

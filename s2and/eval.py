@@ -883,6 +883,24 @@ def _claims_eval_prediction_output(
     return output_to_write
 
 
+def _shap_values_for_tree_model_preserving_booster_params(
+    classifier: Any,
+    features: np.ndarray,
+) -> np.ndarray:
+    import s2and.shap_utils as shap_utils
+
+    base_estimator = shap_utils._base_estimator(classifier)
+    booster = getattr(base_estimator, "booster_", None)
+    booster_params = getattr(booster, "params", None)
+    original_params = dict(booster_params) if isinstance(booster_params, dict) else None
+    try:
+        return shap_utils._shap_values_for_tree_model(base_estimator, features, class_index=1)
+    finally:
+        if original_params is not None:
+            booster_params.clear()
+            booster_params.update(original_params)
+
+
 def _write_claims_eval_shap_plots(
     *,
     id1: str,
@@ -905,15 +923,13 @@ def _write_claims_eval_shap_plots(
         warnings.simplefilter("ignore")
         import s2and.shap_utils as shap_utils
 
-        shap_output = shap_utils._shap_values_for_tree_model(
-            shap_utils._base_estimator(clusterer.classifier),
+        shap_output = _shap_values_for_tree_model_preserving_booster_params(
+            clusterer.classifier,
             features,
-            class_index=1,
         )
-        shap_output_nameless = shap_utils._shap_values_for_tree_model(
-            shap_utils._base_estimator(clusterer.nameless_classifier),
+        shap_output_nameless = _shap_values_for_tree_model_preserving_booster_params(
+            clusterer.nameless_classifier,
             nameless_features,
-            class_index=1,
         )
 
         title = f"{id1}-{id2}"

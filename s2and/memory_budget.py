@@ -19,6 +19,7 @@ AUTODETECT_RAM_SAFETY_FACTOR = 0.8
 DEFAULT_SAFETY_MARGIN_FRACTION = 0.10
 # Rust batch featurization defaults.
 RUST_BATCH_BASE_CHUNK_PAIRS = 0  # Disabled - rely on memory-budget-derived limit
+RUST_BATCH_MAX_CHUNK_PAIRS = 10_000
 RUST_BATCH_STAGE_BUDGET_FRACTION = 0.25
 RUST_BATCH_ROW_OVERHEAD_BYTES = 128
 # Bundle 4 calibration (4 workload shapes: 37, 37, 49, 49 bytes/row); P95 = 49; 52 provides ~6% margin.
@@ -58,6 +59,7 @@ class RustBatchChunkPlan:
     stage_budget_fraction: float
     stage_budget_bytes: int
     base_chunk_pairs: int
+    max_chunk_pairs: int
     row_overhead_bytes: int
     persistent_row_overhead_bytes: int
     fixed_overhead_bytes: int
@@ -210,6 +212,7 @@ def compute_chunk_size(
 def resolve_rust_batch_prediction_params() -> dict[str, int]:
     return {
         "base_chunk_pairs": RUST_BATCH_BASE_CHUNK_PAIRS,
+        "max_chunk_pairs": RUST_BATCH_MAX_CHUNK_PAIRS,
         "row_overhead_bytes": RUST_BATCH_ROW_OVERHEAD_BYTES,
         "persistent_row_overhead_bytes": RUST_BATCH_PERSISTENT_ROW_OVERHEAD_BYTES,
         "fixed_overhead_bytes": RUST_BATCH_FIXED_OVERHEAD_BYTES,
@@ -529,6 +532,7 @@ def compute_rust_batch_chunk_plan(
     safety_margin_fraction: float = DEFAULT_SAFETY_MARGIN_FRACTION,
     stage_budget_fraction: float = RUST_BATCH_STAGE_BUDGET_FRACTION,
     base_chunk_pairs: int | None = None,
+    max_chunk_pairs: int | None = None,
     row_overhead_bytes: int | None = None,
     persistent_row_overhead_bytes: int | None = None,
     fixed_overhead_bytes: int | None = None,
@@ -539,6 +543,8 @@ def compute_rust_batch_chunk_plan(
     resolved = resolve_rust_batch_prediction_params()
     if base_chunk_pairs is None:
         base_chunk_pairs = resolved["base_chunk_pairs"]
+    if max_chunk_pairs is None:
+        max_chunk_pairs = resolved["max_chunk_pairs"]
     if row_overhead_bytes is None:
         row_overhead_bytes = resolved["row_overhead_bytes"]
     if persistent_row_overhead_bytes is None:
@@ -565,6 +571,11 @@ def compute_rust_batch_chunk_plan(
     chunk_feature_count = max(1, selected_feature_count_bounded + nameless_feature_count_bounded)
     bytes_per_pair_row = max(1, chunk_feature_count * 8 + row_overhead_bytes)
     bounded_total_pairs = max(1, total_pairs)
+    if int(max_chunk_pairs) < 0:
+        raise ValueError(f"Invalid max_chunk_pairs={max_chunk_pairs}; expected >= 0")
+    hard_limit_pairs = bounded_total_pairs
+    if int(max_chunk_pairs) > 0:
+        hard_limit_pairs = min(hard_limit_pairs, int(max_chunk_pairs))
     bounded_total_rows = bounded_total_pairs
     if total_rows is not None:
         bounded_total_rows = max(1, total_rows)
@@ -572,7 +583,7 @@ def compute_rust_batch_chunk_plan(
         item_bytes=bytes_per_pair_row,
         budget_bytes=stage_budget_bytes,
         fixed_overhead_bytes=fixed_overhead_bytes,
-        hard_limit_items=bounded_total_pairs,
+        hard_limit_items=hard_limit_pairs,
         soft_limit_items=base_chunk_pairs,
     )
 
@@ -602,6 +613,7 @@ def compute_rust_batch_chunk_plan(
         stage_budget_fraction=float(stage_budget_fraction),
         stage_budget_bytes=stage_budget_bytes,
         base_chunk_pairs=max(0, base_chunk_pairs),
+        max_chunk_pairs=max(0, int(max_chunk_pairs)),
         row_overhead_bytes=max(0, row_overhead_bytes),
         persistent_row_overhead_bytes=max(0, persistent_row_overhead_bytes),
         fixed_overhead_bytes=predicted_fixed_overhead_bytes,

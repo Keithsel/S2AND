@@ -2961,11 +2961,7 @@ def _prepare_prod_training_data(
 def _artifact_gate_config_from_classic_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     rule = dict(summary["abstain_rule"])
     return {
-        "score_threshold": rule["score_threshold"],
-        "margin_threshold": rule["margin_threshold"],
-        "single_candidate_score_threshold": rule["single_candidate_score_threshold"],
         "bucketed_score_thresholds": rule.get("bucketed_score_thresholds"),
-        "bucketed_margin_threshold": rule.get("bucketed_margin_threshold"),
         "bucketed_margin_thresholds": rule.get("bucketed_margin_thresholds"),
         "calibration_mode": rule["calibration_mode"],
     }

@@ -26,6 +26,8 @@ from s2and.incremental_linking_training.query_support import (
 )
 from s2and.thread_config import resolve_n_jobs
 
+DEFAULT_CLASSIC_N_JOBS = 20
+
 # Shared training, calibration, and evaluation helpers for the official replay
 # target. CLI entrypoints should import this module instead of owning copies.
 _ANCHOR_EVIDENCE_FEATURE_COLUMNS = (
@@ -906,7 +908,7 @@ def _build_classic_classifier(
     params: dict[str, Any],
     *,
     monotone_constraints: list[int] | None = None,
-    n_jobs: int = 1,
+    n_jobs: int = DEFAULT_CLASSIC_N_JOBS,
 ) -> LGBMClassifier:
     classifier_params = {key: value for key, value in params.items()}
     if monotone_constraints is not None:
@@ -2365,7 +2367,7 @@ def run_classic(
     save_artifact_to: Path | None = None,
     artifact_audit_metadata: Mapping[str, Any] | None = None,
     required_rust_capabilities: Sequence[str] = INCREMENTAL_LINKING_RUST_CAPABILITIES,
-    n_jobs: int = 1,
+    n_jobs: int = DEFAULT_CLASSIC_N_JOBS,
 ) -> dict[str, Any]:
     """Fit, calibrate, and evaluate the official classic pipeline."""
 
@@ -2635,11 +2637,7 @@ def run_classic(
             feature_columns=feature_columns,
             retrieval_top_k=25,
             gate_config={
-                "score_threshold": score_threshold,
-                "margin_threshold": margin_threshold,
-                "single_candidate_score_threshold": single_candidate_score_threshold,
                 "bucketed_score_thresholds": bucketed_score_thresholds,
-                "bucketed_margin_threshold": bucketed_margin_threshold,
                 "bucketed_margin_thresholds": bucketed_margin_thresholds,
                 "calibration_mode": summary["abstain_rule"]["calibration_mode"],
             },

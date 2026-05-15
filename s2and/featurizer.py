@@ -795,8 +795,12 @@ class FeaturizationInfo:
 
     @staticmethod
     def feature_cache_lookup_keys(signature_pair: tuple[Any, ...]) -> tuple[str, ...]:
-        """Return exact-direction pair-feature cache lookup keys."""
-        return (FeaturizationInfo.feature_cache_key(signature_pair),)
+        """Return cache lookup keys in forward-first order, including reverse when distinct."""
+        forward = FeaturizationInfo.feature_cache_key(signature_pair)
+        reverse = FeaturizationInfo.feature_cache_key((signature_pair[1], signature_pair[0]))
+        if reverse == forward:
+            return (forward,)
+        return (forward, reverse)
 
     def cache_directory(self, dataset_name: str) -> str:
         """

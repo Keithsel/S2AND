@@ -64,9 +64,9 @@ def _build_run_metadata() -> dict[str, Any]:
     )
 
 
-def _configure_file_logging(log_file: str | None) -> None:
+def _configure_file_logging(log_file: str | None) -> logging.FileHandler | None:
     if not log_file:
-        return
+        return None
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     resolved_log_path = log_path.resolve()
@@ -74,12 +74,13 @@ def _configure_file_logging(log_file: str | None) -> None:
     logger = logging.getLogger("s2and")
     for handler in logger.handlers:
         if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename).resolve() == resolved_log_path:
-            return
+            return None
 
     handler = logging.FileHandler(resolved_log_path, encoding="utf-8")
+    handler.setLevel(logging.NOTSET)
     handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    return handler
 
 
 def _configure_memory_telemetry_jsonl(path: str | None) -> None:
@@ -368,11 +369,15 @@ def main(argv: list[str] | None = None) -> int:
     previous_memory_telemetry_env = os.environ.get(MEMORY_TELEMETRY_JSONL_ENV)
     _ACTIVE_LOG_FILE = parsed.log_file
     _ACTIVE_MEMORY_TELEMETRY_JSONL = parsed.memory_telemetry_jsonl
-    _configure_file_logging(parsed.log_file)
+    file_handler = _configure_file_logging(parsed.log_file)
     _configure_memory_telemetry_jsonl(parsed.memory_telemetry_jsonl)
     try:
         return _dispatch(parsed.command, forwarded_args, global_args=global_args)
     finally:
+        if file_handler is not None:
+            logger = logging.getLogger("s2and")
+            logger.removeHandler(file_handler)
+            file_handler.close()
         _ACTIVE_LOG_FILE = previous_log_file
         _ACTIVE_MEMORY_TELEMETRY_JSONL = previous_memory_telemetry
         if parsed.memory_telemetry_jsonl:

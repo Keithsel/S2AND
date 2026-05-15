@@ -4,6 +4,7 @@ import copy
 import math
 import os
 from collections import Counter, namedtuple
+from typing import Any, cast
 
 import pytest
 
@@ -14,7 +15,9 @@ from tests.helpers import equalish, import_s2and_rust
 
 HAS_RUST, s2and_rust = import_s2and_rust(required_method="from_dataset")
 if not HAS_RUST:
-    pytest.skip("s2and_rust RustFeaturizer.from_dataset is unavailable", allow_module_level=True)
+    raise pytest.skip.Exception("s2and_rust RustFeaturizer.from_dataset is unavailable", allow_module_level=True)
+assert s2and_rust is not None and not isinstance(s2and_rust, Exception)
+_S2AND_RUST = cast(Any, s2and_rust)
 
 
 def _build_minimal_dataset(name: str) -> ANDData:
@@ -118,14 +121,6 @@ def _build_minimal_dataset(name: str) -> ANDData:
             os.environ["S2AND_BACKEND"] = prior_backend
 
 
-@pytest.fixture(autouse=True)
-def _cleanup_global_dataset():
-    """Restore featurizer_mod.global_dataset after each test."""
-    original = featurizer_mod.global_dataset
-    yield
-    featurizer_mod.global_dataset = original
-
-
 def test_from_dataset_fastpath_parity_for_field_sensitive_values():
     dataset = _build_minimal_dataset("rust_contract_fastpath_parity")
 
@@ -155,9 +150,8 @@ def test_from_dataset_fastpath_parity_for_field_sensitive_values():
         author_info_name_counts=NameCounts(13.0, 23.0, 33.0, 43.0),
     )
 
-    featurizer_mod.global_dataset = dataset  # type: ignore
-    python_features, _ = _single_pair_featurize(("s1", "s2"))
-    rust_featurizer = s2and_rust.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
+    python_features, _ = _single_pair_featurize(("s1", "s2"), dataset=dataset)
+    rust_featurizer = _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
     rust_features = rust_featurizer.featurize_pair("s1", "s2")
     feature_names = featurizer_mod.FeaturizationInfo().get_feature_names()
     venue_idx = feature_names.index("venue_overlap")
@@ -179,7 +173,7 @@ def test_from_dataset_raw_papers_match_preprocessed_for_language_and_coauthors()
             author_info_coauthor_n_grams=None,
         )
 
-    rust_preprocessed = s2and_rust.RustFeaturizer.from_dataset(dataset_preprocessed, 0.0, 10000.0, 1)
+    rust_preprocessed = _S2AND_RUST.RustFeaturizer.from_dataset(dataset_preprocessed, 0.0, 10000.0, 1)
     expected_features = rust_preprocessed.featurize_pair("s1", "s2")
     expected_constraint = rust_preprocessed.get_constraint("s1", "s2")
 
@@ -206,15 +200,19 @@ def test_from_dataset_raw_papers_match_preprocessed_for_language_and_coauthors()
         journal_ngrams=None,
     )
 
-    rust_raw = s2and_rust.RustFeaturizer.from_dataset(dataset_raw, 0.0, 10000.0, 1)
+    rust_raw = _S2AND_RUST.RustFeaturizer.from_dataset(dataset_raw, 0.0, 10000.0, 1)
     observed_features = rust_raw.featurize_pair("s1", "s2")
     observed_constraint = rust_raw.get_constraint("s1", "s2")
 
     assert len(expected_features) == len(observed_features)
     for idx, (expected, observed) in enumerate(zip(expected_features, observed_features, strict=True)):
         assert equalish(expected, observed), f"Mismatch idx={idx}: expected={expected} observed={observed}"
-    assert equalish(expected_constraint, observed_constraint)
-    assert not math.isnan(float(expected_constraint))
+    if expected_constraint is None or observed_constraint is None:
+        assert expected_constraint is None
+        assert observed_constraint is None
+    else:
+        assert equalish(expected_constraint, observed_constraint)
+        assert not math.isnan(float(expected_constraint))
 
 
 def test_from_dataset_rejects_namedtuple_field_order_mismatch():
@@ -230,4 +228,4 @@ def test_from_dataset_rejects_namedtuple_field_order_mismatch():
         dataset.papers[paper_id] = SwappedPaper(*swapped_values)
 
     with pytest.raises(ValueError, match="Paper fast-path contract mismatch"):
-        s2and_rust.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
+        _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)

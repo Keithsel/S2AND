@@ -3,6 +3,7 @@ import threading
 import time
 import unittest
 from collections import Counter
+from typing import Any, cast
 
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -36,9 +37,10 @@ class TestClusterer(unittest.TestCase):
         assert "text" == normalize_text("te'xt", True)
 
     def test_name_similarity_features(self):
-        assert [NUMPY_NAN] * 4 == name_text_features("", None)
+        assert [NUMPY_NAN] * 4 == name_text_features("", cast(Any, None))
         assert [0.0, 0.0, 0.0, 1.0] == name_text_features("text", "text")
         assert all([s >= 0.0 and s <= 1.0 for s in name_text_features("textual", "txt")])
+        assert all([s >= 0.0 and s <= 1.0 for s in name_text_features("a", "alice")])
 
     def test_cosine_sim(self):
         random_vec_1 = np.array([random.uniform(-1000, 1000) for i in range(1000)])
@@ -47,7 +49,7 @@ class TestClusterer(unittest.TestCase):
             cosine_sim(random_vec_1, random_vec_2),
             cosine_similarity(random_vec_1.reshape(1, -1), random_vec_2.reshape(1, -1))[0][0],
         )
-        assert cosine_sim([0] * 1000, random_vec_2) == 0
+        assert cosine_sim(np.zeros(1000), random_vec_2) == 0
 
     def test_get_text_ngrams(self):
         assert Counter() == get_text_ngrams(None)
@@ -141,7 +143,7 @@ class TestClusterer(unittest.TestCase):
         self.assertAlmostEqual(4 / 7, counter_jaccard(Counter([1, 2, 3, 4, 5, 5]), Counter([1, 2, 3, 4, 6])))
 
     def test_jaccard(self):
-        assert np.isnan(jaccard({}, {}))
+        assert np.isnan(jaccard(set(), set()))
         self.assertAlmostEqual(4 / 6, jaccard({1, 2, 3, 4, 5}, {1, 2, 3, 4, 6}))
         self.assertAlmostEqual(4 / 6, jaccard({1, 2, 3, 4, 5}, {1, 2, 3, 4, 6}))
 
@@ -204,3 +206,14 @@ def test_fasttext_model_lazy_load_is_thread_safe(monkeypatch):
     assert load_calls["count"] == 1
     assert len(outputs) == 8
     assert all(model is fake_model for model in outputs)
+
+
+def test_fasttext_skip_overrides_cached_model(monkeypatch):
+    import s2and.text as text_module
+
+    text_module._FASTTEXT_MODEL = object()
+    text_module._FASTTEXT_MODEL_INITIALIZED = True
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+
+    assert text_module._get_fasttext_model() is None
+    assert text_module._FASTTEXT_MODEL is None

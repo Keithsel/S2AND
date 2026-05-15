@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
         default=str(Path(PROJECT_ROOT_PATH) / "scratch" / "name_counts_rust.json"),
         help=(
             "Path to output JSON artifact for Rust from_json_paths ingest "
-            "(use --output data/... explicitly if desired)."
+            "(use --output s2and/data/... explicitly if desired)."
         ),
     )
     parser.add_argument(
@@ -47,7 +47,7 @@ def main() -> None:
     payload = {
         "normalization_version": args.normalization_version,
         "generation_provenance": {
-            "script": "scripts/export_name_counts_for_rust.py",
+            "script": "scripts/production/counts/export_name_counts_for_rust.py",
             "generated_utc": dt.datetime.now(tz=dt.UTC).isoformat(),
             "source_path": os.fspath(input_path),
         },

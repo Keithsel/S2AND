@@ -26,9 +26,6 @@ if not os.path.exists(DATA_DIR):
 
 os.environ["S2AND_CACHE"] = os.path.join(DATA_DIR, ".feature_cache")
 os.environ["OMP_NUM_THREADS"] = "8"
-# Keep only a tiny number of in-memory Rust featurizers in this multi-dataset script
-# to prevent native-memory buildup across datasets.
-os.environ.setdefault("S2AND_RUST_FEATURIZER_MAX_INMEM", "1")
 
 import argparse
 import copy
@@ -693,7 +690,7 @@ def main(
             chunk_size=DEFAULT_CHUNK_SIZE,
             nameless_featurizer_info=NAMELESS_FEATURIZER_INFO,
             nan_value=NAN_VALUE,
-        )  # type: ignore
+        )
         X_train, y_train, nameless_X_train = train
         # if we sampled more training pairs than required, then we downsample
         if len(y_train) > N_TRAIN_PAIRS_SIZE:

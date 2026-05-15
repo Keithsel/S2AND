@@ -55,7 +55,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from _rust_suite.common import (  # noqa: E402
+from _rust_suite.common import (  # type: ignore  # noqa: E402
     PROJECT_ROOT,
     ProcessTreeRSSMonitor,
     build_run_metadata,
@@ -63,18 +63,18 @@ from _rust_suite.common import (  # noqa: E402
     extract_marked_json_payload,
     get_result_markers,
 )
-from _rust_suite.common import (  # noqa: E402
+from _rust_suite.common import (  # type: ignore  # noqa: E402
     cluster_membership_digest as _cluster_membership_digest,
 )
-from _rust_suite.common import (  # noqa: E402
+from _rust_suite.common import (  # type: ignore  # noqa: E402
     signature_to_cluster_fingerprint_map as _signature_to_cluster_fingerprint_map,
 )
 
 RESULT_JSON_START, RESULT_JSON_END = get_result_markers("largest_block")
-DATA_DIR = PROJECT_ROOT / "data"
-DEFAULT_MODEL_PATH = str(DATA_DIR / "production_model_v1.1.pickle")
+DATA_DIR = PROJECT_ROOT / "s2and" / "data"
+DEFAULT_MODEL_PATH = str(DATA_DIR / "production_model_v1.21")
 
-# All known dataset directories (top-level under data/)
+# All known dataset directories under s2and/data/.
 DATASET_CANDIDATES = [
     "aminer",
     "arnetminer",
@@ -265,7 +265,7 @@ def _run_single(
 
     import s2and.model as model_module
     from s2and.data import ANDData
-    from s2and.serialization import load_pickle_with_verified_label_encoder_compat
+    from s2and.production_model import load_production_model
 
     resolved_model_path = _resolve_path(model_path)
     resolved_data_root = _resolve_path(data_root)
@@ -273,8 +273,7 @@ def _run_single(
     _check_paths(paths, require_clusters=False)
 
     # Load model
-    model_artifact = load_pickle_with_verified_label_encoder_compat(resolved_model_path)
-    clusterer = model_artifact["clusterer"]
+    clusterer = load_production_model(resolved_model_path)
     model_module._ensure_lightgbm_fitted(clusterer.classifier)
     model_module._ensure_lightgbm_fitted(clusterer.nameless_classifier)
     clusterer.use_cache = False
@@ -447,7 +446,7 @@ def _run_single(
             max_pairs = n * (n - 1) // 2
             sample_pairs = min(int(constraint_sample), int(max_pairs))
 
-            rust_featurizer = _get_rust_featurizer(anddata, use_cache=False)
+            rust_featurizer = _get_rust_featurizer(anddata)
 
             mismatch_count = 0
             mismatch_python_none = 0
@@ -481,7 +480,6 @@ def _run_single(
                     dont_merge_cluster_seeds=dont_merge,
                     incremental_dont_use_cluster_seeds=False,
                     featurizer=rust_featurizer,
-                    use_cache=False,
                 )
 
                 if py_val is not None:

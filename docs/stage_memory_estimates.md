@@ -38,20 +38,26 @@ Boundary rules:
 No additional work is planned right now. These predictors are treated as best-effort; we prioritize stable telemetry contracts and regression tests over further tightening.
 
 Regression coverage:
-- `tests/test_cluster_incremental.py::test_phase_a_memory_prediction_logged_and_bounded`
-- `tests/test_rust_batch_chunking.py::test_rust_batch_prediction_matches_observed_real_workload`
+- `tests/test_memory_budget.py`
 - `tests/test_memory_calibration.py`
+- `tests/test_memory_telemetry_summary.py`
+- `tests/test_rust_batch_chunking.py::test_rust_batch_prediction_matches_observed_real_workload`
 
 ## Where to look / how to calibrate
 
 - Calibration logic: `s2and/memory_calibration.py`
+- Structured memory telemetry is written as JSONL when
+  `--memory-telemetry-jsonl <path>` is passed to `scripts/rust_suite.py` before
+  the command name. Human-readable logs can be captured separately with
+  `--log-file <path>`.
 - CLIs:
-  - `uv run python scripts/rust_suite.py calibrate-phase-a`
-  - `uv run python scripts/rust_suite.py calibrate-rust-batch`
+  - `uv run python scripts/rust_suite.py calibrate-phase-a scratch/run_memory_telemetry.jsonl`
+  - `uv run python scripts/rust_suite.py calibrate-rust-batch scratch/run_memory_telemetry.jsonl`
+  - `uv run python scripts/rust_suite.py summarize-memory-telemetry scratch/run_memory_telemetry.jsonl`
 
 ## Verification (repeatable)
 
-1. Run a fixed workload and capture logs (use a reproducible command line and record `n_jobs` / thread env vars).
+1. Run a fixed workload with `--memory-telemetry-jsonl` (use a reproducible command line and record `n_jobs` / thread env vars).
 2. Extract stage telemetry records and confirm:
    - contract fields are present
    - peaks are not missed (probes/sampling covers the real peak window)

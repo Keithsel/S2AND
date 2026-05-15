@@ -19,10 +19,11 @@ RuntimeSource = Literal["S2AND_BACKEND", "default"]
 _STARTUP_WARNING_EMITTED = False
 _STARTUP_WARNING_LOCK = threading.Lock()
 
-MIN_SUPPORTED_RUST_EXTENSION_VERSION = (0, 40, 0)
+MIN_SUPPORTED_RUST_EXTENSION_VERSION = (0, 50, 0)
 _CORE_REQUIRED_FEATURIZER_MARKERS = (
     "from_dataset",
     "from_json_paths",
+    "json_ingest_telemetry",
     "signature_ids",
     "get_constraint",
     "get_constraints_matrix",
@@ -37,11 +38,16 @@ _FEATURIZER_API_SCORE_MARKERS = tuple(
     in {
         "from_dataset",
         "from_json_paths",
+        "json_ingest_telemetry",
         "signature_ids",
         "featurize_pairs_matrix_indexed",
         "update_signature_name_counts",
     }
 )
+RUST_CAPABILITY_HYBRID_CENTROID_RETRIEVER_V1 = "hybrid_centroid_retriever_v1"
+RUST_CAPABILITY_INDEXED_PAIR_ARRAY_FEATURIZATION_V1 = "indexed_pair_array_featurization_v1"
+RUST_CAPABILITY_INCREMENTAL_LINKING_PAIR_PLAN_V1 = "incremental_linking_pair_plan_v1"
+RUST_CAPABILITY_INCREMENTAL_LINKING_CONSTRAINT_ARRAYS_V1 = "incremental_linking_constraint_arrays_v1"
 
 
 @dataclass(frozen=True)
@@ -50,6 +56,7 @@ class RustRuntimeCapabilities:
     core_runtime_available: bool
     from_dataset_paper_preprocess_available: bool
     reason: str
+    named_capabilities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,11 +104,44 @@ def _rust_featurizer_api_score(module: Any) -> int:
     return sum(1 for marker in _FEATURIZER_API_SCORE_MARKERS if hasattr(rust_featurizer_cls, marker))
 
 
+def _callable_signature_mentions(method: Any, parameter_name: str) -> bool:
+    if not callable(method):
+        return False
+    text_signature = str(getattr(method, "__text_signature__", "") or "")
+    return parameter_name in text_signature
+
+
+def _detect_named_rust_capabilities(module: Any) -> tuple[str, ...]:
+    capabilities: list[str] = []
+    rust_featurizer_cls = getattr(module, "RustFeaturizer", None)
+    rust_retriever_cls = getattr(module, "RustHybridCentroidRetriever", None)
+    if rust_retriever_cls is not None and callable(getattr(rust_retriever_cls, "top_k_hybrid_centroid", None)):
+        capabilities.append(RUST_CAPABILITY_HYBRID_CENTROID_RETRIEVER_V1)
+    if rust_featurizer_cls is not None and callable(
+        getattr(rust_featurizer_cls, "linker_pair_index_arrays_aggregate_stats", None)
+    ):
+        capabilities.append(RUST_CAPABILITY_INDEXED_PAIR_ARRAY_FEATURIZATION_V1)
+    if rust_retriever_cls is not None and _callable_signature_mentions(
+        getattr(rust_retriever_cls, "top_k_hybrid_centroid_pair_plan", None),
+        "query_candidate_component_keys_by_signature_id",
+    ):
+        capabilities.append(RUST_CAPABILITY_INCREMENTAL_LINKING_PAIR_PLAN_V1)
+    if (
+        rust_featurizer_cls is not None
+        and callable(getattr(rust_featurizer_cls, "linker_pair_index_arrays_constraint_labels", None))
+        and callable(getattr(rust_featurizer_cls, "linker_pair_distance_accumulators", None))
+    ):
+        capabilities.append(RUST_CAPABILITY_INCREMENTAL_LINKING_CONSTRAINT_ARRAYS_V1)
+    return tuple(capabilities)
+
+
 def load_s2and_rust_extension(*, import_module: Callable[[str], Any] | None = None) -> Any | None:
     importer = import_module or importlib.import_module
     try:
         module = importer("s2and_rust")
-    except Exception:
+    except ModuleNotFoundError as exc:
+        if exc.name != "s2and_rust":
+            raise
         return None
 
     shim_score = _rust_featurizer_api_score(module)
@@ -111,7 +151,9 @@ def load_s2and_rust_extension(*, import_module: Callable[[str], Any] | None = No
     candidate_module: Any | None = None
     try:
         candidate_module = importer("s2and_rust._s2and_rust")
-    except Exception:
+    except ModuleNotFoundError as exc:
+        if exc.name != "s2and_rust._s2and_rust":
+            raise
         candidate_module = None
 
     candidate_score = _rust_featurizer_api_score(candidate_module) if candidate_module is not None else -1
@@ -145,6 +187,7 @@ def detect_rust_runtime_capabilities(
             core_runtime_available=False,
             from_dataset_paper_preprocess_available=False,
             reason="rust_extension_unavailable",
+            named_capabilities=(),
         )
 
     rust_featurizer_cls = getattr(module, "RustFeaturizer", None)
@@ -154,6 +197,7 @@ def detect_rust_runtime_capabilities(
             core_runtime_available=False,
             from_dataset_paper_preprocess_available=False,
             reason="rust_featurizer_missing",
+            named_capabilities=_detect_named_rust_capabilities(module),
         )
 
     missing_markers = [
@@ -192,6 +236,7 @@ def detect_rust_runtime_capabilities(
         core_runtime_available=core_runtime_available,
         from_dataset_paper_preprocess_available=from_dataset_paper_preprocess_available,
         reason=reason,
+        named_capabilities=_detect_named_rust_capabilities(module),
     )
 
 

@@ -96,12 +96,21 @@ These gates must pass before promoting any Rust defaults further.
 
 ---
 
+## Cache semantics
+
+- Public `use_cache` remains the pair-feature persistent-cache knob across training and inference.
+- `use_cache=True` enables the pair-feature SQLite cache.
+- Same-process Rust featurizer reuse is independent of `use_cache`.
+- See [../caching.md](../caching.md) for the full cache layout and operational guidance.
+
+---
+
 ## Implementation notes
 
 Key design decisions and their rationale (in order of implementation):
 
 - **Batch constraint APIs** (`get_constraints_matrix`, `get_constraints_matrix_indexed`): integrated
-  across `distance_matrix_helper`, `_predict_incremental_helper`, and `_phase_a_seed_distances`.
+  across `distance_matrix_helper` and `_predict_incremental_helper`.
 - **Compact `CounterData`**: replaced `HashMap<String, f64>` with `Vec<(u64, f32)>` sorted by
   FNV-1a 64-bit hash; `counter_jaccard_data` uses binary search. ~400 MB savings on kisti.
   Disk-cache version bumped to 5. Note: 64-bit birthday collision risk is very low at million-scale
@@ -113,12 +122,8 @@ Key design decisions and their rationale (in order of implementation):
 - **L1b cleanup boundary**: `scripts/transfer_experiment_seed_paper.py` runs targeted
   `evict_rust_featurizer(dataset)` + `gc.collect()` after LightGBM fit; emits
   `Telemetry: post_rust_cleanup ...`.
-- **Phase-split overflow surface**: return field `phase_a_accumulator_overflow_early_stop` +
-  log line `Telemetry: phase_split_phase_a_overflow ...`.
 - **Rust batch chunk-budget control**: max chunk budget 256 MB; startup fixed-overhead calibration
   hardened with page-touch probe and conservative adoption (never decreases `fixed_overhead_bytes`).
-- **`from_dataset` disk-cache version**: bumped to 4 (ref_details gate) then 5 (compact CounterData);
-  add-before-evict race fixed.
 
 ---
 

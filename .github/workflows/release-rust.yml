@@ -168,16 +168,103 @@ jobs:
     if: needs.detect-versions.outputs.s2and_changed == 'true' || needs.detect-versions.outputs.force_build == 'true' || needs.detect-versions.outputs.publish_s2and == 'true'
     steps:
       - uses: actions/checkout@v5
+        with:
+          lfs: true
 
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Hydrate production model LFS files
+        run: git lfs pull --include="s2and/data/production_model_v*.pickle,s2and/data/production_model_v*/**"
+
+      - name: Verify hydrated production model files
+        run: |
+          uv run --no-project python - <<'PY'
+          from pathlib import Path
+
+          pointer_prefix = b"version https://git-lfs.github.com/spec/v1"
+          required_paths = [
+              Path("s2and/data/production_model_v1.0.pickle"),
+              Path("s2and/data/production_model_v1.1.pickle"),
+              Path("s2and/data/production_model_v1.2.pickle"),
+          ]
+          required_paths.extend(
+              sorted(path for path in Path("s2and/data/production_model_v1.21").rglob("*") if path.is_file())
+          )
+
+          failures = []
+          for path in required_paths:
+              if not path.exists():
+                  failures.append(f"missing: {path}")
+                  continue
+              head = path.read_bytes()[: len(pointer_prefix)]
+              if head == pointer_prefix:
+                  failures.append(f"LFS pointer was not hydrated: {path}")
+
+          if failures:
+              raise SystemExit("\n".join(failures))
+          print(f"Verified {len(required_paths)} hydrated production model files.")
+          PY
+
       - name: Build s2and distributions
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install build
-          python -m build --sdist --wheel --outdir dist
+          rm -rf build
+          uv build --sdist --wheel --out-dir dist --clear
+
+      - name: Verify built distributions contain hydrated models
+        run: |
+          uv run --no-project python - <<'PY'
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          pointer_prefix = b"version https://git-lfs.github.com/spec/v1"
+          required = [
+              "s2and/data/production_model_v1.0.pickle",
+              "s2and/data/production_model_v1.1.pickle",
+              "s2and/data/production_model_v1.2.pickle",
+          ]
+          required.extend(
+              path.as_posix()
+              for path in sorted(Path("s2and/data/production_model_v1.21").rglob("*"))
+              if path.is_file()
+          )
+
+          def fail(message: str) -> None:
+              raise SystemExit(message)
+
+          wheels = sorted(Path("dist").glob("s2and-*.whl"))
+          if len(wheels) != 1:
+              fail(f"expected exactly one s2and wheel, found {len(wheels)}")
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              wheel_names = set(wheel.namelist())
+              for path in required:
+                  if path not in wheel_names:
+                      fail(f"wheel missing production model file: {path}")
+                  if wheel.read(path).startswith(pointer_prefix):
+                      fail(f"wheel contains an unhydrated LFS pointer: {path}")
+
+          sdists = sorted(Path("dist").glob("s2and-*.tar.gz"))
+          if len(sdists) != 1:
+              fail(f"expected exactly one s2and sdist, found {len(sdists)}")
+          with tarfile.open(sdists[0], "r:gz") as sdist:
+              members = {member.name: member for member in sdist.getmembers()}
+              for path in required:
+                  matches = [name for name in members if name.endswith(f"/{path}")]
+                  if len(matches) != 1:
+                      fail(f"sdist missing production model file: {path}")
+                  extracted = sdist.extractfile(members[matches[0]])
+                  if extracted is None:
+                      fail(f"sdist production model file is not readable: {path}")
+                  if extracted.read(len(pointer_prefix)) == pointer_prefix:
+                      fail(f"sdist contains an unhydrated LFS pointer: {path}")
+
+          print(f"Verified hydrated production models in {wheels[0].name} and {sdists[0].name}.")
+          PY
 
       - uses: actions/upload-artifact@v6
         with:

@@ -11,7 +11,7 @@ Knobs turned down vs the real command:
   - 5 hyperopt iterations instead of 50
 
 What's preserved:
-  - Multi-dataset featurizer cache thrashing  (S2AND_RUST_FEATURIZER_MAX_INMEM=1)
+  - Multi-dataset transfer workload with repeated Rust featurizer builds
   - Union model: train pairwise + nameless, fit clusterer on combined val blocks
   - cluster_eval on a target dataset  (fused predict path with Rust featurization)
   - Stage-level timing and peak-RSS monitoring
@@ -47,7 +47,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from _rust_suite.common import (  # noqa: E402
+from _rust_suite.common import (  # type: ignore  # noqa: E402
     PROJECT_ROOT,
     ProcessTreeRSSMonitor,
     build_run_metadata,
@@ -356,8 +356,6 @@ def _single_run(
     os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
     os.environ["S2AND_BACKEND"] = backend
     os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
-    # Match the internal script: limit featurizer residency
-    os.environ["S2AND_RUST_FEATURIZER_MAX_INMEM"] = "1"
 
     rust_extension_identity: dict[str, Any] | None = None
     if backend == "rust":

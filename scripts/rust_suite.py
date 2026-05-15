@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import logging
 import os
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PACKAGE_DATA_ROOT = PROJECT_ROOT / "s2and" / "data"
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 
 # Ensure `scripts/_rust_suite` is importable even when this file is loaded via
@@ -31,6 +33,7 @@ else:
     from _rust_suite.common import get_result_markers as common_get_result_markers
 
 RESULT_JSON_START, RESULT_JSON_END = common_get_result_markers("profile")
+MEMORY_TELEMETRY_JSONL_ENV = "S2AND_MEMORY_TELEMETRY_JSONL"
 
 _MODULE_IMPORTS = {
     "compare": "_rust_suite.compare_cmd",
@@ -48,6 +51,8 @@ _MODULE_IMPORTS = {
 
 _MODULE_CACHE: dict[str, ModuleType] = {}
 _ACTIVE_CANONICAL_ARGV: list[str] | None = None
+_ACTIVE_LOG_FILE: str | None = None
+_ACTIVE_MEMORY_TELEMETRY_JSONL: str | None = None
 
 
 def _build_run_metadata() -> dict[str, Any]:
@@ -57,6 +62,41 @@ def _build_run_metadata() -> dict[str, Any]:
         argv=list(canonical_argv),
         project_root=PROJECT_ROOT,
     )
+
+
+def _configure_file_logging(log_file: str | None) -> None:
+    if not log_file:
+        return
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_log_path = log_path.resolve()
+
+    logger = logging.getLogger("s2and")
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename).resolve() == resolved_log_path:
+            return
+
+    handler = logging.FileHandler(resolved_log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
+def _configure_memory_telemetry_jsonl(path: str | None) -> None:
+    if not path:
+        return
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    os.environ[MEMORY_TELEMETRY_JSONL_ENV] = str(output_path)
+
+
+def _active_global_cli_args() -> list[str]:
+    args: list[str] = []
+    if _ACTIVE_LOG_FILE:
+        args.extend(["--log-file", _ACTIVE_LOG_FILE])
+    if _ACTIVE_MEMORY_TELEMETRY_JSONL:
+        args.extend(["--memory-telemetry-jsonl", _ACTIVE_MEMORY_TELEMETRY_JSONL])
+    return args
 
 
 # Preserve historical test-facing helper exports while using shared implementations.
@@ -85,8 +125,8 @@ def _single_run(
     dataset_name: str,
     n_jobs: int,
     profile_output_path: str,
-    model_path: str = os.path.join("data", "production_model_v1.1.pickle"),
-    data_root: str = os.path.join("data", "s2and_mini"),
+    model_path: str = str(PACKAGE_DATA_ROOT / "production_model_v1.21"),
+    data_root: str = str(PACKAGE_DATA_ROOT / "s2and_mini"),
     specter_file: str = "",
     rust_warm_featurizer_before_predict: int = 0,
     run_label: str | None = None,
@@ -115,8 +155,8 @@ def _run_single_subprocess(
     dataset_name: str,
     n_jobs: int,
     profile_output_path: str,
-    model_path: str = os.path.join("data", "production_model_v1.1.pickle"),
-    data_root: str = os.path.join("data", "s2and_mini"),
+    model_path: str = str(PACKAGE_DATA_ROOT / "production_model_v1.21"),
+    data_root: str = str(PACKAGE_DATA_ROOT / "s2and_mini"),
     specter_file: str = "",
     rust_warm_featurizer_before_predict: int = 0,
     single_write_json: str = "",
@@ -127,6 +167,7 @@ def _run_single_subprocess(
         cmd = [
             sys.executable,
             str(script_path_resolved),
+            *_active_global_cli_args(),
             "prod-inference",
             "--mode",
             "single",
@@ -228,7 +269,7 @@ _COMMANDS = {
     },
     "big-block-incremental": {
         "module": "big_block_incremental",
-        "help": "Big-block incremental baseline/phase-split workflow.",
+        "help": "Big-block incremental baseline/promoted-linker workflow.",
         "main_kind": "noargv",
     },
     "featurizer-reuse": {
@@ -243,17 +284,17 @@ _COMMANDS = {
     },
     "calibrate-phase-a": {
         "module": "calibrate_phase_a",
-        "help": "Calibrate phase-A accumulator entry bytes from logs.",
+        "help": "Calibrate phase-A accumulator entry bytes from memory telemetry JSONL.",
         "main_kind": "argv",
     },
     "calibrate-rust-batch": {
         "module": "calibrate_rust_batch",
-        "help": "Calibrate Rust batch overhead bytes from logs.",
+        "help": "Calibrate Rust batch overhead bytes from memory telemetry JSONL.",
         "main_kind": "argv",
     },
     "summarize-memory-telemetry": {
         "module": "summarize_memory_telemetry",
-        "help": "Summarize memory prediction error ratios from telemetry logs.",
+        "help": "Summarize memory prediction error ratios from memory telemetry JSONL.",
         "main_kind": "argv",
     },
     "measure-counter-data": {
@@ -275,16 +316,26 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("command", choices=sorted(_COMMANDS.keys()))
     parser.add_argument("args", nargs=argparse.REMAINDER)
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Append s2and logger output to this file. Must appear before the command name.",
+    )
+    parser.add_argument(
+        "--memory-telemetry-jsonl",
+        default=None,
+        help="Append structured memory telemetry JSONL to this file. Must appear before the command name.",
+    )
     return parser
 
 
-def _dispatch(command: str, forwarded_args: list[str]) -> int:
+def _dispatch(command: str, forwarded_args: list[str], *, global_args: list[str] | None = None) -> int:
     command_spec = _COMMANDS[command]
     module = _load_internal_module(command_spec["module"])
 
     global _ACTIVE_CANONICAL_ARGV
     previous_argv = list(sys.argv)
-    _ACTIVE_CANONICAL_ARGV = [str(Path(__file__).resolve()), command, *forwarded_args]
+    _ACTIVE_CANONICAL_ARGV = [str(Path(__file__).resolve()), *(global_args or []), command, *forwarded_args]
 
     try:
         if command_spec["main_kind"] == "argv":
@@ -304,7 +355,31 @@ def main(argv: list[str] | None = None) -> int:
     forwarded_args = list(parsed.args)
     if forwarded_args and forwarded_args[0] == "--":
         forwarded_args = forwarded_args[1:]
-    return _dispatch(parsed.command, forwarded_args)
+
+    global_args: list[str] = []
+    if parsed.log_file:
+        global_args.extend(["--log-file", parsed.log_file])
+    if parsed.memory_telemetry_jsonl:
+        global_args.extend(["--memory-telemetry-jsonl", parsed.memory_telemetry_jsonl])
+
+    global _ACTIVE_LOG_FILE, _ACTIVE_MEMORY_TELEMETRY_JSONL
+    previous_log_file = _ACTIVE_LOG_FILE
+    previous_memory_telemetry = _ACTIVE_MEMORY_TELEMETRY_JSONL
+    previous_memory_telemetry_env = os.environ.get(MEMORY_TELEMETRY_JSONL_ENV)
+    _ACTIVE_LOG_FILE = parsed.log_file
+    _ACTIVE_MEMORY_TELEMETRY_JSONL = parsed.memory_telemetry_jsonl
+    _configure_file_logging(parsed.log_file)
+    _configure_memory_telemetry_jsonl(parsed.memory_telemetry_jsonl)
+    try:
+        return _dispatch(parsed.command, forwarded_args, global_args=global_args)
+    finally:
+        _ACTIVE_LOG_FILE = previous_log_file
+        _ACTIVE_MEMORY_TELEMETRY_JSONL = previous_memory_telemetry
+        if parsed.memory_telemetry_jsonl:
+            if previous_memory_telemetry_env is None:
+                os.environ.pop(MEMORY_TELEMETRY_JSONL_ENV, None)
+            else:
+                os.environ[MEMORY_TELEMETRY_JSONL_ENV] = previous_memory_telemetry_env
 
 
 if __name__ == "__main__":

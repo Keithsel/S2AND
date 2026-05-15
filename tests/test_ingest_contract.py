@@ -1,4 +1,5 @@
-from s2and.ingest_contract import build_rust_json_ingest_contract
+from s2and.feature_port import _from_json_paths_with_contract
+from s2and.rust_lifecycle import build_rust_json_ingest_contract
 
 
 class DummyDataset:
@@ -32,7 +33,28 @@ def test_build_rust_json_ingest_contract_collects_canonical_fields():
     assert contract.num_threads == 4
     assert contract.expected_normalization_version is None
     assert contract.allow_normalization_version_mismatch is False
-    assert contract.as_from_json_paths_args() == (
+
+
+def test_rust_json_ingest_contract_is_applied_explicitly():
+    contract = build_rust_json_ingest_contract(
+        DummyDataset(),
+        name_counts_path="name_counts.json",
+        cluster_seed_require_value=0.0,
+        cluster_seed_disallow_value=10000.0,
+        num_threads=4,
+        name_tuples_path="name_tuples.txt",
+    )
+
+    class RustFeaturizer:
+        observed_args = None
+
+        @classmethod
+        def from_json_paths(cls, *args):
+            cls.observed_args = args
+            return "featurizer"
+
+    assert _from_json_paths_with_contract(RustFeaturizer, contract) == "featurizer"
+    assert RustFeaturizer.observed_args == (
         "signatures.json",
         "papers.json",
         "cluster_seeds.json",

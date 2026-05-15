@@ -14,7 +14,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from _rust_suite.common import (  # noqa: E402
+from _rust_suite.common import (  # type: ignore  # noqa: E402
     RSSMonitor,
     build_run_metadata,
     collect_rust_extension_identity,
@@ -23,8 +23,8 @@ from _rust_suite.common import (  # noqa: E402
 )
 
 RESULT_JSON_START, RESULT_JSON_END = get_result_markers("profile")
-DEFAULT_DATA_ROOT = os.path.join("data", "s2and_mini")
-DEFAULT_MODEL_PATH = os.path.join("data", "production_model_v1.1.pickle")
+DEFAULT_DATA_ROOT = os.path.join("s2and", "data", "s2and_mini")
+DEFAULT_MODEL_PATH = os.path.join("s2and", "data", "production_model_v1.21")
 
 
 def _as_triplet(metrics: dict[str, Any], key: str) -> tuple[float, float, float]:
@@ -58,8 +58,7 @@ def _resolve_dataset_file(
     if os.path.exists(fallback_path):
         return fallback_path
     raise FileNotFoundError(
-        "Missing dataset file for "
-        f"'{dataset_name}'. Tried '{preferred_path}' and '{fallback_path}'."
+        "Missing dataset file for " f"'{dataset_name}'. Tried '{preferred_path}' and '{fallback_path}'."
     )
 
 
@@ -125,10 +124,10 @@ def _single_run(
     from s2and.consts import PROJECT_ROOT_PATH
     from s2and.data import ANDData
     from s2and.eval import cluster_eval
-    from s2and.serialization import load_pickle_with_verified_label_encoder_compat
+    from s2and.production_model import load_production_model
 
     resolved_model_path = _resolve_path(PROJECT_ROOT_PATH, model_path)
-    clusterer = load_pickle_with_verified_label_encoder_compat(resolved_model_path)["clusterer"]
+    clusterer = load_production_model(resolved_model_path)
     clusterer.use_cache = False
     clusterer.n_jobs = n_jobs
 

@@ -1,16 +1,17 @@
-import json
 import threading
 import time
-from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 import s2and.feature_port as feature_port
 import s2and.rust_capabilities as rust_capabilities
-from s2and.data import NameCounts
+from s2and.data import ANDData, NameCounts
 
-_REAL_RUST_CACHE_PATH = feature_port._rust_cache_path
+
+def _missing_module(name: str) -> ModuleNotFoundError:
+    return ModuleNotFoundError(f"No module named {name!r}", name=name)
 
 
 class DummyRustFeaturizer:
@@ -32,6 +33,9 @@ class DummyRustFeaturizer:
 
     def get_constraints_matrix_indexed(self, *_args, **_kwargs):
         return []
+
+    def json_ingest_telemetry(self):
+        return {"stage_seconds": {}, "counts": {}}
 
     @classmethod
     def from_dataset(cls, dataset, _require_value, _disallow_value, _num_threads=None):
@@ -59,17 +63,17 @@ class DummyRustFeaturizer:
 
 
 class DummyRustModule:
-    __version__ = "0.48.0"
+    __version__ = "0.51.0"
     RustFeaturizer = DummyRustFeaturizer
 
 
-class DummyDataset:
+class DummyDataset(ANDData):
     def __init__(self, name: str, mode: str = "train"):
         self.name = name
         self.mode = mode
         self.signatures = {}
         self.papers = {}
-        self.name_tuples = {}
+        self.name_tuples = set()
         self.compute_reference_features = False
         self.preprocess = True
         self.n_jobs = 1
@@ -100,58 +104,37 @@ class SleepyCounter:
 
 
 def _cache_size() -> int:
-    return len(list(feature_port._RUST_FEATURIZER_CACHE.keys()))
+    return sum(len(entries) for entries in feature_port._RUST_FEATURIZER_CACHE.values())
 
 
 @pytest.fixture(autouse=True)
-def _reset_feature_port_state(monkeypatch, tmp_path):
+def _reset_feature_port_state(monkeypatch):
     feature_port.clear_rust_featurizer_cache()
-    feature_port._RUST_FEATURIZER_MAX_INMEM_CACHE = None
     DummyRustFeaturizer.created = []
     DummyRustFeaturizer.from_json_created = []
     DummyRustFeaturizer.signature_overlay_payloads = []
     monkeypatch.setattr(feature_port, "s2and_rust", DummyRustModule)
-    monkeypatch.setattr(
-        feature_port,
-        "_rust_cache_path",
-        lambda dataset: str(tmp_path / f"{dataset.name}_{id(dataset)}.bin"),
-    )
-    monkeypatch.delenv("S2AND_RUST_FEATURIZER_MAX_INMEM", raising=False)
     monkeypatch.delenv("S2AND_RUST_NAME_COUNTS_JSON", raising=False)
     yield
     feature_port.clear_rust_featurizer_cache()
 
 
-def test_use_cache_true_keeps_unbounded_cache_in_train_mode():
-    """Default MAX_INMEM=0 keeps all featurizers, matching Python CACHED_FEATURES."""
+def test_rust_featurizer_in_memory_cache_keeps_train_entries():
+    """Same-process cache keeps all live dataset entries."""
     d1 = DummyDataset("d1", mode="train")
     d2 = DummyDataset("d2", mode="train")
 
-    feature_port._get_rust_featurizer(d1, use_cache=True)
+    feature_port._get_rust_featurizer(d1)
     assert _cache_size() == 1
 
-    feature_port._get_rust_featurizer(d2, use_cache=True)
+    feature_port._get_rust_featurizer(d2)
     assert _cache_size() == 2
     assert feature_port._RUST_FEATURIZER_CACHE.get(d1) is not None
     assert feature_port._RUST_FEATURIZER_CACHE.get(d2) is not None
 
     # Re-access d1 — should be a cache hit, no rebuild.
-    feature_port._get_rust_featurizer(d1, use_cache=True)
+    feature_port._get_rust_featurizer(d1)
     assert DummyRustFeaturizer.created == ["d1", "d2"]
-
-
-def test_rust_cache_path_sanitizes_dataset_name_for_windows_paths(monkeypatch, tmp_path):
-    monkeypatch.setattr(feature_port, "CACHE_ROOT", tmp_path)
-    dataset = DummyDataset("a:b/c", mode="train")
-
-    cache_path = _REAL_RUST_CACHE_PATH(dataset)
-    cache_name = Path(cache_path).name
-
-    assert Path(cache_path).suffix == ".bin"
-    assert ":" not in cache_name
-    assert "/" not in cache_name
-    assert "\\" not in cache_name
-    assert Path(cache_path).parent == tmp_path / "rust_featurizer"
 
 
 def test_rust_featurizer_available_reloads_extension_when_missing(monkeypatch):
@@ -182,44 +165,31 @@ def test_rust_signature_preprocess_available_reloads_extension_when_missing(monk
         load_calls["count"] += 1
         return sentinel_module
 
+    def _detect_stub(*, extension_module):
+        return SimpleNamespace(core_runtime_available=extension_module is sentinel_module)
+
     monkeypatch.setattr(feature_port, "s2and_rust", None)
     monkeypatch.setattr(feature_port, "load_s2and_rust_extension", _load_stub)
+    monkeypatch.setattr(feature_port, "detect_rust_runtime_capabilities", _detect_stub)
 
     assert feature_port.rust_signature_preprocess_available() is True
     assert feature_port.s2and_rust is sentinel_module
     assert load_calls["count"] == 1
 
 
-def test_max_inmem_env_uses_lru_eviction_policy(monkeypatch):
-    monkeypatch.setenv("S2AND_RUST_FEATURIZER_MAX_INMEM", "2")
-    d1 = DummyDataset("d1", mode="train")
-    d2 = DummyDataset("d2", mode="train")
-    d3 = DummyDataset("d3", mode="train")
-
-    feature_port._get_rust_featurizer(d1, use_cache=True)
-    feature_port._get_rust_featurizer(d2, use_cache=True)
-    feature_port._get_rust_featurizer(d1, use_cache=True)  # Make d1 most-recently-used
-    feature_port._get_rust_featurizer(d3, use_cache=True)
-
-    assert _cache_size() == 2
-    assert feature_port._RUST_FEATURIZER_CACHE.get(d1) is not None
-    assert feature_port._RUST_FEATURIZER_CACHE.get(d2) is None
-    assert feature_port._RUST_FEATURIZER_CACHE.get(d3) is not None
-
-
-def test_use_cache_true_is_unbounded_in_inference_mode():
+def test_rust_featurizer_in_memory_cache_keeps_inference_entries():
     d1 = DummyDataset("d1", mode="inference")
     d2 = DummyDataset("d2", mode="inference")
     d3 = DummyDataset("d3", mode="inference")
 
-    feature_port._get_rust_featurizer(d1, use_cache=True)
-    feature_port._get_rust_featurizer(d2, use_cache=True)
-    feature_port._get_rust_featurizer(d3, use_cache=True)
+    feature_port._get_rust_featurizer(d1)
+    feature_port._get_rust_featurizer(d2)
+    feature_port._get_rust_featurizer(d3)
 
     assert _cache_size() == 3
 
 
-def test_use_cache_false_reuses_rust_featurizer_in_memory():
+def test_rust_featurizer_reuses_live_dataset_entry():
     dataset = DummyDataset("no_cache_dataset", mode="train")
 
     feature_port._get_rust_featurizer(dataset)
@@ -229,62 +199,49 @@ def test_use_cache_false_reuses_rust_featurizer_in_memory():
     assert _cache_size() == 1
 
 
-def test_use_cache_false_skips_disk_cache_lookup(monkeypatch):
-    dataset = DummyDataset("no_cache_disk_dataset", mode="train")
-
-    monkeypatch.setattr(
-        feature_port,
-        "_try_load_rust_featurizer_from_disk_cache",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Disk cache lookup should be disabled")),
-    )
-
-    feature_port._get_rust_featurizer(dataset, use_cache=False)
-
-
-def test_warm_rust_featurizer_persists_without_use_cache():
+def test_warm_rust_featurizer_populates_in_memory_cache():
     dataset = DummyDataset("warm_dataset", mode="train")
 
-    feature_port.warm_rust_featurizer(dataset, use_cache=False)
-    feature_port._get_rust_featurizer(dataset, use_cache=False)
+    feature_port.warm_rust_featurizer(dataset)
+    feature_port._get_rust_featurizer(dataset)
 
     assert DummyRustFeaturizer.created == ["warm_dataset"]
     assert _cache_size() == 1
 
 
-def test_use_cache_true_checks_disk_cache_in_inference_mode(monkeypatch):
-    dataset = DummyDataset("inference_cache_dataset", mode="inference")
-    lookup_state = {"called": False}
+def test_rust_featurizer_cache_keeps_distinct_build_options(monkeypatch):
+    dataset = DummyDataset("option_cache_dataset", mode="train")
+    build_calls: list[tuple[str, bool]] = []
 
-    def _track_disk_lookup(*args, **kwargs):
-        lookup_state["called"] = True
-        return None, "skipped"
+    def _build_stub(dataset_arg, *, requested_build_path, allow_normalization_version_mismatch):
+        build_calls.append((requested_build_path, bool(allow_normalization_version_mismatch)))
+        return (
+            DummyRustFeaturizer(f"{dataset_arg.name}:{requested_build_path}:{allow_normalization_version_mismatch}"),
+            requested_build_path,
+            {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
+            1,
+            0.0,
+        )
 
-    monkeypatch.setattr(feature_port, "_try_load_rust_featurizer_from_disk_cache", _track_disk_lookup)
-    feature_port._get_rust_featurizer(dataset, use_cache=True)
+    monkeypatch.setattr(feature_port, "_build_rust_featurizer_strict", _build_stub)
 
-    assert lookup_state["called"] is True
-
-
-def test_disk_cache_save_runs_outside_global_cache_lock(monkeypatch):
-    dataset = DummyDataset("save_outside_lock", mode="train")
-    save_calls: list[str] = []
-
-    monkeypatch.setattr(
-        feature_port,
-        "_try_load_rust_featurizer_from_disk_cache",
-        lambda *args, **kwargs: (None, "skipped"),
+    first = feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
+    feature_port.warm_rust_featurizer(
+        dataset,
+        rust_build_path="from_json_paths",
+        allow_normalization_version_mismatch=True,
+    )
+    first_again = feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
+    json_entry = feature_port._get_rust_featurizer(
+        dataset,
+        rust_build_path="from_json_paths",
+        allow_normalization_version_mismatch=True,
     )
 
-    def _save_outside_lock(_featurizer, *, cache_path, cache_metadata):
-        assert feature_port._RUST_FEATURIZER_CACHE_LOCK.locked() is False
-        assert isinstance(cache_metadata, dict)
-        save_calls.append(cache_path)
-
-    monkeypatch.setattr(feature_port, "_save_rust_featurizer_cache_best_effort", _save_outside_lock)
-
-    feature_port._get_rust_featurizer(dataset, use_cache=True)
-
-    assert len(save_calls) == 1
+    assert first_again is first
+    assert json_entry.dataset_name == "option_cache_dataset:from_json_paths:True"
+    assert build_calls == [("from_dataset", False), ("from_json_paths", True)]
+    assert _cache_size() == 2
 
 
 def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
@@ -294,7 +251,8 @@ def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
     build_windows: dict[str, tuple[float, float]] = {}
     window_lock = threading.Lock()
 
-    def _build_stub(dataset, *, requested_build_path):
+    def _build_stub(dataset, *, requested_build_path, allow_normalization_version_mismatch):
+        assert allow_normalization_version_mismatch is False
         ready.wait(timeout=2)
         build_start = time.perf_counter()
         time.sleep(0.25)
@@ -311,7 +269,7 @@ def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
 
     monkeypatch.setattr(
         feature_port,
-        "_build_rust_featurizer_with_retry_for_missing_signature_ngrams",
+        "_build_rust_featurizer_strict",
         _build_stub,
     )
 
@@ -319,7 +277,7 @@ def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
 
     def _worker(dataset):
         try:
-            feature_port._get_rust_featurizer(dataset, use_cache=False)
+            feature_port._get_rust_featurizer(dataset)
         except Exception as exc:  # pragma: no cover - assertion guard
             errors.append(exc)
 
@@ -343,7 +301,8 @@ def test_concurrent_builds_for_same_dataset_share_single_inflight_build(monkeypa
     ready = threading.Event()
     build_calls = {"count": 0}
 
-    def _build_stub(dataset_arg, *, requested_build_path):
+    def _build_stub(dataset_arg, *, requested_build_path, allow_normalization_version_mismatch):
+        assert allow_normalization_version_mismatch is False
         build_calls["count"] += 1
         ready.wait(timeout=2)
         time.sleep(0.25)
@@ -357,7 +316,7 @@ def test_concurrent_builds_for_same_dataset_share_single_inflight_build(monkeypa
 
     monkeypatch.setattr(
         feature_port,
-        "_build_rust_featurizer_with_retry_for_missing_signature_ngrams",
+        "_build_rust_featurizer_strict",
         _build_stub,
     )
 
@@ -365,7 +324,7 @@ def test_concurrent_builds_for_same_dataset_share_single_inflight_build(monkeypa
 
     def _worker():
         try:
-            feature_port._get_rust_featurizer(dataset, use_cache=False)
+            feature_port._get_rust_featurizer(dataset)
         except Exception as exc:  # pragma: no cover - assertion guard
             errors.append(exc)
 
@@ -383,11 +342,14 @@ def test_concurrent_builds_for_same_dataset_share_single_inflight_build(monkeypa
 
 def test_increment_rust_featurizer_build_count_is_thread_safe():
     dataset = DummyDataset("build_count_threadsafe", mode="train")
+    cache_key = feature_port._rust_featurizer_cache_key("from_dataset", False)  # noqa: SLF001
     with feature_port._RUST_FEATURIZER_CACHE_LOCK:
-        feature_port._RUST_FEATURIZER_CACHE[dataset] = feature_port._CacheEntry(
-            featurizer=DummyRustFeaturizer(dataset.name),
-            build_count=SleepyCounter(0),
-        )
+        feature_port._RUST_FEATURIZER_CACHE[dataset] = {
+            cache_key: feature_port._CacheEntry(
+                featurizer=DummyRustFeaturizer(dataset.name),
+                build_count=cast(Any, SleepyCounter(0)),
+            )
+        }
 
     worker_count = 8
     increments_per_worker = 25
@@ -398,7 +360,7 @@ def test_increment_rust_featurizer_build_count_is_thread_safe():
     def _worker():
         try:
             for _ in range(increments_per_worker):
-                next_count = feature_port._increment_rust_featurizer_build_count(dataset)
+                next_count = feature_port._increment_rust_featurizer_build_count(dataset, cache_key)
                 with counts_lock:
                     counts.append(next_count)
         except Exception as exc:  # pragma: no cover - assertion guard
@@ -412,7 +374,7 @@ def test_increment_rust_featurizer_build_count_is_thread_safe():
 
     assert errors == []
     expected_count = worker_count * increments_per_worker
-    assert feature_port._rust_featurizer_build_count(dataset) == expected_count
+    assert feature_port._rust_featurizer_build_count(dataset, cache_key) == expected_count
     assert sorted(counts) == list(range(1, expected_count + 1))
 
 
@@ -420,8 +382,8 @@ def test_get_rust_featurizer_raises_after_repeated_empty_wait(monkeypatch):
     dataset = DummyDataset("empty_wait_retry_budget", mode="train")
     attempts = {"count": 0}
     runtime_context = type("RuntimeContext", (), {"operation": "test_empty_wait", "run_id": "run-empty-wait"})()
-    monkeypatch.setenv(feature_port.RUST_FEATURIZER_EMPTY_WAIT_MAX_RETRIES_ENV, "2")
-    monkeypatch.setenv(feature_port.RUST_FEATURIZER_EMPTY_WAIT_BACKOFF_SECONDS_ENV, "0")
+    monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_MAX_RETRIES", 2)
+    monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_BACKOFF_SECONDS", 0.0)
 
     def _always_empty(_dataset, *, build_context):
         del build_context
@@ -431,7 +393,7 @@ def test_get_rust_featurizer_raises_after_repeated_empty_wait(monkeypatch):
     monkeypatch.setattr(feature_port, "_get_or_wait_for_cached", _always_empty)
 
     with pytest.raises(RuntimeError, match="empty wait state") as exc_info:
-        feature_port._get_rust_featurizer(dataset, runtime_context=runtime_context, use_cache=False)
+        feature_port._get_rust_featurizer(dataset, runtime_context=runtime_context)
     message = str(exc_info.value)
     assert "dataset=empty_wait_retry_budget" in message
     assert "run=run-empty-wait" in message
@@ -443,10 +405,10 @@ def test_get_rust_featurizer_retries_empty_wait_then_builds(monkeypatch):
     dataset = DummyDataset("empty_wait_then_build", mode="train")
     attempts = {"count": 0}
     build_calls = {"count": 0}
-    inflight = feature_port._InFlightFeaturizerBuild()
+    inflight = feature_port._InFlightFeaturizerBuild("from_dataset")
     expected_featurizer = DummyRustFeaturizer("built_after_empty_wait")
-    monkeypatch.setenv(feature_port.RUST_FEATURIZER_EMPTY_WAIT_MAX_RETRIES_ENV, "2")
-    monkeypatch.setenv(feature_port.RUST_FEATURIZER_EMPTY_WAIT_BACKOFF_SECONDS_ENV, "0")
+    monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_MAX_RETRIES", 2)
+    monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_BACKOFF_SECONDS", 0.0)
 
     def _empty_then_build(_dataset, *, build_context):
         del build_context
@@ -464,73 +426,13 @@ def test_get_rust_featurizer_retries_empty_wait_then_builds(monkeypatch):
     monkeypatch.setattr(feature_port, "_get_or_wait_for_cached", _empty_then_build)
     monkeypatch.setattr(feature_port, "_build_and_cache_rust_featurizer", _build_stub)
 
-    featurizer = feature_port._get_rust_featurizer(dataset, use_cache=False)
+    featurizer = feature_port._get_rust_featurizer(dataset)
     assert featurizer is expected_featurizer
     assert attempts["count"] == 2
     assert build_calls["count"] == 1
 
 
-def test_disk_cache_metadata_mismatch_skips_load(monkeypatch, tmp_path):
-    dataset = DummyDataset("cache_meta_miss", mode="train")
-    cache_path = str(tmp_path / "cache_meta_miss.bin")
-    metadata_path = feature_port._rust_cache_metadata_path(cache_path)
-
-    monkeypatch.setattr(feature_port, "_rust_cache_path", lambda _dataset: cache_path)
-    monkeypatch.setattr(
-        feature_port,
-        "_save_rust_featurizer_cache_best_effort",
-        lambda *_args, **_kwargs: None,
-    )
-
-    # Simulate an old/stale cache artifact with non-matching metadata.
-    with open(cache_path, "wb") as cache_file:
-        cache_file.write(b"stale")
-    with open(metadata_path, "w", encoding="utf-8") as metadata_file:
-        json.dump({"schema_version": 1, "dataset_name": "different_dataset"}, metadata_file)
-
-    def _unexpected_load(_path):
-        raise AssertionError("RustFeaturizer.load should not run when metadata mismatches")
-
-    monkeypatch.setattr(DummyRustFeaturizer, "load", staticmethod(_unexpected_load))
-    feature_port._get_rust_featurizer(dataset, use_cache=True)
-
-    assert DummyRustFeaturizer.created == ["cache_meta_miss"]
-
-
-def test_disk_cache_metadata_match_loads_without_rebuild(monkeypatch, tmp_path):
-    dataset = DummyDataset("cache_meta_hit", mode="train")
-    cache_path = str(tmp_path / "cache_meta_hit.bin")
-    metadata_path = feature_port._rust_cache_metadata_path(cache_path)
-
-    monkeypatch.setattr(feature_port, "_rust_cache_path", lambda _dataset: cache_path)
-    monkeypatch.setattr(
-        feature_port,
-        "_save_rust_featurizer_cache_best_effort",
-        lambda *_args, **_kwargs: None,
-    )
-
-    with open(cache_path, "wb") as cache_file:
-        cache_file.write(b"fresh")
-    expected_metadata = feature_port._rust_featurizer_cache_metadata(dataset, requested_build_path="from_dataset")
-    with open(metadata_path, "w", encoding="utf-8") as metadata_file:
-        json.dump(expected_metadata, metadata_file, sort_keys=True, separators=(",", ":"))
-
-    loaded = DummyRustFeaturizer("loaded")
-    load_calls: list[str] = []
-
-    def _load(path):
-        load_calls.append(path)
-        return loaded
-
-    monkeypatch.setattr(DummyRustFeaturizer, "load", staticmethod(_load))
-    featurizer = feature_port._get_rust_featurizer(dataset, use_cache=True)
-
-    assert featurizer is loaded
-    assert load_calls == [cache_path]
-    assert DummyRustFeaturizer.created == []
-
-
-def test_json_ingest_is_inference_only(monkeypatch):
+def test_json_ingest_is_inference_only():
     dataset = DummyDataset("train_dataset", mode="train")
     dataset.signatures_path = "signatures.json"
     dataset.papers_path = "papers.json"
@@ -585,37 +487,30 @@ def test_json_ingest_routes_canonical_payload(monkeypatch):
     )
 
 
-def test_featurizer_telemetry_logs_runtime_callsite(caplog):
-    dataset = DummyDataset("telemetry_dataset", mode="train")
-    runtime_context = type("RuntimeContext", (), {"operation": "constraints", "run_id": "run-123"})()
-
-    with caplog.at_level("INFO", logger="s2and"):
-        feature_port._get_rust_featurizer(dataset, runtime_context=runtime_context, use_cache=True)
-        feature_port._get_rust_featurizer(dataset, runtime_context=runtime_context, use_cache=True)
-
-    logs = "\n".join(caplog.messages)
-    assert "rust_featurizer_cache cache=miss" in logs
-    assert "rust_featurizer_cache cache=hit" in logs
-    assert "rust_core_build seconds=" in logs
-    assert "op=constraints" in logs
-    assert "run=run-123" in logs
-    assert "path=from_dataset" in logs
-
-
-def test_featurizer_telemetry_logs_json_build_path(caplog, monkeypatch):
-    dataset = DummyDataset("telemetry_json_dataset", mode="inference")
+def test_rust_build_path_argument_forces_from_dataset_even_with_json_paths():
+    dataset = DummyDataset("inference_dataset", mode="inference")
     dataset.signatures_path = "signatures.json"
     dataset.papers_path = "papers.json"
 
-    with caplog.at_level("INFO", logger="s2and"):
-        feature_port._get_rust_featurizer(dataset)
+    feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
 
-    logs = "\n".join(caplog.messages)
-    assert "rust_core_build seconds=" in logs
-    assert "path=from_json_paths" in logs
+    assert DummyRustFeaturizer.created == ["inference_dataset"]
+    assert DummyRustFeaturizer.from_json_created == []
 
 
-def test_json_ingest_overlay_payload_includes_only_signatures_with_name_counts(monkeypatch):
+def test_rust_build_path_argument_rebuilds_cached_different_path():
+    dataset = DummyDataset("inference_dataset", mode="inference")
+    dataset.signatures_path = "signatures.json"
+    dataset.papers_path = "papers.json"
+
+    feature_port._get_rust_featurizer(dataset)
+    feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
+
+    assert len(DummyRustFeaturizer.from_json_created) == 1
+    assert DummyRustFeaturizer.created == ["inference_dataset"]
+
+
+def test_json_ingest_overlay_payload_includes_only_signatures_with_name_counts():
     dataset = DummyDataset("inference_dataset", mode="inference")
     dataset.signatures_path = "signatures.json"
     dataset.papers_path = "papers.json"
@@ -650,7 +545,7 @@ def test_json_ingest_overlay_payload_includes_only_signatures_with_name_counts(m
     assert payload_entry.author_info_name_counts.last_first_initial == 4.0
 
 
-def test_signature_name_counts_overlay_payload_surfaces_items_failure(caplog):
+def test_signature_name_counts_overlay_payload_surfaces_items_failure():
     class FailingSignatures:
         def __len__(self):
             return 2
@@ -661,15 +556,11 @@ def test_signature_name_counts_overlay_payload_surfaces_items_failure(caplog):
     dataset = DummyDataset("overlay_items_failure", mode="inference")
     dataset.signatures = FailingSignatures()
 
-    with caplog.at_level("ERROR", logger="s2and"):
-        with pytest.raises(RuntimeError, match="iterating signatures"):
-            feature_port._signature_name_counts_overlay_payload_from_dataset(dataset)
-
-    logs = "\n".join(caplog.messages)
-    assert "failed to iterate signatures for name-count overlay dataset=overlay_items_failure" in logs
+    with pytest.raises(RuntimeError, match="iterating signatures"):
+        feature_port._signature_name_counts_overlay_payload_from_dataset(dataset)
 
 
-def test_json_ingest_source_telemetry_prefers_dataset_over_artifact(caplog, monkeypatch):
+def test_json_ingest_prefers_dataset_name_counts_over_artifact(monkeypatch):
     monkeypatch.setenv("S2AND_RUST_NAME_COUNTS_JSON", "name_counts.json")
     dataset = DummyDataset("telemetry_json_dataset", mode="inference")
     dataset.signatures_path = "signatures.json"
@@ -690,21 +581,13 @@ def test_json_ingest_source_telemetry_prefers_dataset_over_artifact(caplog, monk
         "s2": type("Sig", (), {"author_info_name_counts": None})(),
     }
 
-    with caplog.at_level("INFO", logger="s2and"):
-        feature_port._get_rust_featurizer(dataset)
-
-    logs = "\n".join(caplog.messages)
-    assert "stage=rust_json_ingest_name_counts_source" in logs
-    assert "name_counts_source=dataset" in logs
-    assert "signatures_total=2" in logs
-    assert "signatures_with_counts=1" in logs
-    assert "artifact_configured=True" in logs
+    feature_port._get_rust_featurizer(dataset)
 
     args, _kwargs = DummyRustFeaturizer.from_json_created[0]
     assert args[5] is None
 
 
-def test_json_ingest_source_telemetry_uses_artifact_when_non_minimal(tmp_path, caplog, monkeypatch):
+def test_json_ingest_uses_name_counts_artifact_when_dataset_has_no_counts(tmp_path, monkeypatch):
     artifact_path = tmp_path / "name_counts.json"
     artifact_path.write_text('{"normalization_version":"legacy_compat","counts":{}}', encoding="utf-8")
 
@@ -714,26 +597,46 @@ def test_json_ingest_source_telemetry_uses_artifact_when_non_minimal(tmp_path, c
     dataset.papers_path = "papers.json"
     dataset.signatures = {"s1": type("Sig", (), {"author_info_name_counts": None})()}
 
-    with caplog.at_level("INFO", logger="s2and"):
-        feature_port._get_rust_featurizer(dataset)
-
-    logs = "\n".join(caplog.messages)
-    assert "stage=rust_json_ingest_name_counts_source" in logs
-    assert "name_counts_source=artifact" in logs
-    assert "normalization_check_executed=True" in logs
+    feature_port._get_rust_featurizer(dataset)
 
     args, _kwargs = DummyRustFeaturizer.from_json_created[0]
     assert args[5] == str(artifact_path)
+    assert args[12] is False
 
 
-def test_explicit_evict_and_clear_api(monkeypatch):
+def test_json_ingest_normalization_mismatch_allowance_is_explicit(tmp_path, monkeypatch):
+    artifact_path = tmp_path / "name_counts.json"
+    artifact_path.write_text('{"normalization_version":"other","counts":{}}', encoding="utf-8")
+
+    monkeypatch.setenv("S2AND_RUST_NAME_COUNTS_JSON", str(artifact_path))
+    dataset = DummyDataset("normalization_mismatch_explicit", mode="inference")
+    dataset.signatures_path = "signatures.json"
+    dataset.papers_path = "papers.json"
+    dataset.signatures = {"s1": type("Sig", (), {"author_info_name_counts": None})()}
+
+    feature_port._get_rust_featurizer(dataset, allow_normalization_version_mismatch=True)
+
+    args, _kwargs = DummyRustFeaturizer.from_json_created[0]
+    assert args[5] == str(artifact_path)
+    assert args[12] is True
+
+
+def test_explicit_from_json_paths_requires_json_paths():
+    dataset = DummyDataset("missing_json_paths", mode="train")
+
+    with pytest.raises(RuntimeError, match="signatures_path/papers_path are missing"):
+        feature_port._get_rust_featurizer(dataset, rust_build_path="from_json_paths")
+
+    assert DummyRustFeaturizer.created == []
+    assert DummyRustFeaturizer.from_json_created == []
+
+
+def test_explicit_evict_and_clear_api():
     d1 = DummyDataset("d1", mode="train")
     d2 = DummyDataset("d2", mode="train")
 
-    # Disable cap in this test so we can keep two entries at once.
-    monkeypatch.setenv("S2AND_RUST_FEATURIZER_MAX_INMEM", "0")
-    feature_port._get_rust_featurizer(d1, use_cache=True)
-    feature_port._get_rust_featurizer(d2, use_cache=True)
+    feature_port._get_rust_featurizer(d1)
+    feature_port._get_rust_featurizer(d2)
     assert _cache_size() == 2
 
     assert feature_port.evict_rust_featurizer(d1) is True
@@ -757,7 +660,7 @@ def test_load_s2and_rust_extension_falls_back_from_namespace_package(monkeypatch
             return NamespaceOnly()
         if name == "s2and_rust._s2and_rust":
             return NativeExtension
-        raise ImportError(name)
+        raise _missing_module(name)
 
     monkeypatch.setattr(rust_capabilities.importlib, "import_module", fake_import_module)
 
@@ -784,7 +687,7 @@ def test_load_s2and_rust_extension_returns_first_valid_module(monkeypatch):
     def fake_import_module(name: str):
         if name == "s2and_rust":
             return TopLevelModule
-        raise ImportError(name)
+        raise _missing_module(name)
 
     monkeypatch.setattr(rust_capabilities.importlib, "import_module", fake_import_module)
 

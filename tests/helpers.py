@@ -3,10 +3,13 @@ from __future__ import annotations
 import importlib.util
 import math
 import sys
+from collections import Counter
 from importlib.machinery import PathFinder
 from typing import Any
 
 from s2and.data import ANDData
+from s2and.incremental_linking.query_adapter import ClusterSummary, QueryFeatures
+from s2and.runtime import detect_rust_runtime_capabilities
 
 
 def equalish(a: float, b: float, rel_tol: float = 1e-6, abs_tol: float = 1e-3) -> bool:
@@ -25,7 +28,10 @@ def import_s2and_rust(
         if rust_featurizer is None:
             return False
         method_name = required_method or "from_dataset"
-        return hasattr(rust_featurizer, method_name)
+        if not hasattr(rust_featurizer, method_name):
+            return False
+        capabilities = detect_rust_runtime_capabilities(extension_module=module)
+        return capabilities.core_runtime_available
 
     try:
         import s2and_rust
@@ -73,4 +79,122 @@ def build_dummy_dataset(
         preprocess=True,
         n_jobs=n_jobs,
         compute_reference_features=compute_reference_features,
+    )
+
+
+def build_query_features(
+    *,
+    first: str = "a",
+    middle_initials: frozenset[str] = frozenset(),
+    year: int | None = None,
+    orcid: str | None = None,
+    specter: Any | None = None,
+    coauthor_blocks: frozenset[str] | None = None,
+    affiliation_terms: frozenset[str] | None = None,
+    venue_terms: frozenset[str] | None = None,
+    has_coauthors: bool = False,
+    has_affiliations: bool = False,
+    has_full_first: bool = False,
+    has_middle: bool = False,
+    title_terms: frozenset[str] = frozenset(),
+    name_counts: Any | None = None,
+    paper_author_count: int = 0,
+    paper_author_names: frozenset[str] = frozenset(),
+    author_position: int | None = None,
+    local10_author_names: frozenset[str] = frozenset(),
+    signature_id: str = "",
+) -> QueryFeatures:
+    """Build a compact `QueryFeatures` fixture for retrieval tests."""
+
+    return QueryFeatures(
+        first=first,
+        middle="",
+        first_initial=first[:1] if first else "",
+        middle_initials=middle_initials,
+        coauthor_blocks=(
+            coauthor_blocks
+            if coauthor_blocks is not None
+            else (frozenset({"a smith"}) if has_coauthors else frozenset())
+        ),
+        affiliation_terms=(
+            affiliation_terms
+            if affiliation_terms is not None
+            else (frozenset({"lab"}) if has_affiliations else frozenset())
+        ),
+        venue_terms=venue_terms if venue_terms is not None else frozenset(),
+        year=year,
+        orcid=orcid,
+        specter=specter,
+        has_specter=specter is not None,
+        has_coauthors=has_coauthors,
+        has_affiliations=has_affiliations,
+        has_full_first=has_full_first,
+        has_middle=has_middle,
+        title_terms=title_terms,
+        name_counts=name_counts,
+        paper_author_count=paper_author_count,
+        paper_author_names=paper_author_names,
+        author_position=author_position,
+        local10_author_names=local10_author_names,
+        signature_id=signature_id,
+    )
+
+
+def build_cluster_summary(
+    *,
+    component_key: str,
+    size: int = 1,
+    first_name_counts: Counter[str] | None = None,
+    middle_initial_counts: Counter[str] | None = None,
+    coauthor_counts: Counter[str] | None = None,
+    non_mega_coauthor_counts: Counter[str] | None = None,
+    affiliation_counts: Counter[str] | None = None,
+    venue_counts: Counter[str] | None = None,
+    year_min: int | None = None,
+    year_max: int | None = None,
+    year_mean: float | None = None,
+    orcid_values: frozenset[str] = frozenset(),
+    specter_centroid: Any | None = None,
+    exemplar_vectors: list[Any] | None = None,
+    title_counts: Counter[str] | None = None,
+    name_counts_values: tuple[Any, ...] = (),
+    max_paper_author_count: int = 0,
+    member_paper_author_names: tuple[frozenset[str], ...] = (),
+    member_paper_author_counts: tuple[int, ...] = (),
+    member_author_positions: tuple[int | None, ...] = (),
+    member_local10_author_names: tuple[frozenset[str], ...] = (),
+    member_signature_ids: tuple[str, ...] = (),
+    member_title_terms: tuple[frozenset[str], ...] = (),
+) -> ClusterSummary:
+    """Build a compact `ClusterSummary` fixture for retrieval tests."""
+
+    return ClusterSummary(
+        component_key=component_key,
+        cluster_id=component_key,
+        block_key="b",
+        size=size,
+        first_name_counts=first_name_counts or Counter(),
+        middle_initial_counts=middle_initial_counts or Counter(),
+        coauthor_counts=coauthor_counts or Counter(),
+        non_mega_coauthor_counts=(
+            non_mega_coauthor_counts if non_mega_coauthor_counts is not None else coauthor_counts or Counter()
+        ),
+        affiliation_counts=affiliation_counts or Counter(),
+        venue_counts=venue_counts or Counter(),
+        year_values=[],
+        year_min=year_min,
+        year_max=year_max,
+        year_mean=year_mean,
+        orcid_values=orcid_values,
+        specter_centroid=specter_centroid,
+        exemplar_vectors=[] if exemplar_vectors is None else exemplar_vectors,
+        title_counts=title_counts or Counter(),
+        name_counts_values=name_counts_values,
+        max_paper_author_count=max_paper_author_count,
+        member_paper_author_names=member_paper_author_names,
+        member_paper_author_counts=member_paper_author_counts,
+        member_author_positions=member_author_positions,
+        member_local10_author_names=member_local10_author_names,
+        member_signature_ids=member_signature_ids,
+        member_title_terms=member_title_terms,
     )

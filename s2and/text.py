@@ -29,21 +29,25 @@ _FASTTEXT_MODEL_LOCK = threading.Lock()
 def _get_fasttext_model():
     """Return a cached fastText model instance, loading on first use.
 
-    Honors env var `S2AND_SKIP_FASTTEXT` to skip loading (tests can rely on CLD2 only).
+    Honors test/benchmark env var `S2AND_SKIP_FASTTEXT` to skip loading.
     """
     import os
 
     global _FASTTEXT_MODEL
     global _FASTTEXT_MODEL_INITIALIZED
+    if os.environ.get("S2AND_SKIP_FASTTEXT", "").lower() in {"1", "true", "yes"}:
+        _FASTTEXT_MODEL = None
+        _FASTTEXT_MODEL_INITIALIZED = True
+        return None
     if _FASTTEXT_MODEL_INITIALIZED:
         return _FASTTEXT_MODEL
     with _FASTTEXT_MODEL_LOCK:
-        if _FASTTEXT_MODEL_INITIALIZED:
-            return _FASTTEXT_MODEL
         if os.environ.get("S2AND_SKIP_FASTTEXT", "").lower() in {"1", "true", "yes"}:
             _FASTTEXT_MODEL = None
             _FASTTEXT_MODEL_INITIALIZED = True
             return None
+        if _FASTTEXT_MODEL_INITIALIZED:
+            return _FASTTEXT_MODEL
         try:
             _FASTTEXT_MODEL = fasttext.load_model(cached_path(FASTTEXT_PATH))
         except Exception:
@@ -428,7 +432,7 @@ def name_text_features(
     List[float]: a list of the various similarity scores for the two names
     """
     scores = []
-    if name_1 is None or name_2 is None or len(name_1) <= 1 or len(name_2) <= 1:
+    if name_1 is None or name_2 is None or len(name_1) == 0 or len(name_2) == 0:
         return [default_val] * len(TEXT_FUNCTIONS)
 
     for function, function_name in TEXT_FUNCTIONS:
@@ -488,13 +492,13 @@ def get_text_ngrams(
     if stopwords is not None:
         text = " ".join([word for word in text.split(" ") if word not in stopwords and len(word) > 2])
 
-    unigrams = []  # type: ignore
+    unigrams = []
     if use_unigrams:
-        unigrams = filter(lambda x: " " not in x, text)  # type: ignore
+        unigrams = filter(lambda x: " " not in x, text)
 
-    bigrams = []  # type: ignore
+    bigrams = []
     if use_bigrams:
-        bigrams = map(  # type: ignore
+        bigrams = map(
             lambda x: "".join(x),
             filter(lambda x: " " not in x, zip(text, text[1:], strict=False)),
         )
@@ -563,6 +567,31 @@ def same_prefix_tokens(a: str, b: str) -> bool:
         if not (x.startswith(y) or y.startswith(x)):
             return False
     return True
+
+
+def first_names_name_compatible(first_a: str, first_b: str, name_tuples: set[tuple[str, str]]) -> bool:
+    """Return current legacy-compatible first-name compatibility.
+
+    This keeps the normalization migration shim in one place: legacy
+    `name_tuples` were curated over single-token names, while Sinonym-aware
+    first names can be multi-token. Remove the joined/first-token probes only
+    after canonical name-tuple artifacts are regenerated.
+    """
+
+    if same_prefix_tokens(first_a, first_b):
+        return True
+
+    first_a_parts = first_a.split()
+    first_b_parts = first_b.split()
+    first_a_joined = "".join(first_a_parts)
+    first_b_joined = "".join(first_b_parts)
+    first_a_token = first_a_parts[0] if first_a_parts else first_a
+    first_b_token = first_b_parts[0] if first_b_parts else first_b
+    return (
+        (first_a, first_b) in name_tuples
+        or (first_a_joined, first_b_joined) in name_tuples
+        or (first_a_token, first_b_token) in name_tuples
+    )
 
 
 def equal(

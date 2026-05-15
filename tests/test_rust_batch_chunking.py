@@ -10,27 +10,55 @@ from s2and.featurizer import FeaturizationInfo, many_pairs_featurize
 from tests.helpers import build_dummy_dataset
 
 
-def _mock_chunk_plan(chunk_pairs: int, total_pairs: int) -> dict[str, int | str | float]:
+def _mock_chunk_plan(chunk_pairs: int, total_pairs: int) -> memory_budget.RustBatchChunkPlan:
     bytes_per_pair_row = featurizer_mod.NUM_FEATURES * 8 + 128
     predicted_chunk_bytes = int(chunk_pairs) * int(bytes_per_pair_row)
     predicted_features_matrix_bytes = int(total_pairs) * int(featurizer_mod.NUM_FEATURES * 8)
-    return {
-        "total_ram_bytes": 2 * 1024 * 1024 * 1024,
-        "total_ram_source": "test",
-        "current_rss_bytes": 256 * 1024 * 1024,
-        "current_rss_source": "test",
-        "available_bytes": 1024 * 1024 * 1024,
-        "safety_margin_bytes": 128 * 1024 * 1024,
-        "stage_budget_fraction": 0.25,
-        "stage_budget_bytes": 256 * 1024 * 1024,
-        "base_chunk_pairs": 10_000,
-        "bytes_per_pair_row": int(bytes_per_pair_row),
-        "derived_chunk_pairs": int(chunk_pairs),
-        "chunk_pairs": int(chunk_pairs),
-        "predicted_chunk_bytes": int(predicted_chunk_bytes),
-        "predicted_features_matrix_bytes": int(predicted_features_matrix_bytes),
-        "predicted_stage_peak_bytes": int(predicted_chunk_bytes + predicted_features_matrix_bytes),
-    }
+    predicted_labels_bytes = int(total_pairs) * 8
+    predicted_stage_peak_delta_bytes = int(
+        predicted_chunk_bytes + predicted_features_matrix_bytes + predicted_labels_bytes
+    )
+    return memory_budget.RustBatchChunkPlan(
+        total_ram_bytes=2 * 1024 * 1024 * 1024,
+        total_ram_source="test",
+        current_rss_bytes=256 * 1024 * 1024,
+        current_rss_source="test",
+        available_bytes=1024 * 1024 * 1024,
+        effective_available_fraction=0.5,
+        safety_margin_bytes=128 * 1024 * 1024,
+        stage_budget_fraction=0.25,
+        stage_budget_bytes=256 * 1024 * 1024,
+        base_chunk_pairs=10_000,
+        row_overhead_bytes=128,
+        persistent_row_overhead_bytes=0,
+        fixed_overhead_bytes=0,
+        bytes_per_pair_row=int(bytes_per_pair_row),
+        derived_chunk_pairs=int(chunk_pairs),
+        chunk_pairs=int(chunk_pairs),
+        total_rows=int(total_pairs),
+        full_feature_count=featurizer_mod.NUM_FEATURES,
+        selected_feature_count=featurizer_mod.NUM_FEATURES,
+        nameless_feature_count=0,
+        predicted_chunk_bytes=int(predicted_chunk_bytes),
+        predicted_features_matrix_bytes=int(predicted_features_matrix_bytes),
+        predicted_labels_bytes=predicted_labels_bytes,
+        predicted_persistent_row_overhead_bytes=0,
+        predicted_fixed_overhead_bytes=0,
+        predicted_selected_features_bytes=int(predicted_features_matrix_bytes),
+        predicted_nameless_features_bytes=0,
+        predicted_stage_peak_delta_bytes=predicted_stage_peak_delta_bytes,
+        predicted_stage_peak_rss_bytes=256 * 1024 * 1024 + predicted_stage_peak_delta_bytes,
+    )
+
+
+def _pin_stable_rss(monkeypatch, rss_bytes: int = 256 * 1024 * 1024) -> None:
+    """Keep chunk-size contract tests independent from live process RSS movement."""
+
+    monkeypatch.setattr(
+        memory_budget,
+        "current_rss_bytes_best_effort",
+        lambda _total_ram_bytes: (int(rss_bytes), "test"),
+    )
 
 
 def _build_pairs(count: int) -> list[tuple[str, str, float]]:
@@ -82,7 +110,7 @@ def test_rust_batch_plan_never_decreases_fixed_overhead(monkeypatch):
     monkeypatch.setattr(
         feature_port,
         "_get_rust_featurizer",
-        lambda _dataset, use_cache=False, **_kw: FakeRustFeaturizer(),
+        lambda _dataset, **_kw: FakeRustFeaturizer(),
     )
     monkeypatch.setattr(
         featurizer_mod,
@@ -124,6 +152,7 @@ def test_rust_batch_plan_never_decreases_fixed_overhead(monkeypatch):
 def test_rust_batch_calls_are_chunked_for_progress_updates(monkeypatch):
     dataset = build_dummy_dataset("dummy_rust_chunking", load_name_counts=True)
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
+    _pin_stable_rss(monkeypatch)
 
     call_sizes = []
 
@@ -146,7 +175,7 @@ def test_rust_batch_calls_are_chunked_for_progress_updates(monkeypatch):
     monkeypatch.setattr(
         feature_port,
         "_get_rust_featurizer",
-        lambda _dataset, use_cache=False, **_kw: fake_rust_featurizer,
+        lambda _dataset, **_kw: fake_rust_featurizer,
     )
 
     features, labels, _ = many_pairs_featurize(
@@ -168,6 +197,7 @@ def test_rust_batch_calls_are_chunked_for_progress_updates(monkeypatch):
 def test_rust_batch_prefers_indexed_api_when_available(monkeypatch):
     dataset = build_dummy_dataset("dummy_rust_chunking_indexed", load_name_counts=True)
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
+    _pin_stable_rss(monkeypatch)
 
     indexed_call_sizes = []
     selected_indices_seen: list[list[int] | None] = []
@@ -200,7 +230,7 @@ def test_rust_batch_prefers_indexed_api_when_available(monkeypatch):
     monkeypatch.setattr(
         feature_port,
         "_get_rust_featurizer",
-        lambda _dataset, use_cache=False, **_kw: fake_rust_featurizer,
+        lambda _dataset, **_kw: fake_rust_featurizer,
     )
 
     features, labels, _ = many_pairs_featurize(
@@ -258,7 +288,7 @@ def test_rust_batch_indexed_api_normalizes_integer_signature_ids(monkeypatch):
     monkeypatch.setattr(
         feature_port,
         "_get_rust_featurizer",
-        lambda _dataset, use_cache=False, **_kw: fake_rust_featurizer,
+        lambda _dataset, **_kw: fake_rust_featurizer,
     )
 
     features, labels, _ = many_pairs_featurize(
@@ -282,10 +312,10 @@ def test_rust_batch_indexed_api_normalizes_integer_signature_ids(monkeypatch):
     assert labels.shape[0] == len(pairs)
 
 
-def test_rust_batch_forwards_use_cache_flag(monkeypatch):
-    dataset = build_dummy_dataset("dummy_rust_chunking_use_cache_forward", load_name_counts=True)
+def test_rust_batch_uses_same_process_featurizer_without_cache_flag(monkeypatch):
+    dataset = build_dummy_dataset("dummy_rust_chunking_same_process_featurizer", load_name_counts=True)
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
-    forwarded_use_cache: list[bool | None] = []
+    featurizer_calls = {"count": 0}
 
     class FakeRustFeaturizer:
         def featurize_pairs(self, pairs, num_threads=None):
@@ -302,10 +332,16 @@ def test_rust_batch_forwards_use_cache_flag(monkeypatch):
         lambda **_kwargs: _mock_chunk_plan(chunk_pairs=1, total_pairs=len(pairs)),
     )
     monkeypatch.setattr(feature_port, "s2and_rust", object())
+
+    def _fake_get_rust_featurizer(_dataset, **kwargs):
+        assert "use_cache" not in kwargs
+        featurizer_calls["count"] += 1
+        return fake_rust_featurizer
+
     monkeypatch.setattr(
         feature_port,
         "_get_rust_featurizer",
-        lambda _dataset, use_cache=False, **_kw: forwarded_use_cache.append(use_cache) or fake_rust_featurizer,
+        _fake_get_rust_featurizer,
     )
 
     many_pairs_featurize(
@@ -319,11 +355,10 @@ def test_rust_batch_forwards_use_cache_flag(monkeypatch):
         total_ram_bytes=2 * 1024 * 1024 * 1024,
     )
 
-    assert forwarded_use_cache
-    assert set(forwarded_use_cache) == {False}
+    assert featurizer_calls["count"] >= 1
 
 
-def test_rust_batch_prediction_matches_observed_real_workload(monkeypatch, caplog):
+def test_rust_batch_prediction_matches_observed_real_workload(monkeypatch):
     dataset = build_dummy_dataset("dummy_rust_chunking_prediction", load_name_counts=True)
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
     pairs = _build_pairs(12_000)
@@ -346,17 +381,17 @@ def test_rust_batch_prediction_matches_observed_real_workload(monkeypatch, caplo
     monkeypatch.setattr(
         feature_port,
         "_get_rust_featurizer",
-        lambda _dataset, use_cache=False, **_kw: fake_rust_featurizer,
+        lambda _dataset, **_kw: fake_rust_featurizer,
     )
 
     stop = threading.Event()
     rss_peak = {"value": 0}
-    rss_before, _ = memory_budget.current_rss_bytes_best_effort(int(plan["total_ram_bytes"]))
+    rss_before, _ = memory_budget.current_rss_bytes_best_effort(int(plan.total_ram_bytes))
     rss_peak["value"] = rss_before
 
     def _sample_peak() -> None:
         while not stop.is_set():
-            rss_now, _ = memory_budget.current_rss_bytes_best_effort(int(plan["total_ram_bytes"]))
+            rss_now, _ = memory_budget.current_rss_bytes_best_effort(int(plan.total_ram_bytes))
             if rss_now > rss_peak["value"]:
                 rss_peak["value"] = rss_now
             stop.wait(0.005)
@@ -364,38 +399,26 @@ def test_rust_batch_prediction_matches_observed_real_workload(monkeypatch, caplo
     worker = threading.Thread(target=_sample_peak, daemon=True)
     worker.start()
     try:
-        with caplog.at_level("INFO", logger="s2and"):
-            many_pairs_featurize(
-                pairs,
-                dataset,
-                featurizer_info,
-                n_jobs=2,
-                use_cache=False,
-                chunk_size=100,
-                nan_value=np.nan,
-                total_ram_bytes=total_ram_bytes,
-            )
+        many_pairs_featurize(
+            pairs,
+            dataset,
+            featurizer_info,
+            n_jobs=2,
+            use_cache=False,
+            chunk_size=100,
+            nan_value=np.nan,
+            total_ram_bytes=total_ram_bytes,
+        )
     finally:
         stop.set()
         worker.join(timeout=2)
 
-    rss_after, _ = memory_budget.current_rss_bytes_best_effort(int(plan["total_ram_bytes"]))
+    rss_after, _ = memory_budget.current_rss_bytes_best_effort(int(plan.total_ram_bytes))
     summary = memory_budget.summarize_prediction_accuracy(
         stage_name="pair_featurization_rust_batch_test",
-        predicted_peak_delta_bytes=int(plan["predicted_stage_peak_delta_bytes"]),
+        predicted_peak_delta_bytes=int(plan.predicted_stage_peak_delta_bytes),
         rss_before_bytes=rss_before,
         rss_peak_bytes=int(rss_peak["value"]),
         rss_after_bytes=rss_after,
     )
-    telemetry_lines = [
-        record.message for record in caplog.records if "Telemetry: pair_featurization_memory" in record.message
-    ]
-    assert telemetry_lines
-    telemetry = telemetry_lines[-1]
-    assert "prediction_contract_version=" in telemetry
-    assert "predicted_peak_delta_bytes=" in telemetry
-    assert "predicted_peak_rss_bytes=" in telemetry
-    assert "rss_before_bytes=" in telemetry
-    assert "rss_peak_bytes=" in telemetry
-    assert "observed_peak_delta_bytes=" in telemetry
-    assert float(summary["prediction_error_ratio"]) <= 3.0
+    assert float(summary.prediction_error_ratio) <= 3.0

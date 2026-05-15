@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Callable
+from typing import TypedDict
 
 import pytest
 
 from s2and import memory_budget
+
+
+class _MemoryBudgetKwargs(TypedDict):
+    total_ram_bytes: int
+    detect_cgroup_fn: Callable[[], tuple[int | None, str]]
+    detect_total_fn: Callable[[], tuple[int | None, str]]
+    current_rss_fn: Callable[[int], tuple[int, str]]
+
+
+class _RustBatchPlanKwargs(_MemoryBudgetKwargs):
+    base_chunk_pairs: int
+    row_overhead_bytes: int
 
 
 def test_resolve_total_ram_arg_overrides_autodetect():
@@ -15,6 +30,19 @@ def test_resolve_total_ram_arg_overrides_autodetect():
     )
     assert resolved == 4096
     assert source == "arg"
+
+
+def test_emit_memory_telemetry_writes_jsonl(monkeypatch, tmp_path):
+    output_path = tmp_path / "memory_telemetry.jsonl"
+    monkeypatch.setenv(memory_budget.MEMORY_TELEMETRY_JSONL_ENV, str(output_path))
+
+    memory_budget.emit_memory_telemetry({"stage": "test_stage", "value": 7})
+
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert record["schema_version"] == 1
+    assert record["event"] == "memory_telemetry"
+    assert record["stage"] == "test_stage"
+    assert record["value"] == 7
 
 
 def test_resolve_total_ram_cgroup_uses_safety_factor():
@@ -73,36 +101,6 @@ def test_current_rss_windows_fallback_used_when_psutil_missing(monkeypatch):
     assert source == "winapi:test"
 
 
-def test_compute_incremental_limits_uses_available_bytes():
-    limits = memory_budget.compute_incremental_phase_split_limits(
-        num_features=64,
-        total_ram_bytes=1_000_000,
-        detect_cgroup_fn=lambda: (None, "unavailable"),
-        detect_total_fn=lambda: (None, "unavailable"),
-        current_rss_fn=lambda _total: (200_000, "rss:test"),
-    )
-    # 10% safety margin on total_ram_bytes=1_000_000 => 100_000
-    # available = 1_000_000 - 200_000 - 100_000 = 700_000
-    assert int(limits["available_bytes"]) == 700_000
-    assert 0 < int(limits["accumulator_budget_bytes"]) < int(limits["available_bytes"])
-    assert int(limits["accumulator_budget_bytes"]) < int(limits["chunk_budget_bytes"])
-    assert int(limits["chunk_budget_bytes"]) < int(limits["available_bytes"])
-    assert int(limits["chunk_pairs"]) >= 1
-
-
-def test_compute_incremental_limits_uses_default_phase_a_chunk_cap():
-    limits = memory_budget.compute_incremental_phase_split_limits(
-        num_features=1,
-        total_ram_bytes=100_000_000_000,
-        detect_cgroup_fn=lambda: (None, "unavailable"),
-        detect_total_fn=lambda: (None, "unavailable"),
-        current_rss_fn=lambda _total: (10_000_000, "rss:test"),
-    )
-    assert int(limits["derived_chunk_pairs"]) > memory_budget.PHASE_A_MAX_CHUNK_PAIRS_DEFAULT
-    assert int(limits["max_chunk_pairs"]) == memory_budget.PHASE_A_MAX_CHUNK_PAIRS_DEFAULT
-    assert int(limits["chunk_pairs"]) == memory_budget.PHASE_A_MAX_CHUNK_PAIRS_DEFAULT
-
-
 def test_compute_rust_batch_chunk_plan_respects_stage_budget():
     plan = memory_budget.compute_rust_batch_chunk_plan(
         num_features=1_000,
@@ -115,13 +113,12 @@ def test_compute_rust_batch_chunk_plan_respects_stage_budget():
         detect_total_fn=lambda: (None, "unavailable"),
         current_rss_fn=lambda _total: (200_000, "rss:test"),
     )
-    # available = 700_000 -> stage budget = 70_000 bytes
-    # bytes_per_pair_row ~= 8,128 => chunk_pairs should clamp to 8
-    assert int(plan["chunk_pairs"]) == 8
-    assert int(plan["predicted_chunk_bytes"]) == 8 * int(plan["bytes_per_pair_row"])
-    assert int(plan["predicted_stage_peak_delta_bytes"]) == int(plan["predicted_stage_peak_bytes"])
-    assert int(plan["predicted_stage_peak_rss_bytes"]) >= int(plan["predicted_stage_peak_delta_bytes"])
-    assert int(plan["predicted_stage_peak_bytes"]) >= int(plan["predicted_chunk_bytes"])
+    # available = 700_000 -> stage budget = 70_000 bytes. The configured fixed
+    # overhead already exceeds that budget, so the helper keeps the chunk minimal.
+    assert int(plan.chunk_pairs) == 1
+    assert int(plan.predicted_chunk_bytes) == int(plan.bytes_per_pair_row)
+    assert int(plan.predicted_stage_peak_rss_bytes) >= int(plan.predicted_stage_peak_delta_bytes)
+    assert int(plan.predicted_stage_peak_delta_bytes) >= int(plan.predicted_chunk_bytes)
 
 
 def test_compute_rust_batch_chunk_plan_base_chunk_pairs_zero_disables_floor():
@@ -139,7 +136,7 @@ def test_compute_rust_batch_chunk_plan_base_chunk_pairs_zero_disables_floor():
     # Same setup as test_compute_rust_batch_chunk_plan_respects_stage_budget but
     # base_chunk_pairs=0 means the floor is disabled. chunk_pairs should equal
     # min(total_pairs, derived_chunk_pairs) — the base floor is not a candidate.
-    assert int(plan["chunk_pairs"]) == 8  # still budget-limited, same as before
+    assert int(plan.chunk_pairs) == 1  # fixed overhead already consumes the tight budget
     # Now verify with generous RAM so derived_chunk_pairs > total_pairs:
     # chunk_pairs should equal total_pairs (not clamped by a base floor).
     plan_big = memory_budget.compute_rust_batch_chunk_plan(
@@ -151,7 +148,100 @@ def test_compute_rust_batch_chunk_plan_base_chunk_pairs_zero_disables_floor():
         detect_total_fn=lambda: (None, "unavailable"),
         current_rss_fn=lambda _total: (10_000_000, "rss:test"),
     )
-    assert int(plan_big["chunk_pairs"]) == 500  # total_pairs is the only limit
+    assert int(plan_big.chunk_pairs) == 500  # total_pairs is the only limit
+
+
+def test_compute_promoted_phase_a_limits_uses_top_k_largest_components():
+    limits = memory_budget.compute_promoted_phase_a_limits(
+        query_count=20,
+        component_sizes=[100, 50, 25, 10],
+        retrieval_top_k=3,
+        total_ram_bytes=1_000_000_000,
+        stage_budget_fraction=0.50,
+        fixed_overhead_bytes=1024,
+        detect_cgroup_fn=lambda: (None, "unavailable"),
+        detect_total_fn=lambda: (None, "unavailable"),
+        current_rss_fn=lambda _total: (100_000_000, "rss:test"),
+    )
+
+    assert int(limits.candidate_rows_per_query) == 3
+    assert int(limits.conservative_pairs_per_query) == 175
+    assert int(limits.max_component_size) == 100
+    assert int(limits.query_batch_size) == 20
+    assert int(limits.predicted_candidate_rows_per_batch) == 60
+    assert int(limits.predicted_pairs_per_batch) == 3500
+    assert float(limits.observed_safety_multiplier) == pytest.approx(2.0)
+    assert bool(limits.single_query_exceeds_budget) is False
+
+
+def test_compute_promoted_phase_a_limits_shrinks_query_batch_under_tight_budget():
+    limits = memory_budget.compute_promoted_phase_a_limits(
+        query_count=100,
+        component_sizes=[20_000, 16_000, 12_000, 8_000, 4_000],
+        retrieval_top_k=5,
+        total_ram_bytes=100_000_000,
+        stage_budget_fraction=0.50,
+        fixed_overhead_bytes=1_000_000,
+        detect_cgroup_fn=lambda: (None, "unavailable"),
+        detect_total_fn=lambda: (None, "unavailable"),
+        current_rss_fn=lambda _total: (10_000_000, "rss:test"),
+    )
+
+    assert int(limits.query_batch_size) < 100
+    assert int(limits.query_batch_size) >= 1
+    assert int(limits.predicted_peak_rss_bytes) > int(limits.current_rss_bytes)
+    assert int(limits.pair_chunk_pairs) >= 1
+
+
+def test_compute_promoted_phase_a_limits_uses_observed_probe_for_operational_batch():
+    hard = memory_budget.compute_promoted_phase_a_limits(
+        query_count=100,
+        component_sizes=[20_000, 16_000, 12_000, 8_000, 4_000],
+        retrieval_top_k=5,
+        total_ram_bytes=100_000_000,
+        stage_budget_fraction=0.50,
+        fixed_overhead_bytes=1_000_000,
+        detect_cgroup_fn=lambda: (None, "unavailable"),
+        detect_total_fn=lambda: (None, "unavailable"),
+        current_rss_fn=lambda _total: (10_000_000, "rss:test"),
+    )
+    observed = memory_budget.compute_promoted_phase_a_limits(
+        query_count=100,
+        component_sizes=[20_000, 16_000, 12_000, 8_000, 4_000],
+        retrieval_top_k=5,
+        total_ram_bytes=100_000_000,
+        stage_budget_fraction=0.50,
+        fixed_overhead_bytes=1_000_000,
+        observed_query_count=16,
+        observed_candidate_rows_per_query=5,
+        observed_pairs_per_query=5_000,
+        observed_safety_multiplier=2.0,
+        detect_cgroup_fn=lambda: (None, "unavailable"),
+        detect_total_fn=lambda: (None, "unavailable"),
+        current_rss_fn=lambda _total: (10_000_000, "rss:test"),
+    )
+
+    assert str(hard.operational_estimate_source) == "top_k_largest_components"
+    assert str(observed.operational_estimate_source) == "observed_probe"
+    assert int(observed.hard_query_batch_size) == int(hard.query_batch_size)
+    assert int(observed.query_batch_size) > int(observed.hard_query_batch_size)
+    assert int(observed.operational_pairs_per_query) == 10_000
+    assert int(observed.hard_predicted_pairs_per_batch) > int(observed.predicted_pairs_per_batch)
+
+
+def test_compute_promoted_phase_a_limits_fails_when_single_query_exceeds_budget():
+    with pytest.raises(MemoryError, match="cannot fit a single query"):
+        memory_budget.compute_promoted_phase_a_limits(
+            query_count=10,
+            component_sizes=[2_000_000],
+            retrieval_top_k=1,
+            total_ram_bytes=100_000_000,
+            stage_budget_fraction=0.10,
+            fixed_overhead_bytes=1_000_000,
+            detect_cgroup_fn=lambda: (None, "unavailable"),
+            detect_total_fn=lambda: (None, "unavailable"),
+            current_rss_fn=lambda _total: (10_000_000, "rss:test"),
+        )
 
 
 def test_summarize_prediction_accuracy_flags_underprediction():
@@ -162,13 +252,13 @@ def test_summarize_prediction_accuracy_flags_underprediction():
         rss_peak_bytes=1200,
         rss_after_bytes=1100,
     )
-    assert str(summary["prediction_contract_version"]) == "delta_v1"
-    assert int(summary["predicted_peak_delta_bytes"]) == 100
-    assert int(summary["predicted_peak_rss_bytes"]) == 1100
-    assert int(summary["predicted_bytes"]) == 100
-    assert int(summary["observed_peak_delta_bytes"]) == 200
-    assert bool(summary["underpredicted"]) is True
-    assert float(summary["prediction_error_ratio"]) == 2.0
+    assert str(summary.prediction_contract_version) == "delta_v1"
+    assert int(summary.predicted_peak_delta_bytes) == 100
+    assert int(summary.predicted_peak_rss_bytes) == 1100
+    assert int(summary.predicted_bytes) == 100
+    assert int(summary.observed_peak_delta_bytes) == 200
+    assert bool(summary.underpredicted) is True
+    assert float(summary.prediction_error_ratio) == 2.0
 
 
 def test_compute_rust_batch_chunk_plan_adds_persistent_row_overhead():
@@ -187,16 +277,16 @@ def test_compute_rust_batch_chunk_plan_adds_persistent_row_overhead():
         detect_total_fn=lambda: (None, "unavailable"),
         current_rss_fn=lambda _total: (1_000_000, "rss:test"),
     )
-    assert int(plan["predicted_persistent_row_overhead_bytes"]) == 1200
-    assert int(plan["predicted_fixed_overhead_bytes"]) == 2048
+    assert int(plan.predicted_persistent_row_overhead_bytes) == 1200
+    assert int(plan.predicted_fixed_overhead_bytes) == 2048
     expected = (
-        int(plan["predicted_features_matrix_bytes"])
-        + int(plan["predicted_labels_bytes"])
-        + int(plan["predicted_chunk_bytes"])
-        + int(plan["predicted_persistent_row_overhead_bytes"])
-        + int(plan["predicted_fixed_overhead_bytes"])
+        int(plan.predicted_features_matrix_bytes)
+        + int(plan.predicted_labels_bytes)
+        + int(plan.predicted_chunk_bytes)
+        + int(plan.predicted_persistent_row_overhead_bytes)
+        + int(plan.predicted_fixed_overhead_bytes)
     )
-    assert int(plan["predicted_stage_peak_delta_bytes"]) == expected
+    assert int(plan.predicted_stage_peak_delta_bytes) == expected
 
 
 def test_rss_fallback_logs_warning(caplog, monkeypatch):
@@ -212,30 +302,9 @@ def test_rss_fallback_logs_warning(caplog, monkeypatch):
     assert any("falling back to 50%" in r.message for r in caplog.records)
 
 
-def test_incremental_limits_with_selected_feature_counts():
-    """Fix #2: selected_feature_count should produce tighter bytes_per_pair."""
-    common_kwargs = dict(
-        total_ram_bytes=100_000_000,
-        detect_cgroup_fn=lambda: (None, "unavailable"),
-        detect_total_fn=lambda: (None, "unavailable"),
-        current_rss_fn=lambda _total: (10_000_000, "rss:test"),
-    )
-    # Legacy (no selected counts): bytes_per_pair = 64*8*2 + 8 + 100 = 1132
-    legacy = memory_budget.compute_incremental_phase_split_limits(num_features=64, **common_kwargs)
-    assert int(legacy["bytes_per_pair"]) == 64 * 8 * 2 + 8 + 100
-
-    # With selected counts: bytes_per_pair = (30+10)*8 + 8 + 100 = 428
-    selected = memory_budget.compute_incremental_phase_split_limits(
-        num_features=64, selected_feature_count=30, nameless_feature_count=10, **common_kwargs
-    )
-    assert int(selected["bytes_per_pair"]) == (30 + 10) * 8 + 8 + 100
-    # Tighter estimate -> more pairs fit in the same budget
-    assert int(selected["chunk_pairs"]) >= int(legacy["chunk_pairs"])
-
-
 def test_rust_batch_selected_features_tighter_chunk_sizing():
     """Fix #6: Rust batch should use selected+nameless for chunk sizing, not full_feature_count."""
-    common_kwargs = dict(
+    common_kwargs: _RustBatchPlanKwargs = dict(
         total_ram_bytes=10_000_000,
         base_chunk_pairs=100_000,
         row_overhead_bytes=128,
@@ -246,7 +315,7 @@ def test_rust_batch_selected_features_tighter_chunk_sizing():
     # No selected_feature_count (legacy): chunk_feature_count = full = 100
     # bytes_per_pair_row = 100*8 + 128 = 928
     legacy = memory_budget.compute_rust_batch_chunk_plan(num_features=100, total_pairs=50_000, **common_kwargs)
-    assert int(legacy["bytes_per_pair_row"]) == 100 * 8 + 128
+    assert int(legacy.bytes_per_pair_row) == 100 * 8 + 128
 
     # With selected=20, nameless=5: chunk_feature_count = 25
     # bytes_per_pair_row = 25*8 + 128 = 328
@@ -257,9 +326,9 @@ def test_rust_batch_selected_features_tighter_chunk_sizing():
         nameless_feature_count=5,
         **common_kwargs,
     )
-    assert int(selected["bytes_per_pair_row"]) == 25 * 8 + 128
+    assert int(selected.bytes_per_pair_row) == 25 * 8 + 128
     # Tighter row estimate -> more pairs per chunk
-    assert int(selected["chunk_pairs"]) >= int(legacy["chunk_pairs"])
+    assert int(selected.chunk_pairs) >= int(legacy.chunk_pairs)
 
 
 def test_degenerate_budget_logs_warning(caplog):
@@ -292,19 +361,6 @@ def test_effective_available_fraction_in_snapshot():
     assert abs(snapshot.effective_available_fraction - expected_fraction) < 1e-6
 
 
-def test_effective_available_fraction_in_incremental_limits():
-    """compute_incremental_phase_split_limits should include effective_available_fraction."""
-    limits = memory_budget.compute_incremental_phase_split_limits(
-        num_features=64,
-        total_ram_bytes=1_000_000,
-        detect_cgroup_fn=lambda: (None, "unavailable"),
-        detect_total_fn=lambda: (None, "unavailable"),
-        current_rss_fn=lambda _total: (200_000, "rss:test"),
-    )
-    assert "effective_available_fraction" in limits
-    assert float(limits["effective_available_fraction"]) == pytest.approx(0.7, abs=1e-6)
-
-
 def test_effective_available_fraction_in_rust_batch_plan():
     """compute_rust_batch_chunk_plan should include effective_available_fraction."""
     plan = memory_budget.compute_rust_batch_chunk_plan(
@@ -315,12 +371,4 @@ def test_effective_available_fraction_in_rust_batch_plan():
         detect_total_fn=lambda: (None, "unavailable"),
         current_rss_fn=lambda _total: (200_000, "rss:test"),
     )
-    assert "effective_available_fraction" in plan
-    assert float(plan["effective_available_fraction"]) == pytest.approx(0.7, abs=1e-6)
-
-
-def test_gc_collect_and_log(caplog):
-    """gc_collect_and_log should run without error."""
-    with caplog.at_level(logging.INFO, logger="s2and"):
-        memory_budget.gc_collect_and_log("test_stage")
-    # We can't assert exact collection counts, but it should not raise.
+    assert float(plan.effective_available_fraction) == pytest.approx(0.7, abs=1e-6)

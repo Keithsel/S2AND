@@ -1,4 +1,3 @@
-import logging
 import os
 import random
 from contextlib import contextmanager
@@ -6,7 +5,6 @@ from itertools import combinations
 
 import pytest
 
-import s2and.featurizer as featurizer_mod
 from s2and import feature_port
 from s2and.featurizer import _single_pair_featurize
 from s2and.subblocking import make_subblocks
@@ -14,7 +12,7 @@ from s2and.text import AFFILIATIONS_STOP_WORDS, get_text_ngrams, get_text_ngrams
 from tests.helpers import build_dummy_dataset, equalish
 
 if not feature_port.rust_signature_preprocess_available():
-    pytest.skip("s2and_rust signature preprocessing API is unavailable", allow_module_level=True)
+    raise pytest.skip.Exception("s2and_rust signature preprocessing API is unavailable", allow_module_level=True)
 
 
 @contextmanager
@@ -117,13 +115,12 @@ def test_signature_preprocess_pair_features_and_constraints_parity_with_deferred
     with _temporary_env("S2AND_BACKEND", "rust"):
         dataset_rust = build_dummy_dataset("dummy_signature_preprocess_materialize_rust")
 
-    featurizer_mod.global_dataset = dataset_python  # type: ignore
     signature_ids = list(dataset_python.signatures.keys())
     pairs = _sample_pairs(signature_ids, limit=8)
     assert len(pairs) > 0
 
     for s1, s2 in pairs:
-        python_features, _ = _single_pair_featurize((s1, s2))
+        python_features, _ = _single_pair_featurize((s1, s2), dataset=dataset_python)
         rust_features = feature_port.featurize_pair_rust(dataset_rust, s1, s2)
         assert len(python_features) == len(rust_features)
         for idx, (python_value, rust_value) in enumerate(zip(python_features, rust_features, strict=True)):
@@ -176,14 +173,6 @@ def test_subblocking_membership_parity_python_vs_rust():
     clusters_python = {tuple(sorted(subblock)) for subblock in output_python.values()}
     clusters_rust = {tuple(sorted(subblock)) for subblock in output_rust.values()}
     assert clusters_python == clusters_rust
-
-
-def test_signature_preprocess_backend_decision_logged(caplog):
-    with _temporary_env("S2AND_BACKEND", "rust"):
-        with caplog.at_level(logging.INFO, logger="s2and"):
-            build_dummy_dataset("dummy_signature_preprocess_backend_log")
-
-    assert any("Signature preprocessing backend decision:" in record.message for record in caplog.records)
 
 
 def test_rust_json_ingest_uses_minimal_python_paper_preprocess():

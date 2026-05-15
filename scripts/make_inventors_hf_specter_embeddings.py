@@ -12,7 +12,7 @@ Pickle format matches S2AND expectations: `(X, keys)`, where
 
 Example:
 uv run --with torch --with transformers --with adapters \
-  python scripts/generate_inventors_hf_specter_embeddings.py \
+  python scripts/make_inventors_hf_specter_embeddings.py \
   --signatures-path scratch/inventors_s2and/inventors_s2and_signatures.json \
   --papers-path scratch/inventors_s2and/inventors_s2and_papers.json \
   --output-specter-path scratch/inventors_s2and/inventors_s2and_specter.pickle \
@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
     return parser.parse_args()
@@ -200,7 +200,7 @@ def build_text(title: str, abstract: str, sep_token: str) -> str:
 
 
 def resolve_device(requested: str) -> str:
-    import torch
+    import torch  # type: ignore
 
     if requested == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
@@ -210,7 +210,7 @@ def resolve_device(requested: str) -> str:
 
 
 def load_specter_model(device: str):
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer  # type: ignore
 
     tokenizer = AutoTokenizer.from_pretrained("allenai/specter")
     model = AutoModel.from_pretrained("allenai/specter")
@@ -220,8 +220,8 @@ def load_specter_model(device: str):
 
 
 def load_specter2_proximity_model(device: str):
-    from adapters import AutoAdapterModel
-    from transformers import AutoTokenizer
+    from adapters import AutoAdapterModel  # type: ignore
+    from transformers import AutoTokenizer  # type: ignore
 
     tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_base")
     model = AutoAdapterModel.from_pretrained("allenai/specter2_base")
@@ -243,7 +243,7 @@ def embed_records(
     progress_desc: str,
     use_autocast: bool,
 ) -> tuple[np.ndarray, list[str]]:
-    import torch
+    import torch  # type: ignore
 
     keys: list[str] = []
     embeddings_chunks: list[np.ndarray] = []

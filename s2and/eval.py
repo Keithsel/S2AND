@@ -813,21 +813,21 @@ def pairwise_precision_recall_fscore(true_clus, pred_clus, test_block, strategy=
     if tcset != pcset:
         raise ValueError("predictions do not cover all the signatures.")
 
-    rev_true_clusters = {}
-    for k, v in true_clusters.items():
-        for vi in v:
-            rev_true_clusters[vi] = k
-
-    rev_pred_clusters = {}
-    for k, v in pred_clusters.items():
-        for vi in v:
-            rev_pred_clusters[vi] = k
-
     if strategy == "clusters":
         precision, recall, f1 = cluster_precision_recall_fscore(true_clus, pred_clus)
         return np.round(precision, 3), np.round(recall, 3), np.round(f1, 3)
 
     elif strategy == "cmacro":
+        rev_true_clusters = {}
+        for k, v in true_clusters.items():
+            for vi in v:
+                rev_true_clusters[vi] = k
+
+        rev_pred_clusters = {}
+        for k, v in pred_clusters.items():
+            for vi in v:
+                rev_pred_clusters[vi] = k
+
         if len(test_block) == 0:
             return np.round(0.0, 3), np.round(0.0, 3), np.round(0.0, 3)
         mprecision = 0
@@ -861,6 +861,78 @@ def pairwise_precision_recall_fscore(true_clus, pred_clus, test_block, strategy=
         return np.round(mprecision, 3), np.round(mrecall, 3), np.round(mf1, 3)
     else:
         raise ValueError(f"Unknown strategy: {strategy!r}")
+
+
+def _claims_eval_prediction_output(
+    preds: dict[str, list[str]],
+    *,
+    paper_metadata_by_id: dict[str, tuple[str, list[str]]],
+    signature_affiliations_by_id: dict[str, list[str]],
+) -> dict[str, Any]:
+    output_to_write: dict[str, Any] = {}
+    for cluster_key, cluster_signatures in preds.items():
+        cluster_output = []
+        for signature in cluster_signatures:
+            paper_id, _ = signature.split("___")
+            title, authors = paper_metadata_by_id[paper_id]
+            affiliations = signature_affiliations_by_id[signature]
+            cluster_output.append((paper_id, signature, title, affiliations, authors))
+        output_to_write[cluster_key] = cluster_output
+    output_to_write["sig_pairs_wrong"] = []
+    output_to_write["sig_pairs_right"] = []
+    return output_to_write
+
+
+def _write_claims_eval_shap_plots(
+    *,
+    id1: str,
+    id2: str,
+    dataset: "ANDData",
+    clusterer: "Clusterer",
+    directory_for_caching: str,
+) -> None:
+    features, _, nameless_features = many_pairs_featurize(
+        [(id1, id2, np.nan)],
+        dataset,
+        clusterer.featurizer_info,
+        n_jobs=10,
+        use_cache=True,
+        chunk_size=100,
+        nameless_featurizer_info=clusterer.nameless_featurizer_info,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        import s2and.shap_utils as shap_utils
+
+        shap_output = shap_utils._shap_values_for_tree_model(
+            shap_utils._base_estimator(clusterer.classifier),
+            features,
+            class_index=1,
+        )
+        shap_output_nameless = shap_utils._shap_values_for_tree_model(
+            shap_utils._base_estimator(clusterer.nameless_classifier),
+            nameless_features,
+            class_index=1,
+        )
+
+        title = f"{id1}-{id2}"
+        shap_utils._safe_summary_plot(
+            shap_output,
+            features,
+            clusterer.featurizer_info.get_feature_names(),
+            "dot",
+            join(directory_for_caching, f"{title}_shap.png"),
+            fig_num=1,
+        )
+        shap_utils._safe_summary_plot(
+            shap_output_nameless,
+            nameless_features,
+            clusterer.nameless_featurizer_info.get_feature_names(),  # type: ignore
+            "dot",
+            join(directory_for_caching, f"{title}_shap_nameless.png"),
+            fig_num=2,
+        )
 
 
 def claims_eval(
@@ -953,18 +1025,11 @@ def claims_eval(
             tn += 1
 
     logger.info("Computing predictions (output_to_write)")
-    output_to_write: dict[str, Any] = {}
-    for cluster_key, cluster_signatures in preds.items():
-        cluster_output = []
-        for signature in cluster_signatures:
-            paper_id, _ = signature.split("___")
-            title, authors = paper_metadata_by_id[paper_id]
-            affiliations = signature_affiliations_by_id[signature]
-            cluster_output.append((paper_id, signature, title, affiliations, authors))
-        output_to_write[cluster_key] = cluster_output
-
-    output_to_write["sig_pairs_wrong"] = []
-    output_to_write["sig_pairs_right"] = []
+    output_to_write = _claims_eval_prediction_output(
+        preds,
+        paper_metadata_by_id=paper_metadata_by_id,
+        signature_affiliations_by_id=signature_affiliations_by_id,
+    )
     # keep tqdm off for programmatic runs; enable by setting env var if desired
     for id1, id2, pred_same, gold_same in tqdm(sig_pairs, disable=True):
         paper_id1, _ = id1.split("___")
@@ -984,61 +1049,13 @@ def claims_eval(
             logger.setLevel(_prev_level)
 
         if output_shap and directory_for_caching is not None:
-            features, _, nameless_features = many_pairs_featurize(
-                [(id1, id2, np.nan)],
-                dataset,
-                clusterer.featurizer_info,
-                n_jobs=10,
-                use_cache=True,
-                chunk_size=100,
-                nameless_featurizer_info=clusterer.nameless_featurizer_info,
+            _write_claims_eval_shap_plots(
+                id1=id1,
+                id2=id2,
+                dataset=dataset,
+                clusterer=clusterer,
+                directory_for_caching=directory_for_caching,
             )
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                # Use helpers from s2and.shap_utils so we stay compatible across
-                # SHAP/NumPy versions while preserving identical filenames + titles.
-                import s2and.shap_utils as shap_utils
-
-                # Avoid mutating fitted objects in-place. If the booster params
-                # need temporary changes, copy and restore. Many SHAP versions
-                # work without this, so we only touch params defensively.
-                def _safe_get_shap_vals(clf, X):
-                    base = shap_utils._base_estimator(clf)
-                    # copy params if LightGBM-like
-                    booster = getattr(clf, "booster_", None)
-                    orig_params = None
-                    if booster is not None and hasattr(booster, "params"):
-                        orig_params = dict(booster.params)
-                    try:
-                        return shap_utils._shap_values_for_tree_model(base, X, class_index=1)
-                    finally:
-                        if orig_params is not None:
-                            booster.params.clear()
-                            booster.params.update(orig_params)
-
-                shap_output = _safe_get_shap_vals(clusterer.classifier, features)
-                shap_output_nameless = _safe_get_shap_vals(clusterer.nameless_classifier, nameless_features)
-
-                title = f"{id1}-{id2}"
-                # Named
-                shap_utils._safe_summary_plot(
-                    shap_output,
-                    features,
-                    clusterer.featurizer_info.get_feature_names(),
-                    "dot",
-                    join(directory_for_caching, f"{title}_shap.png"),
-                    fig_num=1,
-                )
-                # Nameless
-                shap_utils._safe_summary_plot(
-                    shap_output_nameless,
-                    nameless_features,
-                    clusterer.nameless_featurizer_info.get_feature_names(),  # type: ignore
-                    "dot",
-                    join(directory_for_caching, f"{title}_shap_nameless.png"),
-                    fig_num=2,
-                )
 
     if directory_for_caching is not None:
         logger.info("Writing predictions to disk")

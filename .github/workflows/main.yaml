@@ -59,6 +59,8 @@ jobs:
         lane: [py-only, rust-enabled]
     steps:
       - uses: actions/checkout@v5
+        with:
+          lfs: true
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
@@ -104,14 +106,14 @@ jobs:
         run: |
           if [[ -f uv.lock ]]; then
             if [[ "${{ matrix.lane }}" == "rust-enabled" ]]; then
-              uv sync --extra dev --extra rust --frozen
+              uv sync --extra dev --extra rust --frozen --no-install-package s2and-rust
             else
               uv sync --extra dev --frozen
             fi
           else
             # No lock present; resolve once, then install
             if [[ "${{ matrix.lane }}" == "rust-enabled" ]]; then
-              uv sync --extra dev --extra rust
+              uv sync --extra dev --extra rust --no-install-package s2and-rust
             else
               uv sync --extra dev
             fi
@@ -121,6 +123,10 @@ jobs:
       - name: Build Rust extension
         if: matrix.lane == 'rust-enabled'
         run: uv run --with maturin maturin develop -m s2and_rust/Cargo.toml
+
+      - name: "Rust artifact guardrail: default incremental linker"
+        if: matrix.lane == 'rust-enabled'
+        run: uv run pytest -q tests/test_incremental_linking_default_artifact.py
 
       - name: "Rust parity guardrail: feature parity"
         if: matrix.lane == 'rust-enabled'
@@ -165,7 +171,6 @@ jobs:
         if: matrix.lane == 'py-only'
         env:
           # keep startup lean; avoid user-level plugins on hosted runners
-          PYTHONPATH: .
           S2AND_BACKEND: python
         run: |
           uv run pytest tests/ \
@@ -173,9 +178,6 @@ jobs:
 
       - name: pytest (coverage, rust-enabled)
         if: matrix.lane == 'rust-enabled'
-        env:
-          # keep startup lean; avoid user-level plugins on hosted runners
-          PYTHONPATH: .
         run: |
           uv run pytest tests/ \
             --cov=s2and --cov-report=term-missing --cov-fail-under=40

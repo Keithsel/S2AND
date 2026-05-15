@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import json
 import logging
+import math
 import os
-from collections.abc import Callable, Iterator, Mapping
+import threading
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 logger = logging.getLogger("s2and")
 
+MEMORY_TELEMETRY_JSONL_ENV = "S2AND_MEMORY_TELEMETRY_JSONL"
+_MEMORY_TELEMETRY_LOCK = threading.Lock()
+
 AUTODETECT_RAM_SAFETY_FACTOR = 0.8
 DEFAULT_SAFETY_MARGIN_FRACTION = 0.10
-# Approximate bytes/entry for Phase A's `signature_to_cluster_sum_count` accumulator.
-# Calibrated on big-block telemetry (Feb 2026); tune via `scripts/rust_suite.py calibrate-phase-a`.
-# Bundle 4 calibration (4 workload shapes): P95 ~192; 200 provides ~4% margin.
-INCREMENTAL_ACCUMULATOR_ENTRY_BYTES = 200
-
 # Rust batch featurization defaults.
 RUST_BATCH_BASE_CHUNK_PAIRS = 0  # Disabled - rely on memory-budget-derived limit
 RUST_BATCH_STAGE_BUDGET_FRACTION = 0.25
@@ -22,12 +24,14 @@ RUST_BATCH_ROW_OVERHEAD_BYTES = 128
 # Bundle 4 calibration (4 workload shapes: 37, 37, 49, 49 bytes/row); P95 = 49; 52 provides ~6% margin.
 RUST_BATCH_PERSISTENT_ROW_OVERHEAD_BYTES = 52
 RUST_BATCH_FIXED_OVERHEAD_BYTES = 16 * (1 << 20)
-PHASE_A_FIXED_OVERHEAD_BYTES = 2 * (1 << 20)
-PHASE_A_PAIR_BUFFER_ENTRY_BYTES = 80
-PHASE_A_MAX_CHUNK_PAIRS_DEFAULT = 100_000_000
-# Defensive upper bound on accumulator entries when no memory limits are provided.
-# ~2 GB at 200 bytes/entry. Prevents unbounded growth if chunk_limits is None.
-FALLBACK_ACCUMULATOR_MAX_ENTRIES = 10_000_000
+PROMOTED_PHASE_A_FIXED_OVERHEAD_BYTES = 16 * (1 << 20)
+PROMOTED_PHASE_A_RETRIEVAL_PAIR_BYTES = 16
+PROMOTED_PHASE_A_RETRIEVAL_ROW_BYTES = 512
+PROMOTED_PHASE_A_PAIR_LABEL_BYTES = 8
+PROMOTED_PHASE_A_DISTANCE_ROW_BYTES = 96
+PROMOTED_PHASE_A_DEFAULT_FEATURE_COUNT = 70
+PROMOTED_PHASE_A_DEFAULT_AGGREGATE_FEATURE_COUNT = 31
+PROMOTED_PHASE_A_STAGE_BUDGET_FRACTION = 0.50
 
 
 @dataclass(frozen=True)
@@ -43,51 +47,7 @@ class MemorySnapshot:
 
 
 @dataclass(frozen=True)
-class _MappingDataclass(Mapping[str, Any]):
-    """Dataclass payload with read-only dict-like access for compatibility."""
-
-    def as_dict(self) -> dict[str, Any]:
-        return {key: getattr(self, key) for key in self.__dataclass_fields__}
-
-    def __getitem__(self, key: str) -> Any:
-        if key not in self.__dataclass_fields__:
-            raise KeyError(key)
-        return getattr(self, key)
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.__dataclass_fields__)
-
-    def __len__(self) -> int:
-        return len(self.__dataclass_fields__)
-
-    def get(self, key: str, default: Any = None) -> Any:
-        if key not in self.__dataclass_fields__:
-            return default
-        return getattr(self, key)
-
-
-@dataclass(frozen=True)
-class IncrementalPhaseSplitLimits(_MappingDataclass):
-    total_ram_bytes: int
-    total_ram_source: str
-    current_rss_bytes: int
-    current_rss_source: str
-    available_bytes: int
-    effective_available_fraction: float
-    safety_margin_bytes: int
-    chunk_budget_bytes: int
-    accumulator_budget_bytes: int
-    bytes_per_pair: int
-    derived_chunk_pairs: int
-    chunk_pairs: int
-    max_chunk_pairs: int
-    accumulator_entry_bytes: int
-    accumulator_warn: int
-    accumulator_max: int
-
-
-@dataclass(frozen=True)
-class RustBatchChunkPlan(_MappingDataclass):
+class RustBatchChunkPlan:
     total_ram_bytes: int
     total_ram_source: str
     current_rss_bytes: int
@@ -117,11 +77,66 @@ class RustBatchChunkPlan(_MappingDataclass):
     predicted_nameless_features_bytes: int
     predicted_stage_peak_delta_bytes: int
     predicted_stage_peak_rss_bytes: int
-    predicted_stage_peak_bytes: int
 
 
 @dataclass(frozen=True)
-class PredictionAccuracySummary(_MappingDataclass):
+class PromotedPhaseALimits:
+    total_ram_bytes: int
+    total_ram_source: str
+    current_rss_bytes: int
+    current_rss_source: str
+    available_bytes: int
+    effective_available_fraction: float
+    safety_margin_bytes: int
+    stage_budget_fraction: float
+    stage_budget_bytes: int
+    query_count: int
+    max_query_batch_size: int
+    query_batch_size: int
+    component_count: int
+    retrieval_top_k: int
+    candidate_rows_per_query: int
+    conservative_pairs_per_query: int
+    hard_query_batch_size: int
+    observed_query_count: int
+    observed_candidate_rows_per_query: int
+    observed_pairs_per_query: int
+    observed_safety_multiplier: float
+    operational_candidate_rows_per_query: int
+    operational_pairs_per_query: int
+    operational_estimate_source: str
+    max_component_size: int
+    predicted_candidate_rows_per_batch: int
+    predicted_pairs_per_batch: int
+    hard_predicted_candidate_rows_per_batch: int
+    hard_predicted_pairs_per_batch: int
+    retrieval_pair_bytes: int
+    retrieval_row_bytes: int
+    pair_label_bytes: int
+    distance_row_bytes: int
+    final_matrix_feature_count: int
+    aggregate_feature_count: int
+    fixed_overhead_bytes: int
+    predicted_retrieval_pair_arrays_bytes: int
+    predicted_retrieval_row_bytes: int
+    predicted_pair_label_bytes: int
+    predicted_aggregate_bytes: int
+    predicted_distance_row_bytes: int
+    predicted_final_matrix_bytes: int
+    predicted_fixed_overhead_bytes: int
+    predicted_persistent_bytes: int
+    predicted_pair_chunk_bytes: int
+    predicted_peak_delta_bytes: int
+    predicted_peak_rss_bytes: int
+    pair_chunk_pairs: int
+    pair_chunk_count: int
+    pair_chunk_stage_budget_bytes: int
+    single_query_predicted_persistent_bytes: int
+    single_query_exceeds_budget: bool
+
+
+@dataclass(frozen=True)
+class PredictionAccuracySummary:
     stage_name: str
     prediction_contract_version: str
     predicted_peak_delta_bytes: int
@@ -134,6 +149,62 @@ class PredictionAccuracySummary(_MappingDataclass):
     observed_end_delta_bytes: int
     prediction_error_ratio: float
     underpredicted: bool
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    item = getattr(value, "item", None)
+    if callable(item):
+        converted = item()
+        if converted is None or isinstance(converted, str | int | float | bool):
+            return converted
+    return str(value)
+
+
+def emit_memory_telemetry(record: Mapping[str, Any]) -> None:
+    """Append one structured memory telemetry record when configured by env var."""
+
+    output_path_raw = os.environ.get(MEMORY_TELEMETRY_JSONL_ENV)
+    if not output_path_raw:
+        return
+    output_path = Path(output_path_raw)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "event": "memory_telemetry",
+    }
+    for key, value in record.items():
+        payload[str(key)] = _json_safe_value(value)
+
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    with _MEMORY_TELEMETRY_LOCK:
+        with output_path.open("a", encoding="utf-8") as telemetry_file:
+            telemetry_file.write(encoded)
+
+
+def compute_stage_budget_bytes(available_bytes: int, stage_fraction: float) -> int:
+    return max(1, int(float(stage_fraction) * float(max(1, int(available_bytes)))))
+
+
+def compute_chunk_size(
+    *,
+    item_bytes: int,
+    budget_bytes: int,
+    fixed_overhead_bytes: int = 0,
+    hard_limit_items: int | None = None,
+    soft_limit_items: int | None = None,
+) -> tuple[int, int]:
+    """Return ``(chunk_size, derived_chunk_size)`` for a fixed byte budget."""
+
+    budget_after_fixed = max(1, int(budget_bytes) - max(0, int(fixed_overhead_bytes)))
+    derived_chunk_size = max(1, budget_after_fixed // max(1, int(item_bytes)))
+    candidates = [derived_chunk_size]
+    if hard_limit_items is not None and int(hard_limit_items) > 0:
+        candidates.append(int(hard_limit_items))
+    if soft_limit_items is not None and int(soft_limit_items) > 0:
+        candidates.append(int(soft_limit_items))
+    return max(1, min(candidates)), derived_chunk_size
 
 
 def resolve_rust_batch_prediction_params() -> dict[str, int]:
@@ -163,7 +234,7 @@ def _is_windows() -> bool:
 
 def _psutil_virtual_memory_total_bytes_best_effort() -> int | None:
     try:
-        import psutil  # type: ignore
+        import psutil
     except Exception:
         return None
     try:
@@ -177,7 +248,7 @@ def _psutil_virtual_memory_total_bytes_best_effort() -> int | None:
 
 def _psutil_process_rss_bytes_best_effort() -> int | None:
     try:
-        import psutil  # type: ignore
+        import psutil
     except Exception:
         return None
     try:
@@ -447,71 +518,6 @@ def memory_snapshot_for_stage(
     )
 
 
-def compute_incremental_phase_split_limits(
-    num_features: int,
-    *,
-    selected_feature_count: int | None = None,
-    nameless_feature_count: int = 0,
-    total_ram_bytes: int | None = None,
-    safety_margin_fraction: float = DEFAULT_SAFETY_MARGIN_FRACTION,
-    chunk_budget_fraction: float = 0.60,
-    accumulator_budget_fraction: float = 0.20,
-    accumulator_entry_bytes: int = INCREMENTAL_ACCUMULATOR_ENTRY_BYTES,
-    max_chunk_pairs: int | None = None,
-    detect_cgroup_fn: Callable[[], tuple[int | None, str]] | None = None,
-    detect_total_fn: Callable[[], tuple[int | None, str]] | None = None,
-    current_rss_fn: Callable[[int], tuple[int, str]] | None = None,
-) -> IncrementalPhaseSplitLimits:
-    snapshot = memory_snapshot_for_stage(
-        total_ram_bytes=total_ram_bytes,
-        safety_margin_fraction=safety_margin_fraction,
-        detect_cgroup_fn=detect_cgroup_fn,
-        detect_total_fn=detect_total_fn,
-        current_rss_fn=current_rss_fn,
-    )
-    chunk_budget_bytes = int(float(chunk_budget_fraction) * float(snapshot.available_bytes))
-    accumulator_budget_bytes = int(float(accumulator_budget_fraction) * float(snapshot.available_bytes))
-
-    if selected_feature_count is not None:
-        effective_selected = max(1, min(num_features, selected_feature_count))
-        effective_nameless = max(0, min(num_features, nameless_feature_count))
-        bytes_per_pair = max(1, (effective_selected + effective_nameless) * 8 + 8 + 100)
-    else:
-        # Legacy: assume worst case (main + nameless at full width).
-        bytes_per_pair = max(1, num_features * 8 * 2 + 8 + 100)
-    derived_chunk_pairs = max(1, chunk_budget_bytes // bytes_per_pair)
-    chunk_pairs = derived_chunk_pairs
-
-    max_pairs = max_chunk_pairs
-    if max_pairs is None:
-        max_pairs = PHASE_A_MAX_CHUNK_PAIRS_DEFAULT
-    if max_pairs < 0:
-        raise ValueError(f"Invalid max_chunk_pairs={max_pairs}; expected >=0")
-    if max_pairs > 0:
-        chunk_pairs = min(chunk_pairs, max_pairs)
-
-    accumulator_warn = max(1, accumulator_budget_bytes // accumulator_entry_bytes // 5)
-    accumulator_max = max(accumulator_warn + 1, accumulator_budget_bytes // accumulator_entry_bytes)
-    return IncrementalPhaseSplitLimits(
-        total_ram_bytes=snapshot.total_ram_bytes,
-        total_ram_source=snapshot.total_ram_source,
-        current_rss_bytes=snapshot.current_rss_bytes,
-        current_rss_source=snapshot.current_rss_source,
-        available_bytes=snapshot.available_bytes,
-        effective_available_fraction=snapshot.effective_available_fraction,
-        safety_margin_bytes=snapshot.safety_margin_bytes,
-        chunk_budget_bytes=chunk_budget_bytes,
-        accumulator_budget_bytes=accumulator_budget_bytes,
-        bytes_per_pair=bytes_per_pair,
-        derived_chunk_pairs=derived_chunk_pairs,
-        chunk_pairs=chunk_pairs,
-        max_chunk_pairs=max_pairs,
-        accumulator_entry_bytes=accumulator_entry_bytes,
-        accumulator_warn=accumulator_warn,
-        accumulator_max=accumulator_max,
-    )
-
-
 def compute_rust_batch_chunk_plan(
     *,
     num_features: int,
@@ -547,7 +553,7 @@ def compute_rust_batch_chunk_plan(
         detect_total_fn=detect_total_fn,
         current_rss_fn=current_rss_fn,
     )
-    stage_budget_bytes = max(1, int(float(stage_budget_fraction) * float(snapshot.available_bytes)))
+    stage_budget_bytes = compute_stage_budget_bytes(snapshot.available_bytes, stage_budget_fraction)
     full_feature_count = max(1, num_features)
     selected_feature_count_bounded = full_feature_count
     if selected_feature_count is not None:
@@ -558,16 +564,17 @@ def compute_rust_batch_chunk_plan(
     # so behavior is unchanged for callers that don't specify feature counts.
     chunk_feature_count = max(1, selected_feature_count_bounded + nameless_feature_count_bounded)
     bytes_per_pair_row = max(1, chunk_feature_count * 8 + row_overhead_bytes)
-    derived_chunk_pairs = max(1, stage_budget_bytes // bytes_per_pair_row)
     bounded_total_pairs = max(1, total_pairs)
     bounded_total_rows = bounded_total_pairs
     if total_rows is not None:
         bounded_total_rows = max(1, total_rows)
-    # base_chunk_pairs <= 0 means disabled; only include it when positive.
-    candidates = [bounded_total_pairs, derived_chunk_pairs]
-    if base_chunk_pairs > 0:
-        candidates.append(base_chunk_pairs)
-    chunk_pairs = max(1, min(candidates))
+    chunk_pairs, derived_chunk_pairs = compute_chunk_size(
+        item_bytes=bytes_per_pair_row,
+        budget_bytes=stage_budget_bytes,
+        fixed_overhead_bytes=fixed_overhead_bytes,
+        hard_limit_items=bounded_total_pairs,
+        soft_limit_items=base_chunk_pairs,
+    )
 
     predicted_chunk_bytes = chunk_pairs * bytes_per_pair_row
     predicted_selected_features_bytes = bounded_total_rows * (selected_feature_count_bounded * 8)
@@ -614,8 +621,232 @@ def compute_rust_batch_chunk_plan(
         predicted_nameless_features_bytes=predicted_nameless_features_bytes,
         predicted_stage_peak_delta_bytes=predicted_stage_peak_delta_bytes,
         predicted_stage_peak_rss_bytes=predicted_stage_peak_rss_bytes,
-        # Backward-compatible alias; prefer predicted_stage_peak_delta_bytes.
-        predicted_stage_peak_bytes=predicted_stage_peak_delta_bytes,
+    )
+
+
+def _largest_sum(values: list[int], count: int) -> int:
+    if count <= 0 or not values:
+        return 0
+    return int(sum(sorted((max(0, int(value)) for value in values), reverse=True)[:count]))
+
+
+def compute_promoted_phase_a_limits(
+    *,
+    query_count: int,
+    component_sizes: Mapping[Any, int] | list[int] | tuple[int, ...],
+    retrieval_top_k: int,
+    total_ram_bytes: int | None = None,
+    max_query_batch_size: int | None = None,
+    safety_margin_fraction: float = DEFAULT_SAFETY_MARGIN_FRACTION,
+    stage_budget_fraction: float = PROMOTED_PHASE_A_STAGE_BUDGET_FRACTION,
+    final_matrix_feature_count: int = PROMOTED_PHASE_A_DEFAULT_FEATURE_COUNT,
+    aggregate_feature_count: int = PROMOTED_PHASE_A_DEFAULT_AGGREGATE_FEATURE_COUNT,
+    retrieval_pair_bytes: int = PROMOTED_PHASE_A_RETRIEVAL_PAIR_BYTES,
+    retrieval_row_bytes: int = PROMOTED_PHASE_A_RETRIEVAL_ROW_BYTES,
+    pair_label_bytes: int = PROMOTED_PHASE_A_PAIR_LABEL_BYTES,
+    distance_row_bytes: int = PROMOTED_PHASE_A_DISTANCE_ROW_BYTES,
+    fixed_overhead_bytes: int = PROMOTED_PHASE_A_FIXED_OVERHEAD_BYTES,
+    observed_query_count: int = 0,
+    observed_candidate_rows_per_query: int | None = None,
+    observed_pairs_per_query: int | None = None,
+    observed_safety_multiplier: float = 2.0,
+    detect_cgroup_fn: Callable[[], tuple[int | None, str]] | None = None,
+    detect_total_fn: Callable[[], tuple[int | None, str]] | None = None,
+    current_rss_fn: Callable[[int], tuple[int, str]] | None = None,
+) -> PromotedPhaseALimits:
+    """Compute conservative query-batch limits for promoted incremental Phase A.
+
+    The planner sizes the retrieval-owned ``LinkerCandidateBatch`` before Rust
+    retrieval allocation and reuses the Rust pair chunk planner for pair scoring.
+    ``component_sizes`` should contain the current seeded component sizes.
+    """
+
+    parsed_query_count = int(query_count)
+    if parsed_query_count < 0:
+        raise ValueError(f"query_count must be >= 0, got {query_count}")
+    parsed_top_k = int(retrieval_top_k)
+    if parsed_top_k <= 0:
+        raise ValueError(f"retrieval_top_k must be positive, got {retrieval_top_k}")
+    size_values: Iterable[int] = (
+        cast(Iterable[int], component_sizes.values()) if isinstance(component_sizes, Mapping) else component_sizes
+    )
+    sizes = [max(0, int(value)) for value in size_values]
+    sizes = [size for size in sizes if size > 0]
+    component_count = len(sizes)
+    candidate_rows_per_query = min(parsed_top_k, component_count)
+    conservative_pairs_per_query = _largest_sum(sizes, candidate_rows_per_query)
+    max_component_size = max(sizes, default=0)
+    parsed_observed_query_count = max(0, int(observed_query_count))
+    multiplier = float(observed_safety_multiplier)
+    if not math.isfinite(multiplier) or multiplier < 1.0:
+        raise ValueError(f"observed_safety_multiplier must be finite and >= 1.0, got {observed_safety_multiplier}")
+    observed_rows = 0 if observed_candidate_rows_per_query is None else max(0, int(observed_candidate_rows_per_query))
+    observed_pairs = 0 if observed_pairs_per_query is None else max(0, int(observed_pairs_per_query))
+    if parsed_observed_query_count > 0 and observed_candidate_rows_per_query is not None:
+        operational_candidate_rows_per_query = min(
+            candidate_rows_per_query,
+            int(math.ceil(float(observed_rows) * multiplier)),
+        )
+    else:
+        operational_candidate_rows_per_query = candidate_rows_per_query
+    if parsed_observed_query_count > 0 and observed_pairs_per_query is not None:
+        operational_pairs_per_query = min(
+            conservative_pairs_per_query,
+            int(math.ceil(float(observed_pairs) * multiplier)),
+        )
+        operational_estimate_source = "observed_probe"
+    else:
+        operational_pairs_per_query = conservative_pairs_per_query
+        operational_estimate_source = "top_k_largest_components"
+
+    snapshot = memory_snapshot_for_stage(
+        total_ram_bytes=total_ram_bytes,
+        safety_margin_fraction=safety_margin_fraction,
+        detect_cgroup_fn=detect_cgroup_fn,
+        detect_total_fn=detect_total_fn,
+        current_rss_fn=current_rss_fn,
+    )
+    stage_budget_bytes = compute_stage_budget_bytes(snapshot.available_bytes, stage_budget_fraction)
+    max_batch = parsed_query_count if max_query_batch_size is None else int(max_query_batch_size)
+    if max_batch <= 0:
+        raise ValueError(f"max_query_batch_size must be positive, got {max_query_batch_size}")
+    max_batch = max(1, min(parsed_query_count if parsed_query_count > 0 else 1, max_batch))
+
+    row_state_bytes_per_row = (
+        int(aggregate_feature_count) * 3 * 8 + int(distance_row_bytes) + int(final_matrix_feature_count) * 4
+    )
+    hard_persistent_bytes_per_query = conservative_pairs_per_query * (
+        int(retrieval_pair_bytes) + int(pair_label_bytes)
+    ) + candidate_rows_per_query * (int(retrieval_row_bytes) + row_state_bytes_per_row)
+    operational_persistent_bytes_per_query = operational_pairs_per_query * (
+        int(retrieval_pair_bytes) + int(pair_label_bytes)
+    ) + operational_candidate_rows_per_query * (int(retrieval_row_bytes) + row_state_bytes_per_row)
+    single_query_predicted_persistent_bytes = int(fixed_overhead_bytes) + hard_persistent_bytes_per_query
+    if parsed_query_count > 0 and single_query_predicted_persistent_bytes > stage_budget_bytes:
+        raise MemoryError(
+            "Promoted incremental linker cannot fit a single query under the memory budget: "
+            f"single_query_predicted_persistent_bytes={int(single_query_predicted_persistent_bytes)} "
+            f"stage_budget_bytes={int(stage_budget_bytes)} "
+            f"total_ram_bytes={int(snapshot.total_ram_bytes)} "
+            f"current_rss_bytes={int(snapshot.current_rss_bytes)} "
+            f"safety_margin_bytes={int(snapshot.safety_margin_bytes)}"
+        )
+    if parsed_query_count == 0:
+        query_batch_size = 0
+        hard_query_batch_size = 0
+    elif operational_persistent_bytes_per_query <= 0:
+        query_batch_size = max_batch
+        hard_query_batch_size = max_batch
+    else:
+        query_batch_size, _ = compute_chunk_size(
+            item_bytes=operational_persistent_bytes_per_query,
+            budget_bytes=stage_budget_bytes,
+            fixed_overhead_bytes=fixed_overhead_bytes,
+            hard_limit_items=max_batch,
+        )
+        hard_query_batch_size, _ = compute_chunk_size(
+            item_bytes=max(1, hard_persistent_bytes_per_query),
+            budget_bytes=stage_budget_bytes,
+            fixed_overhead_bytes=fixed_overhead_bytes,
+            hard_limit_items=max_batch,
+        )
+
+    predicted_candidate_rows_per_batch = int(query_batch_size) * operational_candidate_rows_per_query
+    predicted_pairs_per_batch = int(query_batch_size) * operational_pairs_per_query
+    hard_predicted_candidate_rows_per_batch = int(query_batch_size) * candidate_rows_per_query
+    hard_predicted_pairs_per_batch = int(query_batch_size) * conservative_pairs_per_query
+    predicted_retrieval_pair_arrays_bytes = predicted_pairs_per_batch * int(retrieval_pair_bytes)
+    predicted_retrieval_row_bytes = predicted_candidate_rows_per_batch * int(retrieval_row_bytes)
+    predicted_pair_label_bytes = predicted_pairs_per_batch * int(pair_label_bytes)
+    predicted_aggregate_bytes = predicted_candidate_rows_per_batch * int(aggregate_feature_count) * 3 * 8
+    predicted_distance_row_bytes = predicted_candidate_rows_per_batch * int(distance_row_bytes)
+    predicted_final_matrix_bytes = predicted_candidate_rows_per_batch * int(final_matrix_feature_count) * 4
+    predicted_fixed_overhead_bytes = int(fixed_overhead_bytes)
+    predicted_persistent_bytes = (
+        predicted_retrieval_pair_arrays_bytes
+        + predicted_retrieval_row_bytes
+        + predicted_pair_label_bytes
+        + predicted_aggregate_bytes
+        + predicted_distance_row_bytes
+        + predicted_final_matrix_bytes
+        + predicted_fixed_overhead_bytes
+    )
+
+    # Match s2and.incremental_linking.linker_pairwise.compute_linker_pair_chunk_plan
+    # without importing the incremental-linking package from this core utility.
+    pair_memory_feature_count = max(1, int(final_matrix_feature_count) + int(aggregate_feature_count) * 3 + 1)
+    pair_plan = compute_rust_batch_chunk_plan(
+        num_features=pair_memory_feature_count,
+        total_pairs=max(0, predicted_pairs_per_batch),
+        total_rows=max(0, predicted_candidate_rows_per_batch),
+        total_ram_bytes=snapshot.total_ram_bytes,
+        safety_margin_fraction=safety_margin_fraction,
+        detect_cgroup_fn=lambda: (snapshot.total_ram_bytes, snapshot.total_ram_source),
+        detect_total_fn=lambda: (snapshot.total_ram_bytes, snapshot.total_ram_source),
+        current_rss_fn=lambda _total: (snapshot.current_rss_bytes, snapshot.current_rss_source),
+    )
+    predicted_pair_chunk_bytes = int(pair_plan.predicted_chunk_bytes)
+    predicted_peak_delta_bytes = predicted_persistent_bytes + predicted_pair_chunk_bytes
+    predicted_peak_rss_bytes = snapshot.current_rss_bytes + predicted_peak_delta_bytes
+    pair_chunk_pairs = int(pair_plan.chunk_pairs)
+    pair_chunk_count = (
+        int((predicted_pairs_per_batch + pair_chunk_pairs - 1) // pair_chunk_pairs)
+        if predicted_pairs_per_batch > 0
+        else 0
+    )
+    return PromotedPhaseALimits(
+        total_ram_bytes=snapshot.total_ram_bytes,
+        total_ram_source=snapshot.total_ram_source,
+        current_rss_bytes=snapshot.current_rss_bytes,
+        current_rss_source=snapshot.current_rss_source,
+        available_bytes=snapshot.available_bytes,
+        effective_available_fraction=snapshot.effective_available_fraction,
+        safety_margin_bytes=snapshot.safety_margin_bytes,
+        stage_budget_fraction=float(stage_budget_fraction),
+        stage_budget_bytes=stage_budget_bytes,
+        query_count=parsed_query_count,
+        max_query_batch_size=max_batch,
+        query_batch_size=int(query_batch_size),
+        component_count=component_count,
+        retrieval_top_k=parsed_top_k,
+        candidate_rows_per_query=candidate_rows_per_query,
+        conservative_pairs_per_query=conservative_pairs_per_query,
+        hard_query_batch_size=int(hard_query_batch_size),
+        observed_query_count=parsed_observed_query_count,
+        observed_candidate_rows_per_query=observed_rows,
+        observed_pairs_per_query=observed_pairs,
+        observed_safety_multiplier=multiplier,
+        operational_candidate_rows_per_query=operational_candidate_rows_per_query,
+        operational_pairs_per_query=operational_pairs_per_query,
+        operational_estimate_source=operational_estimate_source,
+        max_component_size=max_component_size,
+        predicted_candidate_rows_per_batch=predicted_candidate_rows_per_batch,
+        predicted_pairs_per_batch=predicted_pairs_per_batch,
+        hard_predicted_candidate_rows_per_batch=hard_predicted_candidate_rows_per_batch,
+        hard_predicted_pairs_per_batch=hard_predicted_pairs_per_batch,
+        retrieval_pair_bytes=int(retrieval_pair_bytes),
+        retrieval_row_bytes=int(retrieval_row_bytes),
+        pair_label_bytes=int(pair_label_bytes),
+        distance_row_bytes=int(distance_row_bytes),
+        final_matrix_feature_count=int(final_matrix_feature_count),
+        aggregate_feature_count=int(aggregate_feature_count),
+        fixed_overhead_bytes=int(fixed_overhead_bytes),
+        predicted_retrieval_pair_arrays_bytes=predicted_retrieval_pair_arrays_bytes,
+        predicted_retrieval_row_bytes=predicted_retrieval_row_bytes,
+        predicted_pair_label_bytes=predicted_pair_label_bytes,
+        predicted_aggregate_bytes=predicted_aggregate_bytes,
+        predicted_distance_row_bytes=predicted_distance_row_bytes,
+        predicted_final_matrix_bytes=predicted_final_matrix_bytes,
+        predicted_fixed_overhead_bytes=predicted_fixed_overhead_bytes,
+        predicted_persistent_bytes=predicted_persistent_bytes,
+        predicted_pair_chunk_bytes=predicted_pair_chunk_bytes,
+        predicted_peak_delta_bytes=predicted_peak_delta_bytes,
+        predicted_peak_rss_bytes=predicted_peak_rss_bytes,
+        pair_chunk_pairs=pair_chunk_pairs,
+        pair_chunk_count=pair_chunk_count,
+        pair_chunk_stage_budget_bytes=int(pair_plan.stage_budget_bytes),
+        single_query_predicted_persistent_bytes=single_query_predicted_persistent_bytes,
+        single_query_exceeds_budget=single_query_predicted_persistent_bytes > stage_budget_bytes,
     )
 
 

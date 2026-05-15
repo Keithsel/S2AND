@@ -1,10 +1,9 @@
 import unittest
 
-import lightgbm as lgb
 import numpy as np
 import pytest
+from lightgbm import LGBMClassifier
 
-import s2and.featurizer
 from s2and.consts import LARGE_DISTANCE
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
@@ -14,9 +13,6 @@ from s2and.model import Clusterer
 class TestClusterer(unittest.TestCase):
     def setUp(self):
         super().setUp()
-        if "global_dataset" in dir(s2and.featurizer):
-            del s2and.featurizer.global_dataset
-
         self.dummy_dataset = ANDData(
             "tests/dummy/signatures.json",
             "tests/dummy/papers.json",
@@ -36,7 +32,7 @@ class TestClusterer(unittest.TestCase):
         y_random = np.random.randint(0, 6, 10)
         self.dummy_clusterer = Clusterer(
             featurizer_info=featurizer_info,
-            classifier=lgb.LGBMClassifier(random_state=1, data_random_seed=1, feature_fraction_seed=1).fit(
+            classifier=LGBMClassifier(random_state=1, data_random_seed=1, feature_fraction_seed=1).fit(
                 X_random, y_random
             ),
             n_jobs=1,
@@ -54,6 +50,30 @@ class TestClusterer(unittest.TestCase):
         self.assertIs(constraint_2, LARGE_DISTANCE)
         self.assertIs(constraint_3, 0)
         self.assertIs(constraint_4, 0)
+
+    def test_incremental_dont_use_cluster_seeds_keeps_explicit_disallow(self):
+        self.dummy_dataset.cluster_seeds_disallow = {("0", "1")}
+        self.dummy_dataset.cluster_seeds_require = {"0": 0, "1": 1}
+        constraint = self.dummy_dataset.get_constraint(
+            "0",
+            "1",
+            low_value=0,
+            high_value=2,
+            incremental_dont_use_cluster_seeds=True,
+        )
+        self.assertIs(constraint, LARGE_DISTANCE)
+
+    def test_incremental_dont_use_cluster_seeds_ignores_cross_seed_disallow(self):
+        self.dummy_dataset.cluster_seeds_disallow = set()
+        self.dummy_dataset.cluster_seeds_require = {"0": 0, "1": 1}
+        constraint = self.dummy_dataset.get_constraint(
+            "0",
+            "1",
+            low_value=0,
+            high_value=2,
+            incremental_dont_use_cluster_seeds=True,
+        )
+        self.assertIsNone(constraint)
 
     def test_make_distance_matrix_fastcluster(self):
         block = {

@@ -1,8 +1,8 @@
 # mypy: ignore-errors
 """
-This script demonstrates how to use the production S2AND model (v1.1) for clustering.
+This script demonstrates how to use the checked-in production S2AND model bundle for clustering.
 
-Default examples use `data/s2and_mini/*`.
+Default examples use `s2and/data/s2and_mini/*`.
 You can also point `--data-root` to `tests` and run `--dataset qian`.
 
 Examples:
@@ -121,7 +121,7 @@ def main() -> None:
     parser.add_argument(
         "--data-root",
         type=str,
-        default=os.path.join("data", "s2and_mini"),
+        default=os.path.join("s2and", "data", "s2and_mini"),
         help=(
             "Root directory containing per-dataset subfolders. "
             "Supports both <dataset>_*.json naming (mini) and plain *.json naming (tests fixtures)."
@@ -182,8 +182,8 @@ def main() -> None:
     parser.add_argument(
         "--model-path",
         type=str,
-        default=os.path.join("data", "production_model_v1.1.pickle"),
-        help="Model pickle path relative to repo root or absolute.",
+        default=os.path.join("s2and", "data", "production_model_v1.21"),
+        help="Production model bundle directory or legacy pickle path, relative to repo root or absolute.",
     )
     args = parser.parse_args()
 
@@ -196,7 +196,7 @@ def main() -> None:
     from s2and.data import ANDData
     from s2and.feature_port import warm_rust_featurizer
     from s2and.featurizer import FeaturizationInfo
-    from s2and.serialization import load_pickle_with_verified_label_encoder_compat
+    from s2and.production_model import load_production_model
 
     n_jobs = args.n_jobs
     use_cache = bool(args.use_cache)
@@ -251,9 +251,9 @@ def main() -> None:
     )
     _ = (featurization_info, nameless_featurization_info)
 
-    # this defaults to prod 1.1 model; override via --model-path if needed
+    # this defaults to the checked-in native production bundle; override via --model-path if needed
     model_path = _resolve_root(PROJECT_ROOT_PATH, args.model_path)
-    clusterer = load_pickle_with_verified_label_encoder_compat(model_path)["clusterer"]
+    clusterer = load_production_model(model_path)
     clusterer.use_cache = use_cache
     clusterer.n_jobs = n_jobs
 
@@ -311,7 +311,7 @@ def main() -> None:
 
         if args.warm_rust_featurizer_before_predict:
             if anddata.runtime_context.resolved_backend == "rust":
-                warm_rust_featurizer(anddata, use_cache=use_cache)
+                warm_rust_featurizer(anddata)
                 print(f"[{dataset_name}] Warmed Rust featurizer")
             else:
                 print(

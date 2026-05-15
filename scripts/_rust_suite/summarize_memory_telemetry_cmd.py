@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from _rust_suite.calibrate_cmd import _open_text_log
+from _rust_suite.calibrate_cmd import _open_text_log  # type: ignore
 
-from s2and.memory_calibration import iter_log_records, parse_kv_tokens, percentile
+from s2and.memory_calibration import iter_memory_telemetry_records, percentile
 
 
 @dataclass(frozen=True)
@@ -35,15 +35,18 @@ def _summarize(values: list[float]) -> dict[str, float]:
     }
 
 
-def _truthy(value: str) -> bool:
-    return value.strip().lower() in {"1", "true", "t", "yes", "y"}
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "y"}
+    return bool(value)
 
 
 def _collect_ratio_summary(
     *,
     log_paths: list[Path],
-    record_matcher: str,
-    stage_filter: str | None = None,
+    stage: str,
 ) -> _RatioSummary:
     matched_records = 0
     ratio_values: list[float] = []
@@ -53,15 +56,12 @@ def _collect_ratio_summary(
         if not path.exists():
             raise FileNotFoundError(str(path))
         with _open_text_log(path) as fh:
-            for record in iter_log_records(fh):
-                if record_matcher not in record:
-                    continue
-                kv = parse_kv_tokens(record)
-                if stage_filter is not None and kv.get("stage") != stage_filter:
+            for record in iter_memory_telemetry_records(fh):
+                if record.get("stage") != stage:
                     continue
                 matched_records += 1
 
-                ratio_raw = kv.get("prediction_error_ratio")
+                ratio_raw = record.get("prediction_error_ratio")
                 if ratio_raw is None:
                     continue
                 try:
@@ -69,7 +69,7 @@ def _collect_ratio_summary(
                 except ValueError:
                     continue
 
-                if _truthy(kv.get("underpredicted", "false")):
+                if _truthy(record.get("underpredicted", False)):
                     underpredicted_count += 1
 
     samples = len(ratio_values)
@@ -84,8 +84,8 @@ def _collect_ratio_summary(
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Summarize memory prediction error ratios from telemetry logs.")
-    parser.add_argument("logs", nargs="+", help="Log file(s) containing telemetry lines.")
+    parser = argparse.ArgumentParser(description="Summarize memory prediction error ratios from JSONL telemetry.")
+    parser.add_argument("logs", nargs="+", help="JSONL file(s) containing structured memory telemetry records.")
     parser.add_argument(
         "--write-json",
         type=str,
@@ -97,12 +97,11 @@ def main(argv: list[str]) -> int:
     log_paths = [Path(raw) for raw in args.logs]
     phase_a = _collect_ratio_summary(
         log_paths=log_paths,
-        record_matcher="Telemetry: phase_split_phase_a",
+        stage="phase_a_seed_distances",
     )
     rust_batch = _collect_ratio_summary(
         log_paths=log_paths,
-        record_matcher="Telemetry: pair_featurization_memory",
-        stage_filter="pair_featurization_rust_batch",
+        stage="pair_featurization_rust_batch",
     )
 
     blob = {
@@ -113,7 +112,7 @@ def main(argv: list[str]) -> int:
         "inputs": [str(p.resolve()) for p in log_paths],
         "stages": {
             "phase_a_seed_distances": {
-                "record_matcher": "Telemetry: phase_split_phase_a",
+                "stage": "phase_a_seed_distances",
                 "matched_records": int(phase_a.matched_records),
                 "samples": int(phase_a.samples),
                 "underpredicted_count": int(phase_a.underpredicted_count),
@@ -121,8 +120,7 @@ def main(argv: list[str]) -> int:
                 "ratio_summary": {k: float(v) for k, v in phase_a.ratio_summary.items()},
             },
             "pair_featurization_rust_batch": {
-                "record_matcher": "Telemetry: pair_featurization_memory",
-                "stage_filter": "pair_featurization_rust_batch",
+                "stage": "pair_featurization_rust_batch",
                 "matched_records": int(rust_batch.matched_records),
                 "samples": int(rust_batch.samples),
                 "underpredicted_count": int(rust_batch.underpredicted_count),

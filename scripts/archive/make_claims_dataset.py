@@ -18,11 +18,11 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("s2and")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 ch = logging.StreamHandler()
 ch.setFormatter(formatter)
-ch.setLevel(logging.INFO)
+ch.setLevel(logging.DEBUG)
 logger.addHandler(ch)
 
 from tqdm import tqdm
@@ -32,7 +32,7 @@ os.environ["S2AND_CACHE"] = os.path.join(CONFIG["internal_data_dir"], ".feature_
 DATA_DIR = CONFIG["internal_data_dir"]
 
 # NOTE: This script will not run, because these functions need to access internal resources
-from scripts.redshift_funcs import (
+from scripts.redshift_funcs import (  # type: ignore
     get_affiliations,
     get_all_author_rows_for_block_key,
     get_all_references,

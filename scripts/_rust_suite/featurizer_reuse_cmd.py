@@ -10,11 +10,11 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from _rust_suite.common import RSSMonitor, collect_rust_extension_identity  # noqa: E402
+from _rust_suite.common import RSSMonitor, collect_rust_extension_identity  # type: ignore  # noqa: E402
 
 
 def _build_data_paths(project_root: str, dataset_name: str) -> dict[str, str]:
-    data_root = os.path.join(project_root, "data", "s2and_mini")
+    data_root = os.path.join(project_root, "s2and", "data", "s2and_mini")
     dataset_root = os.path.join(data_root, dataset_name)
     return {
         "signatures": os.path.join(dataset_root, f"{dataset_name}_signatures.json"),
@@ -77,15 +77,15 @@ def run_reuse_profile(
     from s2and.data import ANDData
     from s2and.eval import cluster_eval
     from s2and.feature_port import _rust_featurizer_build_count, clear_rust_featurizer_cache
-    from s2and.serialization import load_pickle_with_verified_label_encoder_compat
+    from s2and.production_model import load_production_model
 
     paths = _build_data_paths(PROJECT_ROOT_PATH, dataset_name)
     for key, path in paths.items():
         if not os.path.exists(path):
             raise FileNotFoundError(f"Missing {key} path for dataset '{dataset_name}': {path}")
 
-    model_path = os.path.join(PROJECT_ROOT_PATH, "data", "production_model_v1.1.pickle")
-    clusterer = load_pickle_with_verified_label_encoder_compat(model_path)["clusterer"]
+    model_path = os.path.join(PROJECT_ROOT_PATH, "s2and", "data", "production_model_v1.21")
+    clusterer = load_production_model(model_path)
     clusterer.use_cache = False
     clusterer.n_jobs = n_jobs
 

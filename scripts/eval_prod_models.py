@@ -55,16 +55,19 @@ Performance with SPECTERv2 data, on zbmath (B3): (0.961, 0.97, 0.965)
 
 Usage:
     # Evaluate on inventors_s2and (default)
-    python scripts/eval_prod_models.py
+    uv run python scripts/eval_prod_models.py
+
+    # Evaluate on inventors_s2and
+    uv run python scripts/eval_prod_models.py --dataset inventors_s2and
 
     # Evaluate on s2and_mini datasets
-    python scripts/eval_prod_models.py --dataset mini
+    uv run python scripts/eval_prod_models.py --dataset mini
 
     # Retrain from scratch instead of using prod models
-    python scripts/eval_prod_models.py --train
+    uv run python scripts/eval_prod_models.py --train
 
     # Override seed / n_jobs
-    python scripts/eval_prod_models.py --seed 42 --n_jobs 8
+    uv run python scripts/eval_prod_models.py --seed 42 --n_jobs 8
 """
 
 import argparse
@@ -75,7 +78,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate prod S2AND models (SPECTER1 vs SPECTER2)")
     parser.add_argument(
         "--dataset",
-        choices=["inventors_s2and", "mini"],
+        choices=["inventors_s2and", "mini", "full"],
         default="inventors_s2and",
         help="Which dataset(s) to evaluate on (default: inventors_s2and)",
     )
@@ -101,14 +104,14 @@ from s2and.data import ANDData
 from s2and.eval import cluster_eval
 from s2and.featurizer import FeaturizationInfo, featurize
 from s2and.model import Clusterer, PairwiseModeler
-from s2and.serialization import load_pickle_with_verified_label_encoder_compat
+from s2and.production_model import load_production_model
 from s2and.warnings_utils import suppress_sklearn_feature_name_warnings
 
-# specter suffix -> production model pickle
-# v1.1 was trained on specter1 features, v1.2 on specter2
+# specter suffix -> production model artifact
+# v1.1 was trained on specter1 features; v1.21 bundles the v1.2 SPECTER2 pairwise model.
 MODELS = {
     "_specter.pickle": "production_model_v1.1.pickle",
-    "_specter2.pkl": "production_model_v1.2.pickle",
+    "_specter2.pkl": "production_model_v1.21",
 }
 specter_suffixes = list(MODELS.keys())
 
@@ -161,11 +164,14 @@ def main() -> None:
     os.environ["OMP_NUM_THREADS"] = str(n_jobs)
 
     if args.dataset == "mini":
-        data_original = os.path.join(PROJECT_ROOT_PATH, "data", "s2and_mini")
+        data_original = os.path.join(PROJECT_ROOT_PATH, "s2and", "data", "s2and_mini")
         # aminer has too much variance; medline is pairwise only
         datasets = ["arnetminer", "inspire", "kisti", "pubmed", "qian", "zbmath"]
+    elif args.dataset == "full":
+        data_original = os.path.join(PROJECT_ROOT_PATH, "s2and", "data")
+        datasets = ["arnetminer", "inspire", "kisti", "pubmed", "qian", "zbmath"]
     else:
-        data_original = os.path.join(PROJECT_ROOT_PATH, "data")
+        data_original = os.path.join(PROJECT_ROOT_PATH, "s2and", "data")
         datasets = ["inventors_s2and"]
 
     print(f"Config: dataset={args.dataset}, seed={random_seed}, n_jobs={n_jobs}, train={train_flag}")
@@ -178,14 +184,14 @@ def main() -> None:
 
         if not train_flag:
             model_name = MODELS[specter_suffix]
-            model_path = os.path.join(PROJECT_ROOT_PATH, "data", model_name)
+            model_path = os.path.join(PROJECT_ROOT_PATH, "s2and", "data", model_name)
             if not os.path.exists(model_path):
                 raise FileNotFoundError(
                     f"Missing model artifact at {model_path}. "
-                    "Either use --train to retrain, or place the model pickle in data/."
+                    "Either use --train to retrain, or place the model artifact in s2and/data/."
                 )
             print(f"=== specter_suffix: {specter_suffix}, model: {model_name} ===")
-            clusterer = load_pickle_with_verified_label_encoder_compat(model_path)["clusterer"]
+            clusterer = load_production_model(model_path)
             clusterer.use_cache = False
             clusterer.n_jobs = n_jobs
         else:

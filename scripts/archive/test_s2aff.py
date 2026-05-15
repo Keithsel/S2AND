@@ -19,7 +19,7 @@ import numpy as np
 
 from s2and.data import ANDData
 from s2and.eval import cluster_eval
-from s2and.serialization import load_pickle_with_verified_label_encoder_compat
+from s2and.production_model import load_production_model
 
 data_original = "/net/nfs2.s2-research/phantasm/S2AND/s2and_mini/"
 data_s2aff = "/home/sergey/S2AFF/data/s2and_mini/"
@@ -39,10 +39,10 @@ datasets = [
 ]
 
 # this is the prod 1.1 model
-clusterer = load_pickle_with_verified_label_encoder_compat("data/production_model_v1.1.pickle")["clusterer"]
+clusterer = load_production_model("s2and/data/production_model_v1.1.pickle")
 clusterer.use_cache = False
 
-clusterer2 = load_pickle_with_verified_label_encoder_compat("data/model_dump_specter2.pickle")["clusterer"]
+clusterer2 = load_production_model("s2and/data/model_dump_specter2.pickle")
 clusterer2.use_cache = False
 
 
@@ -210,7 +210,7 @@ _, _, test1 = featurize(
     chunk_size=DEFAULT_CHUNK_SIZE,
     nameless_featurizer_info=nameless_featurization_info,
     nan_value=np.nan,
-)  # type: ignore
+)
 if test1 is None:
     raise RuntimeError("Expected featurize to return test split outputs for anddata1")
 X_test1, y_test1, nameless_X_test1 = test1
@@ -223,7 +223,7 @@ _, _, test2 = featurize(
     chunk_size=DEFAULT_CHUNK_SIZE,
     nameless_featurizer_info=nameless_featurization_info,
     nan_value=np.nan,
-)  # type: ignore
+)
 if test2 is None:
     raise RuntimeError("Expected featurize to return test split outputs for anddata2")
 X_test2, y_test2, nameless_X_test2 = test2

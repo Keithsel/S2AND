@@ -24,12 +24,27 @@ import time
 from collections import Counter
 from pathlib import Path
 
-import ijson
 import matplotlib.pyplot as plt
 import numpy as np
 
+try:
+    import ijson  # type: ignore
+except ModuleNotFoundError:
+    ijson = None  # type: ignore[assignment]
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CLUSTER_LOG_INTERVAL = 250_000
+
+
+def require_ijson():
+    """Return the optional streaming JSON parser or raise with install guidance."""
+
+    if ijson is None:
+        raise ModuleNotFoundError(
+            "ijson is required for inventors histogram streaming. "
+            "Run this script with `uv run --with ijson scripts/make_inventors_split_and_histograms.py ...`."
+        )
+    return ijson
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,9 +95,10 @@ def iter_cluster_id_and_size(clusters_path: Path):
     """Yield `(cluster_id, cluster_size)` tuples from clusters.json."""
     current_cluster_size: int | None = None
     in_signature_ids = False
+    ijson_module = require_ijson()
 
     with clusters_path.open("rb") as infile:
-        for prefix, event, value in ijson.parse(infile):
+        for prefix, event, value in ijson_module.parse(infile):
             if event == "map_key" and value == "signature_ids":
                 in_signature_ids = True
                 current_cluster_size = 0

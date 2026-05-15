@@ -28,7 +28,7 @@ def uv_exe() -> list[str]:
     if uv_path:
         return [uv_path]
     try:
-        import uv  # noqa: F401
+        import uv  # type: ignore  # noqa: F401
     except Exception:
         print("ERROR: 'uv' not found. Install uv first.", file=sys.stderr)
         sys.exit(2)
@@ -46,6 +46,7 @@ def repo_root() -> Path:
 REPO = repo_root()
 LANES = ["py-only", "rust-enabled"]
 RUST_PARITY_TESTS = [
+    "tests/test_incremental_linking_default_artifact.py",
     "tests/test_feature_port_parity.py",
     "tests/test_rust_signature_preprocess.py",
     "tests/test_rust_batch_chunking.py",
@@ -140,6 +141,8 @@ def sync_deps(*, lock_present: bool, lane: str) -> None:
         args.extend(["--extra", "rust"])
     if lock_present:
         args.append("--frozen")
+    if lane == "rust-enabled":
+        args.extend(["--no-install-package", "s2and-rust"])
     run_uv(args)
 
 
@@ -205,7 +208,6 @@ def run_typecheck_and_test_lane(*, lane: str, lock_present: bool) -> None:
     run_ty_checks()
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(REPO)
     if lane == "py-only":
         env["S2AND_BACKEND"] = "python"
 

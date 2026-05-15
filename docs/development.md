@@ -25,6 +25,10 @@ uv run python scripts/run_ci_locally.py
 - `typecheck-and-test` matrix lanes (`py-only`, then `rust-enabled`)
 - Rust parity guardrail tests in the `rust-enabled` lane
 
+The local runner passes `-ra` to pytest so skip reasons are printed under each lane. Rust-only tests may skip in the
+`py-only` lane because that lane intentionally syncs without the `rust` extra and forces `S2AND_BACKEND=python`; the
+same tests must run in the later `rust-enabled` lane after `maturin develop` builds the extension.
+
 By default, local `ty` checks use `--python-version 3.11 --python-platform linux` to match GitHub Linux runners.
 
 To override the local platform emulation:

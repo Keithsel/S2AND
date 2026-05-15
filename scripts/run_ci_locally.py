@@ -52,6 +52,11 @@ RUST_PARITY_TESTS = [
     "tests/test_rust_batch_chunking.py",
     "tests/test_rust_from_json_paths.py",
 ]
+PYTEST_REPORT_FLAGS = ["-ra"]
+PY_ONLY_EXPECTED_SKIP_NOTE = (
+    "Rust-only tests are expected to report skips in the py-only lane; "
+    "the rust-enabled lane builds s2and_rust and must exercise them."
+)
 TY_PYTHON_VERSION = "3.11"
 TY_PYTHON_PLATFORM = os.environ.get("S2AND_CI_TY_PLATFORM", "linux")
 TY_BASE_IGNORES = [
@@ -75,6 +80,15 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
 
 def run_uv(args: list[str], *, env: dict[str, str] | None = None) -> None:
     run(uv_exe() + args, env=env)
+
+
+def pytest_args(*args: str, quiet: bool = False) -> list[str]:
+    cmd = ["run", "pytest"]
+    if quiet:
+        cmd.append("-q")
+    cmd.extend(PYTEST_REPORT_FLAGS)
+    cmd.extend(args)
+    return cmd
 
 
 def ensure_rust_on_path() -> None:
@@ -203,23 +217,22 @@ def run_typecheck_and_test_lane(*, lane: str, lock_present: bool) -> None:
         ensure_rust_on_path()
         run_maturin_develop_with_retries()
         for parity_test in RUST_PARITY_TESTS:
-            run_uv(["run", "pytest", "-q", parity_test])
+            run_uv(pytest_args(parity_test, quiet=True))
 
     run_ty_checks()
 
     env = os.environ.copy()
     if lane == "py-only":
         env["S2AND_BACKEND"] = "python"
+        print(f"[{lane}] {PY_ONLY_EXPECTED_SKIP_NOTE}")
 
     run_uv(
-        [
-            "run",
-            "pytest",
+        pytest_args(
             "tests/",
             "--cov=s2and",
             "--cov-report=term-missing",
             "--cov-fail-under=40",
-        ],
+        ),
         env=env,
     )
 

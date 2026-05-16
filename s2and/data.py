@@ -656,7 +656,6 @@ class ANDData:
                 sinonym_results,
                 overwrite_blocks=(mode == "inference"),
                 allow_overwrite_pos=allow_overwrite_pos,
-                compute_block_fn=self.compute_block_fn,
             )
             logger.info(f"Sinonym overwrote {overwrite_count} signature name(s)")
             # Update paper-level author strings so co-author features use Sinonym-normalized names
@@ -2422,7 +2421,6 @@ def apply_sinonym_overwrites(
     *,
     overwrite_blocks: bool = False,
     allow_overwrite_pos: dict[str, set[int]] | None = None,
-    compute_block_fn: Callable[[str], str] = compute_block,
 ) -> int:
     """Overwrite signature name parts with Sinonym-normalized names where applicable.
 
@@ -2430,10 +2428,8 @@ def apply_sinonym_overwrites(
         signatures: signature_id -> Signature
         per_paper_results: paper_id(str) -> { position -> parsed_struct }
         overwrite_blocks: if True, also overwrite author_info_block with the new
-            block derived from the normalized reconstructed author name. Use only
-            in inference to avoid changing dataset splits.
-        compute_block_fn: author-name-to-block function used when overwrite_blocks
-            is enabled and Sinonym produced both first and last names.
+            S2AND block derived from normalized first initial and normalized last.
+            Use only in inference to avoid changing dataset splits.
 
     Returns:
         Number of signatures updated.
@@ -2456,14 +2452,7 @@ def apply_sinonym_overwrites(
                     continue
             new_block = None
             if first and last:
-                normalized_author_name = _assemble_full_name(
-                    [
-                        normalize_text(first),
-                        normalize_text(middle),
-                        normalize_text(last),
-                    ]
-                )
-                new_block = compute_block_fn(normalized_author_name)
+                new_block = normalize_text(f"{first[:1]} {last}")
 
             # Always update first/middle/last; conditionally update block in inference
             new_sig = sig._replace(

@@ -148,10 +148,10 @@ def test_apply_sinonym_overwrites_block_compound_surname():
     )
     assert updated == 1
     new_sig = signatures["s1"]
-    assert new_sig.author_info_block == "q yang"
+    assert new_sig.author_info_block == "q ou yang"
 
 
-def test_sinonym_overwrite_block_uses_custom_compute_block_fn(monkeypatch):
+def test_sinonym_overwrite_block_preserves_s2and_block_shape(monkeypatch):
     signatures = {
         "s1": _raw_signature("s1", paper_id=1, first="Bo", last="Wang"),
     }
@@ -194,5 +194,5 @@ def test_sinonym_overwrite_block_uses_custom_compute_block_fn(monkeypatch):
         compute_block_fn=custom_compute_block,
     )
 
-    assert block_inputs == ["alex g wang"]
-    assert dataset.signatures["s1"].author_info_block == "custom::alex_g_wang"
+    assert block_inputs == []
+    assert dataset.signatures["s1"].author_info_block == "a wang"

@@ -185,7 +185,7 @@ def _run_single(args: argparse.Namespace) -> dict[str, Any]:
             val_pairs_size=1000,
             test_pairs_size=1000,
             n_jobs=args.n_jobs,
-            load_name_counts=False,
+            load_name_counts=True,
             preprocess=True,
             random_seed=42,
             name_tuples="filtered",

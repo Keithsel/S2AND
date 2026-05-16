@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+from argparse import Namespace
+from pathlib import Path
+
+import numpy as np
+
+import scripts._rust_suite.compare_cmd as compare_cmd
+
+
+def test_run_single_loads_name_counts_for_name_count_features(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(compare_cmd, "_load_dataset_inputs", lambda *_args, **_kwargs: ({}, {}, None))
+    monkeypatch.setattr(
+        compare_cmd,
+        "ProcessTreeRSSMonitor",
+        type(
+            "FakeMonitor",
+            (),
+            {
+                "__init__": lambda self, interval_seconds=0.05: setattr(self, "peak_gb", 0.25),
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, exc_type, exc, tb: False,
+            },
+        ),
+    )
+
+    captured_anddata_kwargs = {}
+
+    class FakeANDData:
+        def __init__(self, **kwargs):
+            captured_anddata_kwargs.update(kwargs)
+            self.signatures = {"s1": {}, "s2": {}}
+
+    class FakeFeaturizationInfo:
+        def __init__(self, *, features_to_use):
+            self.features_to_use = list(features_to_use)
+
+        def get_feature_names(self):
+            return list(self.features_to_use)
+
+    def fake_many_pairs_featurize(pairs, dataset, featurizer_info, *_args, **_kwargs):
+        assert "name_counts" in featurizer_info.features_to_use
+        return np.zeros((len(pairs), len(featurizer_info.features_to_use))), None, None
+
+    monkeypatch.setattr("s2and.data.ANDData", FakeANDData)
+    monkeypatch.setattr("s2and.featurizer.FeaturizationInfo", FakeFeaturizationInfo)
+    monkeypatch.setattr("s2and.featurizer.many_pairs_featurize", fake_many_pairs_featurize)
+
+    result = compare_cmd._run_single(
+        Namespace(
+            backend="python",
+            dataset="dummy",
+            limit=2,
+            pair_count=1,
+            n_jobs=1,
+            chunk_size=10,
+            seed=7,
+            require_non_dev_rust=0,
+            require_rust_release=0,
+            output_features_path=str(tmp_path / "features.npy"),
+        )
+    )
+
+    assert captured_anddata_kwargs["load_name_counts"] is True
+    assert "name_counts" in result["feature_names"]

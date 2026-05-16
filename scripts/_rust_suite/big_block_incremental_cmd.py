@@ -847,7 +847,7 @@ def _run_single_impl(args: argparse.Namespace) -> dict[str, Any]:
             val_pairs_size=1000,
             test_pairs_size=1000,
             n_jobs=int(args.n_jobs),
-            load_name_counts=False,
+            load_name_counts=True,
             preprocess=True,
             random_seed=int(args.random_seed),
             name_tuples="filtered",

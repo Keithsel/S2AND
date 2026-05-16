@@ -205,6 +205,7 @@ def test_run_single_uses_synthetic_cluster_seeds_when_no_path_is_supplied(monkey
     assert captured_anddata_kwargs["specter_embeddings"] is None
     assert captured_anddata_kwargs["cluster_seeds"] == synthetic_cluster_seeds
     assert captured_anddata_kwargs["altered_cluster_signatures"] is None
+    assert captured_anddata_kwargs["load_name_counts"] is True
     assert captured_anddata_kwargs["use_orcid_id"] is True
     assert result["cluster_seeds_source"] == "synthetic"
     assert result["specter_embeddings_source"] == "unset"

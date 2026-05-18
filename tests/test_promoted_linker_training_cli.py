@@ -10,7 +10,6 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from s2and.incremental_linking_training.classic import run_classic
 from scripts.production.model import linker_train_calibrate_eval as promoted_train
 
 
@@ -158,13 +157,6 @@ def test_promoted_training_uses_extracted_training_helpers() -> None:
 
     assert all(value not in source for value in disallowed_imports)
     assert "s2and.incremental_linking_training" in source
-
-
-def test_run_classic_keeps_artifact_export_hook() -> None:
-    signature = inspect.signature(run_classic)
-
-    assert "save_artifact_to" in signature.parameters
-    assert signature.parameters["save_artifact_to"].default is None
 
 
 def test_hyperopt_loss_uses_weighted_average_error() -> None:
@@ -441,10 +433,10 @@ def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(
         run_classic_calls.append(
             {
                 "params": dict(feature_bundle.models["classic"]["best_params"]),
-                "save_artifact_to": kwargs.get("save_artifact_to"),
                 "output_dir": output_dir,
             }
         )
+        assert set(kwargs) == {"n_jobs"}
         return {
             "training_summary": {"rows": 3, "positive_rows": 1},
             "abstain_rule": {"promoted_logistic_gate": {"mode": "promoted_logistic_topk_multiclass_l2"}},
@@ -504,9 +496,7 @@ def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(
 
     result = promoted_train.run(args)
 
-    assert run_classic_calls == [
-        {"params": {"n_estimators": 42}, "save_artifact_to": None, "output_dir": tmp_path / "out" / "classic"}
-    ]
+    assert run_classic_calls == [{"params": {"n_estimators": 42}, "output_dir": tmp_path / "out" / "classic"}]
     assert prod_calls == [
         {
             "params": {"n_estimators": 42},

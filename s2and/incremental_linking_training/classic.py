@@ -18,8 +18,6 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
-from s2and.incremental_linking.artifact import save_incremental_linking_artifact
-from s2and.incremental_linking.contracts import INCREMENTAL_LINKING_RUST_CAPABILITIES
 from s2and.incremental_linking.features import PROMOTED_NON_PAIRWISE_FEATURE_COLUMNS
 from s2and.incremental_linking.gate_buckets import first_name_bucket_from_token_view, normalize_bucket_letters
 from s2and.incremental_linking.linker_pairwise import promoted_pairwise_aggregate_columns
@@ -335,26 +333,6 @@ def _apply_classic_train_holdout_filter(
         "holdout_sources": list(holdout_sources or []),
     }
     return filtered, summary
-
-
-def _bounded_threshold_grid(values: np.ndarray, grid_size: int) -> np.ndarray:
-    """Build a bounded quantile grid with inclusive edge thresholds."""
-
-    cleaned = np.asarray(values, dtype=np.float64)
-    if cleaned.size == 0:
-        return np.array([0.0], dtype=np.float64)
-    quantiles = np.linspace(0.0, 1.0, num=max(int(grid_size), 2), dtype=np.float64)
-    thresholds = np.unique(np.quantile(cleaned, quantiles))
-    epsilon = 1e-12
-    return np.unique(
-        np.concatenate(
-            (
-                np.array([float(cleaned.min()) - epsilon], dtype=np.float64),
-                thresholds.astype(np.float64, copy=False),
-                np.array([float(cleaned.max()) + epsilon], dtype=np.float64),
-            )
-        )
-    )
 
 
 def _is_missing_scalar(value: Any) -> bool:
@@ -1670,9 +1648,6 @@ def run_classic(
     bundle: OfficialBundle,
     output_dir: Path,
     *,
-    save_artifact_to: Path | None = None,
-    artifact_audit_metadata: Mapping[str, Any] | None = None,
-    required_rust_capabilities: Sequence[str] = INCREMENTAL_LINKING_RUST_CAPABILITIES,
     n_jobs: int = DEFAULT_CLASSIC_N_JOBS,
 ) -> dict[str, Any]:
     """Fit, calibrate, and evaluate the official classic pipeline."""
@@ -1895,29 +1870,6 @@ def run_classic(
         selected_gate_tables_path = output_dir / "selected_gate_tables.md"
         selected_gate_tables_path.write_text(selected_gate_tables, encoding="utf-8")
         summary["selected_gate_tables_path"] = str(selected_gate_tables_path.relative_to(output_dir))
-    if save_artifact_to is not None:
-        fixture_source = gate_source_eval.head(5)
-        if len(fixture_source) == 0:
-            fixture_matrix = train_matrix[:5]
-        else:
-            fixture_matrix = _classic_feature_matrix(fixture_source, feature_columns).to_numpy(dtype=np.float32)
-        artifact_metadata = save_incremental_linking_artifact(
-            model,
-            Path(save_artifact_to),
-            feature_columns=feature_columns,
-            retrieval_top_k=25,
-            gate_config=logistic_gate_config,
-            prediction_fixture_matrix=fixture_matrix,
-            required_rust_capabilities=required_rust_capabilities,
-            audit_metadata=artifact_audit_metadata,
-        )
-        summary["artifact"] = {
-            "path": str(Path(save_artifact_to)),
-            "schema_version": artifact_metadata.schema_version,
-            "feature_schema_digest": artifact_metadata.feature_schema_digest,
-            "production_contract_digest": artifact_metadata.production_contract_digest,
-            "retrieval_stack_digest": artifact_metadata.retrieval_stack_digest,
-        }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from lightgbm import LGBMClassifier
 
+import s2and.incremental_linking.production as production_module
 import s2and.model as model_module
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
@@ -519,7 +520,9 @@ def test_predict_incremental_promoted_linker_recalibrates_query_batch_size(
             pair_chunk_count=1 if query_batch_size else 0,
         )
 
-    monkeypatch.setattr(model_module, "_compute_promoted_incremental_limits", lambda **kwargs: fake_limits(**kwargs))
+    monkeypatch.setattr(
+        production_module, "compute_promoted_incremental_limits", lambda **kwargs: fake_limits(**kwargs)
+    )
 
     def fake_predict_helper(block_dict, dataset_arg, partial_supervision, runtime_context, total_ram_bytes=None):
         del dataset_arg, partial_supervision, runtime_context, total_ram_bytes
@@ -600,7 +603,7 @@ def test_predict_incremental_promoted_linker_recalibrates_query_batch_size(
 
 
 def test_promoted_incremental_batch_telemetry_does_not_sum_absolute_memory_fields() -> None:
-    merged = model_module._merge_promoted_incremental_batch_telemetry(
+    merged = production_module.merge_promoted_incremental_batch_telemetry(
         [
             {
                 "query_count": 1,
@@ -655,8 +658,8 @@ def test_predict_incremental_promoted_linker_fails_closed_when_single_query_exce
         lambda _path: SimpleNamespace(metadata=SimpleNamespace(retrieval_top_k=25)),
     )
     monkeypatch.setattr(
-        model_module,
-        "_compute_promoted_incremental_limits",
+        production_module,
+        "compute_promoted_incremental_limits",
         lambda **_kwargs: _mock_promoted_limits(single_query_exceeds_budget=True),
     )
 

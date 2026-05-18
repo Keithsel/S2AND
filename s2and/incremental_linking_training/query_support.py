@@ -6,7 +6,6 @@ import os
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -21,10 +20,8 @@ from s2and.incremental_linking.query_adapter import (
     build_rust_hybrid_centroid_retriever,
 )
 from s2and.incremental_linking.row_features import GENERIC_FAMILY_MIN_COUNT, GENERIC_FAMILY_MIN_RATIO
-from s2and.incremental_linking_training.name_counts import LoadNameCountsMode, resolve_load_name_counts
 from s2and.subblocking import make_subblocks_with_telemetry
 from s2and.text import normalize_text
-from s2and.thread_config import resolve_n_jobs
 
 DEFAULT_CHOOSER_CACHE_MAX_TOP_K = 25
 FROZEN_BEST_RUST_HYBRID_CENTROID_POLICY_NAME = "h_wang_any_input_v2"
@@ -165,68 +162,6 @@ def _safe_compute_block(name: str) -> str:
     from s2and.text import compute_block
 
     return compute_block(normalized_name)
-
-
-def configure_runtime_environment(*, n_jobs: int, backend: str = "rust") -> None:
-    """Set the runtime environment for reproducible inference."""
-
-    os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
-    os.environ["S2AND_BACKEND"] = backend
-    thread_count = str(resolve_n_jobs(n_jobs))
-    os.environ["OMP_NUM_THREADS"] = thread_count
-    os.environ["RAYON_NUM_THREADS"] = thread_count
-
-
-def _resolve_dataset_file(data_root: Path, dataset_name: str, *candidates: str) -> str:
-    for candidate in candidates:
-        path = data_root / dataset_name / candidate
-        if path.exists():
-            return str(path)
-    attempted_paths = [str(data_root / dataset_name / value) for value in candidates]
-    raise FileNotFoundError(f"Missing dataset file for {dataset_name!r}; tried {attempted_paths}")
-
-
-def _resolve_specter_file(data_root: Path, dataset_name: str) -> str | None:
-    for candidate in (
-        f"{dataset_name}_specter.pickle",
-        "specter.pickle",
-        f"{dataset_name}_specter2.pkl",
-        "specter2.pkl",
-    ):
-        path = data_root / dataset_name / candidate
-        if path.exists():
-            return str(path)
-    return None
-
-
-def load_labeled_dataset(
-    data_root: Path,
-    dataset_name: str,
-    *,
-    n_jobs: int,
-    clusterer: Any | None = None,
-    load_name_counts: LoadNameCountsMode = "auto",
-) -> ANDData:
-    """Load one labeled dataset for promoted replay generation or evaluation."""
-
-    configure_runtime_environment(n_jobs=n_jobs, backend="rust")
-    return ANDData(
-        signatures=_resolve_dataset_file(data_root, dataset_name, f"{dataset_name}_signatures.json", "signatures.json"),
-        papers=_resolve_dataset_file(data_root, dataset_name, f"{dataset_name}_papers.json", "papers.json"),
-        name=dataset_name,
-        mode="inference",
-        specter_embeddings=_resolve_specter_file(data_root, dataset_name),
-        clusters=_resolve_dataset_file(data_root, dataset_name, f"{dataset_name}_clusters.json", "clusters.json"),
-        block_type="s2",
-        n_jobs=int(n_jobs),
-        load_name_counts=resolve_load_name_counts(load_name_counts=load_name_counts, clusterer=clusterer),
-        preprocess=True,
-        random_seed=13,
-        name_tuples="filtered",
-        use_orcid_id=False,
-        use_sinonym_overwrite=False,
-        compute_block_fn=_safe_compute_block,
-    )
 
 
 def _subblock_tokens(subblock_key: str) -> list[str]:
@@ -436,78 +371,33 @@ def _resolve_rust_num_threads(num_threads: int | None) -> int | None:
 def rank_top_summaries_rust_hybrid_centroid(
     *,
     query: QueryFeatures,
-    max_ranked_clusters: int,
     retriever: RustHybridCentroidRetrieverHandle,
-    component_keys: list[str] | None = None,
-    max_block_component_size: int | None = None,
+    component_keys: list[str],
+    max_block_component_size: int,
     override_summary: ClusterSummary | None = None,
     num_threads: int | None = None,
-    weights: tuple[float, ...] | list[float] | None = None,
-    scoring_config: RustHybridCentroidScoringConfig | dict[str, Any] | None = None,
+    weights: tuple[float, ...] | list[float],
+    scoring_config: RustHybridCentroidScoringConfig | None,
 ) -> list[tuple[float, ClusterSummary]]:
-    """Score and rank candidate summaries with the Rust hybrid-centroid path."""
+    """Score a known component subset with the frozen Rust hybrid-centroid path."""
 
-    if max_ranked_clusters <= 0:
-        raise ValueError("max_ranked_clusters must be positive")
+    if not component_keys:
+        return []
+    if max_block_component_size <= 0:
+        raise ValueError("max_block_component_size must be positive")
+    if scoring_config is None:
+        raise ValueError("scoring_config is required")
     resolved_num_threads = _resolve_rust_num_threads(num_threads)
-    weights_payload = None if weights is None else [float(value) for value in weights]
-    scoring_kwargs = None
-    if scoring_config is not None:
-        if isinstance(scoring_config, RustHybridCentroidScoringConfig):
-            scoring_kwargs = scoring_config.to_kwargs()
-        else:
-            scoring_kwargs = dict(scoring_config)
-    if component_keys is None:
-        if scoring_kwargs is not None:
-            raise ValueError("scoring_config requires component_keys so the experimental subset scorer can be used")
-        if weights_payload is None:
-            ranked_component_keys, scores = retriever.retriever.top_k_hybrid_centroid(
-                query,
-                top_k=int(max_ranked_clusters),
-                num_threads=resolved_num_threads,
-            )
-        else:
-            ranked_component_keys, scores = retriever.retriever.top_k_weighted_hybrid_centroid(
-                query,
-                top_k=int(max_ranked_clusters),
-                weights=weights_payload,
-                num_threads=resolved_num_threads,
-            )
-    else:
-        if max_block_component_size is None:
-            raise ValueError("max_block_component_size is required when component_keys are provided")
-        if scoring_kwargs is not None:
-            if weights_payload is None:
-                raise ValueError("scoring_config requires explicit weights")
-            ranked_component_keys, scores = retriever.retriever.top_k_experimental_weighted_hybrid_centroid_subset(
-                query,
-                component_keys,
-                top_k=int(max_ranked_clusters),
-                max_block_component_size=int(max_block_component_size),
-                weights=weights_payload,
-                num_threads=resolved_num_threads,
-                override_summary=override_summary,
-                **scoring_kwargs,
-            )
-        elif weights_payload is None:
-            ranked_component_keys, scores = retriever.retriever.top_k_hybrid_centroid_subset(
-                query,
-                component_keys,
-                top_k=int(max_ranked_clusters),
-                max_block_component_size=int(max_block_component_size),
-                num_threads=resolved_num_threads,
-                override_summary=override_summary,
-            )
-        else:
-            ranked_component_keys, scores = retriever.retriever.top_k_weighted_hybrid_centroid_subset(
-                query,
-                component_keys,
-                top_k=int(max_ranked_clusters),
-                max_block_component_size=int(max_block_component_size),
-                weights=weights_payload,
-                num_threads=resolved_num_threads,
-                override_summary=override_summary,
-            )
+    ranked_component_keys, scores = retriever.retriever.top_k_experimental_weighted_hybrid_centroid_subset(
+        query,
+        component_keys,
+        top_k=len(component_keys),
+        max_block_component_size=int(max_block_component_size),
+        weights=[float(value) for value in weights],
+        num_threads=resolved_num_threads,
+        override_summary=override_summary,
+        **scoring_config.to_kwargs(),
+    )
     return [
         (
             float(score),
@@ -533,7 +423,6 @@ __all__ = [
     "build_labeled_retrieval_subblock_index",
     "build_rust_hybrid_centroid_retriever",
     "counter_query_overlap",
-    "load_labeled_dataset",
     "middle_initial_compatibility",
     "rank_top_summaries_rust_hybrid_centroid",
     "specter_exemplar_similarity",

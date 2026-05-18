@@ -1140,7 +1140,6 @@ def _score_candidate_summaries_with_frozen_rust_policy(
         )
     ranked = rank_top_summaries_rust_hybrid_centroid(
         query=query,
-        max_ranked_clusters=len(component_keys),
         retriever=retriever,
         component_keys=component_keys,
         max_block_component_size=max(1, int(max_block_component_size)),
@@ -2708,11 +2707,7 @@ def _prepare_prod_training_data(
                 "positive_rows": int(labels.sum()),
                 "importance_weights": weight_values,
                 "sample_weight_sum": round(float(sample_weight[source_indices].sum()), 6),
-                **(
-                    {"splits": sorted(set(source_rows["split"].astype(str)))}
-                    if "split" in source_rows.columns
-                    else {}
-                ),
+                **({"splits": sorted(set(source_rows["split"].astype(str)))} if "split" in source_rows.columns else {}),
                 **(
                     {"source_keys": sorted(set(source_rows["source_key"].astype(str)))}
                     if "source_key" in source_rows.columns

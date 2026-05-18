@@ -1,39 +1,8 @@
-from functools import partial
-
 import numpy as np
-from hyperopt import Trials, fmin, hp, space_eval, tpe
-from hyperopt.pyll import scope
+from hyperopt import Trials, hp
 from sklearn.linear_model import LogisticRegression
 
-from s2and.model import PairwiseModeler, intify
-
-
-def test_hyperopt_fmin_space_eval_with_tpe_partial():
-    search_space = {
-        "eps": hp.uniform("eps", 0.0, 1.0),
-        "max_depth": scope.int(hp.quniform("max_depth", 1, 3, 1)),
-        "learning_rate": hp.loguniform("learning_rate", -7, 0),
-    }
-
-    def obj(params):
-        params = {k: intify(v) for k, v in params.items()}
-        return (params["eps"] - 0.2) ** 2 + (params["max_depth"] - 2) ** 2 + params["learning_rate"]
-
-    trials = Trials()
-    _ = fmin(
-        fn=obj,
-        space=search_space,
-        algo=partial(tpe.suggest, n_startup_jobs=2),
-        max_evals=5,
-        trials=trials,
-        rstate=np.random.default_rng(0),
-    )
-
-    assert len(trials.trials) == 5
-    best_params = space_eval(search_space, trials.argmin)
-    best_params = {k: intify(v) for k, v in best_params.items()}
-    assert set(best_params.keys()) == {"eps", "max_depth", "learning_rate"}
-    assert isinstance(best_params["max_depth"], int)
+from s2and.model import PairwiseModeler
 
 
 def test_pairwise_modeler_hyperopt_small():

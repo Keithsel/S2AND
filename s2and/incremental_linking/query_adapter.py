@@ -66,6 +66,7 @@ class QueryFeatures:
     author_position: int | None = None
     local10_author_names: frozenset[str] = EMPTY_STRING_SET
     signature_id: str = ""
+    query_author: str = ""
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,21 @@ def _get_specter_vector(dataset: ANDData, paper_id: Any) -> np.ndarray | None:
     return arr
 
 
+def _signature_query_author(signature: Any) -> str:
+    """Return the best available raw author text for query-level gate features."""
+
+    full_name = getattr(signature, "author_info_full_name", None)
+    if full_name:
+        return str(full_name)
+    parts = [
+        getattr(signature, "author_info_first", None),
+        getattr(signature, "author_info_middle", None),
+        getattr(signature, "author_info_last", None),
+        getattr(signature, "author_info_suffix", None),
+    ]
+    return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
+
+
 def extract_query_features(
     dataset: ANDData,
     signature_id: str,
@@ -277,6 +293,7 @@ def extract_query_features(
             author_position=author_position,
             local10_author_names=local10_author_names,
             signature_id=str(signature_id),
+            query_author=_signature_query_author(signature),
         )
         if feature_cache is not None:
             feature_cache[signature_id] = features
@@ -316,6 +333,7 @@ def mask_query_features(base: QueryFeatures, view: str, *, orcid_enabled: bool =
         author_position=base.author_position,
         local10_author_names=base.local10_author_names,
         signature_id=base.signature_id,
+        query_author=base.query_author,
     )
     if view == "initial_only":
         return masked

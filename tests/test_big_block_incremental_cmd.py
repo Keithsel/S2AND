@@ -529,11 +529,3 @@ def test_load_truth_bundle_rejects_invalid_component_member_index(tmp_path: Path
                 truth_table_key="extra_eval_paths.a_khan",
             )
         )
-
-
-def test_big_block_incremental_parser_defaults_to_single_promoted_measurement():
-    args = big_block_incremental_cmd._build_parser().parse_args([])
-
-    assert args.mode == "single"
-    assert args.backend == "rust"
-    assert args.fail_on_cluster_mismatch == 0

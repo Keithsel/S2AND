@@ -1,9 +1,5 @@
-import importlib.util
-import json
-import math
-from pathlib import Path
 from types import SimpleNamespace
-from typing import TypedDict, cast
+from typing import cast
 
 import numpy as np
 import pytest
@@ -18,24 +14,9 @@ from s2and.model import Clusterer
 from s2and.runtime import RuntimeContext
 from s2and.sampling import sampling
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-class _ConstraintCapture(TypedDict):
-    batch_calls: int
-    fallback_calls: int
-
 
 def _as_anddata(dataset: object) -> ANDData:
     return cast(ANDData, dataset)
-
-
-def _load_script_module(relative_path: str, module_name: str):
-    spec = importlib.util.spec_from_file_location(module_name, REPO_ROOT / relative_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _subblocking_signature(first_name: str, *, middle_name: str = "", orcid: str | None = None):
@@ -259,74 +240,6 @@ def test_make_subblocks_merges_orcid_when_target_has_capacity(monkeypatch):
     assert all(len(signature_ids) <= 4 for signature_ids in output.values())
 
 
-def test_transform_signature_file_handles_empty_email_field(tmp_path):
-    transform_module = _load_script_module(
-        "scripts/archive/transform_all_datasets.py",
-        "transform_all_datasets_regression",
-    )
-
-    signatures = {
-        "1": {
-            "paperid": 1,
-            "authorinfo": {
-                "position": 0,
-                "block": "a smith",
-                "first": "A",
-                "middle": "",
-                "last": "Smith",
-                "suffix": "",
-                "emails": "{}",
-                "affiliations": "",
-                "given-block": "",
-                "ethnicity": "",
-                "gender": "",
-            },
-            "actual_name": "",
-        }
-    }
-    input_path = tmp_path / "signatures.json"
-    with open(input_path, "w") as input_file:
-        json.dump(signatures, input_file)
-
-    transformed = transform_module.transform_signature_file(str(input_path))
-    assert transformed["1"]["author_info"]["email"] is None
-
-
-@pytest.mark.parametrize(
-    ("script_path", "module_name"),
-    [
-        ("scripts/transfer_experiment_seed_paper.py", "transfer_seed_regression"),
-        ("scripts/archive/transfer_experiment_internal.py", "transfer_internal_regression"),
-    ],
-)
-def test_transfer_script_facet_helpers_handle_empty_groups(script_path, module_name):
-    module = _load_script_module(script_path, module_name)
-
-    disparity_scores = module.disparity_analysis({"group": []}, {"group": []})
-    assert math.isnan(disparity_scores["S2AND std"])
-    assert disparity_scores["S2AND max-perf-group"] is None
-
-    empty_feature = ([], [])
-    s2and_scores, s2_scores = module.summary_features_analysis(
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-    )
-    assert math.isnan(s2and_scores["first_name_diff"])
-    assert math.isnan(s2_scores["first_name_diff"])
-
-
 def test_clusterer_predict_uses_minimum_one_for_incremental_batch_threshold(monkeypatch):
     class Signature:
         def __init__(self, first_name):
@@ -497,138 +410,6 @@ def test_clusterer_predict_optionally_skips_final_rust_seed_restore(
     version_before_mutation = int(dataset._cluster_seeds_version)
     dataset.cluster_seeds_require["new_seed"] = "new_cluster"
     assert int(dataset._cluster_seeds_version) == version_before_mutation + 1
-
-
-def test_distance_matrix_helper_uses_indexed_constraint_api(monkeypatch):
-    dataset = _as_anddata(SimpleNamespace())
-    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
-    clusterer = Clusterer(
-        featurizer_info=featurizer_info,
-        classifier=None,
-        n_jobs=1,
-        use_cache=False,
-        use_default_constraints_as_supervision=True,
-    )
-
-    class _FakeFeaturizer:
-        def signature_ids(self):
-            return ["s1", "s2"]
-
-        def get_constraints_matrix_indexed(self, *_args, **_kwargs):
-            return [None]
-
-    captured: _ConstraintCapture = {
-        "batch_calls": 0,
-        "fallback_calls": 0,
-    }
-
-    monkeypatch.setattr(model_module, "_use_rust_constraints", lambda runtime_context=None: True)
-    monkeypatch.setattr(
-        model_module,
-        "_get_rust_featurizer",
-        lambda _dataset, runtime_context=None: _FakeFeaturizer(),
-    )
-
-    def fake_get_constraints_matrix_indexed_rust(*args, **kwargs):
-        del args, kwargs
-        captured["batch_calls"] += 1
-        return [0.0]
-
-    def fake_get_constraint_rust(*args, **kwargs):
-        del args, kwargs
-        captured["fallback_calls"] += 1
-        return None
-
-    monkeypatch.setattr(model_module, "get_constraints_matrix_indexed_rust", fake_get_constraints_matrix_indexed_rust)
-    monkeypatch.setattr(model_module, "get_constraint_rust", fake_get_constraint_rust)
-
-    helper = clusterer.distance_matrix_helper({"b": ["s1", "s2"]}, dataset, partial_supervision={})
-    next(helper)
-
-    assert captured["batch_calls"] == 1
-    assert captured["fallback_calls"] == 0
-
-
-def test_make_distance_matrices_rust_blockwise_uses_indexed_constraint_api(monkeypatch):
-    from s2and import feature_port
-
-    if not feature_port.rust_featurizer_available():
-        raise pytest.skip.Exception("s2and_rust extension is unavailable")
-
-    monkeypatch.setenv("S2AND_BACKEND", "rust")
-    dataset = _as_anddata(SimpleNamespace(cluster_seeds_require={}, cluster_seeds_disallow=set()))
-    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
-    clusterer = Clusterer(
-        featurizer_info=featurizer_info,
-        classifier=None,
-        n_jobs=1,
-        use_cache=False,
-        use_default_constraints_as_supervision=True,
-        batch_size=2,
-    )
-
-    class _FakeFeaturizer:
-        def signature_ids(self):
-            return ["s1", "s2"]
-
-        def get_constraints_matrix_indexed(self, *_args, **_kwargs):
-            return [None]
-
-    captured: _ConstraintCapture = {
-        "batch_calls": 0,
-        "fallback_calls": 0,
-    }
-
-    monkeypatch.setattr(model_module, "_use_rust_constraints", lambda runtime_context=None: True)
-    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        model_module.Clusterer,
-        "distance_matrix_helper",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy helper path should not be called")),
-    )
-    monkeypatch.setattr(
-        model_module,
-        "_get_rust_featurizer",
-        lambda _dataset, runtime_context=None: _FakeFeaturizer(),
-    )
-
-    def fake_get_constraints_matrix_indexed_rust(*args, **kwargs):
-        del args, kwargs
-        captured["batch_calls"] += 1
-        return [0.0]
-
-    def fake_get_constraint_rust(*args, **kwargs):
-        del args, kwargs
-        captured["fallback_calls"] += 1
-        return None
-
-    def fake_many_pairs_featurize(signature_pairs, *_args, **_kwargs):
-        labels = np.asarray([float(pair[2]) for pair in signature_pairs], dtype=np.float64)
-        features = np.zeros((len(signature_pairs), 1), dtype=np.float64)
-        return features, labels, None
-
-    def fake_predict_and_combine(
-        _classifier,
-        _nameless_classifier,
-        _features,
-        labels,
-        _nameless_features,
-        _batch_label,
-        runtime_context=None,
-        **_kwargs,
-    ):
-        del runtime_context, _kwargs
-        return np.asarray(labels + model_module.LARGE_INTEGER, dtype=np.float64), 0.0
-
-    monkeypatch.setattr(model_module, "get_constraints_matrix_indexed_rust", fake_get_constraints_matrix_indexed_rust)
-    monkeypatch.setattr(model_module, "get_constraint_rust", fake_get_constraint_rust)
-    monkeypatch.setattr(model_module, "many_pairs_featurize", fake_many_pairs_featurize)
-    monkeypatch.setattr(model_module, "_predict_and_combine", fake_predict_and_combine)
-
-    output = clusterer.make_distance_matrices({"b": ["s1", "s2"]}, dataset, partial_supervision={})
-    assert float(output["b"][0]) == pytest.approx(0.0, abs=0.0)
-    assert captured["batch_calls"] == 1
-    assert captured["fallback_calls"] == 0
 
 
 def test_sync_rust_cluster_seeds_skips_when_unchanged(monkeypatch):

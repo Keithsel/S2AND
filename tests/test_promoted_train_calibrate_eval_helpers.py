@@ -21,7 +21,6 @@ from s2and.incremental_linking_training.classic import (
     OfficialBundle,
     _apply_classic_train_holdout_filter,
     _apply_classic_train_row_cap,
-    _augmented_feature_matrix,
     _build_classic_classifier,
     _classic_feature_matrix,
     _evaluate_logistic_manual_holdout,
@@ -29,7 +28,6 @@ from s2and.incremental_linking_training.classic import (
     _fit_multiclass_logistic_gate,
     _fold_standard_scaler_into_logistic,
     _iter_extra_eval_paths,
-    _normalize_augmented_feature_frame,
     _promoted_stratified_gate_spec,
     _resolve_classic_monotone_constraints,
     _resolve_path,
@@ -47,157 +45,13 @@ from s2and.incremental_linking_training.classic import (
 )
 
 
-def test_normalize_augmented_feature_frame_derives_query_first_features() -> None:
-    """Augmented frame normalization should derive missing first-name features."""
+def test_classic_feature_matrix_requires_materialized_target_features() -> None:
+    """Promoted feature tables must already contain the target feature columns."""
 
-    df = pd.DataFrame(
-        [
-            {
-                "query_author": "Hanbing Wang",
-                "dominant_first_name": "hanbing",
-                "query_view": "full",
-            },
-            {
-                "query_author": "H. Wang",
-                "dominant_first_name": "huijuan",
-                "query_view": "initial_only",
-            },
-        ]
-    )
-    out = _normalize_augmented_feature_frame(
-        df,
-        feature_columns=("query_first_prefix_match_any_length",),
-    )
-    assert out["query_first_prefix_match_any_length"].tolist() == [1.0, 1.0]
+    df = pd.DataFrame([{"cluster_size": 17}])
 
-
-def test_normalize_augmented_feature_frame_overwrites_stale_runtime_features() -> None:
-    """Runtime-derived features should be recomputed from raw prerequisites when available."""
-
-    df = pd.DataFrame(
-        [
-            {
-                "query_author": "Hanbing Wang",
-                "dominant_first_name": "hanbing",
-                "cluster_size": 17,
-                "query_first_prefix_match_any_length": 0.0,
-                "cluster_size_log": 0.0,
-            }
-        ]
-    )
-
-    out = _normalize_augmented_feature_frame(
-        df,
-        feature_columns=("query_first_prefix_match_any_length", "cluster_size_log"),
-    )
-
-    assert out.iloc[0]["query_first_prefix_match_any_length"] == 1.0
-    assert out.iloc[0]["cluster_size_log"] == pytest.approx(np.log1p(17))
-
-
-def test_normalize_augmented_feature_frame_derives_anchor_evidence_features() -> None:
-    """Promoted anchor formulas should be derived from raw candidate-row evidence."""
-
-    df = pd.DataFrame(
-        [
-            {
-                "min_distance": 0.1,
-                "specter_exemplar_similarity": 0.8,
-                "title_overlap": 0.3,
-                "coauthor_overlap": 0.3,
-                "affiliation_overlap": 0.1,
-                "venue_overlap": 0.4,
-                "year_compatibility": 0.95,
-                "retrieval_score_gap_vs_best_competitor": 0.06,
-                "candidate_contradiction_score": 0.2,
-                "same_family_as_top1": 1.0,
-                "candidate_pair_share_within_coarse_family": 0.25,
-                "cluster_size": 2,
-                "named_signature_count": 2,
-                "retrieval_rank": 1,
-                "anchor_evidence_count": 0.0,
-            }
-        ]
-    )
-
-    out = _normalize_augmented_feature_frame(
-        df,
-        feature_columns=(
-            "anchor_evidence_count",
-            "strong_positive_anchor_score",
-            "weak_residual_anchor_score",
-            "sparse_relative_winner_score",
-        ),
-    )
-
-    assert out.iloc[0]["anchor_evidence_count"] == pytest.approx(2.0)
-    assert out.iloc[0]["strong_positive_anchor_score"] == pytest.approx(0.18, abs=1e-6)
-    assert out.iloc[0]["weak_residual_anchor_score"] == pytest.approx(0.2936, abs=1e-6)
-    assert out.iloc[0]["sparse_relative_winner_score"] == pytest.approx(0.05872, abs=1e-6)
-
-
-def test_normalize_augmented_feature_frame_derives_promoted_primitives() -> None:
-    """Promoted runtime primitives should be recomputed from raw evidence."""
-
-    df = pd.DataFrame(
-        [
-            {
-                "query_group_id": "q1",
-                "query_author": "C. Zhang",
-                "candidate_component_key": "c1",
-                "dominant_first_name": "chen",
-                "retrieval_rank": 2,
-                "retrieval_score": 0.75,
-                "top5_mean_distance": 0.4,
-                "cluster_size": 200,
-                "candidate_year_min": 2010,
-                "candidate_year_max": 2015,
-                "candidate_year_range_missing": 0,
-                "query_year": 2007,
-                "query_year_missing": 0,
-            }
-        ]
-    )
-
-    out = _normalize_augmented_feature_frame(
-        df,
-        feature_columns=(
-            "retrieval_reciprocal_rank",
-            "cluster_size_log",
-            "candidate_year_span",
-            "year_gap_to_candidate_range",
-            "year_gap_signed_to_candidate_range",
-            "candidate_dominant_first_name_length",
-            "query_first_prefix_match_any_length",
-            "same_dominant_first_as_best_top5",
-            "same_family_as_heuristic_choice",
-        ),
-    )
-
-    assert out.iloc[0]["retrieval_reciprocal_rank"] == pytest.approx(0.5)
-    assert out.iloc[0]["cluster_size_log"] == pytest.approx(np.log1p(200))
-    assert out.iloc[0]["candidate_year_span"] == pytest.approx(5.0)
-    assert out.iloc[0]["year_gap_to_candidate_range"] == pytest.approx(3.0)
-    assert out.iloc[0]["year_gap_signed_to_candidate_range"] == pytest.approx(-3.0)
-    assert out.iloc[0]["candidate_dominant_first_name_length"] == pytest.approx(4.0)
-    assert out.iloc[0]["query_first_prefix_match_any_length"] == pytest.approx(1.0)
-    assert out.iloc[0]["same_dominant_first_as_best_top5"] == pytest.approx(1.0)
-    assert out.iloc[0]["same_family_as_heuristic_choice"] == pytest.approx(1.35)
-
-
-def test_classic_feature_matrix_uses_query_first_token_without_query_author() -> None:
-    """Public eval files should derive prefix match from query_first_token."""
-
-    df = pd.DataFrame(
-        [
-            {"query_first_token": "Hanbing", "dominant_first_name": "hanbing"},
-            {"dominant_first_name": "hanbing"},
-        ]
-    )
-
-    features = _classic_feature_matrix(df, ("query_first_prefix_match_any_length",))
-
-    assert features["query_first_prefix_match_any_length"].tolist() == [1.0, 0.0]
+    with pytest.raises(ValueError, match=r"missing_features=\['cluster_size_log'\]"):
+        _classic_feature_matrix(df, ("cluster_size", "cluster_size_log"))
 
 
 def test_score_query_choices_preserves_float64_probability_tie_breaking() -> None:
@@ -584,69 +438,6 @@ def test_logistic_eval_summaries_accept_empty_candidate_tables() -> None:
 
     assert manual_summary["overall"]["n_queries"] == 0
     assert manual_summary["by_bucket"] == {}
-
-
-def test_augmented_feature_matrix_respects_ablation_columns() -> None:
-    """Augmented feature matrices should honor ablated promoted feature lists."""
-
-    df = pd.DataFrame(
-        [
-            {
-                "query_author": "Hanbing Wang",
-                "dominant_first_name": "hanbing",
-                "title_overlap": 0.25,
-                "cluster_size": 17,
-                "model_score": 0.91,
-                "gap_to_top1": 0.01,
-                "candidate_rank": 2,
-            }
-        ]
-    )
-    features = _augmented_feature_matrix(
-        df,
-        feature_columns=(
-            "title_overlap",
-            "cluster_size",
-            "query_first_prefix_match_any_length",
-        ),
-    )
-    assert list(features.columns) == [
-        "title_overlap",
-        "cluster_size",
-        "query_first_prefix_match_any_length",
-    ]
-
-
-def test_classic_feature_matrix_supports_augmented_union_features() -> None:
-    """Classic feature matrices should derive declared runtime features only."""
-
-    df = pd.DataFrame(
-        [
-            {
-                "query_author": "Hanbing Wang",
-                "dominant_first_name": "hanbing",
-                "title_overlap": 0.25,
-                "cluster_size": 17,
-                "count_normalized_confidence": 0.6,
-            }
-        ]
-    )
-    features = _classic_feature_matrix(
-        df,
-        (
-            "title_overlap",
-            "cluster_size",
-            "cluster_size_log",
-        ),
-    )
-    assert list(features.columns) == [
-        "title_overlap",
-        "cluster_size",
-        "cluster_size_log",
-    ]
-    assert features.iloc[0]["title_overlap"] == 0.25
-    assert features.iloc[0]["cluster_size"] == 17.0
-    assert features.iloc[0]["cluster_size_log"] == pytest.approx(np.log1p(17))
 
 
 def test_classic_feature_matrix_preserves_present_derivable_features() -> None:

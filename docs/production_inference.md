@@ -126,10 +126,8 @@ the non-pairwise row features; then writes target-ordered feature tables and
 bundle metadata under `--output-dir`. These feature values are tied to the exact
 pairwise model passed with `--pairwise-model-path`.
 
-The other feature modes are narrower:
+The other feature mode is narrower:
 
-- `rust-recompute-pw` rematerializes promoted tables from an existing source
-  bundle while recomputing the Rust pairwise aggregate columns.
 - `precomputed-promoted` loads an already materialized portable feature bundle.
   It validates relative table paths, row counts, required tables, target-spec
   digest, feature-schema digest, and exact target feature-column order before

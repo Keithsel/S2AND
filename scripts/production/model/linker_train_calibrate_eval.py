@@ -50,10 +50,7 @@ from s2and.incremental_linking.contracts import (  # noqa: E402
     promoted_linker_feature_schema_digest,
 )
 from s2and.incremental_linking.gate_buckets import first_name_bucket_from_token_view  # noqa: E402
-from s2and.incremental_linking.linker_pairwise import (  # noqa: E402
-    LinkerCandidateBatch,
-    compute_candidate_batch_pairwise_aggregate_stats_rust,
-)
+from s2and.incremental_linking.linker_pairwise import LinkerCandidateBatch  # noqa: E402
 from s2and.incremental_linking.query_adapter import name_count_rarity_features  # noqa: E402
 from s2and.incremental_linking.row_features import build_promoted_non_pairwise_row_features  # noqa: E402
 from s2and.incremental_linking.runtime import compute_candidate_batch_pairwise_model_and_aggregate_stats  # noqa: E402
@@ -83,17 +80,13 @@ from s2and.incremental_linking_training.classic import (  # noqa: E402
     load_bundle,
     run_classic,
 )
-from s2and.incremental_linking_training.data_loading import (  # noqa: E402
-    load_clusterer,
-    load_giant_block_dataset,
-)
+from s2and.incremental_linking_training.data_loading import load_clusterer  # noqa: E402
 from s2and.incremental_linking_training.query_support import (  # noqa: E402
     DEFAULT_CHOOSER_CACHE_MAX_TOP_K,
     build_cluster_profile,
     build_labeled_retrieval_subblock_index,
     build_rust_hybrid_centroid_retriever,
     counter_query_overlap,
-    load_labeled_dataset,
     rank_top_summaries_rust_hybrid_centroid,
     specter_exemplar_similarity,
     year_compatibility,
@@ -114,9 +107,7 @@ DEFAULT_TARGET_JSON = (
 )
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "scratch" / "joint_safe_link_promoted_official_20260507"
 DEFAULT_PAIRWISE_MODEL_PATH = PACKAGE_DATA_ROOT / "production_model_v1.21"
-DEFAULT_GIANT_DATASET_ROOT = Path(r"D:\data")
 DEFAULT_TOTAL_RAM_BYTES = 48 * 1024**3
-GIANT_DATASETS = frozenset({"a_khan", "a_silva", "h_wang", "j_smith", "s_gupta", "s_lee", "s_park"})
 REQUIRED_TABLE_KEYS = (
     "train_path",
     "classic_gate_source_path",
@@ -847,45 +838,6 @@ def _candidate_batch_from_rows(
     )
 
 
-def _load_original_pairwise_dataset(dataset_name: str, *, n_jobs: int, giant_dataset_root: Path) -> Any:
-    if dataset_name in GIANT_DATASETS:
-        dataset_dir = giant_dataset_root / dataset_name
-        if not dataset_dir.exists():
-            raise FileNotFoundError(f"Original giant dataset directory is required for exact recompute: {dataset_dir}")
-        dataset, _load_info = load_giant_block_dataset(
-            dataset_dir,
-            block_key=None,
-            n_jobs=int(n_jobs),
-            load_name_counts=True,
-        )
-        return dataset
-    return load_labeled_dataset(
-        REPO_ROOT / "data",
-        dataset_name,
-        n_jobs=int(n_jobs),
-        load_name_counts=True,
-    )
-
-
-def _load_featureless_raw_dataset(bundle: OfficialBundle, dataset_name: str, *, n_jobs: int) -> ANDData:
-    raw_datasets = dict(bundle.assets["raw_metadata"]["datasets"])
-    if dataset_name not in raw_datasets:
-        raise KeyError(f"Featureless raw metadata is missing dataset {dataset_name!r}")
-    raw_spec = dict(raw_datasets[dataset_name])
-    signatures_path = _resolve_path(bundle, str(raw_spec["signatures_path"]))
-    papers_path = _resolve_path(bundle, str(raw_spec["papers_path"]))
-    return ANDData(
-        str(signatures_path),
-        str(papers_path),
-        name=f"joint_safe_link_featureless_{dataset_name}",
-        mode="inference",
-        load_name_counts=True,
-        preprocess=True,
-        n_jobs=max(1, int(n_jobs)),
-        compute_reference_features=False,
-    )
-
-
 def _load_minimal_raw_specter_dataset(
     bundle: OfficialBundle,
     dataset_name: str,
@@ -1113,25 +1065,6 @@ def _release_minimal_raw_dataset_context(context: MinimalRawDatasetContext) -> N
     context.signature_id_to_index.clear()
     feature_port.clear_rust_featurizer_cache()
     gc.collect()
-
-
-def _load_pairwise_dataset(
-    *,
-    source_bundle: OfficialBundle,
-    dataset_name: str,
-    pairwise_source: str,
-    n_jobs: int,
-    giant_dataset_root: Path,
-) -> Any:
-    if pairwise_source == "official-original":
-        return _load_original_pairwise_dataset(
-            dataset_name,
-            n_jobs=n_jobs,
-            giant_dataset_root=giant_dataset_root,
-        )
-    if pairwise_source == "featureless-raw":
-        return _load_featureless_raw_dataset(source_bundle, dataset_name, n_jobs=n_jobs)
-    raise ValueError(f"Unknown pairwise source: {pairwise_source}")
 
 
 def _assert_pairwise_model_is_raw_bundle_compatible(clusterer: Any, model_path: Path) -> None:
@@ -1451,108 +1384,6 @@ def _resolve_candidate_batch_pair_labels(
     }
 
 
-def _materialize_promoted_table(
-    *,
-    source_bundle: OfficialBundle,
-    table_key: str,
-    output_path: Path,
-    target_features: Sequence[str],
-    pairwise_source: str,
-    n_jobs: int,
-    total_ram_bytes: int,
-    giant_dataset_root: Path,
-    datasets: set[str] | None,
-    limit_rows: int | None,
-    pairwise_aggregate_nan_value: float,
-) -> dict[str, Any]:
-    labels_path = _asset_file(source_bundle, "featureless_rows", table_key)
-    corrected_path = _asset_file(source_bundle, "corrected_feature_rows", table_key)
-    labels, corrected = _read_selected_rows(
-        labels_path=labels_path,
-        corrected_path=corrected_path,
-        datasets=datasets,
-        limit_rows=limit_rows,
-    )
-    non_pairwise = tuple(feature for feature in target_features if not str(feature).startswith("pw_"))
-    missing_non_pairwise = sorted(feature for feature in non_pairwise if feature not in corrected.columns)
-    if missing_non_pairwise:
-        raise ValueError(f"{corrected_path.name} is missing promoted non-pw columns: {missing_non_pairwise}")
-
-    output = corrected.copy()
-    for column in labels.columns:
-        if column not in output.columns:
-            output[column] = labels[column]
-
-    pairwise_columns = tuple(feature for feature in target_features if str(feature).startswith("pw_"))
-    pairwise_matrix = np.full((len(labels), len(pairwise_columns)), np.nan, dtype=np.float32)
-
-    started = time.perf_counter()
-    pair_count = 0
-    dataset_summaries: list[dict[str, Any]] = []
-    for dataset_name, dataset_rows in labels.groupby(labels["dataset"].astype(str), sort=False):
-        dataset_name = str(dataset_name)
-        row_positions = dataset_rows.index.to_numpy(dtype=np.int64)
-        dataset_started = time.perf_counter()
-        dataset = _load_pairwise_dataset(
-            source_bundle=source_bundle,
-            dataset_name=dataset_name,
-            pairwise_source=pairwise_source,
-            n_jobs=n_jobs,
-            giant_dataset_root=giant_dataset_root,
-        )
-        featurizer = feature_port._get_rust_featurizer(dataset)  # noqa: SLF001
-        signature_id_to_index = _signature_id_to_index(featurizer)
-        member_path = _resolve_path(
-            source_bundle,
-            str(source_bundle.assets["candidate_members"]["datasets"][dataset_name]),
-        )
-        component_members = _component_members_by_key(member_path, signature_id_to_index)
-        batch = _candidate_batch_from_rows(dataset_rows, component_members, signature_id_to_index)
-        stats = compute_candidate_batch_pairwise_aggregate_stats_rust(
-            dataset,
-            batch,
-            n_jobs=max(1, int(n_jobs)),
-            total_ram_bytes=int(total_ram_bytes),
-            nan_value=float(pairwise_aggregate_nan_value),
-            featurizer=featurizer,
-        )
-        pairwise_values = _pairwise_feature_values(stats)
-        for column_index, column in enumerate(pairwise_columns):
-            pairwise_matrix[row_positions, column_index] = pairwise_values[str(column)]
-        pair_count += int(batch.pair_count)
-        dataset_summaries.append(
-            {
-                "dataset": dataset_name,
-                "rows": int(len(dataset_rows)),
-                "pairs": int(batch.pair_count),
-                "seconds": round(float(time.perf_counter() - dataset_started), 3),
-            }
-        )
-        del dataset, featurizer, component_members, batch, stats
-        feature_port.clear_rust_featurizer_cache()
-        gc.collect()
-
-    pairwise_frame = pd.DataFrame(pairwise_matrix, columns=list(pairwise_columns))
-    for column in pairwise_columns:
-        output[column] = pairwise_frame[column].to_numpy(dtype=np.float32, copy=False)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output.to_parquet(output_path, index=False)
-    return {
-        "table_key": table_key,
-        "labels_path": str(labels_path.relative_to(source_bundle.root)),
-        "corrected_path": str(corrected_path.relative_to(source_bundle.root)),
-        "output_path": str(output_path),
-        "rows": int(len(output)),
-        "pairs": int(pair_count),
-        "datasets": dataset_summaries,
-        "seconds": round(float(time.perf_counter() - started), 3),
-        "pairwise_source": pairwise_source,
-        "pairwise_aggregate_nan_value": (
-            "nan" if math.isnan(float(pairwise_aggregate_nan_value)) else float(pairwise_aggregate_nan_value)
-        ),
-    }
-
-
 def _parquet_row_count_and_columns(path: Path) -> tuple[int, set[str]]:
     parquet_file = pq.ParquetFile(path)
     return int(parquet_file.metadata.num_rows), set(parquet_file.schema_arrow.names)
@@ -1786,86 +1617,6 @@ def _copy_bundle_support_files(
         encoding="utf-8",
     )
     return payload
-
-
-def _materialize_promoted_feature_bundle(
-    *,
-    source_bundle: OfficialBundle,
-    output_bundle_root: Path,
-    target: Mapping[str, Any],
-    pairwise_source: str,
-    n_jobs: int,
-    total_ram_bytes: int,
-    giant_dataset_root: Path,
-    table_keys: Sequence[str] | None,
-    datasets: set[str] | None,
-    limit_rows: int | None,
-    pairwise_aggregate_nan_value: float,
-) -> tuple[OfficialBundle, list[dict[str, Any]]]:
-    _copy_bundle_support_files(source_bundle, output_bundle_root)
-    table_key_set = set(table_keys) if table_keys is not None else None
-    source_spec = dict(source_bundle.models["classic"])
-    selected_keys = [
-        table_key
-        for table_key in _classic_table_keys(source_spec)
-        if table_key_set is None or table_key in table_key_set
-    ]
-    summaries: list[dict[str, Any]] = []
-    for table_key in selected_keys:
-        labels_path = _asset_file(source_bundle, "featureless_rows", table_key)
-        output_relpath = _output_table_relpath(table_key, labels_path)
-        output_path = output_bundle_root / output_relpath
-        print(
-            json.dumps(
-                {
-                    "event": "materialize_promoted_table_start",
-                    "table_key": table_key,
-                    "output_path": str(output_path),
-                }
-            ),
-            flush=True,
-        )
-        summary = _materialize_promoted_table(
-            source_bundle=source_bundle,
-            table_key=table_key,
-            output_path=output_path,
-            target_features=tuple(str(feature) for feature in target["features"]),
-            pairwise_source=pairwise_source,
-            n_jobs=n_jobs,
-            total_ram_bytes=total_ram_bytes,
-            giant_dataset_root=giant_dataset_root,
-            datasets=datasets,
-            limit_rows=limit_rows,
-            pairwise_aggregate_nan_value=float(pairwise_aggregate_nan_value),
-        )
-        summaries.append(summary)
-        print(json.dumps({"event": "materialize_promoted_table_done", **summary}), flush=True)
-
-    payload = json.loads((output_bundle_root / "bundle.json").read_text(encoding="utf-8"))
-    for table_key in selected_keys:
-        labels_path = _asset_file(source_bundle, "featureless_rows", table_key)
-        relpath = str(_output_table_relpath(table_key, labels_path))
-        payload["assets"]["corrected_feature_rows"]["files"][table_key] = relpath
-        if table_key.startswith("extra_eval_paths."):
-            dataset_name = table_key.split(".", 1)[1]
-            payload["models"]["classic"]["extra_eval_paths"][dataset_name] = relpath
-        else:
-            payload["models"]["classic"][table_key] = relpath
-    payload["models"]["classic"]["feature_columns"] = list(target["features"])
-    payload["models"]["classic"]["best_params"] = dict(target["params"])
-    payload["expected_metrics"] = {"classic": _target_expected_metrics(target)}
-    (output_bundle_root / "bundle.json").write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    _write_json(output_bundle_root / "featureization_summary.json", summaries)
-    if table_keys is None and datasets is None and limit_rows is None:
-        _stamp_precomputed_promoted_bundle_metadata(
-            output_bundle_root=output_bundle_root,
-            target=target,
-            source_mode="rust-recompute-pw",
-        )
-    return _bundle_with_promoted_target(load_bundle(output_bundle_root), target), summaries
 
 
 def _build_summary_for_members(
@@ -3234,36 +2985,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             }
             _write_json(output_dir / "run_summary.json", result)
             return result
-    elif args.feature_mode == "rust-recompute-pw":
-        if args.limit_rows is None and not args.run_full:
-            raise SystemExit("unbounded Rust feature rematerialization requires --run-full")
-        if not args.materialize_only and (args.limit_rows is not None or args.tables or args.datasets):
-            raise SystemExit("limited/table-filtered Rust rematerialization is smoke-only; pass --materialize-only")
-        source_bundle = load_bundle(args.source_bundle_root)
-        feature_bundle_root = output_dir / "recomputed_feature_bundle"
-        feature_bundle, featureization_summaries = _materialize_promoted_feature_bundle(
-            source_bundle=source_bundle,
-            output_bundle_root=feature_bundle_root,
-            target=target,
-            pairwise_source=str(args.pairwise_source),
-            n_jobs=int(args.n_jobs),
-            total_ram_bytes=int(args.total_ram_bytes),
-            giant_dataset_root=args.giant_dataset_root,
-            table_keys=_parse_tables(args.tables),
-            datasets=_parse_datasets(args.datasets),
-            limit_rows=args.limit_rows,
-            pairwise_aggregate_nan_value=pairwise_aggregate_nan_value,
-        )
-        if args.materialize_only:
-            result = {
-                "mode": args.feature_mode,
-                "feature_bundle_root": str(feature_bundle.root),
-                "feature_count": int(target["feature_count"]),
-                "feature_nan_policy": feature_nan_policy,
-                "featureization": featureization_summaries,
-            }
-            _write_json(output_dir / "run_summary.json", result)
-            return result
     elif args.feature_mode == "precomputed-promoted":
         if args.precomputed_feature_bundle_root is None:
             raise SystemExit("--feature-mode precomputed-promoted requires --precomputed-feature-bundle-root")
@@ -3451,7 +3172,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hyperopt-seed", type=int, default=13)
     parser.add_argument(
         "--feature-mode",
-        choices=("minimal-raw-rust", "rust-recompute-pw", "precomputed-promoted"),
+        choices=("minimal-raw-rust", "precomputed-promoted"),
         default="minimal-raw-rust",
         help="Feature source for the official train/calibrate/eval run.",
     )
@@ -3463,12 +3184,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Explicit portable precomputed promoted feature bundle root. Required only with "
             "--feature-mode precomputed-promoted."
         ),
-    )
-    parser.add_argument(
-        "--pairwise-source",
-        choices=("official-original", "featureless-raw"),
-        default="official-original",
-        help="Dataset source for Rust pairwise aggregate recomputation.",
     )
     parser.add_argument(
         "--pairwise-model-nan-policy",
@@ -3494,7 +3209,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="finite",
         help="Missing-value policy for promoted non-pw row features.",
     )
-    parser.add_argument("--giant-dataset-root", type=Path, default=DEFAULT_GIANT_DATASET_ROOT)
     parser.add_argument("--n-jobs", type=int, default=20)
     parser.add_argument("--total-ram-bytes", type=int, default=DEFAULT_TOTAL_RAM_BYTES)
     parser.add_argument("--pair-batch-size", type=int, default=None)

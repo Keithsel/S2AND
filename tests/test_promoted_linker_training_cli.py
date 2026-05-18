@@ -4,6 +4,7 @@ import ast
 import inspect
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
@@ -47,7 +48,7 @@ def test_promoted_training_defaults_to_minimal_raw_specter_source() -> None:
         "s2and/data/production_model_v1.21/reproducibility/incremental_linker_training_target.json"
     )
     assert parser_defaults["feature_mode"] == "minimal-raw-rust"
-    assert feature_mode_action.choices == ("minimal-raw-rust", "rust-recompute-pw", "precomputed-promoted")
+    assert feature_mode_action.choices == ("minimal-raw-rust", "precomputed-promoted")
     assert parser_defaults["precomputed_feature_bundle_root"] is None
     assert parser_defaults["save_production_bundle_to"] is None
     assert parser_defaults["production_bundle_version"] is None
@@ -475,10 +476,12 @@ def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(
 
     monkeypatch.setattr(promoted_train, "_load_target", lambda _path: target)  # noqa: SLF001
     monkeypatch.setattr(promoted_train, "load_bundle", lambda _path: bundle)
+    monkeypatch.setattr(promoted_train, "load_clusterer", lambda *_args, **_kwargs: SimpleNamespace(batch_size=10))
+    monkeypatch.setattr(promoted_train, "_assert_pairwise_model_is_raw_bundle_compatible", lambda *_args: None)  # noqa: SLF001
     monkeypatch.setattr(
         promoted_train,
-        "_materialize_promoted_feature_bundle",
-        lambda **_kwargs: (bundle, [{"mode": "rust-recompute-pw"}]),
+        "_materialize_minimal_raw_feature_bundle",
+        lambda **_kwargs: (bundle, [{"mode": "minimal-raw-rust"}]),
     )
     monkeypatch.setattr(promoted_train, "_run_classic_hyperopt", fake_hyperopt)  # noqa: SLF001
     monkeypatch.setattr(promoted_train, "run_classic", fake_run_classic)
@@ -488,7 +491,7 @@ def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(
     args = promoted_train.build_parser().parse_args(
         [
             "--feature-mode",
-            "rust-recompute-pw",
+            "minimal-raw-rust",
             "--run-full",
             "--hyperopt-evals",
             "2",

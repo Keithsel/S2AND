@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 import warnings
 from collections.abc import Mapping, Sequence
@@ -46,66 +45,6 @@ DEFAULT_CLASSIC_N_JOBS = 20
 
 # Shared training, calibration, and evaluation helpers for the official replay
 # target. CLI entrypoints should import this module instead of owning copies.
-_ANCHOR_EVIDENCE_FEATURE_COLUMNS = (
-    "anchor_evidence_count",
-    "strong_positive_anchor_score",
-    "weak_residual_anchor_score",
-    "sparse_relative_winner_score",
-)
-_DERIVED_PROMOTED_FEATURE_COLUMNS = (
-    "retrieval_reciprocal_rank",
-    "cluster_size_log",
-    "candidate_year_span",
-    "year_gap_to_candidate_range",
-    "year_gap_signed_to_candidate_range",
-    "candidate_dominant_first_name_length",
-    "query_first_prefix_match_any_length",
-    "same_dominant_first_as_best_top5",
-    "same_family_as_heuristic_choice",
-)
-_ANCHOR_EVIDENCE_PREREQUISITES = (
-    "min_distance",
-    "retrieval_score_gap_vs_best_competitor",
-    "same_family_as_top1",
-    "retrieval_rank",
-)
-_CLASSIC_DERIVABLE_FEATURE_PREREQUISITES: dict[str, tuple[str, ...]] = {
-    "retrieval_reciprocal_rank": ("retrieval_rank",),
-    "cluster_size_log": ("cluster_size",),
-    "candidate_year_span": ("candidate_year_min", "candidate_year_max", "candidate_year_range_missing"),
-    "year_gap_to_candidate_range": (
-        "candidate_year_min",
-        "candidate_year_max",
-        "candidate_year_range_missing",
-        "query_year",
-        "query_year_missing",
-    ),
-    "year_gap_signed_to_candidate_range": (
-        "candidate_year_min",
-        "candidate_year_max",
-        "candidate_year_range_missing",
-        "query_year",
-        "query_year_missing",
-    ),
-    "candidate_dominant_first_name_length": ("dominant_first_name",),
-    "query_first_prefix_match_any_length": ("dominant_first_name",),
-    "same_dominant_first_as_best_top5": (
-        "query_group_id",
-        "dominant_first_name",
-        "retrieval_rank",
-        "top5_mean_distance",
-        "candidate_component_key",
-    ),
-    "same_family_as_heuristic_choice": (
-        "query_group_id",
-        "dominant_first_name",
-        "retrieval_rank",
-        "top5_mean_distance",
-        "candidate_component_key",
-        "retrieval_score",
-    ),
-    **{feature: _ANCHOR_EVIDENCE_PREREQUISITES for feature in _ANCHOR_EVIDENCE_FEATURE_COLUMNS},
-}
 
 
 @dataclass(frozen=True)
@@ -418,12 +357,6 @@ def _bounded_threshold_grid(values: np.ndarray, grid_size: int) -> np.ndarray:
     )
 
 
-def _normalize_letters(value: Any) -> str:
-    """Normalize a name-like token down to lowercase letters."""
-
-    return re.sub(r"[^a-z]", "", str(value).lower())
-
-
 def _is_missing_scalar(value: Any) -> bool:
     """Return whether a scalar-like value is pandas-missing."""
 
@@ -436,251 +369,6 @@ def _is_missing_scalar(value: Any) -> bool:
     if isinstance(missing, bool | np.bool_):
         return bool(missing)
     return False
-
-
-def _normalize_optional_letters(value: Any) -> str:
-    """Normalize a name token, treating missing values as absent."""
-
-    if _is_missing_scalar(value):
-        return ""
-    return _normalize_letters(value)
-
-
-def _cluster_size_log(cluster_size: Any) -> float:
-    """Return an uncapped log-size primitive."""
-
-    return float(math.log1p(max(0.0, float(cluster_size or 0.0))))
-
-
-def _numeric_feature_series(df: pd.DataFrame, column: str, *, default: float = 0.0) -> pd.Series:
-    """Return one numeric feature column with a deterministic default for formula derivation."""
-
-    if column not in df.columns:
-        return pd.Series(default, index=df.index, dtype=np.float32)
-    return pd.to_numeric(df[column], errors="coerce").fillna(default).astype(np.float32)
-
-
-def _query_first_series_for_prefix(out: pd.DataFrame) -> list[str]:
-    if "query_author" in out.columns:
-        query_first_from_author = out["query_author"].map(_query_first_token)
-    else:
-        query_first_from_author = pd.Series([""] * len(out), index=out.index, dtype="string")
-    if "query_first_token" in out.columns:
-        query_first_from_token = out["query_first_token"].map(_normalize_optional_letters)
-    else:
-        query_first_from_token = pd.Series([""] * len(out), index=out.index, dtype="string")
-    return [
-        author_token if author_token else token
-        for author_token, token in zip(query_first_from_author, query_first_from_token, strict=True)
-    ]
-
-
-def _derive_promoted_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Derive promoted row features from portable candidate-row primitives."""
-
-    out = df.copy()
-    if "retrieval_rank" in out.columns:
-        retrieval_rank = pd.to_numeric(out["retrieval_rank"], errors="coerce").fillna(0.0).astype(np.float32)
-        out["retrieval_reciprocal_rank"] = 1.0 / np.maximum(retrieval_rank.to_numpy(dtype=np.float32), 1.0)
-    if "cluster_size" in out.columns:
-        cluster_size = pd.to_numeric(out["cluster_size"], errors="coerce").fillna(0.0).astype(np.float32)
-        out["cluster_size_log"] = cluster_size.map(_cluster_size_log)
-    if {"candidate_year_min", "candidate_year_max", "candidate_year_range_missing"}.issubset(out.columns):
-        candidate_year_min = pd.to_numeric(out["candidate_year_min"], errors="coerce").fillna(0.0).astype(np.float32)
-        candidate_year_max = pd.to_numeric(out["candidate_year_max"], errors="coerce").fillna(0.0).astype(np.float32)
-        candidate_missing = (
-            pd.to_numeric(out["candidate_year_range_missing"], errors="coerce").fillna(1.0).astype(np.float32) > 0.0
-        )
-        out["candidate_year_span"] = np.where(
-            candidate_missing,
-            0.0,
-            np.maximum(
-                candidate_year_max.to_numpy(dtype=np.float32) - candidate_year_min.to_numpy(dtype=np.float32),
-                0.0,
-            ),
-        )
-        if {"query_year", "query_year_missing"}.issubset(out.columns):
-            query_year = pd.to_numeric(out["query_year"], errors="coerce").fillna(0.0).astype(np.float32)
-            query_missing = (
-                pd.to_numeric(out["query_year_missing"], errors="coerce").fillna(1.0).astype(np.float32) > 0.0
-            )
-            observed = ~(candidate_missing | query_missing)
-            lower = observed & (query_year < candidate_year_min)
-            upper = observed & (query_year > candidate_year_max)
-            gap = np.zeros(len(out), dtype=np.float32)
-            signed_gap = np.zeros(len(out), dtype=np.float32)
-            lower_gap = (candidate_year_min[lower] - query_year[lower]).to_numpy(dtype=np.float32)
-            upper_gap = (query_year[upper] - candidate_year_max[upper]).to_numpy(dtype=np.float32)
-            gap[lower.to_numpy(dtype=bool)] = lower_gap
-            gap[upper.to_numpy(dtype=bool)] = upper_gap
-            signed_gap[lower.to_numpy(dtype=bool)] = -lower_gap
-            signed_gap[upper.to_numpy(dtype=bool)] = upper_gap
-            out["year_gap_to_candidate_range"] = gap
-            out["year_gap_signed_to_candidate_range"] = signed_gap
-    if "dominant_first_name" in out.columns:
-        query_first = _query_first_series_for_prefix(out)
-        dominant_first = out["dominant_first_name"].map(_normalize_optional_letters)
-        out["candidate_dominant_first_name_length"] = [float(len(value)) for value in dominant_first]
-        out["query_first_prefix_match_any_length"] = [
-            1.0 if query and dominant and (query.startswith(dominant) or dominant.startswith(query)) else 0.0
-            for query, dominant in zip(query_first, dominant_first, strict=True)
-        ]
-        if {
-            "query_group_id",
-            "retrieval_rank",
-            "top5_mean_distance",
-            "candidate_component_key",
-        }.issubset(out.columns):
-            group_key = out["query_group_id"].astype(str)
-            retrieval_rank_numeric = pd.to_numeric(out["retrieval_rank"], errors="coerce")
-            retrieval_score_sort = (
-                -pd.to_numeric(out["retrieval_score"], errors="coerce")
-                if "retrieval_score" in out.columns
-                else retrieval_rank_numeric
-            )
-            grouping_frame = out.assign(
-                _query_group_key=group_key,
-                _dominant_first_alpha=dominant_first,
-                _retrieval_rank_numeric=retrieval_rank_numeric,
-                _retrieval_score_sort=retrieval_score_sort,
-                _top5_mean_distance_numeric=pd.to_numeric(out["top5_mean_distance"], errors="coerce"),
-                _row_order=np.arange(len(out)),
-            )
-            top1_rows = grouping_frame.sort_values(
-                [
-                    "_query_group_key",
-                    "_retrieval_score_sort",
-                    "_retrieval_rank_numeric",
-                    "candidate_component_key",
-                    "_row_order",
-                ],
-                kind="stable",
-            )
-            top1_by_group = top1_rows.drop_duplicates("_query_group_key").set_index("_query_group_key")
-            top1_dominant = group_key.map(top1_by_group["_dominant_first_alpha"])
-            best_top5_rows = grouping_frame.sort_values(
-                [
-                    "_query_group_key",
-                    "_top5_mean_distance_numeric",
-                    "_retrieval_score_sort",
-                    "_retrieval_rank_numeric",
-                    "candidate_component_key",
-                    "_row_order",
-                ],
-                kind="stable",
-            )
-            best_top5_by_group = best_top5_rows.drop_duplicates("_query_group_key").set_index("_query_group_key")
-            best_top5_dominant = group_key.map(best_top5_by_group["_dominant_first_alpha"])
-            dominant_first_top1_match = np.asarray(
-                [
-                    1.0 if dominant and top1 and dominant == top1 else 0.0
-                    for dominant, top1 in zip(dominant_first, top1_dominant, strict=True)
-                ],
-                dtype=np.float32,
-            )
-            same_dominant_first_as_best_top5 = np.asarray(
-                [
-                    1.0 if dominant and best and dominant == best else 0.0
-                    for dominant, best in zip(dominant_first, best_top5_dominant, strict=True)
-                ],
-                dtype=np.float32,
-            )
-            out["same_dominant_first_as_best_top5"] = same_dominant_first_as_best_top5
-            out["same_family_as_heuristic_choice"] = (
-                dominant_first_top1_match
-                * pd.to_numeric(out["retrieval_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-                + same_dominant_first_as_best_top5
-                * (
-                    1.0
-                    - pd.to_numeric(out["top5_mean_distance"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-                )
-            ).astype(np.float32)
-    return out
-
-
-def _derive_anchor_evidence_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Derive anchor-evidence formulas from existing candidate-row evidence columns."""
-
-    out = df.copy()
-    if {
-        "query_group_id",
-        "retrieval_score",
-        "retrieval_rank",
-        "candidate_component_key",
-    }.issubset(out.columns):
-        retrieval_score_values = pd.to_numeric(out["retrieval_score"], errors="coerce").astype(np.float32)
-        stored_rank_values = pd.to_numeric(out["retrieval_rank"], errors="coerce").fillna(99.0).astype(np.float32)
-        current_rank = np.zeros(len(out), dtype=np.float32)
-        current_gap = np.zeros(len(out), dtype=np.float32)
-        best_gap = np.zeros(len(out), dtype=np.float32)
-        ordering_frame = pd.DataFrame(
-            {
-                "_query_group_key": out["query_group_id"].astype(str),
-                "_score": retrieval_score_values,
-                "_stored_rank": stored_rank_values,
-                "_component_key": out["candidate_component_key"].astype(str),
-                "_row_index": np.arange(len(out)),
-            }
-        )
-        for _group_key, group in ordering_frame.groupby("_query_group_key", sort=False):
-            ordered = group.sort_values(
-                ["_score", "_stored_rank", "_component_key", "_row_index"],
-                ascending=[False, True, True, True],
-                kind="stable",
-            )
-            indices = ordered["_row_index"].to_numpy(dtype=np.int64)
-            if len(indices) == 0:
-                continue
-            scores = retrieval_score_values.iloc[indices].to_numpy(dtype=np.float32)
-            top1 = int(indices[0])
-            runner_up = int(indices[1]) if len(indices) > 1 else top1
-            best_score = float(np.max(scores))
-            for rank, row_index in enumerate(indices, start=1):
-                competitor = runner_up if int(row_index) == top1 else top1
-                current_rank[int(row_index)] = float(rank)
-                current_gap[int(row_index)] = float(
-                    retrieval_score_values.iloc[int(row_index)] - retrieval_score_values.iloc[int(competitor)]
-                )
-                best_gap[int(row_index)] = float(best_score - retrieval_score_values.iloc[int(row_index)])
-        out["retrieval_rank"] = current_rank
-        out["retrieval_score_gap_vs_best_competitor"] = np.round(current_gap, 6).astype(np.float32)
-        out["retrieval_score_best_gap"] = np.round(best_gap, 6).astype(np.float32)
-
-    min_distance = _numeric_feature_series(out, "min_distance", default=10000.0)
-    retrieval_gap = _numeric_feature_series(out, "retrieval_score_gap_vs_best_competitor")
-    same_top1 = _numeric_feature_series(out, "same_family_as_top1")
-    retrieval_rank = _numeric_feature_series(out, "retrieval_rank", default=99.0)
-
-    min_distance_values = min_distance.to_numpy(dtype=np.float32, copy=False)
-    retrieval_gap_values = retrieval_gap.to_numpy(dtype=np.float32, copy=False)
-    same_top1_values = same_top1.to_numpy(dtype=np.float32, copy=False)
-    retrieval_rank_values = retrieval_rank.to_numpy(dtype=np.float32, copy=False)
-
-    min_distance_clip = np.clip(min_distance_values, 0.0, 1.0)
-    same_top1_clip = np.clip(same_top1_values, 0.0, 1.0)
-    retrieval_gap_positive = np.clip(retrieval_gap_values, 0.0, 0.3) / 0.3
-    retrieval_gap_normalized = np.clip((np.clip(retrieval_gap_values, -0.2, 0.3) + 0.2) / 0.5, 0.0, 1.0)
-
-    out["anchor_evidence_count"] = (
-        (min_distance_values <= 0.15).astype(np.float32) + (retrieval_gap_values >= 0.02).astype(np.float32)
-    ).astype(np.float32)
-
-    distance_signal = 1.0 - min_distance_clip
-    support_strength = 0.20 * distance_signal
-    out["strong_positive_anchor_score"] = (np.clip(support_strength, 0.0, 1.0) * (0.5 + 0.5 * same_top1_clip)).astype(
-        np.float32
-    )
-
-    residual_support = 0.28 * distance_signal + 0.08 * retrieval_gap_normalized
-    out["weak_residual_anchor_score"] = (same_top1_clip * np.clip(residual_support, 0.0, 1.0)).astype(np.float32)
-
-    out["sparse_relative_winner_score"] = (
-        (retrieval_rank_values <= 1.0).astype(np.float32)
-        * same_top1_clip
-        * np.clip(retrieval_gap_positive, 0.0, 1.0)
-        * np.clip(residual_support, 0.0, 1.0)
-    ).astype(np.float32)
-    return out
 
 
 def _query_first_token(author: Any) -> str:
@@ -835,46 +523,13 @@ def _summarize_predictions(predictions: pd.DataFrame) -> dict[str, Any]:
     return summary
 
 
-def _normalize_augmented_feature_frame(df: pd.DataFrame, feature_columns: tuple[str, ...]) -> pd.DataFrame:
-    out = df.copy()
-    requested_anchor_features = set(feature_columns) & set(_ANCHOR_EVIDENCE_FEATURE_COLUMNS)
-    if requested_anchor_features:
-        out = _derive_anchor_evidence_features(out)
-    requested_derived_features = set(feature_columns) & set(_DERIVED_PROMOTED_FEATURE_COLUMNS)
-    if requested_derived_features:
-        out = _derive_promoted_features(out)
-    for column in feature_columns:
-        if column not in out.columns:
-            out[column] = np.nan
-    for column in feature_columns:
-        out[column] = pd.to_numeric(out[column], errors="coerce")
-    return out
-
-
-def _augmented_feature_matrix(df: pd.DataFrame, feature_columns: tuple[str, ...]) -> pd.DataFrame:
-    prepared = _normalize_augmented_feature_frame(df, feature_columns)
-    return prepared.loc[:, list(feature_columns)].copy().astype(np.float32)
-
-
 def _validate_classic_feature_inputs(df: pd.DataFrame, feature_columns: tuple[str, ...]) -> None:
-    """Require active features to be present or explicitly derivable."""
+    """Require active linker features to already be materialized."""
 
-    missing_required: list[str] = []
-    missing_prerequisites: dict[str, list[str]] = {}
-    for column in feature_columns:
-        if column in df.columns:
-            continue
-        prerequisites = _CLASSIC_DERIVABLE_FEATURE_PREREQUISITES.get(str(column))
-        if prerequisites is None:
-            missing_required.append(str(column))
-            continue
-        missing_for_column = [required for required in prerequisites if required not in df.columns]
-        if missing_for_column:
-            missing_prerequisites[str(column)] = missing_for_column
-    if missing_required or missing_prerequisites:
+    missing_required = [str(column) for column in feature_columns if str(column) not in df.columns]
+    if missing_required:
         raise ValueError(
-            "Classic feature matrix is missing required feature inputs: "
-            f"missing_features={missing_required}, missing_prerequisites={missing_prerequisites}"
+            "Classic feature matrix is missing required feature inputs: " f"missing_features={missing_required}"
         )
 
 
@@ -948,15 +603,10 @@ def _build_classic_classifier(
 
 
 def _classic_feature_matrix(df: pd.DataFrame, feature_columns: tuple[str, ...]) -> pd.DataFrame:
-    """Build a classic feature frame, allowing union-style augmented features when requested."""
+    """Build a classic feature frame from already materialized promoted columns."""
 
     _validate_classic_feature_inputs(df, feature_columns)
-    missing_feature_columns = [column for column in feature_columns if column not in df.columns]
-    if missing_feature_columns:
-        features = _augmented_feature_matrix(df, feature_columns)
-        return _coerce_classic_feature_matrix(features, feature_columns)
-    out = df.copy()
-    return _coerce_classic_feature_matrix(out, feature_columns)
+    return _coerce_classic_feature_matrix(df, feature_columns)
 
 
 def _apply_classic_train_row_cap(

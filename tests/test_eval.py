@@ -4,10 +4,12 @@ import unittest
 import warnings
 
 import numpy as np
+import pytest
 
 import s2and.shap_utils as shap_utils
 from s2and.eval import (
     _shap_values_for_tree_model_preserving_booster_params,
+    _write_claims_eval_shap_plots,
     b3_precision_recall_fscore,
     claims_eval,
     f1_score,
@@ -480,6 +482,32 @@ def test_shap_values_restore_lightgbm_booster_params(monkeypatch):
 
     np.testing.assert_array_equal(values, np.zeros((2, 3)))
     assert classifier.booster_.params == {"keep": "value"}
+
+
+def test_write_claims_eval_shap_plots_requires_nameless_features(monkeypatch):
+    class DummyFeatureInfo:
+        def get_feature_names(self):
+            return ["feature"]
+
+    class DummyClusterer:
+        classifier = object()
+        nameless_classifier = object()
+        featurizer_info = DummyFeatureInfo()
+        nameless_featurizer_info = None
+
+    def fake_many_pairs_featurize(*_args, **_kwargs):
+        return np.ones((1, 1)), np.array([1]), None
+
+    monkeypatch.setattr("s2and.eval.many_pairs_featurize", fake_many_pairs_featurize)
+
+    with pytest.raises(ValueError, match="output_shap=True requires clusterer.nameless_featurizer_info"):
+        _write_claims_eval_shap_plots(
+            id1="p1___0",
+            id2="p2___0",
+            dataset=object(),
+            clusterer=DummyClusterer(),
+            directory_for_caching=".",
+        )
 
 
 if __name__ == "__main__":

@@ -918,6 +918,8 @@ def _write_claims_eval_shap_plots(
         chunk_size=100,
         nameless_featurizer_info=clusterer.nameless_featurizer_info,
     )
+    if nameless_features is None:
+        raise ValueError("output_shap=True requires clusterer.nameless_featurizer_info to produce nameless features")
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

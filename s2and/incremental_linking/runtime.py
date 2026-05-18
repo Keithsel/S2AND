@@ -990,8 +990,7 @@ def _predict_incremental_link_or_abstain_production_private(
         for query_index, query_signature_id in zip(query_signature_indices, query_signature_id_strings, strict=True)
     }
     query_by_signature_id = {
-        query_signature_id: query
-        for query_signature_id, query in zip(query_signature_id_strings, queries, strict=True)
+        query_signature_id: query for query_signature_id, query in zip(query_signature_id_strings, queries, strict=True)
     }
     component_member_indices_by_key = _build_component_member_indices_by_key(
         cluster_seeds_require,

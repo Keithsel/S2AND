@@ -135,12 +135,21 @@ def _detect_named_rust_capabilities(module: Any) -> tuple[str, ...]:
     return tuple(capabilities)
 
 
+def _is_missing_s2and_rust_native_module(exc: ModuleNotFoundError) -> bool:
+    """Return whether an import failure means the optional Rust extension is absent."""
+
+    missing_name = exc.name or ""
+    return missing_name == "s2and_rust" or (
+        missing_name.startswith("s2and_rust.") and missing_name.endswith("._s2and_rust")
+    )
+
+
 def load_s2and_rust_extension(*, import_module: Callable[[str], Any] | None = None) -> Any | None:
     importer = import_module or importlib.import_module
     try:
         module = importer("s2and_rust")
     except ModuleNotFoundError as exc:
-        if exc.name != "s2and_rust":
+        if not _is_missing_s2and_rust_native_module(exc):
             raise
         return None
 
@@ -152,7 +161,7 @@ def load_s2and_rust_extension(*, import_module: Callable[[str], Any] | None = No
     try:
         candidate_module = importer("s2and_rust._s2and_rust")
     except ModuleNotFoundError as exc:
-        if exc.name != "s2and_rust._s2and_rust":
+        if not _is_missing_s2and_rust_native_module(exc):
             raise
         candidate_module = None
 

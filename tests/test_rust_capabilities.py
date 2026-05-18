@@ -79,6 +79,17 @@ def test_load_s2and_rust_extension_returns_none_for_missing_top_level(monkeypatc
     assert rust_capabilities.load_s2and_rust_extension() is None
 
 
+def test_load_s2and_rust_extension_returns_none_for_missing_workspace_native_module(monkeypatch):
+    def _fake_import_module(name: str):
+        if name == "s2and_rust":
+            raise _missing_module("s2and_rust.s2and_rust._s2and_rust")
+        raise _missing_module(name)
+
+    monkeypatch.setattr(rust_capabilities.importlib, "import_module", _fake_import_module)
+
+    assert rust_capabilities.load_s2and_rust_extension() is None
+
+
 def test_load_s2and_rust_extension_reraises_import_crash(monkeypatch):
     def _fake_import_module(_name: str):
         raise RuntimeError("bad dll")

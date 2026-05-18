@@ -15,7 +15,7 @@ import numpy as np
 from s2and.incremental_linking.contracts import (
     ARTIFACT_SCHEMA_VERSION,
     DEFAULT_RETRIEVAL_TOP_K,
-    GATE_SURFACE_PROMOTED_STRATIFIED,
+    GATE_SURFACE_PROMOTED_LOGISTIC,
     MODEL_FAMILY_CLASSIC_LIGHTGBM_LINKER,
     production_contract_digest,
     promoted_linker_feature_schema_digest,
@@ -24,6 +24,7 @@ from s2and.incremental_linking.contracts import (
     validate_required_rust_capabilities,
 )
 from s2and.incremental_linking.features import promoted_linker_feature_columns
+from s2and.incremental_linking.logistic_gate import NumpyLogisticGate, load_logistic_gate_config
 
 BOOSTER_FILENAME = "booster.lgb"
 METADATA_FILENAME = "metadata.json"
@@ -84,7 +85,7 @@ class IncrementalLinkingArtifactMetadata:
             production_contract_digest=production_contract_digest(columns),
             retrieval_stack_digest=retrieval_stack_contract_digest(retrieval_top_k=int(retrieval_top_k)),
             retrieval_top_k=int(retrieval_top_k),
-            gate_surface=GATE_SURFACE_PROMOTED_STRATIFIED,
+            gate_surface=GATE_SURFACE_PROMOTED_LOGISTIC,
             gate_config=dict(gate_config or {}),
             prediction_fixture_matrix=fixture_matrix,
             prediction_fixture_expected_probabilities=fixture_probabilities,
@@ -120,6 +121,7 @@ class IncrementalLinkingArtifactMetadata:
             audit_metadata=dict(payload.get("audit_metadata", {})),
         )
         validate_artifact_contract_metadata(metadata.to_json_dict())
+        load_logistic_gate_config(metadata.gate_config)
         validate_required_rust_capabilities(metadata.required_rust_capabilities)
         return metadata
 
@@ -141,6 +143,7 @@ class IncrementalLinkingArtifact:
     booster: lgb.Booster
     metadata: IncrementalLinkingArtifactMetadata
     artifact_dir: Path
+    gate_model: NumpyLogisticGate
 
     def predict_probabilities(self, matrix: np.ndarray) -> np.ndarray:
         """Predict positive-class probabilities for an artifact-ordered matrix."""
@@ -218,6 +221,9 @@ def save_incremental_linking_artifact(
         raise ValueError(f"prediction_fixture_matrix must be 2D, got shape={fixture.shape}")
     if fixture.shape[1] != len(columns):
         raise ValueError(f"prediction_fixture_matrix width must be {len(columns)}, got {fixture.shape[1]}")
+    if gate_config is None:
+        raise ValueError("gate_config is required and must contain a logistic gate model")
+    load_logistic_gate_config(gate_config)
     expected_probabilities = _positive_probabilities_from_model(model, fixture)
     if len(expected_probabilities) != fixture.shape[0]:
         raise ValueError("prediction fixture probability count does not match fixture rows")
@@ -261,6 +267,7 @@ def load_incremental_linking_artifact(artifact_dir: Path) -> IncrementalLinkingA
         booster=booster,
         metadata=metadata,
         artifact_dir=artifact_dir,
+        gate_model=load_logistic_gate_config(metadata.gate_config),
     )
     observed = artifact.predict_probabilities(np.asarray(metadata.prediction_fixture_matrix, dtype=np.float32))
     expected = np.asarray(metadata.prediction_fixture_expected_probabilities, dtype=np.float64)

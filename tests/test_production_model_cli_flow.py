@@ -206,8 +206,8 @@ def _write_tiny_promoted_feature_bundle(feature_root: Path, target_path: Path) -
                     "test_split": "test",
                 },
                 "promoted_stratified_gate": {
-                    "mode": "full_calibration_fixed_grid_4score_2margin",
-                    "fixed_grid_step": 0.01,
+                    "calibration_splits": ["calibration_fit", "calibration_check"],
+                    "test_split": "test",
                 },
                 "feature_columns": feature_columns,
                 "best_params": dict(target["params"]),
@@ -311,8 +311,8 @@ def test_tiny_qian_production_model_two_step_cli_flow(tmp_path: Path) -> None:
     assert clusterer.production_model_bundle_status == "complete"
     assert Path(clusterer.incremental_linker_artifact_dir) == bundle_dir / "incremental_linker"
     artifact_metadata = json.loads((bundle_dir / "incremental_linker" / "metadata.json").read_text(encoding="utf-8"))
-    assert set(artifact_metadata["gate_config"]) == {
-        "bucketed_margin_thresholds",
-        "bucketed_score_thresholds",
-        "calibration_mode",
-    }
+    assert artifact_metadata["gate_surface"] == "promoted_numpy_logistic_gate"
+    assert artifact_metadata["gate_config"]["model_type"] == "multiclass_logistic_numpy_v1"
+    assert len(artifact_metadata["gate_config"]["feature_names"]) == 240
+    assert len(artifact_metadata["gate_config"]["weights"]) == 240
+    assert len(artifact_metadata["gate_config"]["bias"]) == 3

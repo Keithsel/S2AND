@@ -15,6 +15,7 @@ from s2and.incremental_linking.artifact import (
 )
 from s2and.incremental_linking.contracts import validate_required_rust_capabilities
 from s2and.incremental_linking.features import promoted_linker_feature_columns
+from s2and.incremental_linking.logistic_gate import logistic_gate_config
 
 
 def _tiny_booster() -> tuple[lgb.Booster, np.ndarray]:
@@ -41,19 +42,14 @@ def _tiny_booster() -> tuple[lgb.Booster, np.ndarray]:
     return booster, matrix[:3]
 
 
-def _promoted_gate_config(score: float = 0.0, margin: float = 0.0) -> dict[str, object]:
-    return {
-        "bucketed_score_thresholds": {
-            "multi_candidate|multi_letter_first": float(score),
-            "multi_candidate|single_letter_first": float(score),
-            "single_candidate|multi_letter_first": float(score),
-            "single_candidate|single_letter_first": float(score),
-        },
-        "bucketed_margin_thresholds": {
-            "multi_candidate|multi_letter_first": float(margin),
-            "multi_candidate|single_letter_first": float(margin),
-        },
-    }
+def _logistic_gate_config(link: bool = True) -> dict[str, object]:
+    return logistic_gate_config(
+        feature_names=("chosen_probability",),
+        weights=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
+        bias=np.asarray([0.0, 0.0, 10.0 if link else -10.0], dtype=np.float64),
+        missing_values=np.asarray([0.0], dtype=np.float64),
+        calibration_mode="test",
+    )
 
 
 def test_save_and_load_incremental_linking_artifact_round_trip(tmp_path: Path) -> None:
@@ -62,7 +58,7 @@ def test_save_and_load_incremental_linking_artifact_round_trip(tmp_path: Path) -
         booster,
         tmp_path,
         prediction_fixture_matrix=fixture,
-        gate_config=_promoted_gate_config(score=0.25, margin=0.05),
+        gate_config=_logistic_gate_config(),
         audit_metadata={"artifact_version": "v1.2", "pairwise_model": {"version": "1.2"}},
     )
 
@@ -100,7 +96,7 @@ def test_load_incremental_linking_artifact_rejects_digest_drift(
         booster,
         tmp_path,
         prediction_fixture_matrix=fixture,
-        gate_config=_promoted_gate_config(score=0.25),
+        gate_config=_logistic_gate_config(),
     )
     metadata_path = tmp_path / METADATA_FILENAME
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))

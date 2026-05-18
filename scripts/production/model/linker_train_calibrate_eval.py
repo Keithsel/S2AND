@@ -71,12 +71,15 @@ from s2and.incremental_linking_training.classic import (  # noqa: E402
     _apply_classic_train_row_cap,
     _build_classic_classifier,
     _classic_feature_matrix,
-    _iter_classic_train_holdout_paths,
+    _fit_promoted_logistic_gate,
+    _load_classic_stratified_eval_rows,
+    _promoted_stratified_gate_spec,
     _query_first_token,
     _read_classic_holdout_identity_sets,
     _read_csv,
     _resolve_classic_monotone_constraints,
     _resolve_path,
+    _score_classic_stratified_eval_test,
     load_bundle,
     run_classic,
 )
@@ -2877,7 +2880,7 @@ def _prepare_prod_training_data(
     holdout_importance_weight: float,
     retrieval_rank_limit: int = 25,
 ) -> ProdTrainingData:
-    """Build final production rows: train plus calibration/eval rows with extra importance."""
+    """Build final production rows: train plus stratified calibration rows."""
 
     if float(holdout_importance_weight) <= 0.0:
         raise ValueError("holdout_importance_weight must be positive")
@@ -2909,16 +2912,27 @@ def _prepare_prod_training_data(
     train_df["_prod_source_path"] = str(train_path.relative_to(bundle.root))
     frames = [train_df]
 
-    for source_name, path_like in _iter_classic_train_holdout_paths(spec):
-        path = _resolve_path(bundle, path_like)
-        source_df = _classic_candidate_training_rows(
-            _read_csv(path, compression="gzip"),
-            retrieval_rank_limit=int(retrieval_rank_limit),
-        )
-        source_df["_prod_source_kind"] = str(source_name)
-        source_df["_prod_importance_weight"] = float(holdout_importance_weight)
-        source_df["_prod_source_path"] = str(path.relative_to(bundle.root))
-        frames.append(source_df)
+    promoted_gate_config = _promoted_stratified_gate_spec(spec)
+    if promoted_gate_config is None:
+        raise ValueError("classic.promoted_stratified_gate is required for final production training")
+    if spec.get("stratified_eval_test_split") is None:
+        raise ValueError("classic.stratified_eval_test_split is required for final production training")
+    split_spec = dict(spec["stratified_eval_test_split"])
+    calibration_splits = tuple(str(split) for split in promoted_gate_config["calibration_splits"])
+    split_rows, _assignments = _load_classic_stratified_eval_rows(bundle, spec, split_spec)
+    split_values = split_rows["split"].astype(str)
+    calibration_rows = split_rows[split_values.isin(calibration_splits)].copy()
+    if calibration_rows.empty:
+        raise ValueError(f"Final production training requires non-empty calibration splits: {list(calibration_splits)}")
+    calibration_rows = _classic_candidate_training_rows(
+        calibration_rows,
+        retrieval_rank_limit=int(retrieval_rank_limit),
+    )
+    calibration_rows["_prod_source_kind"] = "stratified_calibration_" + calibration_rows["split"].astype(str)
+    calibration_rows["_prod_importance_weight"] = float(holdout_importance_weight)
+    assignments_path = _resolve_path(bundle, str(split_spec["assignments_path"]))
+    calibration_rows["_prod_source_path"] = str(assignments_path.relative_to(bundle.root))
+    frames.append(calibration_rows)
 
     combined = pd.concat(frames, ignore_index=True)
     source_kinds = combined["_prod_source_kind"].astype(str)
@@ -2943,6 +2957,16 @@ def _prepare_prod_training_data(
                 "positive_rows": int(labels.sum()),
                 "importance_weights": weight_values,
                 "sample_weight_sum": round(float(sample_weight[source_indices].sum()), 6),
+                **(
+                    {"splits": sorted(set(source_rows["split"].astype(str)))}
+                    if "split" in source_rows.columns
+                    else {}
+                ),
+                **(
+                    {"source_keys": sorted(set(source_rows["source_key"].astype(str)))}
+                    if "source_key" in source_rows.columns
+                    else {}
+                ),
             }
         )
 
@@ -2956,15 +2980,6 @@ def _prepare_prod_training_data(
         train_holdout_filter_summary=train_holdout_filter_summary,
         train_filter_summary=train_filter_summary,
     )
-
-
-def _artifact_gate_config_from_classic_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
-    rule = dict(summary["abstain_rule"])
-    return {
-        "bucketed_score_thresholds": rule.get("bucketed_score_thresholds"),
-        "bucketed_margin_thresholds": rule.get("bucketed_margin_thresholds"),
-        "calibration_mode": rule["calibration_mode"],
-    }
 
 
 def _train_and_save_prod_artifact(
@@ -2992,11 +3007,36 @@ def _train_and_save_prod_artifact(
     model.fit(train_matrix, train_labels, sample_weight=prod_training_data.sample_weight)
     train_seconds = float(time.perf_counter() - started)
 
+    promoted_gate_config = _promoted_stratified_gate_spec(spec)
+    if promoted_gate_config is None:
+        raise ValueError("classic.promoted_stratified_gate is required to train the logistic artifact gate")
+    if spec.get("stratified_eval_test_split") is None:
+        raise ValueError("classic.stratified_eval_test_split is required to train the logistic artifact gate")
+    split_spec = dict(spec["stratified_eval_test_split"])
+    stratified_scores = _score_classic_stratified_eval_test(
+        feature_bundle,
+        spec,
+        split_spec,
+        model,
+        feature_columns,
+    )
+    logistic_gate_result = _fit_promoted_logistic_gate(
+        stratified_scores.rows,
+        stratified_scores.choices,
+        stratified_scores.probabilities,
+        calibration_splits=(str(promoted_gate_config["test_split"]),),
+    )
+    logistic_gate_config = dict(logistic_gate_result["gate_config"])
+    booster_training_splits = [str(split) for split in promoted_gate_config["calibration_splits"]]
+    gate_calibration_splits = [str(promoted_gate_config["test_split"])]
+
     audit_metadata = dict(artifact_audit_metadata or {})
     audit_metadata["prod_training"] = {
-        "policy": "train_plus_calibration_eval_weighted",
+        "policy": "train_plus_calibration_weighted_test_calibrated_logistic_gate",
         "holdout_importance_weight": float(holdout_importance_weight),
         "retrieval_rank_limit": 25,
+        "booster_training_splits": booster_training_splits,
+        "gate_calibration_splits": gate_calibration_splits,
         "rows": int(len(prod_training_data.rows)),
         "positive_rows": int(train_labels.sum()),
         "sample_weight_sum": round(float(prod_training_data.sample_weight.sum()), 6),
@@ -3004,13 +3044,18 @@ def _train_and_save_prod_artifact(
         "train_holdout_filter_summary": prod_training_data.train_holdout_filter_summary,
         "train_filter_summary": prod_training_data.train_filter_summary,
         "params": dict(spec["best_params"]),
+        "logistic_gate": {
+            "calibration_metrics": dict(logistic_gate_result["calibration_metrics"]),
+            "split_metrics": dict(logistic_gate_result["split_metrics"]),
+            "training_summary": dict(logistic_gate_config.get("training_summary", {})),
+        },
     }
     artifact_metadata = save_incremental_linking_artifact(
         model,
         Path(save_artifact_to),
         feature_columns=feature_columns,
         retrieval_top_k=25,
-        gate_config=_artifact_gate_config_from_classic_summary(classic_summary),
+        gate_config=logistic_gate_config,
         prediction_fixture_matrix=train_matrix[:5],
         required_rust_capabilities=required_rust_capabilities,
         audit_metadata=audit_metadata,
@@ -3027,6 +3072,8 @@ def _train_and_save_prod_artifact(
             "positive_rows": int(train_labels.sum()),
             "sample_weight_sum": round(float(prod_training_data.sample_weight.sum()), 6),
             "holdout_importance_weight": float(holdout_importance_weight),
+            "booster_training_splits": booster_training_splits,
+            "gate_calibration_splits": gate_calibration_splits,
             "elapsed_seconds": round(train_seconds, 6),
             "sources": prod_training_data.source_summaries,
             "train_holdout_filter_summary": prod_training_data.train_holdout_filter_summary,

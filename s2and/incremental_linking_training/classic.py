@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,12 +15,27 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 
 from s2and.incremental_linking.artifact import save_incremental_linking_artifact
 from s2and.incremental_linking.contracts import INCREMENTAL_LINKING_RUST_CAPABILITIES
 from s2and.incremental_linking.features import PROMOTED_NON_PAIRWISE_FEATURE_COLUMNS
 from s2and.incremental_linking.gate_buckets import first_name_bucket_from_token_view, normalize_bucket_letters
 from s2and.incremental_linking.linker_pairwise import promoted_pairwise_aggregate_columns
+from s2and.incremental_linking.logistic_gate import (
+    LOGISTIC_GATE_ERROR_WEIGHTS,
+    LOGISTIC_GATE_FINAL_C,
+    LOGISTIC_GATE_SELECTION_C,
+    LOGISTIC_GATE_SELECTION_FEATURE_COUNT,
+    build_logistic_gate_matrix,
+    default_logistic_gate_feature_names,
+    feature_values_from_candidate_frame,
+    load_logistic_gate_config,
+    logistic_gate_config,
+    outcome_labels,
+)
 from s2and.incremental_linking_training.query_support import (
     FROZEN_BEST_RUST_HYBRID_CENTROID_POLICY,
     FROZEN_BEST_RUST_HYBRID_CENTROID_POLICY_NAME,
@@ -104,30 +120,33 @@ class OfficialBundle:
 
 
 @dataclass(frozen=True)
-class TotalErrorGateSpec:
-    """Bucketed score/margin gate selected by total query errors."""
+class ClassicStratifiedEvalScores:
+    """Loaded stratified eval rows, model probabilities, and scored choices."""
 
-    name: str
-    score_thresholds: dict[str, float]
-    margin_thresholds: dict[str, float]
+    rows: pd.DataFrame
+    probabilities: np.ndarray
+    choices: pd.DataFrame
+    assignments: pd.DataFrame
 
 
-_TOTAL_ERROR_SCORE_BUCKETS = (
+_GATE_BUCKETS = (
     "multi_candidate|multi_letter_first",
     "multi_candidate|single_letter_first",
     "single_candidate|multi_letter_first",
     "single_candidate|single_letter_first",
 )
-_TOTAL_ERROR_MARGIN_BUCKETS = (
-    "multi_candidate|multi_letter_first",
-    "multi_candidate|single_letter_first",
+_MISSING_LOGISTIC_CLASS_LOGIT = -30.0
+_PROMOTED_LOGISTIC_GATE_MODE = "promoted_logistic_topk_multiclass_l2"
+_UNSUPPORTED_STRATIFIED_THRESHOLD_GATE_KEYS = frozenset(
+    {
+        "fixed_grid_step",
+        "selection_metric",
+        "score_thresholds",
+        "margin_thresholds",
+        "bucketed_score_thresholds",
+        "bucketed_margin_thresholds",
+    }
 )
-_DEFAULT_PROMOTED_GATE_FIXED_GRID_STEP = 0.01
-_DEFAULT_PROMOTED_GATE_ERROR_WEIGHTS = {
-    "false_abstain": 0.25,
-    "false_link": 1.0,
-    "wrong_candidate_link": 1.5,
-}
 CALIBRATION_DATASET_SOURCE_KEY_BY_DATASET = {
     "a_khan": "a_khan_eval",
     "a_silva": "a_silva_eval",
@@ -684,16 +703,23 @@ def _classic_gate_first_name_bucket(row: pd.Series | dict[str, Any]) -> str:
 
 
 def _promoted_stratified_gate_spec(spec: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the configured promoted stratified gate calibration, if active."""
+    """Return configured stratified split names for logistic gate calibration."""
 
     configured = spec.get("promoted_stratified_gate")
     if configured is None:
         return None
     if not isinstance(configured, dict):
         raise ValueError("classic.promoted_stratified_gate must be a mapping when provided")
-    if str(configured.get("mode")) != "full_calibration_fixed_grid_4score_2margin":
-        raise ValueError("classic.promoted_stratified_gate.mode must be full_calibration_fixed_grid_4score_2margin")
     out = dict(configured)
+    mode = str(out.get("mode", _PROMOTED_LOGISTIC_GATE_MODE))
+    if mode != _PROMOTED_LOGISTIC_GATE_MODE:
+        raise ValueError(f"classic.promoted_stratified_gate.mode must be {_PROMOTED_LOGISTIC_GATE_MODE!r}")
+    unsupported_keys = sorted(_UNSUPPORTED_STRATIFIED_THRESHOLD_GATE_KEYS.intersection(out))
+    if unsupported_keys:
+        raise ValueError(
+            "classic.promoted_stratified_gate no longer supports threshold calibration keys: " f"{unsupported_keys}"
+        )
+    out["mode"] = _PROMOTED_LOGISTIC_GATE_MODE
     split_spec = spec.get("stratified_eval_test_split")
     split_spec = split_spec if isinstance(split_spec, dict) else {}
     calibration_splits = out.get("calibration_splits")
@@ -708,11 +734,6 @@ def _promoted_stratified_gate_spec(spec: dict[str, Any]) -> dict[str, Any] | Non
     if not out["calibration_splits"]:
         raise ValueError("classic.promoted_stratified_gate.calibration_splits must be non-empty")
     out["test_split"] = str(out.get("test_split", split_spec.get("test_split", "test")))
-    out["fixed_grid_step"] = float(out.get("fixed_grid_step", _DEFAULT_PROMOTED_GATE_FIXED_GRID_STEP))
-    out["selection_metric"] = str(out.get("selection_metric", "weighted_average_error"))
-    if out["selection_metric"] != "weighted_average_error":
-        raise ValueError("classic.promoted_stratified_gate.selection_metric must be weighted_average_error")
-    out["error_weights"] = dict(_DEFAULT_PROMOTED_GATE_ERROR_WEIGHTS)
     return out
 
 
@@ -722,7 +743,7 @@ def _weighted_error_metrics(
     false_abstain: int,
     false_link: int,
     wrong_candidate_link: int,
-    error_weights: Mapping[str, float] = _DEFAULT_PROMOTED_GATE_ERROR_WEIGHTS,
+    error_weights: Mapping[str, float] = LOGISTIC_GATE_ERROR_WEIGHTS,
 ) -> dict[str, Any]:
     false_abstain_error_rate = float(false_abstain) / float(n_queries) if n_queries else 0.0
     false_link_error_rate = float(false_link) / float(n_queries) if n_queries else 0.0
@@ -1017,8 +1038,38 @@ def _score_query_choices(
         keep_columns.append("base_group_id")
     if bucket_column:
         keep_columns.append(bucket_column)
+    output_columns = [
+        "query_case_id",
+        "dataset",
+        "query_view",
+        "query_safe_target",
+        "retrieved_window_safe_target",
+        "query_safe_target_source",
+        "chosen_candidate_target",
+        "chosen_probability",
+        "chosen_candidate_component_key",
+        "predicted_action",
+        "correct",
+        "first_name_bucket",
+    ]
+    if "supervision_type" in df.columns:
+        output_columns.append("supervision_type")
+    if "base_group_id" in df.columns:
+        output_columns.append("base_group_id")
+    if bucket_column:
+        output_columns.append("review_bucket")
+    if include_margin:
+        output_columns.extend(
+            [
+                "second_probability",
+                "score_margin",
+                "has_runner_up",
+                "candidate_kind",
+                "top1_correct",
+            ]
+        )
     scored = df[keep_columns].copy()
-    scored["candidate_probability"] = probabilities.astype(np.float32)
+    scored["candidate_probability"] = np.asarray(probabilities, dtype=np.float64)
     rows: list[dict[str, Any]] = []
     for query_id, group in scored.groupby(query_id_column, sort=False):
         ranked = group.sort_values(
@@ -1060,10 +1111,10 @@ def _score_query_choices(
             row["candidate_kind"] = "multi_candidate" if len(ranked) > 1 else "single_candidate"
             row["top1_correct"] = int(chosen["label"])
         rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=output_columns)
 
 
-def _total_error_gate_bucket(rows: pd.DataFrame) -> pd.Series:
+def _query_gate_bucket(rows: pd.DataFrame) -> pd.Series:
     """Return candidate-kind/first-name gate buckets for scored query choices."""
 
     if "candidate_kind" in rows.columns:
@@ -1105,8 +1156,8 @@ def _summarize_training_gate_buckets(train_df: pd.DataFrame) -> dict[str, dict[s
     query_counts = bucket_frame["bucket"].value_counts(sort=False).to_dict()
     training_row_counts = bucket_frame.groupby("bucket", sort=False)["row_count"].sum().to_dict()
     return {
-        "query_counts": {bucket: int(query_counts.get(bucket, 0)) for bucket in _TOTAL_ERROR_SCORE_BUCKETS},
-        "row_counts": {bucket: int(training_row_counts.get(bucket, 0)) for bucket in _TOTAL_ERROR_SCORE_BUCKETS},
+        "query_counts": {bucket: int(query_counts.get(bucket, 0)) for bucket in _GATE_BUCKETS},
+        "row_counts": {bucket: int(training_row_counts.get(bucket, 0)) for bucket in _GATE_BUCKETS},
     }
 
 
@@ -1114,326 +1165,248 @@ def _gate_bucket_split_counts(predictions: pd.DataFrame, split_order: Sequence[s
     """Count scored query choices by promoted gate bucket and split."""
 
     if predictions.empty:
-        return {bucket: {str(split): 0 for split in split_order} for bucket in _TOTAL_ERROR_SCORE_BUCKETS}
+        return {bucket: {str(split): 0 for split in split_order} for bucket in _GATE_BUCKETS}
     counts = predictions.groupby(["gate_bucket", "split"], dropna=False, sort=False).size()
     return {
         bucket: {str(split): int(counts.get((bucket, str(split)), 0)) for split in split_order}
-        for bucket in _TOTAL_ERROR_SCORE_BUCKETS
+        for bucket in _GATE_BUCKETS
     }
 
 
-def _fixed_probability_threshold_grid(step: float) -> np.ndarray:
-    """Return an inclusive fixed probability grid from 0.0 to 1.0."""
+def _fold_standard_scaler_into_logistic(
+    scaler: StandardScaler,
+    model: LogisticRegression,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return raw-space weights and bias for scaler -> logistic gate."""
 
-    step = float(step)
-    if not 0.0 < step <= 1.0:
-        raise ValueError("classic.promoted_stratified_gate.fixed_grid_step must be in (0, 1]")
-    interval_count = int(round(1.0 / step))
-    if not np.isclose(float(interval_count) * step, 1.0, rtol=0.0, atol=1e-9):
-        raise ValueError("classic.promoted_stratified_gate.fixed_grid_step must evenly divide 1.0")
-    return np.round(np.linspace(0.0, 1.0, interval_count + 1, dtype=np.float64), 6)
+    scale = np.asarray(scaler.scale_, dtype=np.float64)
+    mean = np.asarray(scaler.mean_, dtype=np.float64)
+    coef = np.asarray(model.coef_, dtype=np.float64)
+    intercept = np.asarray(model.intercept_, dtype=np.float64)
+    classes = tuple(int(value) for value in model.classes_)
+    if coef.shape[0] == 1 and len(classes) == 2:
+        binary_weights = coef[0] / scale
+        binary_bias = float(intercept[0] - mean @ binary_weights)
+        weights = np.zeros((len(scale), 3), dtype=np.float64)
+        # LogisticRegression omits absent classes; keep their softmax mass negligible.
+        bias = np.full(3, _MISSING_LOGISTIC_CLASS_LOGIT, dtype=np.float64)
+        # Binary sklearn stores positive-class log odds; softmax([0, z]) reproduces predict_proba.
+        negative_class, positive_class = classes
+        weights[:, negative_class] = 0.0
+        bias[negative_class] = 0.0
+        weights[:, positive_class] = binary_weights
+        bias[positive_class] = binary_bias
+        return weights, bias
+
+    raw_weights = (coef / scale[None, :]).T
+    raw_bias = intercept - mean @ raw_weights
+    weights = np.zeros((len(scale), 3), dtype=np.float64)
+    bias = np.full(3, _MISSING_LOGISTIC_CLASS_LOGIT, dtype=np.float64)
+    for source_index, class_value in enumerate(classes):
+        weights[:, class_value] = raw_weights[:, source_index]
+        bias[class_value] = raw_bias[source_index]
+    return weights, bias
 
 
-def _total_error_components(rows: pd.DataFrame, link: np.ndarray) -> dict[str, np.ndarray]:
-    """Count error components for one or more link/abstain decisions."""
-
-    query_target = rows["query_safe_target"].to_numpy(dtype=np.int8, copy=False)
-    chosen_target = rows["chosen_candidate_target"].to_numpy(dtype=np.int8, copy=False)
-    matrix = np.asarray(link, dtype=bool)
-    if matrix.ndim == 1:
-        matrix = matrix[:, None]
-    false_abstain = ((~matrix) & (query_target[:, None] == 1)).sum(axis=0).astype(np.int64)
-    false_link = (matrix & (query_target[:, None] == 0)).sum(axis=0).astype(np.int64)
-    wrong_candidate_link = (
-        (matrix & (query_target[:, None] == 1) & (chosen_target[:, None] == 0)).sum(axis=0).astype(np.int64)
-    )
-    return {
-        "false_abstain": false_abstain,
-        "false_link": false_link,
-        "wrong_candidate_link": wrong_candidate_link,
-        "errors": false_abstain + false_link + wrong_candidate_link,
-    }
-
-
-def _weighted_error_counts_from_components(
-    components: Mapping[str, np.ndarray],
+def _fit_multiclass_logistic_gate(
+    matrix: np.ndarray,
+    labels: np.ndarray,
     *,
-    error_weights: Mapping[str, float] = _DEFAULT_PROMOTED_GATE_ERROR_WEIGHTS,
-) -> np.ndarray:
-    """Return weighted error counts from vectorized error components."""
+    c_value: float,
+) -> tuple[LogisticRegression, StandardScaler, np.ndarray]:
+    """Fit the sklearn calibration model and return the filled raw matrix."""
 
-    return (
-        float(error_weights["false_abstain"]) * np.asarray(components["false_abstain"], dtype=np.float64)
-        + float(error_weights["false_link"]) * np.asarray(components["false_link"], dtype=np.float64)
-        + float(error_weights["wrong_candidate_link"])
-        * np.asarray(components["wrong_candidate_link"], dtype=np.float64)
-    )
-
-
-def _best_total_error_threshold_index(
-    components: Mapping[str, np.ndarray],
-    *,
-    score_thresholds: np.ndarray,
-    error_weights: Mapping[str, float],
-    margin_thresholds: np.ndarray | None = None,
-) -> int:
-    """Select the best fixed-grid threshold by weighted error with deterministic ties."""
-
-    weighted_errors = _weighted_error_counts_from_components(components, error_weights=error_weights)
-    tie_keys: list[np.ndarray] = [np.asarray(score_thresholds, dtype=np.float64)]
-    if margin_thresholds is not None:
-        tie_keys.append(np.asarray(margin_thresholds, dtype=np.float64))
-    ranking = np.lexsort(
-        tuple(
-            [
-                *tie_keys,
-                np.asarray(components["false_abstain"], dtype=np.int64),
-                np.asarray(components["false_link"], dtype=np.int64),
-                np.asarray(components["wrong_candidate_link"], dtype=np.int64),
-                weighted_errors,
-            ]
+    raw_matrix = np.asarray(matrix, dtype=np.float64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        medians = np.nanmedian(np.where(np.isfinite(raw_matrix), raw_matrix, np.nan), axis=0)
+    medians = np.where(np.isfinite(medians), medians, 0.0)
+    filled = raw_matrix.copy()
+    invalid = ~np.isfinite(filled)
+    if np.any(invalid):
+        row_indices, col_indices = np.nonzero(invalid)
+        filled[row_indices, col_indices] = medians[col_indices]
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(filled)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=ConvergenceWarning)
+        warnings.simplefilter("ignore", category=FutureWarning)
+        model = LogisticRegression(
+            C=float(c_value),
+            penalty="l2",
+            solver="lbfgs",
+            max_iter=4000,
+            random_state=20260517,
         )
-    )
-    return int(ranking[0])
+        model.fit(scaled, labels)
+    return model, scaler, medians
 
 
-def _total_error_fit_metrics(
-    rows: pd.DataFrame,
-    components: Mapping[str, np.ndarray],
-    best_index: int,
-    *,
-    error_weights: Mapping[str, float],
-) -> dict[str, Any]:
-    """Return scalar fit metrics for the selected threshold candidate."""
+def _apply_logistic_gate_predictions(choices: pd.DataFrame, link: np.ndarray) -> pd.DataFrame:
+    """Apply query-level logistic gate decisions to scored query choices."""
 
-    false_abstain = int(np.asarray(components["false_abstain"])[best_index])
-    false_link = int(np.asarray(components["false_link"])[best_index])
-    wrong_candidate_link = int(np.asarray(components["wrong_candidate_link"])[best_index])
-    weighted_error_count = float(
-        _weighted_error_counts_from_components(components, error_weights=error_weights)[best_index]
-    )
-    return {
-        "n_queries": int(len(rows)),
-        "errors": int(np.asarray(components["errors"])[best_index]),
-        "false_abstain": false_abstain,
-        "false_link": false_link,
-        "wrong_candidate_link": wrong_candidate_link,
-        "weighted_error_count": weighted_error_count,
-        **_weighted_error_metrics(
-            n_queries=int(len(rows)),
-            false_abstain=false_abstain,
-            false_link=false_link,
-            wrong_candidate_link=wrong_candidate_link,
-            error_weights=error_weights,
-        ),
-    }
-
-
-def _fit_total_error_single_score(
-    rows: pd.DataFrame,
-    *,
-    threshold_grid: np.ndarray,
-    error_weights: Mapping[str, float],
-) -> tuple[float, dict[str, Any]]:
-    """Fit a score-only threshold on a fixed probability grid."""
-
-    if rows.empty:
-        return float(threshold_grid[-1]), {
-            "n_queries": 0,
-            "errors": 0,
-            "false_abstain": 0,
-            "false_link": 0,
-            "wrong_candidate_link": 0,
-            "weighted_error_count": 0.0,
-            **_weighted_error_metrics(
-                n_queries=0,
-                false_abstain=0,
-                false_link=0,
-                wrong_candidate_link=0,
-                error_weights=error_weights,
-            ),
-        }
-    score = pd.to_numeric(rows["chosen_probability"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
-    links = score[:, None] >= threshold_grid[None, :]
-    components = _total_error_components(rows, links)
-    best_index = _best_total_error_threshold_index(
-        components,
-        score_thresholds=threshold_grid,
-        error_weights=error_weights,
-    )
-    return float(threshold_grid[best_index]), _total_error_fit_metrics(
-        rows,
-        components,
-        best_index,
-        error_weights=error_weights,
-    )
-
-
-def _fit_total_error_score_margin(
-    rows: pd.DataFrame,
-    *,
-    threshold_grid: np.ndarray,
-    error_weights: Mapping[str, float],
-) -> tuple[float, float, dict[str, Any]]:
-    """Fit a score-or-margin threshold pair on a fixed probability grid."""
-
-    if rows.empty:
-        empty_metrics = {
-            "n_queries": 0,
-            "errors": 0,
-            "false_abstain": 0,
-            "false_link": 0,
-            "wrong_candidate_link": 0,
-            "weighted_error_count": 0.0,
-            **_weighted_error_metrics(
-                n_queries=0,
-                false_abstain=0,
-                false_link=0,
-                wrong_candidate_link=0,
-                error_weights=error_weights,
-            ),
-        }
-        return float(threshold_grid[-1]), float(threshold_grid[-1]), empty_metrics
-    score = pd.to_numeric(rows["chosen_probability"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
-    margin = pd.to_numeric(rows["score_margin"], errors="coerce").fillna(-np.inf).to_numpy(dtype=np.float64)
-    best_key: tuple[float, int, int, int, float, float] | None = None
-    best_score_threshold = float(threshold_grid[-1])
-    best_margin_threshold = float(threshold_grid[-1])
-    best_metrics: dict[str, Any] | None = None
-    for score_threshold in threshold_grid:
-        links = (score[:, None] >= float(score_threshold)) | (margin[:, None] >= threshold_grid[None, :])
-        components = _total_error_components(rows, links)
-        score_thresholds = np.repeat(float(score_threshold), len(threshold_grid))
-        best_index = _best_total_error_threshold_index(
-            components,
-            score_thresholds=score_thresholds,
-            margin_thresholds=threshold_grid,
-            error_weights=error_weights,
+    pred = choices.copy()
+    if len(pred) != len(link):
+        raise ValueError(f"logistic gate link count must match choices: {len(link)} != {len(pred)}")
+    pred["predicted_action"] = np.where(np.asarray(link, dtype=bool), "link_candidate", "abstain")
+    pred["correct"] = (
+        ((pred["predicted_action"] == "abstain") & (pred["query_safe_target"] == 0))
+        | (
+            (pred["predicted_action"] == "link_candidate")
+            & (pred["query_safe_target"] == 1)
+            & (pred["chosen_candidate_target"] == 1)
         )
-        metrics = _total_error_fit_metrics(rows, components, best_index, error_weights=error_weights)
-        key = (
-            float(metrics["weighted_error_count"]),
-            int(metrics["wrong_candidate_link"]),
-            int(metrics["false_link"]),
-            int(metrics["false_abstain"]),
-            float(score_threshold),
-            float(threshold_grid[best_index]),
-        )
-        if best_key is None or key < best_key:
-            best_key = key
-            best_score_threshold = float(score_threshold)
-            best_margin_threshold = float(threshold_grid[best_index])
-            best_metrics = metrics
-    if best_metrics is None:
-        raise ValueError("Unable to fit promoted score/margin gate on non-empty calibration rows")
-    return best_score_threshold, best_margin_threshold, best_metrics
+    ).astype(int)
+    return pred
 
 
-def _fit_total_error_gate(
-    calibration_rows: pd.DataFrame,
-    *,
-    fixed_grid_step: float,
-    error_weights: Mapping[str, float],
-) -> dict[str, Any]:
-    """Fit the promoted 4-score/2-margin gate on all calibration rows."""
-
-    threshold_grid = _fixed_probability_threshold_grid(fixed_grid_step)
-    labels = _total_error_gate_bucket(calibration_rows)
-    score_thresholds: dict[str, float] = {}
-    margin_thresholds: dict[str, float] = {}
-    bucket_metrics: dict[str, dict[str, Any]] = {}
-    for bucket in _TOTAL_ERROR_SCORE_BUCKETS:
-        rows = calibration_rows[labels == bucket].copy()
-        if bucket in _TOTAL_ERROR_MARGIN_BUCKETS:
-            score_threshold, margin_threshold, metrics = _fit_total_error_score_margin(
-                rows,
-                threshold_grid=threshold_grid,
-                error_weights=error_weights,
-            )
-            score_thresholds[bucket] = score_threshold
-            margin_thresholds[bucket] = margin_threshold
-        else:
-            score_threshold, metrics = _fit_total_error_single_score(
-                rows,
-                threshold_grid=threshold_grid,
-                error_weights=error_weights,
-            )
-            score_thresholds[bucket] = score_threshold
-        bucket_metrics[bucket] = {
-            "score_threshold": float(score_thresholds[bucket]),
-            "margin_threshold": float(margin_thresholds[bucket]) if bucket in margin_thresholds else None,
-            **metrics,
-        }
-    return {
-        "gate": TotalErrorGateSpec(
-            name=f"full_calibration_fixed_grid_{float(fixed_grid_step):g}",
-            score_thresholds=score_thresholds,
-            margin_thresholds=margin_thresholds,
-        ),
-        "bucket_metrics": bucket_metrics,
-        "threshold_grid_points": int(len(threshold_grid)),
-    }
-
-
-def _apply_total_error_gate(rows: pd.DataFrame, gate: TotalErrorGateSpec) -> pd.DataFrame:
-    """Apply a total-error 4-score/2-margin gate to scored query choices."""
-
-    predictions = _apply_classic_gate(
-        rows,
-        score_threshold=float(gate.score_thresholds["multi_candidate|multi_letter_first"]),
-        margin_threshold=float(gate.margin_thresholds["multi_candidate|multi_letter_first"]),
-        single_candidate_score_threshold=float(gate.score_thresholds["single_candidate|single_letter_first"]),
-        bucketed_score_thresholds=gate.score_thresholds,
-        bucketed_margin_thresholds=gate.margin_thresholds,
-    )
-    predictions["gate_bucket"] = _total_error_gate_bucket(predictions)
-    return predictions
-
-
-def _fit_promoted_stratified_total_error_gate(
+def _fit_promoted_logistic_gate(
+    candidate_rows: pd.DataFrame,
     choices: pd.DataFrame,
-    gate_config: dict[str, Any],
+    probabilities: np.ndarray,
+    *,
+    calibration_splits: Sequence[str],
+    selection_feature_count: int = LOGISTIC_GATE_SELECTION_FEATURE_COUNT,
+    selection_c: float = LOGISTIC_GATE_SELECTION_C,
+    final_c: float = LOGISTIC_GATE_FINAL_C,
 ) -> dict[str, Any]:
-    """Fit the promoted bucketed gate on all configured calibration splits."""
+    """Fit the prod-safe NumPy logistic gate on configured calibration splits."""
 
-    calibration_splits = tuple(str(split) for split in gate_config["calibration_splits"])
-    calibration_rows = choices[choices["split"].astype(str).isin(calibration_splits)].copy()
-    if calibration_rows.empty:
-        raise ValueError(
-            "Promoted stratified gate requires non-empty calibration splits: " f"splits={list(calibration_splits)}"
-        )
-    error_weights = dict(gate_config.get("error_weights", _DEFAULT_PROMOTED_GATE_ERROR_WEIGHTS))
-    fit_result = _fit_total_error_gate(
-        calibration_rows,
-        fixed_grid_step=float(gate_config["fixed_grid_step"]),
-        error_weights=error_weights,
+    all_feature_names = default_logistic_gate_feature_names()
+    full_matrix, query_rows = build_logistic_gate_matrix(
+        all_feature_names,
+        query_indices=candidate_rows["query_group_id"].astype(str).to_numpy(),
+        probabilities=probabilities,
+        feature_values=feature_values_from_candidate_frame(candidate_rows),
+        retrieval_ranks=candidate_rows["retrieval_rank"].to_numpy() if "retrieval_rank" in candidate_rows else None,
+        component_keys=(
+            candidate_rows["candidate_component_key"].astype(str).to_numpy()
+            if "candidate_component_key" in candidate_rows
+            else None
+        ),
     )
-    selected_gate = fit_result["gate"]
-    calibration_predictions = _apply_total_error_gate(calibration_rows, selected_gate)
-    calibration_metrics = _summarize_predictions(calibration_predictions)
-    split_series = choices["split"].astype(str)
-    split_metrics = {
-        split: _summarize_predictions(_apply_total_error_gate(choices[split_series == split].copy(), selected_gate))
-        for split in calibration_splits
+    if len(full_matrix) != len(choices):
+        raise ValueError(f"logistic gate query matrix mismatch: {len(full_matrix)} != {len(choices)}")
+    matrix_query_ids = candidate_rows["query_group_id"].astype(str).to_numpy()[query_rows.best_rows]
+    choice_query_ids = choices["query_case_id"].astype(str).to_numpy()
+    if not np.array_equal(matrix_query_ids, choice_query_ids):
+        mismatch_positions = np.flatnonzero(matrix_query_ids != choice_query_ids)[:5]
+        sample = [
+            {
+                "position": int(position),
+                "matrix_query_id": str(matrix_query_ids[position]),
+                "choice_query_id": str(choice_query_ids[position]),
+            }
+            for position in mismatch_positions
+        ]
+        raise ValueError(f"logistic gate query order mismatch between candidate rows and choices: sample={sample}")
+    split_values = choices["split"].astype(str)
+    calibration_mask = split_values.isin(tuple(str(split) for split in calibration_splits)).to_numpy(dtype=bool)
+    if not np.any(calibration_mask):
+        raise ValueError(f"logistic gate requires non-empty calibration splits: {list(calibration_splits)}")
+    labels = outcome_labels(choices["query_safe_target"], choices["chosen_candidate_target"])
+
+    selection_model, _selection_scaler, _selection_medians = _fit_multiclass_logistic_gate(
+        full_matrix[calibration_mask],
+        labels[calibration_mask],
+        c_value=float(selection_c),
+    )
+    selection_coef = np.asarray(selection_model.coef_, dtype=np.float64)
+    importance = np.max(np.abs(selection_coef), axis=0)
+    ranked_indices = np.lexsort((np.asarray(all_feature_names, dtype=object), -importance))
+    selected_indices = ranked_indices[: int(selection_feature_count)]
+    selected_feature_names = tuple(all_feature_names[int(index)] for index in selected_indices)
+    selected_matrix = full_matrix[:, selected_indices]
+
+    final_model, final_scaler, final_medians = _fit_multiclass_logistic_gate(
+        selected_matrix[calibration_mask],
+        labels[calibration_mask],
+        c_value=float(final_c),
+    )
+    weights, bias = _fold_standard_scaler_into_logistic(final_scaler, final_model)
+    gate_config = logistic_gate_config(
+        feature_names=selected_feature_names,
+        weights=weights,
+        bias=bias,
+        missing_values=final_medians,
+        calibration_mode=_PROMOTED_LOGISTIC_GATE_MODE,
+        error_weights=LOGISTIC_GATE_ERROR_WEIGHTS,
+        training_summary={
+            "calibration_splits": [str(split) for split in calibration_splits],
+            "selection_feature_count": int(selection_feature_count),
+            "selection_c": float(selection_c),
+            "final_c": float(final_c),
+            "all_feature_count": int(len(all_feature_names)),
+            "selected_feature_count": int(len(selected_feature_names)),
+            "calibration_queries": int(calibration_mask.sum()),
+        },
+    )
+    gate = load_logistic_gate_config(gate_config)
+    calibration_predictions = _apply_logistic_gate_predictions(
+        choices[calibration_mask].copy(),
+        gate.predict_link(selected_matrix[calibration_mask]),
+    )
+    split_predictions = {
+        str(split): _apply_logistic_gate_predictions(
+            choices[split_values.eq(str(split)).to_numpy(dtype=bool)].copy(),
+            gate.predict_link(selected_matrix[split_values.eq(str(split)).to_numpy(dtype=bool)]),
+        )
+        for split in tuple(dict.fromkeys(split_values.tolist()))
     }
     return {
-        "gate": selected_gate,
-        "calibration_metrics": calibration_metrics,
-        "calibration_split_metrics": split_metrics,
-        "bucket_metrics": dict(fit_result["bucket_metrics"]),
-        "threshold_grid_points": int(fit_result["threshold_grid_points"]),
-        "selection_key": {
-            "calibration_weighted_average_error": float(calibration_metrics["weighted_average_error"]),
-            "calibration_false_abstain_error_rate": float(calibration_metrics["false_abstain_error_rate"]),
-            "calibration_false_link_error_rate": float(calibration_metrics["false_link_error_rate"]),
-            "calibration_wrong_link_error_rate": float(calibration_metrics["wrong_link_error_rate"]),
-            "error_weights": error_weights,
-            "calibration_errors": int(calibration_metrics["errors"]),
-            "calibration_wrong_candidate_link": int(calibration_metrics["wrong_candidate_link"]),
-            "calibration_false_link": int(calibration_metrics["false_link"]),
-            "calibration_false_abstain": int(calibration_metrics["false_abstain"]),
+        "gate_config": gate_config,
+        "selected_feature_importance": [
+            {
+                "feature": str(all_feature_names[int(index)]),
+                "importance": float(importance[int(index)]),
+            }
+            for index in selected_indices
+        ],
+        "calibration_metrics": _summarize_predictions(calibration_predictions),
+        "split_metrics": {
+            split: _summarize_predictions(predictions) for split, predictions in split_predictions.items()
         },
+        "predictions": _apply_logistic_gate_predictions(choices.copy(), gate.predict_link(selected_matrix)),
     }
+
+
+def _apply_promoted_logistic_gate_to_candidate_rows(
+    candidate_rows: pd.DataFrame,
+    choices: pd.DataFrame,
+    probabilities: np.ndarray,
+    gate_config: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Apply a fitted logistic gate to raw candidate rows and scored choices."""
+
+    gate = load_logistic_gate_config(gate_config)
+    matrix, query_rows = build_logistic_gate_matrix(
+        gate.feature_names,
+        query_indices=candidate_rows["query_group_id"].astype(str).to_numpy(),
+        probabilities=probabilities,
+        feature_values=feature_values_from_candidate_frame(candidate_rows),
+        retrieval_ranks=candidate_rows["retrieval_rank"].to_numpy() if "retrieval_rank" in candidate_rows else None,
+        component_keys=(
+            candidate_rows["candidate_component_key"].astype(str).to_numpy()
+            if "candidate_component_key" in candidate_rows
+            else None
+        ),
+    )
+    if len(matrix) != len(choices):
+        raise ValueError(f"logistic gate query matrix mismatch: {len(matrix)} != {len(choices)}")
+    matrix_query_ids = candidate_rows["query_group_id"].astype(str).to_numpy()[query_rows.best_rows]
+    choice_query_ids = choices["query_case_id"].astype(str).to_numpy()
+    if not np.array_equal(matrix_query_ids, choice_query_ids):
+        mismatch_positions = np.flatnonzero(matrix_query_ids != choice_query_ids)[:5]
+        sample = [
+            {
+                "position": int(position),
+                "matrix_query_id": str(matrix_query_ids[position]),
+                "choice_query_id": str(choice_query_ids[position]),
+            }
+            for position in mismatch_positions
+        ]
+        raise ValueError(f"logistic gate query order mismatch between candidate rows and choices: sample={sample}")
+    return _apply_logistic_gate_predictions(choices, gate.predict_link(matrix))
 
 
 def _apply_clean_hwang_overrides(predictions: pd.DataFrame, override_df: pd.DataFrame) -> pd.DataFrame:
@@ -1460,192 +1433,63 @@ def _apply_clean_hwang_overrides(predictions: pd.DataFrame, override_df: pd.Data
     return merged
 
 
-def _score_abstain_rule(
-    rows: pd.DataFrame,
-    score_threshold: float,
-    margin_threshold: float,
+def _evaluate_logistic_scored_windows(
+    candidate_rows: pd.DataFrame,
+    probabilities: np.ndarray,
+    gate_config: Mapping[str, Any],
     *,
-    single_candidate_score_threshold: float | None = None,
-    bucketed_score_thresholds: dict[str, float] | None = None,
-    bucketed_margin_threshold: float | None = None,
-    bucketed_margin_thresholds: dict[str, float] | None = None,
-) -> dict[str, Any]:
-    scored_rows = _apply_classic_gate(
-        rows,
-        score_threshold=float(score_threshold),
-        margin_threshold=float(margin_threshold),
-        single_candidate_score_threshold=single_candidate_score_threshold,
-        bucketed_score_thresholds=bucketed_score_thresholds,
-        bucketed_margin_threshold=bucketed_margin_threshold,
-        bucketed_margin_thresholds=bucketed_margin_thresholds,
-    )
-    scored_rows["accepted"] = scored_rows["predicted_action"] == "link_candidate"
-    positives = scored_rows[scored_rows["query_safe_target"] == 1]
-    negatives = scored_rows[scored_rows["query_safe_target"] == 0]
-    positive_correct = int(
-        (
-            (scored_rows["accepted"])
-            & (scored_rows["chosen_candidate_target"] == 1)
-            & (scored_rows["query_safe_target"] == 1)
-        ).sum()
-    )
-    positive_accuracy = float(positive_correct / len(positives)) if len(positives) else None
-    negative_reject = int((~scored_rows["accepted"] & (scored_rows["query_safe_target"] == 0)).sum())
-    negative_reject_accuracy = float(negative_reject / len(negatives)) if len(negatives) else None
-    balanced_accuracy = (
-        float(positive_accuracy if positive_accuracy is not None else 0.0)
-        + float(negative_reject_accuracy if negative_reject_accuracy is not None else 0.0)
-    ) / 2.0
-    return {
-        "score_threshold": float(score_threshold),
-        "margin_threshold": float(margin_threshold),
-        "single_candidate_score_threshold": (
-            float(single_candidate_score_threshold) if single_candidate_score_threshold is not None else None
-        ),
-        "queries": int(len(rows)),
-        "eligible_queries": int(len(scored_rows)),
-        "runner_up_queries": int(
-            (
-                (pd.to_numeric(scored_rows["has_runner_up"], errors="coerce").fillna(0).astype(int) == 1)
-                & scored_rows["score_margin"].notna()
-            ).sum()
-        ),
-        "single_candidate_queries": int(
-            (
-                (pd.to_numeric(scored_rows["has_runner_up"], errors="coerce").fillna(0).astype(int) == 0)
-                | scored_rows["score_margin"].isna()
-            ).sum()
-        ),
-        "positive_queries": int(len(positives)),
-        "negative_queries": int(len(negatives)),
-        "balanced_accuracy": float(balanced_accuracy),
-        "positive_accuracy": positive_accuracy,
-        "negative_reject_accuracy": negative_reject_accuracy,
-        "positive_accept_rate": (
-            float(scored_rows.loc[scored_rows["query_safe_target"] == 1, "accepted"].mean()) if len(positives) else None
-        ),
-        "rejection_rate": float((~scored_rows["accepted"]).mean()) if len(scored_rows) else 0.0,
-        "false_positive_links": int(
-            (
-                scored_rows["accepted"]
-                & ~((scored_rows["query_safe_target"] == 1) & (scored_rows["chosen_candidate_target"] == 1))
-            ).sum()
-        ),
-    }
+    override_df: pd.DataFrame | None = None,
+    limits: tuple[int, ...] = (5, 25),
+) -> dict[str, dict[str, Any]]:
+    """Score and summarize retrieval windows with the fitted logistic gate."""
+
+    results: dict[str, dict[str, Any]] = {}
+    if len(probabilities) != len(candidate_rows):
+        raise ValueError(f"probabilities length must match rows: {len(probabilities)} != {len(candidate_rows)}")
+    for limit in sorted(set(int(limit) for limit in limits)):
+        mask = (candidate_rows["retrieval_rank"] <= limit).to_numpy(dtype=bool)
+        limited = candidate_rows.loc[mask].copy()
+        limited_probabilities = probabilities[np.flatnonzero(mask)]
+        choices = _score_query_choices(
+            limited.rename(columns={"query_group_id": "query_case_id"}),
+            limited_probabilities,
+            query_id_column="query_case_id",
+            include_margin=True,
+        )
+        predictions = _apply_promoted_logistic_gate_to_candidate_rows(
+            limited,
+            choices,
+            limited_probabilities,
+            gate_config,
+        )
+        if override_df is not None:
+            predictions = _apply_clean_hwang_overrides(predictions, override_df)
+        results[str(limit)] = {"overall": _summarize_predictions(predictions)}
+    return results
 
 
-def _apply_classic_gate(
-    query_choices: pd.DataFrame,
-    score_threshold: float,
-    margin_threshold: float,
-    *,
-    single_candidate_score_threshold: float | None = None,
-    bucketed_score_thresholds: dict[str, float] | None = None,
-    bucketed_margin_threshold: float | None = None,
-    bucketed_margin_thresholds: dict[str, float] | None = None,
-) -> pd.DataFrame:
-    pred = query_choices.copy()
-    score_margin = pd.to_numeric(pred["score_margin"], errors="coerce")
-    if "has_runner_up" in pred.columns:
-        no_runner_up = pd.to_numeric(pred["has_runner_up"], errors="coerce").fillna(0).astype(int) == 0
-    else:
-        no_runner_up = pd.Series(False, index=pred.index)
-    single_candidate = no_runner_up | score_margin.isna()
-    if bucketed_score_thresholds is not None:
-        normalized_thresholds = {str(key): float(value) for key, value in bucketed_score_thresholds.items()}
-        if "first_name_bucket" in pred.columns:
-            first_name_bucket = pred["first_name_bucket"].astype(str)
-        else:
-            first_name_bucket = pred.apply(_classic_gate_first_name_bucket, axis=1)
-        candidate_kind = pd.Series(
-            np.where(single_candidate, "single_candidate", "multi_candidate"),
-            index=pred.index,
-        )
-        bucket_keys = candidate_kind + "|" + first_name_bucket
-        single_threshold = (
-            float(single_candidate_score_threshold)
-            if single_candidate_score_threshold is not None
-            else float(score_threshold)
-        )
-        fallback_thresholds = pd.Series(
-            np.where(
-                single_candidate,
-                single_threshold,
-                float(score_threshold),
-            ),
-            index=pred.index,
-        )
-        threshold_values = bucket_keys.map(normalized_thresholds).fillna(fallback_thresholds).astype(float)
-        score_link = pd.to_numeric(pred["chosen_probability"], errors="coerce") >= threshold_values
-        if bucketed_margin_thresholds is not None:
-            normalized_margin_thresholds = {str(key): float(value) for key, value in bucketed_margin_thresholds.items()}
-            margin_threshold_values = bucket_keys.map(normalized_margin_thresholds)
-            margin_link = (
-                (~single_candidate)
-                & score_margin.notna()
-                & margin_threshold_values.notna()
-                & (score_margin >= margin_threshold_values.astype(float))
-            )
-        elif bucketed_margin_threshold is None:
-            margin_link = pd.Series(False, index=pred.index)
-        else:
-            margin_link = (
-                (~single_candidate) & score_margin.notna() & (score_margin >= float(bucketed_margin_threshold))
-            )
-        abstain = ~(score_link | margin_link)
-    else:
-        runner_up_abstain = (
-            ~single_candidate
-            & (pred["chosen_probability"] < float(score_threshold))
-            & (score_margin < float(margin_threshold))
-        )
-        single_candidate_threshold = (
-            float(score_threshold)
-            if single_candidate_score_threshold is None
-            else float(single_candidate_score_threshold)
-        )
-        single_candidate_abstain = single_candidate & (pred["chosen_probability"] < single_candidate_threshold)
-        abstain = runner_up_abstain | single_candidate_abstain
-    pred["predicted_action"] = np.where(abstain, "abstain", "link_candidate")
-    pred["correct"] = (
-        ((pred["predicted_action"] == "abstain") & (pred["query_safe_target"] == 0))
-        | (
-            (pred["predicted_action"] == "link_candidate")
-            & (pred["query_safe_target"] == 1)
-            & (pred["chosen_candidate_target"] == 1)
-        )
-    ).astype(int)
-    return pred
-
-
-def _evaluate_classic_manual_holdout(
+def _evaluate_logistic_manual_holdout(
     manual_holdout: pd.DataFrame,
     probabilities: np.ndarray,
-    *,
-    score_threshold: float,
-    margin_threshold: float,
-    single_candidate_score_threshold: float | None = None,
-    bucketed_score_thresholds: dict[str, float] | None = None,
-    bucketed_margin_threshold: float | None = None,
-    bucketed_margin_thresholds: dict[str, float] | None = None,
+    gate_config: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Score and summarize the manual holdout for the freshly fit classic model."""
+    """Score and summarize manual holdout candidates with the logistic gate."""
 
-    query_choices = _score_query_choices(
-        manual_holdout.rename(columns={"binary_safe_link_target": "label"}),
+    candidate_rows = manual_holdout.rename(columns={"binary_safe_link_target": "label"}).copy()
+    if "query_group_id" not in candidate_rows and "query_case_id" in candidate_rows:
+        candidate_rows["query_group_id"] = candidate_rows["query_case_id"].astype(str)
+    choices = _score_query_choices(
+        candidate_rows,
         probabilities,
         query_id_column="query_case_id",
         include_margin=True,
         bucket_column="review_bucket",
     )
-    predictions = _apply_classic_gate(
-        query_choices,
-        score_threshold=float(score_threshold),
-        margin_threshold=float(margin_threshold),
-        single_candidate_score_threshold=single_candidate_score_threshold,
-        bucketed_score_thresholds=bucketed_score_thresholds,
-        bucketed_margin_threshold=bucketed_margin_threshold,
-        bucketed_margin_thresholds=bucketed_margin_thresholds,
+    predictions = _apply_promoted_logistic_gate_to_candidate_rows(
+        candidate_rows,
+        choices,
+        probabilities,
+        gate_config,
     )
     return {
         "overall": _summarize_predictions(predictions),
@@ -1654,35 +1498,6 @@ def _evaluate_classic_manual_holdout(
             for bucket, group in predictions.groupby("review_bucket", sort=False)
         },
     }
-
-
-def _evaluate_scored_windows(
-    query_choices: pd.DataFrame,
-    *,
-    score_threshold: float,
-    margin_threshold: float,
-    single_candidate_score_threshold: float | None = None,
-    override_df: pd.DataFrame | None = None,
-    bucketed_score_thresholds: dict[str, float] | None = None,
-    bucketed_margin_threshold: float | None = None,
-    bucketed_margin_thresholds: dict[str, float] | None = None,
-) -> dict[str, dict[str, Any]]:
-    results: dict[str, dict[str, Any]] = {}
-    for limit in sorted(query_choices["retrieval_rank_limit"].dropna().astype(int).unique()):
-        limited = query_choices[query_choices["retrieval_rank_limit"] == limit].copy()
-        predictions = _apply_classic_gate(
-            limited,
-            float(score_threshold),
-            float(margin_threshold),
-            single_candidate_score_threshold=single_candidate_score_threshold,
-            bucketed_score_thresholds=bucketed_score_thresholds,
-            bucketed_margin_threshold=bucketed_margin_threshold,
-            bucketed_margin_thresholds=bucketed_margin_thresholds,
-        )
-        if override_df is not None:
-            predictions = _apply_clean_hwang_overrides(predictions, override_df)
-        results[str(limit)] = {"overall": _summarize_predictions(predictions)}
-    return results
 
 
 def _classic_stratified_eval_source_specs(spec: dict[str, Any]) -> tuple[dict[str, str], ...]:
@@ -1915,6 +1730,14 @@ def _load_classic_stratified_eval_rows(
             f"matched={len(matched_assignments)}, expected={len(assignments)}"
         )
     _validate_unique_stratified_candidate_rows(rows)
+    source_keys_per_query = rows.groupby("query_group_id")["source_key"].nunique()
+    cross_source_queries = source_keys_per_query[source_keys_per_query > 1]
+    if not cross_source_queries.empty:
+        raise ValueError(
+            "Stratified eval rows contain query_group_id values present under multiple source_keys; "
+            "downstream scoring groups by query_group_id only and would silently collapse them: "
+            f"count={len(cross_source_queries)}, sample={cross_source_queries.head(5).to_dict()}"
+        )
     rows, assignments = _refresh_stratified_metadata_from_active_labels(rows, assignments)
     return rows, assignments
 
@@ -1928,14 +1751,14 @@ def _breakdown_predictions(predictions: pd.DataFrame, column: str) -> dict[str, 
     }
 
 
-def _score_classic_stratified_eval_test_choices(
+def _score_classic_stratified_eval_test(
     bundle: OfficialBundle,
     spec: dict[str, Any],
     split_spec: dict[str, Any],
     model: LGBMClassifier,
     feature_columns: tuple[str, ...],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Score query choices for the promoted stratified calibration/test split."""
+) -> ClassicStratifiedEvalScores:
+    """Load and score the promoted stratified calibration/test split once."""
 
     split_rows, assignments = _load_classic_stratified_eval_rows(bundle, spec, split_spec)
     probabilities = model.predict_proba(_classic_feature_matrix(split_rows, feature_columns))[:, 1]
@@ -1974,7 +1797,12 @@ def _score_classic_stratified_eval_test_choices(
         choices["manual_safe_target_matches_active_label"] = manual_target.isna() | manual_target.astype("Int64").eq(
             choices["query_safe_target"].astype("Int64")
         )
-    return choices, assignments
+    return ClassicStratifiedEvalScores(
+        rows=split_rows,
+        probabilities=probabilities,
+        choices=choices,
+        assignments=assignments,
+    )
 
 
 def _summarize_classic_stratified_predictions(
@@ -1985,9 +1813,7 @@ def _summarize_classic_stratified_predictions(
     """Build promoted stratified split summary and test breakdowns from predictions."""
 
     predictions = predictions.copy()
-    predictions["gate_bucket"] = (
-        _total_error_gate_bucket(predictions) if not predictions.empty else pd.Series(dtype="string")
-    )
+    predictions["gate_bucket"] = _query_gate_bucket(predictions) if not predictions.empty else pd.Series(dtype="string")
     split_order = tuple(
         str(value)
         for value in split_spec.get(
@@ -2051,23 +1877,6 @@ def _metric_count_cell(metrics: dict[str, Any], key: str) -> str:
     return str(int(value))
 
 
-def _optional_metric_float_cell(value: Any) -> str:
-    """Return a formatted float cell, preserving missing values as n/a."""
-
-    if value is None:
-        return "n/a"
-    return _format_metric_float(value)
-
-
-def _count_from_mapping(values: Mapping[str, Any], key: str) -> int:
-    """Return an integer count from a JSON-style mapping."""
-
-    value = values.get(key, 0)
-    if value is None:
-        return 0
-    return int(value)
-
-
 def _metric_breakdown_row(label: str, metrics: dict[str, Any]) -> list[str]:
     """Return one selected-gate breakdown table row."""
 
@@ -2114,91 +1923,6 @@ def _markdown_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     return lines
 
 
-def _classic_gate_bucket_table_rows(summary: dict[str, Any], breakdowns: dict[str, Any]) -> list[list[str]]:
-    """Return selected-gate calibration bucket rows for the promoted bucketed gate."""
-
-    abstain_rule = summary.get("abstain_rule")
-    split_summary = summary.get("stratified_eval_test_split")
-    if not isinstance(abstain_rule, dict) or not isinstance(split_summary, dict):
-        return []
-    score_thresholds = abstain_rule.get("bucketed_score_thresholds")
-    if not isinstance(score_thresholds, dict):
-        return []
-    margin_thresholds = abstain_rule.get("bucketed_margin_thresholds")
-    if not isinstance(margin_thresholds, dict):
-        margin_thresholds = {}
-
-    promoted_gate = abstain_rule.get("promoted_stratified_gate")
-    if isinstance(promoted_gate, dict):
-        calibration_splits_value = promoted_gate.get("calibration_splits", ["calibration_fit", "calibration_check"])
-        if isinstance(calibration_splits_value, str) or not isinstance(calibration_splits_value, Sequence):
-            calibration_splits = ["calibration_fit", "calibration_check"]
-        else:
-            calibration_splits = [str(split) for split in calibration_splits_value]
-        fit_split = calibration_splits[0] if calibration_splits else "calibration_fit"
-        check_split = calibration_splits[1] if len(calibration_splits) > 1 else ""
-        test_split = str(promoted_gate.get("test_split", "test"))
-    else:
-        fit_split = "calibration_fit"
-        check_split = "calibration_check"
-        test_split = "test"
-
-    training_summary = summary.get("training_summary")
-    if not isinstance(training_summary, dict):
-        training_summary = {}
-    train_query_counts = training_summary.get("gate_bucket_query_counts")
-    if not isinstance(train_query_counts, dict):
-        train_query_counts = {}
-    train_row_counts = training_summary.get("gate_bucket_row_counts")
-    if not isinstance(train_row_counts, dict):
-        train_row_counts = {}
-
-    split_counts = split_summary.get("gate_bucket_split_counts")
-    if not isinstance(split_counts, dict):
-        split_counts = {}
-    test_breakdowns = breakdowns.get("gate_bucket")
-    if not isinstance(test_breakdowns, dict):
-        test_breakdowns = {}
-
-    rows: list[list[str]] = []
-    for bucket in _TOTAL_ERROR_SCORE_BUCKETS:
-        bucket_split_counts = split_counts.get(bucket)
-        if not isinstance(bucket_split_counts, dict):
-            bucket_split_counts = {}
-        fit_count = _count_from_mapping(bucket_split_counts, fit_split)
-        check_count = _count_from_mapping(bucket_split_counts, check_split)
-        test_metrics = test_breakdowns.get(bucket)
-        if not isinstance(test_metrics, dict):
-            test_metrics = {}
-        test_count = _count_from_mapping(test_metrics, "n_queries") or _count_from_mapping(
-            bucket_split_counts,
-            test_split,
-        )
-        calibration_count = fit_count + check_count
-        margin_threshold = margin_thresholds.get(bucket) if bucket in _TOTAL_ERROR_MARGIN_BUCKETS else None
-        rows.append(
-            [
-                bucket,
-                _optional_metric_float_cell(score_thresholds.get(bucket)),
-                _optional_metric_float_cell(margin_threshold),
-                str(_count_from_mapping(train_query_counts, bucket)),
-                str(_count_from_mapping(train_row_counts, bucket)),
-                str(fit_count),
-                str(check_count),
-                str(calibration_count),
-                str(test_count),
-                str(_count_from_mapping(test_metrics, "n_positive_queries")),
-                str(_count_from_mapping(test_metrics, "n_negative_queries")),
-                str(_count_from_mapping(test_metrics, "errors")),
-                "n/a" if test_count == 0 else _format_metric_float(test_metrics.get("error_rate", 0.0)),
-                str(_count_from_mapping(test_metrics, "false_abstain")),
-                str(_count_from_mapping(test_metrics, "false_link")),
-                str(_count_from_mapping(test_metrics, "wrong_candidate_link")),
-            ]
-        )
-    return rows
-
-
 def format_classic_selected_gate_tables(summary: dict[str, Any]) -> str:
     """Return the selected-gate stratified-test breakdown tables."""
 
@@ -2210,34 +1934,6 @@ def format_classic_selected_gate_tables(summary: dict[str, Any]) -> str:
         return ""
 
     lines: list[str] = []
-    bucket_rows = _classic_gate_bucket_table_rows(summary, breakdowns)
-    if bucket_rows:
-        lines.extend(["## By Calibration Bucket, Selected Gate", ""])
-        lines.extend(
-            _markdown_table(
-                [
-                    "bucket",
-                    "score threshold",
-                    "margin threshold",
-                    "train queries",
-                    "train rows",
-                    "calibration fit",
-                    "calibration check",
-                    "calibration total",
-                    "test queries",
-                    "test positive queries",
-                    "test negative queries",
-                    "test errors",
-                    "test error rate",
-                    "false abstain",
-                    "false link",
-                    "wrong link",
-                ],
-                bucket_rows,
-            )
-        )
-        lines.append("")
-
     lines.extend(["## By Dataset Slice, Selected Gate", ""])
     source_breakdown = dict(breakdowns.get("source_key", {}))
     source_rows = [
@@ -2293,46 +1989,6 @@ def format_classic_selected_gate_tables(summary: dict[str, Any]) -> str:
         )
     )
     return "\n".join(lines) + "\n"
-
-
-def _evaluate_classic_stratified_eval_test_split(
-    bundle: OfficialBundle,
-    spec: dict[str, Any],
-    split_spec: dict[str, Any],
-    model: LGBMClassifier,
-    feature_columns: tuple[str, ...],
-    *,
-    score_threshold: float,
-    margin_threshold: float,
-    single_candidate_score_threshold: float | None = None,
-    bucketed_score_thresholds: dict[str, float] | None = None,
-    bucketed_margin_threshold: float | None = None,
-    bucketed_margin_thresholds: dict[str, float] | None = None,
-    scored_choices: tuple[pd.DataFrame, pd.DataFrame] | None = None,
-) -> dict[str, Any]:
-    """Score the promoted stratified calibration/test split with the active gate."""
-
-    if scored_choices is None:
-        choices, assignments = _score_classic_stratified_eval_test_choices(
-            bundle,
-            spec,
-            split_spec,
-            model,
-            feature_columns,
-        )
-    else:
-        choices, assignments = scored_choices
-
-    predictions = _apply_classic_gate(
-        choices,
-        score_threshold=score_threshold,
-        margin_threshold=margin_threshold,
-        single_candidate_score_threshold=single_candidate_score_threshold,
-        bucketed_score_thresholds=bucketed_score_thresholds,
-        bucketed_margin_threshold=bucketed_margin_threshold,
-        bucketed_margin_thresholds=bucketed_margin_thresholds,
-    )
-    return _summarize_classic_stratified_predictions(predictions, assignments, split_spec)
 
 
 def _score_eval_candidate_rows(
@@ -2431,7 +2087,6 @@ def run_classic(
         & (gate_source_query_choices["base_group_id"].isin(internal_eval_groups))
     ].copy()
     promoted_gate_config = _promoted_stratified_gate_spec(spec)
-    stratified_scored_choices: tuple[pd.DataFrame, pd.DataFrame] | None = None
     promoted_gate_summary: dict[str, Any] | None = None
     if promoted_gate_config is None:
         raise ValueError("classic.promoted_stratified_gate is required")
@@ -2439,130 +2094,104 @@ def run_classic(
         raise ValueError("classic.promoted_stratified_gate requires classic.stratified_eval_test_split")
 
     split_spec = dict(spec["stratified_eval_test_split"])
-    stratified_scored_choices = _score_classic_stratified_eval_test_choices(
+    stratified_scores = _score_classic_stratified_eval_test(
         bundle,
         spec,
         split_spec,
         model,
         feature_columns,
     )
-    selected_gate_result = _fit_promoted_stratified_total_error_gate(
-        stratified_scored_choices[0],
-        promoted_gate_config,
-    )
-    selected_gate = selected_gate_result["gate"]
-    bucketed_score_thresholds = dict(selected_gate.score_thresholds)
-    bucketed_margin_thresholds = dict(selected_gate.margin_thresholds)
-    bucketed_margin_threshold = None
-    score_threshold = float(bucketed_score_thresholds["multi_candidate|multi_letter_first"])
-    margin_threshold = float(bucketed_margin_thresholds["multi_candidate|multi_letter_first"])
-    single_candidate_score_threshold = float(bucketed_score_thresholds["single_candidate|single_letter_first"])
     calibration_splits = tuple(str(split) for split in promoted_gate_config["calibration_splits"])
     calibration_split_label = "+".join(calibration_splits)
+    selected_gate_result = _fit_promoted_logistic_gate(
+        stratified_scores.rows,
+        stratified_scores.choices,
+        stratified_scores.probabilities,
+        calibration_splits=calibration_splits,
+    )
+    logistic_gate_config = dict(selected_gate_result["gate_config"])
     calibration_metrics = {
         "split": calibration_split_label,
-        "score_threshold": score_threshold,
-        "margin_threshold": margin_threshold,
         **dict(selected_gate_result["calibration_metrics"]),
     }
-    calibration_predictions = _apply_total_error_gate(
-        stratified_scored_choices[0][stratified_scored_choices[0]["split"].astype(str).isin(calibration_splits)].copy(),
-        selected_gate,
-    )
+    calibration_predictions = selected_gate_result["predictions"][
+        stratified_scores.choices["split"].astype(str).isin(calibration_splits)
+    ].copy()
     single_candidate_predictions = calibration_predictions[
         (pd.to_numeric(calibration_predictions["has_runner_up"], errors="coerce").fillna(0).astype(int) == 0)
         | calibration_predictions["score_margin"].isna()
     ].copy()
     single_candidate_calibration_metrics = {
-        "single_candidate_score_threshold": single_candidate_score_threshold,
         **_summarize_predictions(single_candidate_predictions),
     }
     promoted_gate_summary = {
-        "mode": str(promoted_gate_config["mode"]),
+        "mode": _PROMOTED_LOGISTIC_GATE_MODE,
         "calibration_splits": list(calibration_splits),
         "test_split": str(promoted_gate_config["test_split"]),
-        "fixed_grid_step": float(promoted_gate_config["fixed_grid_step"]),
-        "threshold_grid_points": int(selected_gate_result["threshold_grid_points"]),
-        "selection_metric": str(promoted_gate_config["selection_metric"]),
-        "error_weights": dict(promoted_gate_config["error_weights"]),
+        "error_weights": dict(LOGISTIC_GATE_ERROR_WEIGHTS),
         "selected_gate": {
-            "name": selected_gate.name,
-            "score_thresholds": dict(selected_gate.score_thresholds),
-            "margin_thresholds": dict(selected_gate.margin_thresholds),
+            "model_type": str(logistic_gate_config["model_type"]),
+            "feature_count": int(len(logistic_gate_config["feature_names"])),
+            "calibration_mode": str(logistic_gate_config["calibration_mode"]),
+            "training_summary": dict(logistic_gate_config.get("training_summary", {})),
         },
-        "selection_key": dict(selected_gate_result["selection_key"]),
         "calibration_metrics": dict(selected_gate_result["calibration_metrics"]),
-        "calibration_split_metrics": dict(selected_gate_result["calibration_split_metrics"]),
-        "bucket_metrics": dict(selected_gate_result["bucket_metrics"]),
+        "calibration_split_metrics": {
+            split: metrics
+            for split, metrics in dict(selected_gate_result["split_metrics"]).items()
+            if split in set(calibration_splits)
+        },
+        "selected_feature_importance": list(selected_gate_result["selected_feature_importance"]),
     }
 
     s2and_eval = _read_csv(_resolve_path(bundle, spec["s2and_eval_path"]), compression="gzip")
     s2and_probabilities = model.predict_proba(_classic_feature_matrix(s2and_eval, feature_columns))[:, 1]
-    s2and_query_choices = _score_eval_candidate_rows(s2and_eval, s2and_probabilities, include_margin=True)
-    s2and_eval_summary = _evaluate_scored_windows(
-        s2and_query_choices,
-        score_threshold=score_threshold,
-        margin_threshold=margin_threshold,
-        single_candidate_score_threshold=single_candidate_score_threshold,
-        bucketed_score_thresholds=bucketed_score_thresholds,
-        bucketed_margin_threshold=bucketed_margin_threshold,
-        bucketed_margin_thresholds=bucketed_margin_thresholds,
+    s2and_eval_summary = _evaluate_logistic_scored_windows(
+        s2and_eval,
+        s2and_probabilities,
+        logistic_gate_config,
     )
     hwang_eval = _read_csv(_resolve_path(bundle, spec["hwang_eval_path"]), compression="gzip")
     hwang_probabilities = model.predict_proba(_classic_feature_matrix(hwang_eval, feature_columns))[:, 1]
-    hwang_query_choices = _score_eval_candidate_rows(hwang_eval, hwang_probabilities, include_margin=True)
     optional_eval_summaries: dict[str, dict[str, dict[str, Any]]] = {}
     for dataset_name, path_like in _iter_extra_eval_paths(spec):
         eval_df = _read_csv(_resolve_path(bundle, path_like), compression="gzip")
         eval_probabilities = model.predict_proba(_classic_feature_matrix(eval_df, feature_columns))[:, 1]
-        eval_query_choices = _score_eval_candidate_rows(eval_df, eval_probabilities, include_margin=True)
-        optional_eval_summaries[_summary_key_for_eval_dataset(dataset_name)] = _evaluate_scored_windows(
-            eval_query_choices,
-            score_threshold=score_threshold,
-            margin_threshold=margin_threshold,
-            single_candidate_score_threshold=single_candidate_score_threshold,
-            bucketed_score_thresholds=bucketed_score_thresholds,
-            bucketed_margin_threshold=bucketed_margin_threshold,
-            bucketed_margin_thresholds=bucketed_margin_thresholds,
+        optional_eval_summaries[_summary_key_for_eval_dataset(dataset_name)] = _evaluate_logistic_scored_windows(
+            eval_df,
+            eval_probabilities,
+            logistic_gate_config,
         )
 
     override_path = spec.get("hwang_clean_override_path")
     override_df = _read_csv(_resolve_path(bundle, str(override_path))) if override_path else None
-    hwang_eval_summary = _evaluate_scored_windows(
-        hwang_query_choices,
-        score_threshold=score_threshold,
-        margin_threshold=margin_threshold,
-        single_candidate_score_threshold=single_candidate_score_threshold,
+    hwang_eval_summary = _evaluate_logistic_scored_windows(
+        hwang_eval,
+        hwang_probabilities,
+        logistic_gate_config,
         override_df=override_df,
-        bucketed_score_thresholds=bucketed_score_thresholds,
-        bucketed_margin_threshold=bucketed_margin_threshold,
-        bucketed_margin_thresholds=bucketed_margin_thresholds,
     )
-    internal_eval_summary = _score_abstain_rule(
-        internal_eval_rows,
-        score_threshold=score_threshold,
-        margin_threshold=margin_threshold,
-        single_candidate_score_threshold=single_candidate_score_threshold,
-        bucketed_score_thresholds=bucketed_score_thresholds,
-        bucketed_margin_threshold=bucketed_margin_threshold,
-        bucketed_margin_thresholds=bucketed_margin_thresholds,
-    )
-    stratified_eval_test_summary = None
-    if spec.get("stratified_eval_test_split") is not None:
-        stratified_eval_test_summary = _evaluate_classic_stratified_eval_test_split(
-            bundle,
-            spec,
-            dict(spec["stratified_eval_test_split"]),
-            model,
-            feature_columns,
-            score_threshold=score_threshold,
-            margin_threshold=margin_threshold,
-            single_candidate_score_threshold=single_candidate_score_threshold,
-            bucketed_score_thresholds=bucketed_score_thresholds,
-            bucketed_margin_threshold=bucketed_margin_threshold,
-            bucketed_margin_thresholds=bucketed_margin_thresholds,
-            scored_choices=stratified_scored_choices,
+    internal_eval_source_rows = gate_source_eval[
+        gate_source_eval["base_group_id"].astype(str).isin(internal_eval_groups)
+        & (pd.to_numeric(gate_source_eval["retrieval_rank"], errors="coerce") <= calibration_limit)
+    ].copy()
+    internal_eval_source_probabilities = gate_source_probabilities[
+        internal_eval_source_rows.index.to_numpy(dtype=np.int64)
+    ]
+    internal_eval_choices = internal_eval_rows.drop(columns=["retrieval_rank_limit"], errors="ignore")
+    internal_eval_summary = _summarize_predictions(
+        _apply_promoted_logistic_gate_to_candidate_rows(
+            internal_eval_source_rows,
+            internal_eval_choices,
+            internal_eval_source_probabilities,
+            logistic_gate_config,
         )
+    )
+    stratified_eval_test_summary = _summarize_classic_stratified_predictions(
+        selected_gate_result["predictions"],
+        stratified_scores.assignments,
+        split_spec,
+    )
 
     hwang_cleaned_eval = {
         f"w{limit}": {
@@ -2586,14 +2215,10 @@ def run_classic(
             "train_filter_summary": train_filter_summary,
         },
         "abstain_rule": {
-            "score_threshold": score_threshold,
-            "margin_threshold": margin_threshold,
-            "single_candidate_score_threshold": single_candidate_score_threshold,
-            "calibration_mode": "promoted_stratified_full_calibration_fixed_grid_4score_2margin",
-            "promoted_stratified_gate": promoted_gate_summary,
-            "bucketed_score_thresholds": bucketed_score_thresholds,
-            "bucketed_margin_threshold": bucketed_margin_threshold,
-            "bucketed_margin_thresholds": bucketed_margin_thresholds,
+            "calibration_mode": str(logistic_gate_config["calibration_mode"]),
+            "promoted_logistic_gate": promoted_gate_summary,
+            "logistic_gate_config": logistic_gate_config,
+            "logistic_gate_feature_count": int(len(logistic_gate_config["feature_names"])),
             "calibration_retrieval_limit": calibration_limit,
             "calibration_metrics": calibration_metrics,
             "single_candidate_calibration_metrics": single_candidate_calibration_metrics,
@@ -2608,15 +2233,10 @@ def run_classic(
     if manual_holdout_path:
         manual_holdout = _read_csv(_resolve_path(bundle, manual_holdout_path), low_memory=False)
         manual_probabilities = model.predict_proba(_classic_feature_matrix(manual_holdout, feature_columns))[:, 1]
-        summary["manual_holdout"] = _evaluate_classic_manual_holdout(
+        summary["manual_holdout"] = _evaluate_logistic_manual_holdout(
             manual_holdout,
             manual_probabilities,
-            score_threshold=score_threshold,
-            margin_threshold=margin_threshold,
-            single_candidate_score_threshold=single_candidate_score_threshold,
-            bucketed_score_thresholds=bucketed_score_thresholds,
-            bucketed_margin_threshold=bucketed_margin_threshold,
-            bucketed_margin_thresholds=bucketed_margin_thresholds,
+            logistic_gate_config,
         )
     for summary_key, eval_summary in optional_eval_summaries.items():
         summary[summary_key] = eval_summary
@@ -2636,11 +2256,7 @@ def run_classic(
             Path(save_artifact_to),
             feature_columns=feature_columns,
             retrieval_top_k=25,
-            gate_config={
-                "bucketed_score_thresholds": bucketed_score_thresholds,
-                "bucketed_margin_thresholds": bucketed_margin_thresholds,
-                "calibration_mode": summary["abstain_rule"]["calibration_mode"],
-            },
+            gate_config=logistic_gate_config,
             prediction_fixture_matrix=fixture_matrix,
             required_rust_capabilities=required_rust_capabilities,
             audit_metadata=artifact_audit_metadata,
@@ -2662,9 +2278,9 @@ SUPPORTED_PROMOTED_FEATURE_COLUMNS = frozenset(PROMOTED_NON_PAIRWISE_COLUMNS) | 
 FROZEN_RETRIEVAL_POLICY = FROZEN_BEST_RUST_HYBRID_CENTROID_POLICY
 FROZEN_RETRIEVAL_POLICY_NAME = FROZEN_BEST_RUST_HYBRID_CENTROID_POLICY_NAME
 WEIGHTED_ERROR_WEIGHTS = {
-    "false_abstain_error_rate": float(_DEFAULT_PROMOTED_GATE_ERROR_WEIGHTS["false_abstain"]),
-    "false_link_error_rate": float(_DEFAULT_PROMOTED_GATE_ERROR_WEIGHTS["false_link"]),
-    "wrong_link_error_rate": float(_DEFAULT_PROMOTED_GATE_ERROR_WEIGHTS["wrong_candidate_link"]),
+    "false_abstain_error_rate": float(LOGISTIC_GATE_ERROR_WEIGHTS["false_abstain"]),
+    "false_link_error_rate": float(LOGISTIC_GATE_ERROR_WEIGHTS["false_link"]),
+    "wrong_link_error_rate": float(LOGISTIC_GATE_ERROR_WEIGHTS["wrong_candidate_link"]),
 }
 NAN_POLICY_CHOICES = ("preserve", "zero")
 ROW_NAN_POLICY_CHOICES = ("finite", "semantic")

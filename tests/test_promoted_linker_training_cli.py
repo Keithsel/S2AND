@@ -169,7 +169,7 @@ def test_run_classic_keeps_artifact_export_hook() -> None:
 def test_hyperopt_loss_uses_weighted_average_error() -> None:
     summary = {
         "training_summary": {"rows": 10, "positive_rows": 3},
-        "abstain_rule": {"promoted_stratified_gate": {"fixed_grid_step": 0.01}},
+        "abstain_rule": {"promoted_logistic_gate": {"mode": "promoted_logistic_topk_multiclass_l2"}},
         "stratified_eval_test_split": {
             "overall": {
                 "test": {
@@ -218,7 +218,7 @@ def test_hyperopt_includes_base_params_as_candidate(
         calls.append({"params": dict(feature_bundle.models["classic"]["best_params"]), "output_dir": output_dir})
         return {
             "training_summary": {"rows": 3, "positive_rows": 1},
-            "abstain_rule": {"promoted_stratified_gate": {"fixed_grid_step": 0.01}},
+            "abstain_rule": {"promoted_logistic_gate": {"mode": "promoted_logistic_topk_multiclass_l2"}},
             "stratified_eval_test_split": {
                 "overall": {
                     "test": {
@@ -258,35 +258,114 @@ def _write_candidate_rows(path: Path, rows: list[dict[str, Any]]) -> None:
     pd.DataFrame(rows).to_csv(path, index=False, compression="gzip")
 
 
-def test_prepare_prod_training_data_weights_calibration_and_eval_rows(tmp_path: Path) -> None:
+def test_prepare_prod_training_data_weights_calibration_rows_and_leaves_test_for_gate(tmp_path: Path) -> None:
     _write_candidate_rows(
         tmp_path / "train.csv.gz",
         [
-            {"query_group_id": "q_train", "base_group_id": "b_train", "retrieval_rank": 1, "label": 0, "f0": 0.1},
-            {"query_group_id": "q_train", "base_group_id": "b_train", "retrieval_rank": 2, "label": 1, "f0": 0.2},
-            {"query_group_id": "q_calib", "base_group_id": "b_calib", "retrieval_rank": 1, "label": 1, "f0": 0.3},
+            {
+                "query_group_id": "q_train",
+                "base_group_id": "b_train",
+                "candidate_component_key": "c_train_1",
+                "dataset": "unit",
+                "query_view": "full",
+                "retrieval_rank": 1,
+                "label": 0,
+                "f0": 0.1,
+            },
+            {
+                "query_group_id": "q_train",
+                "base_group_id": "b_train",
+                "candidate_component_key": "c_train_2",
+                "dataset": "unit",
+                "query_view": "full",
+                "retrieval_rank": 2,
+                "label": 1,
+                "f0": 0.2,
+            },
+            {
+                "query_group_id": "q_calib",
+                "base_group_id": "b_calib",
+                "candidate_component_key": "c_train_shadowed",
+                "dataset": "unit",
+                "query_view": "full",
+                "retrieval_rank": 1,
+                "label": 1,
+                "f0": 0.3,
+            },
         ],
     )
     _write_candidate_rows(
         tmp_path / "calib.csv.gz",
         [
-            {"query_group_id": "q_calib", "base_group_id": "b_calib", "retrieval_rank": 1, "label": 1, "f0": 0.4},
-            {"query_group_id": "q_calib", "base_group_id": "b_calib", "retrieval_rank": 2, "label": 0, "f0": 0.5},
+            {
+                "query_group_id": "q_calib",
+                "base_group_id": "b_calib",
+                "candidate_component_key": "c_calib_pos",
+                "dataset": "unit",
+                "query_view": "full",
+                "retrieval_rank": 1,
+                "label": 1,
+                "f0": 0.4,
+            },
+            {
+                "query_group_id": "q_calib",
+                "base_group_id": "b_calib",
+                "candidate_component_key": "c_calib_neg",
+                "dataset": "unit",
+                "query_view": "full",
+                "retrieval_rank": 2,
+                "label": 0,
+                "f0": 0.5,
+            },
         ],
     )
     _write_candidate_rows(
         tmp_path / "s2and.csv.gz",
         [
-            {"query_group_id": "q_s2and", "base_group_id": "b_s2and", "retrieval_rank": 1, "label": 1, "f0": 0.6},
-            {"query_group_id": "q_s2and", "base_group_id": "b_s2and", "retrieval_rank": 30, "label": 0, "f0": 0.7},
+            {
+                "query_group_id": "q_s2and",
+                "base_group_id": "b_s2and",
+                "candidate_component_key": "c_s2and",
+                "dataset": "unit",
+                "query_view": "full",
+                "retrieval_rank": 1,
+                "label": 1,
+                "f0": 0.6,
+            },
+            {
+                "query_group_id": "q_s2and",
+                "base_group_id": "b_s2and",
+                "candidate_component_key": "c_s2and_late",
+                "dataset": "unit",
+                "query_view": "full",
+                "retrieval_rank": 30,
+                "label": 0,
+                "f0": 0.7,
+            },
         ],
     )
     _write_candidate_rows(
         tmp_path / "hwang.csv.gz",
         [
-            {"query_group_id": "q_hwang", "base_group_id": "b_hwang", "retrieval_rank": 1, "label": 0, "f0": 0.8},
+            {
+                "query_group_id": "q_hwang",
+                "base_group_id": "b_hwang",
+                "candidate_component_key": "c_hwang",
+                "dataset": "hwang",
+                "query_view": "full",
+                "retrieval_rank": 1,
+                "label": 0,
+                "f0": 0.8,
+            },
         ],
     )
+    (tmp_path / "splits").mkdir()
+    pd.DataFrame(
+        [
+            {"query_group_id": "q_calib", "source_key": "s2and_eval", "split": "calibration_fit"},
+            {"query_group_id": "q_hwang", "source_key": "hwang_eval", "split": "test"},
+        ]
+    ).to_csv(tmp_path / "splits" / "assignments.csv", index=False)
     bundle = promoted_train.OfficialBundle(
         root=tmp_path.resolve(),
         bundle_name="test",
@@ -297,6 +376,14 @@ def test_prepare_prod_training_data_weights_calibration_and_eval_rows(tmp_path: 
                 "classic_gate_source_path": "calib.csv.gz",
                 "s2and_eval_path": "s2and.csv.gz",
                 "hwang_eval_path": "hwang.csv.gz",
+                "stratified_eval_test_split": {
+                    "assignments_path": "splits/assignments.csv",
+                    "test_split": "test",
+                },
+                "promoted_stratified_gate": {
+                    "calibration_splits": ["calibration_fit"],
+                    "test_split": "test",
+                },
                 "feature_columns": ["f0"],
                 "best_params": {"n_estimators": 10},
             }
@@ -314,15 +401,13 @@ def test_prepare_prod_training_data_weights_calibration_and_eval_rows(tmp_path: 
         "q_train",
         "q_calib",
         "q_calib",
-        "q_s2and",
-        "q_hwang",
     ]
-    assert prod_data.sample_weight.tolist() == pytest.approx([0.5, 0.5, 5.0, 5.0, 10.0, 10.0])
+    assert prod_data.sample_weight.tolist() == pytest.approx([0.5, 0.5, 5.0, 5.0])
     summaries = {summary["source"]: summary for summary in prod_data.source_summaries}
     assert summaries["train"]["sample_weight_sum"] == pytest.approx(1.0)
-    assert summaries["classic_gate_source"]["sample_weight_sum"] == pytest.approx(10.0)
-    assert summaries["s2and"]["sample_weight_sum"] == pytest.approx(10.0)
-    assert summaries["hwang"]["sample_weight_sum"] == pytest.approx(10.0)
+    assert summaries["stratified_calibration_calibration_fit"]["sample_weight_sum"] == pytest.approx(10.0)
+    assert summaries["stratified_calibration_calibration_fit"]["splits"] == ["calibration_fit"]
+    assert summaries["stratified_calibration_calibration_fit"]["source_keys"] == ["s2and_eval"]
     assert prod_data.train_holdout_filter_summary["rows_removed"] == 1
 
 
@@ -361,7 +446,7 @@ def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(
         )
         return {
             "training_summary": {"rows": 3, "positive_rows": 1},
-            "abstain_rule": {"promoted_stratified_gate": {"fixed_grid_step": 0.01}},
+            "abstain_rule": {"promoted_logistic_gate": {"mode": "promoted_logistic_topk_multiclass_l2"}},
             "stratified_eval_test_split": {
                 "overall": {
                     "test": {
@@ -459,7 +544,7 @@ def test_run_uses_explicit_precomputed_promoted_bundle(
         assert output_dir == tmp_path / "out" / "classic"
         return {
             "training_summary": {"rows": 3, "positive_rows": 1},
-            "abstain_rule": {"promoted_stratified_gate": {"fixed_grid_step": 0.01}},
+            "abstain_rule": {"promoted_logistic_gate": {"mode": "promoted_logistic_topk_multiclass_l2"}},
             "stratified_eval_test_split": {
                 "overall": {
                     "test": {

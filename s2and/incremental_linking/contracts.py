@@ -20,18 +20,8 @@ from s2and.runtime import (
 ARTIFACT_SCHEMA_VERSION = "incremental_linking_artifact_v1"
 CONTRACT_SCHEMA_VERSION = "incremental_linking_contract_v1"
 MODEL_FAMILY_CLASSIC_LIGHTGBM_LINKER = "classic_lightgbm_linker"
-GATE_SURFACE_PROMOTED_STRATIFIED = "promoted_stratified_gate"
+GATE_SURFACE_PROMOTED_LOGISTIC = "promoted_numpy_logistic_gate"
 DEFAULT_RETRIEVAL_TOP_K = 25
-PROMOTED_GATE_SCORE_BUCKETS: tuple[str, ...] = (
-    "multi_candidate|multi_letter_first",
-    "multi_candidate|single_letter_first",
-    "single_candidate|multi_letter_first",
-    "single_candidate|single_letter_first",
-)
-PROMOTED_GATE_MARGIN_BUCKETS: tuple[str, ...] = (
-    "multi_candidate|multi_letter_first",
-    "multi_candidate|single_letter_first",
-)
 
 INCREMENTAL_LINKING_RUST_CAPABILITIES: tuple[str, ...] = (
     RUST_CAPABILITY_HYBRID_CENTROID_RETRIEVER_V1,
@@ -182,5 +172,5 @@ def validate_artifact_contract_metadata(metadata: Mapping[str, Any]) -> None:
     expected_retrieval_digest = retrieval_stack_contract_digest(retrieval_top_k=retrieval_top_k)
     if metadata.get("retrieval_stack_digest") != expected_retrieval_digest:
         raise ValueError("Incremental linker artifact retrieval_stack_digest mismatch")
-    if metadata.get("gate_surface") != GATE_SURFACE_PROMOTED_STRATIFIED:
+    if metadata.get("gate_surface") != GATE_SURFACE_PROMOTED_LOGISTIC:
         raise ValueError(f"Unsupported incremental linker gate_surface: {metadata.get('gate_surface')!r}")

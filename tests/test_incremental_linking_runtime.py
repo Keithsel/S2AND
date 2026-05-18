@@ -24,6 +24,7 @@ from s2and.incremental_linking.linker_pairwise import (
     LinkerCandidateBatch,
     promoted_pairwise_aggregate_columns,
 )
+from s2and.incremental_linking.logistic_gate import logistic_gate_config
 from s2and.incremental_linking.retrieval import LinkerRetrievalBatch
 from s2and.incremental_linking.runtime import (
     CandidateBatchPairwiseModelResult,
@@ -264,18 +265,15 @@ def _row_features_with_telemetry(retrieval_scores: np.ndarray) -> tuple[dict[str
 
 
 def _promoted_gate_config(score: float = 0.0, margin: float = 0.0) -> dict[str, object]:
-    return {
-        "bucketed_score_thresholds": {
-            "multi_candidate|multi_letter_first": float(score),
-            "multi_candidate|single_letter_first": float(score),
-            "single_candidate|multi_letter_first": float(score),
-            "single_candidate|single_letter_first": float(score),
-        },
-        "bucketed_margin_thresholds": {
-            "multi_candidate|multi_letter_first": float(margin),
-            "multi_candidate|single_letter_first": float(margin),
-        },
-    }
+    del margin
+    scale = 200.0
+    return logistic_gate_config(
+        feature_names=("chosen_probability",),
+        weights=np.asarray([[-scale, 0.0, scale]], dtype=np.float64),
+        bias=np.asarray([scale * float(score), -10.0, -scale * float(score)], dtype=np.float64),
+        missing_values=np.asarray([0.0], dtype=np.float64),
+        calibration_mode="test",
+    )
 
 
 def _retrieval_batch(
@@ -976,7 +974,7 @@ def test_compact_link_or_abstain_abstains_when_artifact_score_threshold_too_high
     assert result.decisions[0].component_key is None
 
 
-def test_compact_link_or_abstain_single_candidate_uses_promoted_bucket() -> None:
+def test_compact_link_or_abstain_single_candidate_uses_logistic_score_feature() -> None:
     artifact = StaticArtifact(
         np.asarray([0.9], dtype=np.float64),
         gate_config=_promoted_gate_config(0.95),
@@ -1000,21 +998,17 @@ def test_compact_link_or_abstain_single_candidate_uses_promoted_bucket() -> None
     assert result.decisions[0].action == "abstain"
 
 
-def test_compact_link_or_abstain_applies_bucketed_classic_gate_parity() -> None:
+def test_compact_link_or_abstain_applies_numpy_logistic_gate_feature() -> None:
+    scale = 200.0
     artifact = StaticArtifact(
         np.asarray([0.60, 0.55, 0.40], dtype=np.float64),
-        gate_config={
-            "bucketed_score_thresholds": {
-                "multi_candidate|single_letter_first": 0.99,
-                "multi_candidate|multi_letter_first": 0.99,
-                "single_candidate|single_letter_first": 0.30,
-                "single_candidate|multi_letter_first": 0.50,
-            },
-            "bucketed_margin_thresholds": {
-                "multi_candidate|single_letter_first": 0.04,
-                "multi_candidate|multi_letter_first": 0.99,
-            },
-        },
+        gate_config=logistic_gate_config(
+            feature_names=("score_margin",),
+            weights=np.asarray([[-scale, 0.0, scale]], dtype=np.float64),
+            bias=np.asarray([scale * 0.04, -10.0, -scale * 0.04], dtype=np.float64),
+            missing_values=np.asarray([0.0], dtype=np.float64),
+            calibration_mode="test",
+        ),
     )
     candidate_batch = LinkerCandidateBatch(
         row_count=3,
@@ -1044,17 +1038,11 @@ def test_compact_link_or_abstain_applies_bucketed_classic_gate_parity() -> None:
     assert result.decisions[0].score_margin == pytest.approx(0.05)
 
 
-def test_compact_gate_requires_complete_promoted_buckets() -> None:
+def test_compact_gate_rejects_non_logistic_config() -> None:
     artifact = StaticArtifact(
         np.asarray([0.60], dtype=np.float64),
         gate_config={
-            "bucketed_score_thresholds": {
-                "single_candidate|multi_letter_first": 0.50,
-            },
-            "bucketed_margin_thresholds": {
-                "multi_candidate|multi_letter_first": 0.0,
-                "multi_candidate|single_letter_first": 0.0,
-            },
+            "model_type": "legacy_thresholds",
         },
     )
     candidate_batch = LinkerCandidateBatch(
@@ -1067,7 +1055,7 @@ def test_compact_gate_requires_complete_promoted_buckets() -> None:
         retrieval_ranks=np.asarray([1], dtype=np.uint16),
     )
 
-    with pytest.raises(ValueError, match="bucketed_score_thresholds missing buckets"):
+    with pytest.raises(ValueError, match="Unsupported logistic gate model_type"):
         _predict_incremental_link_or_abstain_compact(
             artifact,  # type: ignore[arg-type]
             _empty_feature_matrix(candidate_batch),
@@ -1075,10 +1063,16 @@ def test_compact_gate_requires_complete_promoted_buckets() -> None:
         )
 
 
-def test_compact_bucketed_gate_requires_materialized_first_name_bucket() -> None:
+def test_compact_logistic_gate_can_use_materialized_bucket_feature() -> None:
     artifact = StaticArtifact(
         np.asarray([0.60], dtype=np.float64),
-        gate_config=_promoted_gate_config(0.50),
+        gate_config=logistic_gate_config(
+            feature_names=("first_name_bucket_multi_letter_first",),
+            weights=np.asarray([[0.0, 0.0, 5.0]], dtype=np.float64),
+            bias=np.asarray([0.0, 0.0, -2.5], dtype=np.float64),
+            missing_values=np.asarray([0.0], dtype=np.float64),
+            calibration_mode="test",
+        ),
     )
     candidate_batch = LinkerCandidateBatch(
         row_count=1,
@@ -1090,12 +1084,13 @@ def test_compact_bucketed_gate_requires_materialized_first_name_bucket() -> None
         retrieval_ranks=np.asarray([1], dtype=np.uint16),
     )
 
-    with pytest.raises(KeyError, match="first_name_bucket"):
-        _predict_incremental_link_or_abstain_compact(
-            artifact,  # type: ignore[arg-type]
-            _empty_feature_matrix(candidate_batch),
-            row_signals={},
-        )
+    result = _predict_incremental_link_or_abstain_compact(
+        artifact,  # type: ignore[arg-type]
+        _empty_feature_matrix(candidate_batch),
+        row_signals={"first_name_bucket": np.asarray(["multi_letter_first"], dtype=object)},
+    )
+
+    assert result.decisions[0].action == "link"
 
 
 def test_private_retrieved_candidate_slice_scores_matrix_and_records_telemetry(
@@ -1241,6 +1236,71 @@ def test_private_production_slice_links_abstains_and_naturalizes(
     assert result.telemetry["no_candidate_query_count"] == 1
     assert result.telemetry["link_count"] == 1
     assert result.telemetry["abstain_count"] == 1
+
+
+def test_private_production_slice_supplies_query_author_to_logistic_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = SimpleNamespace()
+    featurizer = FakeRuntimeFeaturizer(["q1", "s1"])
+    clusterer = FakeProductionClusterer({"s1": "c1"})
+    scale = 10.0
+    artifact = StaticArtifact(
+        np.asarray([0.9], dtype=np.float64),
+        gate_config=logistic_gate_config(
+            feature_names=("top_meta_query_author_len",),
+            weights=np.asarray([[-scale, 0.0, scale]], dtype=np.float64),
+            bias=np.asarray([scale * 5.0, -10.0, -scale * 5.0], dtype=np.float64),
+            missing_values=np.asarray([0.0], dtype=np.float64),
+            calibration_mode="test",
+        ),
+    )
+
+    monkeypatch.setattr(
+        runtime_module,
+        "build_linker_retrieval_batch_rust",
+        lambda **_kwargs: _production_retrieval_batch(
+            row_query_signature_indices=np.asarray([0], dtype=np.uint32),
+            row_component_keys=("c1",),
+            left_signature_indices=np.asarray([0], dtype=np.uint32),
+            right_signature_indices=np.asarray([1], dtype=np.uint32),
+            pair_row_indices=np.asarray([0], dtype=np.uint32),
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "compute_candidate_batch_pairwise_model_and_aggregate_stats",
+        lambda _dataset, candidate_batch, **_kwargs: _fake_pairwise_result(candidate_batch),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "build_promoted_non_pairwise_row_features_with_telemetry",
+        lambda _candidate_batch, _row_signals: _row_features_with_telemetry(np.asarray([0.9], dtype=np.float32)),
+    )
+
+    result = _predict_incremental_link_or_abstain_production_private(
+        clusterer,
+        artifact,  # type: ignore[arg-type]
+        dataset=dataset,  # type: ignore[arg-type]
+        featurizer=featurizer,
+        retriever=object(),
+        queries=[SimpleNamespace(query_author="Ada Lovelace")],
+        query_signature_ids=["q1"],
+    )
+
+    assert result.compact_result.decisions[0].action == "link"
+
+
+def test_query_author_for_gate_fallback_includes_full_signature_name() -> None:
+    query = SimpleNamespace(
+        query_author="",
+        author_info_first="Ada",
+        author_info_middle="Byron",
+        author_info_last="Lovelace",
+        author_info_suffix="PhD",
+    )
+
+    assert runtime_module._query_author_for_gate(query) == "Ada Byron Lovelace PhD"
 
 
 def test_private_production_slice_preserves_partial_supervision_constraint_labels(

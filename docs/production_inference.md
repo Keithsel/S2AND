@@ -137,7 +137,7 @@ The other feature modes are narrower:
 
 After features are available, the script runs the classic train/calibrate/eval
 stack. It trains the LightGBM linker with the target params, fits or applies the
-configured score/margin gate, evaluates the configured S2AND/Hwang/extra/manual
+configured NumPy logistic gate, evaluates the configured S2AND/Hwang/extra/manual
 holdout tables, writes `classic/summary.json`, and writes `run_summary.json`
 with observed metrics and deltas from the replay target JSON. Unless
 `--allow-metric-drift` is passed, a full replay fails when observed metrics do
@@ -145,12 +145,13 @@ not match the target metrics.
 
 When `--save-artifact-to` or `--save-production-bundle-to` is set, the script
 also fits the final production linker on train rows plus weighted
-calibration/eval rows, then writes
-`booster.lgb` and `metadata.json`. The metadata includes the feature schema,
-gate config, required Rust capabilities, prediction fixture, booster digest,
-pairwise model path/version/digest, source bundle, feature mode, observed
-metrics, and production training summary. Keep the replay target under the
-bundle's `reproducibility/` directory. `--save-production-bundle-to` is the
+`calibration_fit`/`calibration_check` rows, then fits the final NumPy logistic
+gate on the configured `test` split and writes `booster.lgb` and
+`metadata.json`. The metadata includes the feature schema, gate config, required
+Rust capabilities, prediction fixture, booster digest, pairwise model
+path/version/digest, source bundle, feature mode, observed metrics, and
+production training summary. Keep the replay target under the bundle's
+`reproducibility/` directory. `--save-production-bundle-to` is the
 normal release path because it assembles the complete runtime directory and
 validates it with `load_production_model(...)`.
 
@@ -413,7 +414,7 @@ The target behavior is that `Clusterer.predict_incremental(...)` uses the
 promoted Rust linker by default when `S2AND_BACKEND` selects Rust and the
 extension has the required promoted-incremental capabilities. Legacy output
 parity is not a release goal; the promoted path intentionally uses different
-retrieval, linker, and margin-gate decisions.
+retrieval, linker, and logistic-gate decisions.
 
 `S2AND_BACKEND=rust` and `S2AND_BACKEND=auto` now route `predict_incremental`
 through the promoted linker when backend resolution selects Rust. There is no

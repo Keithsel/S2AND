@@ -24,7 +24,7 @@ seed clusters + unassigned queries
   -> Rust candidate pair plan
   -> indexed pair featurization + pairwise model distances + pw_* aggregates
   -> promoted 53-feature row assembly
-  -> calibrated score/margin gate
+  -> calibrated NumPy logistic link-or-abstain gate
   -> exact residual clustering tail for abstained/no-candidate queries
 ```
 

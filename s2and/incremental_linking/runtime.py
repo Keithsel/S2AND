@@ -16,9 +16,7 @@ from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.artifact import IncrementalLinkingArtifact
-from s2and.incremental_linking.contracts import PROMOTED_GATE_MARGIN_BUCKETS, PROMOTED_GATE_SCORE_BUCKETS
 from s2and.incremental_linking.features import LinkerFeatureMatrix, assemble_linker_feature_matrix
-from s2and.incremental_linking.gate_buckets import validate_first_name_bucket
 from s2and.incremental_linking.linker_pairwise import (
     PROMOTED_PAIRWISE_AGG_BASE_FEATURE_NAMES,
     PROMOTED_PAIRWISE_AGG_FEATURE_COLUMNS,
@@ -28,6 +26,11 @@ from s2and.incremental_linking.linker_pairwise import (
     compute_candidate_batch_pairwise_aggregate_stats_rust,
     compute_linker_pair_chunk_plan,
     iter_candidate_batch_pair_feature_chunks_rust,
+)
+from s2and.incremental_linking.logistic_gate import (
+    NumpyLogisticGate,
+    build_runtime_logistic_gate_matrix,
+    load_logistic_gate_config,
 )
 from s2and.incremental_linking.retrieval import LinkerRetrievalBatch, build_linker_retrieval_batch_rust
 from s2and.incremental_linking.row_features import build_promoted_non_pairwise_row_features_with_telemetry
@@ -118,75 +121,11 @@ def _best_row_for_group(
     return min((int(row_index) for row_index in group), key=sort_key)
 
 
-def _first_name_bucket(row_signals: Mapping[str, Any] | None, row_index: int) -> str:
-    if row_signals is None or "first_name_bucket" not in row_signals:
-        raise KeyError("Missing compact linker row signal: first_name_bucket")
-    values = np.asarray(row_signals["first_name_bucket"], dtype=object)
-    if values.ndim != 1 or row_index >= len(values):
-        raise ValueError(
-            "Signal 'first_name_bucket' must be 1D and contain row_index=" f"{row_index}, got shape={values.shape}"
-        )
-    return validate_first_name_bucket(values[row_index])
-
-
-def _artifact_gate_thresholds(
-    artifact: IncrementalLinkingArtifact,
-    *,
-    row_index: int,
-    has_runner_up: bool,
-    row_signals: Mapping[str, Any] | None,
-) -> tuple[float | None, float | None]:
-    gate_config = artifact.metadata.gate_config
-    bucketed_score_thresholds = gate_config.get("bucketed_score_thresholds")
-    if not isinstance(bucketed_score_thresholds, Mapping):
-        raise ValueError("artifact gate_config must contain bucketed_score_thresholds")
-    score_thresholds = {str(key): float(value) for key, value in bucketed_score_thresholds.items()}
-    missing_score_buckets = sorted(set(PROMOTED_GATE_SCORE_BUCKETS) - set(score_thresholds))
-    if missing_score_buckets:
-        raise ValueError(f"artifact gate_config bucketed_score_thresholds missing buckets: {missing_score_buckets}")
-
-    bucketed_margin_thresholds = gate_config.get("bucketed_margin_thresholds")
-    if not isinstance(bucketed_margin_thresholds, Mapping):
-        raise ValueError("artifact gate_config must contain bucketed_margin_thresholds")
-    margin_thresholds = {str(key): float(value) for key, value in bucketed_margin_thresholds.items()}
-    missing_margin_buckets = sorted(set(PROMOTED_GATE_MARGIN_BUCKETS) - set(margin_thresholds))
-    if missing_margin_buckets:
-        raise ValueError(f"artifact gate_config bucketed_margin_thresholds missing buckets: {missing_margin_buckets}")
-
-    single_candidate = not has_runner_up
-    bucket = (
-        ("single_candidate" if single_candidate else "multi_candidate")
-        + "|"
-        + _first_name_bucket(
-            row_signals,
-            row_index,
-        )
-    )
-    resolved_score = score_thresholds[bucket]
-    if single_candidate:
-        return resolved_score, None
-    return resolved_score, margin_thresholds[bucket]
-
-
-def _passes_artifact_gate(
-    artifact: IncrementalLinkingArtifact,
-    *,
-    row_index: int,
-    score: float,
-    margin: float | None,
-    has_runner_up: bool,
-    row_signals: Mapping[str, Any] | None,
-) -> bool:
-    score_threshold, margin_threshold = _artifact_gate_thresholds(
-        artifact,
-        row_index=row_index,
-        has_runner_up=has_runner_up,
-        row_signals=row_signals,
-    )
-    passes_score = score_threshold is None or score >= score_threshold
-    if margin_threshold is None:
-        return passes_score
-    return passes_score or (margin is not None and margin >= margin_threshold)
+def _artifact_logistic_gate(artifact: IncrementalLinkingArtifact) -> NumpyLogisticGate:
+    gate_model = getattr(artifact, "gate_model", None)
+    if gate_model is not None:
+        return gate_model
+    return load_logistic_gate_config(artifact.metadata.gate_config)
 
 
 def _predict_incremental_link_or_abstain_compact(
@@ -195,7 +134,7 @@ def _predict_incremental_link_or_abstain_compact(
     *,
     row_signals: Mapping[str, Any] | None = None,
 ) -> LinkOrAbstainCompactResult:
-    """Score artifact-ordered rows and apply the artifact's bucketed gate.
+    """Score artifact-ordered rows and apply the artifact's logistic gate.
 
     This is intentionally not a public API. It exists to keep the first vertical
     slice concrete while retrieval policy, constraint handling, and telemetry are
@@ -209,35 +148,21 @@ def _predict_incremental_link_or_abstain_compact(
     if len(probabilities) != candidate_batch.row_count:
         raise ValueError("artifact probability count must match candidate row_count")
     query_indices = np.asarray(candidate_batch.row_query_signature_indices, dtype=np.uint32)
-    retrieval_ranks = (
-        None
-        if candidate_batch.retrieval_ranks is None
-        else np.asarray(candidate_batch.retrieval_ranks, dtype=np.uint16)
-    )
     component_keys = candidate_batch.row_component_keys
+    gate = _artifact_logistic_gate(artifact)
+    gate_matrix, gate_query_rows = build_runtime_logistic_gate_matrix(
+        gate,
+        feature_matrix,
+        np.asarray(probabilities, dtype=np.float64),
+        row_signals=row_signals,
+    )
+    gate_links = gate.predict_link(gate_matrix)
     decisions: list[LinkOrAbstainDecision] = []
-    for group in _ordered_group_indices(query_indices):
-        if len(group) == 0:
-            continue
-        best_row = _best_row_for_group(
-            group,
-            probabilities=probabilities,
-            retrieval_ranks=retrieval_ranks,
-            component_keys=component_keys,
-        )
-        runner_ups = [int(row_index) for row_index in group if int(row_index) != best_row]
-        runner_up_score = max((float(probabilities[row_index]) for row_index in runner_ups), default=np.nan)
-        margin = None if np.isnan(runner_up_score) else float(probabilities[best_row] - runner_up_score)
-        has_runner_up = margin is not None
-        passes_gate = _passes_artifact_gate(
-            artifact,
-            row_index=best_row,
-            score=float(probabilities[best_row]),
-            margin=margin,
-            has_runner_up=has_runner_up,
-            row_signals=row_signals,
-        )
-        action: LinkAction = "link" if passes_gate else "abstain"
+    for query_pos, best_row in enumerate(gate_query_rows.best_rows):
+        best_row = int(best_row)
+        runner_up_score = float(gate_query_rows.runner_up_scores[query_pos])
+        margin = None if np.isnan(runner_up_score) else float(gate_query_rows.score_margins[query_pos])
+        action: LinkAction = "link" if bool(gate_links[query_pos]) else "abstain"
         component_key = None
         if action == "link" and component_keys is not None:
             component_key = str(component_keys[best_row])
@@ -570,6 +495,47 @@ def _merge_extra_row_signals(
         raise ValueError(f"extra_row_signals may not override existing row signals: {overlap}")
     row_signals.update(extra_row_signals)
     return row_signals
+
+
+def _query_author_for_gate(query: Any) -> str:
+    value = getattr(query, "query_author", None)
+    if value is not None and str(value).strip():
+        return str(value)
+
+    def first_present(*names: str) -> Any:
+        for name in names:
+            attr_value = getattr(query, name, None)
+            if attr_value is not None and str(attr_value).strip():
+                return attr_value
+        return None
+
+    parts = [
+        first_present("first", "author_info_first"),
+        first_present("middle", "author_info_middle"),
+        first_present("last", "author_info_last"),
+        first_present("suffix", "author_info_suffix"),
+    ]
+    return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
+
+
+def _production_query_author_row_signals(
+    retrieval_batch: LinkerRetrievalBatch,
+    *,
+    query_signature_id_by_index: Mapping[int, str],
+    query_by_signature_id: Mapping[str, Any],
+) -> dict[str, np.ndarray]:
+    candidate_batch = retrieval_batch.candidate_batch
+    row_count = int(candidate_batch.row_count)
+    row_query_indices = candidate_batch.row_query_signature_indices
+    if row_query_indices is None:
+        raise ValueError("candidate_batch.row_query_signature_indices is required for query_author row signals")
+    query_author = np.empty(row_count, dtype=object)
+    for row_index, query_index in enumerate(row_query_indices):
+        query_signature_id = query_signature_id_by_index.get(int(query_index))
+        if query_signature_id is None:
+            raise KeyError(f"Missing query signature id for index {int(query_index)}")
+        query_author[row_index] = _query_author_for_gate(query_by_signature_id[str(query_signature_id)])
+    return {"query_author": query_author}
 
 
 def _featureize_linker_candidates_with_telemetry(
@@ -1023,6 +989,10 @@ def _predict_incremental_link_or_abstain_production_private(
         int(query_index): query_signature_id
         for query_index, query_signature_id in zip(query_signature_indices, query_signature_id_strings, strict=True)
     }
+    query_by_signature_id = {
+        query_signature_id: query
+        for query_signature_id, query in zip(query_signature_id_strings, queries, strict=True)
+    }
     component_member_indices_by_key = _build_component_member_indices_by_key(
         cluster_seeds_require,
         signature_id_to_index,
@@ -1095,12 +1065,18 @@ def _predict_incremental_link_or_abstain_production_private(
         runtime_context=resolved_runtime_context,
         featurizer=featurizer,
     )
+    built_runtime_row_signals = _production_query_author_row_signals(
+        retrieval_batch,
+        query_signature_id_by_index=query_signature_id_by_index,
+        query_by_signature_id=query_by_signature_id,
+    )
     built_extra_row_signals = (
         {}
         if extra_row_signal_builder is None
         else dict(extra_row_signal_builder(retrieval_batch, query_signature_id_by_index))
     )
-    merged_extra_row_signals = _merge_extra_row_signals(built_extra_row_signals, extra_row_signals)
+    merged_extra_row_signals = _merge_extra_row_signals(built_runtime_row_signals, built_extra_row_signals)
+    merged_extra_row_signals = _merge_extra_row_signals(merged_extra_row_signals, extra_row_signals)
     private_result = _predict_incremental_link_or_abstain_retrieved_candidates(
         artifact,
         retrieval_batch,

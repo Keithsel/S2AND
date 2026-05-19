@@ -205,9 +205,7 @@ def _validate_single_constraint_require_target(
             f"query_signature_index={query_signature_index} require_row_count={len(forced_constraint_rows)} "
             "component_keys_missing=True"
         )
-    required_components = tuple(
-        sorted({str(component_keys[int(row_index)]) for row_index in forced_constraint_rows})
-    )
+    required_components = tuple(sorted({str(component_keys[int(row_index)]) for row_index in forced_constraint_rows}))
     if len(required_components) > 1:
         raise ValueError(
             "constraint_require_conflicting_candidate_components: "

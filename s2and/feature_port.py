@@ -481,13 +481,13 @@ def _build_rust_featurizer_from_json_paths(
     if not callable(get_json_ingest_telemetry):
         raise RuntimeError(
             "s2and_rust RustFeaturizer.from_json_paths must expose json_ingest_telemetry; "
-            "rebuild/install s2and_rust>=0.51.0."
+            "rebuild/install s2and_rust>=0.50.0."
         )
     telemetry = get_json_ingest_telemetry()
     if telemetry is None:
         raise RuntimeError(
             "s2and_rust RustFeaturizer.from_json_paths returned no json_ingest_telemetry; "
-            "rebuild/install s2and_rust>=0.51.0."
+            "rebuild/install s2and_rust>=0.50.0."
         )
     stage_seconds = dict(telemetry.get("stage_seconds", {}))
     logger.info(

@@ -57,6 +57,16 @@ def version_targets() -> tuple[VersionTarget, ...]:
             ),
         ),
         VersionTarget(
+            name="readme_version_workflow",
+            relative_path=Path("README.md"),
+            pattern=rf"(?m)^(?P<prefix>echo )(?P<version>{SEMVER_PATTERN})(?P<suffix> > VERSION\s*)$",
+        ),
+        VersionTarget(
+            name="development_version_workflow",
+            relative_path=Path("docs") / "development.md",
+            pattern=rf"(?m)^(?P<prefix>echo )(?P<version>{SEMVER_PATTERN})(?P<suffix> > VERSION\s*)$",
+        ),
+        VersionTarget(
             name="cargo_lock",
             relative_path=Path("s2and_rust") / "Cargo.lock",
             pattern=(

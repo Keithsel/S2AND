@@ -97,6 +97,12 @@ def _version_tuple_to_string(version: tuple[int, int, int]) -> str:
     return ".".join(str(part) for part in version)
 
 
+def min_supported_rust_extension_version_string() -> str:
+    """Return the minimum supported Rust extension version as a semver string."""
+
+    return _version_tuple_to_string(MIN_SUPPORTED_RUST_EXTENSION_VERSION)
+
+
 def _rust_featurizer_api_score(module: Any) -> int:
     rust_featurizer_cls = getattr(module, "RustFeaturizer", None)
     if rust_featurizer_cls is None:
@@ -292,7 +298,7 @@ def _resolve_auto_backend(
 def _resolve_explicit_rust_backend(*, source: RuntimeSource) -> BackendResolution:
     capabilities = detect_rust_runtime_capabilities()
     if not capabilities.core_runtime_available:
-        min_version = _version_tuple_to_string(MIN_SUPPORTED_RUST_EXTENSION_VERSION)
+        min_version = min_supported_rust_extension_version_string()
         raise RuntimeError(
             "S2AND_BACKEND='rust' requested but Rust runtime is unavailable or unsupported "
             f"(reason={capabilities.reason}). Install/upgrade s2and_rust (>= {min_version}) "

@@ -92,6 +92,40 @@ def test_build_rust_json_ingest_contract_prefers_loaded_dict_over_path():
     assert contract.specter_embeddings == {"p1": [0.1, 0.2]}
 
 
+def test_build_rust_json_ingest_contract_accepts_service_shaped_dataset():
+    specter_embeddings = {"p1": [0.1, 0.2], "p2": [0.3, 0.4]}
+
+    class ServiceShapedDataset:
+        signatures_path = "signatures.json"
+        papers_path = "papers.json"
+        clusters_path = None
+        cluster_seeds_path = None
+        specter_embeddings_path = None
+        preprocess = True
+        compute_reference_features = False
+
+    ServiceShapedDataset.specter_embeddings = specter_embeddings
+
+    contract = build_rust_json_ingest_contract(
+        ServiceShapedDataset(),
+        name_counts_path=None,
+        cluster_seed_require_value=0.0,
+        cluster_seed_disallow_value=10000.0,
+        num_threads=2,
+        name_tuples_path=None,
+    )
+
+    assert contract.signatures_path == "signatures.json"
+    assert contract.papers_path == "papers.json"
+    assert contract.cluster_seeds_path is None
+    assert contract.specter_embeddings == specter_embeddings
+    assert contract.name_tuples_path is None
+    assert contract.name_counts_path is None
+    assert contract.preprocess is True
+    assert contract.compute_reference_features is False
+    assert contract.num_threads == 2
+
+
 def test_build_rust_json_ingest_contract_requires_signature_and_paper_paths():
     class MissingPathsDataset:
         signatures_path = None

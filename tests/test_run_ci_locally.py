@@ -40,6 +40,20 @@ def test_py_only_lane_reports_expected_rust_skips(monkeypatch, capsys) -> None:
     assert "Rust-only tests are expected to report skips in the py-only lane" in capsys.readouterr().out
 
 
+def test_lint_job_runs_version_sync_check(monkeypatch) -> None:
+    run_ci = _load_run_ci_locally()
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(run_ci, "sync_deps", lambda *, lock_present, lane: None)
+    monkeypatch.setattr(run_ci, "top_level_script_files", lambda: ["scripts/run_ci_locally.py"])
+    monkeypatch.setattr(run_ci, "run_uv", lambda args, *, env=None: calls.append(args))
+
+    run_ci.run_lint_job(lock_present=True)
+
+    assert calls[0] == ["run", "python", "scripts/sync_version.py", "--check"]
+    assert ["run", "ruff", "check", "s2and", "scripts", "tests"] in calls
+
+
 def test_rust_enabled_lane_reports_skip_reasons_for_all_pytest_runs(monkeypatch) -> None:
     run_ci = _load_run_ci_locally()
     calls: list[tuple[list[str], dict[str, str] | None]] = []

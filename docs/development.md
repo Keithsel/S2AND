@@ -21,7 +21,7 @@ uv run python scripts/run_ci_locally.py
 
 `scripts/run_ci_locally.py` mirrors `.github/workflows/main.yaml` by running:
 
-- lint (`ruff check` and `ruff format --check`)
+- lint (`scripts/sync_version.py --check`, `ruff check`, and `ruff format --check`)
 - `typecheck-and-test` matrix lanes (`py-only`, then `rust-enabled`)
 - Rust parity guardrail tests in the `rust-enabled` lane
 

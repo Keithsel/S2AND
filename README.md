@@ -298,7 +298,7 @@ To run the entire CI suite mimicking the GH Actions:
 uv run python scripts/run_ci_locally.py
 ```
 `scripts/run_ci_locally.py` mirrors `.github/workflows/main.yaml` by running:
-- lint job (`ruff check` + `ruff format --check`)
+- lint job (`scripts/sync_version.py --check`, `ruff check`, and `ruff format --check`)
 - `typecheck-and-test` matrix lanes (`py-only`, then `rust-enabled`)
 - Rust parity guardrail tests in the `rust-enabled` lane
 

@@ -8,6 +8,7 @@ import numpy as np
 
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
+from s2and.runtime import min_supported_rust_extension_version_string
 from s2and.thread_config import resolve_n_jobs
 
 
@@ -68,7 +69,10 @@ def get_constraints_matrix_rust(
 
     get_constraints_matrix = getattr(featurizer, "get_constraints_matrix", None)
     if not callable(get_constraints_matrix):
-        raise RuntimeError("RustFeaturizer.get_constraints_matrix is unavailable; rebuild/install s2and-rust>=0.50.0.")
+        raise RuntimeError(
+            "RustFeaturizer.get_constraints_matrix is unavailable; "
+            f"rebuild/install s2and-rust>={min_supported_rust_extension_version_string()}."
+        )
     return list(
         get_constraints_matrix(
             pairs,

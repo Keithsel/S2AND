@@ -8,6 +8,7 @@ from scripts import sync_version
 def _write_version_fixture(root: Path) -> None:
     (root / "s2and").mkdir()
     (root / "s2and_rust").mkdir()
+    (root / "docs").mkdir()
     (root / "VERSION").write_text("0.50.0\n", encoding="utf-8")
     (root / "pyproject.toml").write_text(
         "\n".join(
@@ -47,6 +48,8 @@ def _write_version_fixture(root: Path) -> None:
         "MIN_SUPPORTED_RUST_EXTENSION_VERSION = (0, 49, 0)\n",
         encoding="utf-8",
     )
+    (root / "README.md").write_text("echo 0.49.0 > VERSION\n", encoding="utf-8")
+    (root / "docs" / "development.md").write_text("echo 0.40.0 > VERSION\n", encoding="utf-8")
     (root / "s2and_rust" / "Cargo.lock").write_text(
         "\n".join(
             [
@@ -86,6 +89,8 @@ def test_sync_version_updates_rust_manifests_runtime_guard_and_lockfiles(tmp_pat
     assert "MIN_SUPPORTED_RUST_EXTENSION_VERSION = (0, 50, 0)" in (tmp_path / "s2and" / "runtime.py").read_text(
         encoding="utf-8"
     )
+    assert "echo 0.50.0 > VERSION" in (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "echo 0.50.0 > VERSION" in (tmp_path / "docs" / "development.md").read_text(encoding="utf-8")
     assert 'version = "0.50.0"' in (tmp_path / "s2and_rust" / "Cargo.lock").read_text(encoding="utf-8")
     assert 'version = "0.50.0"' in (tmp_path / "uv.lock").read_text(encoding="utf-8")
 
@@ -105,3 +110,10 @@ def test_sync_version_rejects_ambiguous_targets(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit, match="Expected one version match"):
         sync_version.sync_version("0.50.0", root=tmp_path)
+
+
+def test_pre_commit_stages_sync_version_targets() -> None:
+    hook_text = (sync_version.ROOT / ".githooks" / "pre-commit").read_text(encoding="utf-8")
+
+    for target in sync_version.version_targets():
+        assert target.relative_path.as_posix() in hook_text

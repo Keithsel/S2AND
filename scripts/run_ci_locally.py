@@ -5,6 +5,7 @@ Run local CI with close parity to `.github/workflows/main.yaml`.
 Execution order:
   1) lint job:
      - uv sync --extra dev [--frozen if uv.lock exists]
+     - version sync check
      - ruff check / format checks
   2) typecheck-and-test matrix:
      - py-only lane
@@ -163,6 +164,7 @@ def sync_deps(*, lock_present: bool, lane: str) -> None:
 def run_lint_job(*, lock_present: bool) -> None:
     print("\n=== lint ===")
     sync_deps(lock_present=lock_present, lane="py-only")
+    run_uv(["run", "python", "scripts/sync_version.py", "--check"])
     run_uv(["run", "ruff", "check", "s2and", "scripts", "tests"])
     run_uv(["run", "ruff", "format", "--check", "s2and"])
     script_files = top_level_script_files()

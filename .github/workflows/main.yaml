@@ -36,6 +36,8 @@ jobs:
             uv sync --extra dev
           fi
 
+      - name: version sync check
+        run: uv run python scripts/sync_version.py --check
       - name: ruff check
         run: uv run ruff check s2and scripts tests
       - name: ruff format (s2and/)

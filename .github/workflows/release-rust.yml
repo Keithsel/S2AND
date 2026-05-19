@@ -36,6 +36,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Version sync check
+        run: uv run --no-project python scripts/sync_version.py --check
+
       - name: Detect version changes
         id: detect
         env:

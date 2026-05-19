@@ -96,6 +96,42 @@ def test_distance_row_signals_distinguish_top3_and_top5_means() -> None:
     assert signals["top5_mean_distance"][0] == pytest.approx(0.3)
 
 
+def test_subset_row_signals_rejects_non_1d_signals() -> None:
+    with pytest.raises(ValueError, match="row signal 'bad' must be 1D"):
+        runtime_module._subset_row_signals(
+            {"bad": np.zeros((2, 2), dtype=np.float32)},
+            np.asarray([0], dtype=np.int64),
+            2,
+        )
+
+
+def test_constraint_row_signals_summarize_require_and_disallow_labels() -> None:
+    candidate_batch = LinkerCandidateBatch(
+        row_count=3,
+        left_signature_indices=np.asarray([10, 10, 11, 11, 12], dtype=np.uint32),
+        right_signature_indices=np.asarray([1, 2, 3, 4, 5], dtype=np.uint32),
+        pair_row_indices=np.asarray([0, 0, 1, 1, 2], dtype=np.uint32),
+    )
+    labels = np.asarray(
+        [
+            -float(LARGE_INTEGER),
+            float(LARGE_DISTANCE - LARGE_INTEGER),
+            np.nan,
+            float(LARGE_DISTANCE - LARGE_INTEGER),
+            float(LARGE_DISTANCE - LARGE_INTEGER),
+        ],
+        dtype=np.float64,
+    )
+
+    signals = runtime_module._constraint_row_signals(candidate_batch, labels)
+
+    np.testing.assert_allclose(signals["constraint_pair_count"], [2.0, 2.0, 1.0])
+    np.testing.assert_allclose(signals["constraint_hit_count"], [2.0, 1.0, 1.0])
+    np.testing.assert_allclose(signals["constraint_require_count"], [1.0, 0.0, 0.0])
+    np.testing.assert_allclose(signals["constraint_disallow_count"], [1.0, 1.0, 1.0])
+    np.testing.assert_allclose(signals["constraint_disallow_fraction"], [0.5, 0.5, 1.0])
+
+
 class FakeRuntimeFeaturizer:
     def __init__(self, signature_ids: list[str], *, default_label: float = float("nan")) -> None:
         self._signature_ids = tuple(signature_ids)
@@ -1093,6 +1129,203 @@ def test_compact_logistic_gate_can_use_materialized_bucket_feature() -> None:
     assert result.decisions[0].action == "link"
 
 
+def test_compact_constraint_require_forces_link() -> None:
+    artifact = StaticArtifact(
+        np.asarray([0.95, 0.10], dtype=np.float64),
+        gate_config=_promoted_gate_config(0.99),
+    )
+    candidate_batch = LinkerCandidateBatch(
+        row_count=2,
+        left_signature_indices=np.zeros(0, dtype=np.uint32),
+        right_signature_indices=np.zeros(0, dtype=np.uint32),
+        pair_row_indices=np.zeros(0, dtype=np.uint32),
+        row_query_signature_indices=np.asarray([10, 10], dtype=np.uint32),
+        row_component_keys=("non_require_high_score", "require_low_score"),
+        retrieval_ranks=np.asarray([1, 2], dtype=np.uint16),
+    )
+
+    result = _predict_incremental_link_or_abstain_compact(
+        artifact,  # type: ignore[arg-type]
+        _empty_feature_matrix(candidate_batch),
+        row_signals={
+            "constraint_pair_count": np.asarray([1.0, 1.0], dtype=np.float32),
+            "constraint_require_count": np.asarray([0.0, 1.0], dtype=np.float32),
+            "constraint_disallow_count": np.asarray([0.0, 0.0], dtype=np.float32),
+            "constraint_disallow_fraction": np.asarray([0.0, 0.0], dtype=np.float32),
+        },
+    )
+
+    assert result.decisions[0].action == "link"
+    assert result.decisions[0].component_key == "require_low_score"
+    assert result.decisions[0].score == pytest.approx(0.10)
+
+
+def test_compact_constraint_require_rejects_conflicting_candidate_components() -> None:
+    artifact = StaticArtifact(
+        np.asarray([0.95, 0.90], dtype=np.float64),
+        gate_config=_promoted_gate_config(0.0),
+    )
+    candidate_batch = LinkerCandidateBatch(
+        row_count=2,
+        left_signature_indices=np.zeros(0, dtype=np.uint32),
+        right_signature_indices=np.zeros(0, dtype=np.uint32),
+        pair_row_indices=np.zeros(0, dtype=np.uint32),
+        row_query_signature_indices=np.asarray([10, 10], dtype=np.uint32),
+        row_component_keys=("required_component_a", "required_component_b"),
+        retrieval_ranks=np.asarray([1, 2], dtype=np.uint16),
+    )
+
+    with pytest.raises(ValueError, match="constraint_require_conflicting_candidate_components"):
+        _predict_incremental_link_or_abstain_compact(
+            artifact,  # type: ignore[arg-type]
+            _empty_feature_matrix(candidate_batch),
+            row_signals={
+                "constraint_pair_count": np.asarray([1.0, 1.0], dtype=np.float32),
+                "constraint_require_count": np.asarray([1.0, 1.0], dtype=np.float32),
+                "constraint_disallow_count": np.asarray([0.0, 0.0], dtype=np.float32),
+                "constraint_disallow_fraction": np.asarray([0.0, 0.0], dtype=np.float32),
+            },
+        )
+
+
+def test_compact_constraint_disallow_vetoes_single_member_candidate_and_chooses_next() -> None:
+    artifact = StaticArtifact(
+        np.asarray([0.95, 0.80], dtype=np.float64),
+        gate_config=_promoted_gate_config(0.5),
+    )
+    candidate_batch = LinkerCandidateBatch(
+        row_count=2,
+        left_signature_indices=np.zeros(0, dtype=np.uint32),
+        right_signature_indices=np.zeros(0, dtype=np.uint32),
+        pair_row_indices=np.zeros(0, dtype=np.uint32),
+        row_query_signature_indices=np.asarray([10, 10], dtype=np.uint32),
+        row_component_keys=("disallowed_high_score", "eligible_lower_score"),
+        retrieval_ranks=np.asarray([1, 2], dtype=np.uint16),
+    )
+
+    result = _predict_incremental_link_or_abstain_compact(
+        artifact,  # type: ignore[arg-type]
+        _empty_feature_matrix(candidate_batch),
+        row_signals={
+            "constraint_pair_count": np.asarray([1.0, 1.0], dtype=np.float32),
+            "constraint_require_count": np.asarray([0.0, 0.0], dtype=np.float32),
+            "constraint_disallow_count": np.asarray([1.0, 0.0], dtype=np.float32),
+            "constraint_disallow_fraction": np.asarray([1.0, 0.0], dtype=np.float32),
+        },
+    )
+
+    assert result.decisions[0].action == "link"
+    assert result.decisions[0].component_key == "eligible_lower_score"
+    assert result.decisions[0].score == pytest.approx(0.80)
+
+
+def test_compact_constraint_veto_recomputes_gate_only_for_affected_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = StaticArtifact(
+        np.asarray([0.95, 0.80, 0.90, 0.10], dtype=np.float64),
+        gate_config=_promoted_gate_config(0.5),
+    )
+    candidate_batch = LinkerCandidateBatch(
+        row_count=4,
+        left_signature_indices=np.zeros(0, dtype=np.uint32),
+        right_signature_indices=np.zeros(0, dtype=np.uint32),
+        pair_row_indices=np.zeros(0, dtype=np.uint32),
+        row_query_signature_indices=np.asarray([10, 10, 11, 11], dtype=np.uint32),
+        row_component_keys=("vetoed_high_score", "eligible_lower_score", "q2_high_score", "q2_low_score"),
+        retrieval_ranks=np.asarray([1, 2, 1, 2], dtype=np.uint16),
+    )
+    gate_row_counts: list[int] = []
+    original_gate_builder = runtime_module.build_runtime_logistic_gate_matrix
+
+    def recording_gate_builder(*args: Any, **kwargs: Any):
+        feature_matrix = args[1]
+        gate_row_counts.append(int(feature_matrix.candidate_batch.row_count))
+        return original_gate_builder(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_module, "build_runtime_logistic_gate_matrix", recording_gate_builder)
+
+    result = _predict_incremental_link_or_abstain_compact(
+        artifact,  # type: ignore[arg-type]
+        _empty_feature_matrix(candidate_batch),
+        row_signals={
+            "constraint_pair_count": np.ones(4, dtype=np.float32),
+            "constraint_require_count": np.zeros(4, dtype=np.float32),
+            "constraint_disallow_count": np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            "constraint_disallow_fraction": np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        },
+    )
+
+    assert gate_row_counts == [4, 1]
+    assert result.decisions[0].component_key == "eligible_lower_score"
+    assert result.decisions[1].component_key == "q2_high_score"
+
+
+def test_compact_constraint_disallow_abstains_when_all_candidate_rows_vetoed() -> None:
+    artifact = StaticArtifact(
+        np.asarray([0.95, 0.80], dtype=np.float64),
+        gate_config=_promoted_gate_config(0.5),
+    )
+    candidate_batch = LinkerCandidateBatch(
+        row_count=2,
+        left_signature_indices=np.zeros(0, dtype=np.uint32),
+        right_signature_indices=np.zeros(0, dtype=np.uint32),
+        pair_row_indices=np.zeros(0, dtype=np.uint32),
+        row_query_signature_indices=np.asarray([10, 10], dtype=np.uint32),
+        row_component_keys=("disallowed_high_score", "disallowed_lower_score"),
+        retrieval_ranks=np.asarray([1, 2], dtype=np.uint16),
+    )
+
+    result = _predict_incremental_link_or_abstain_compact(
+        artifact,  # type: ignore[arg-type]
+        _empty_feature_matrix(candidate_batch),
+        row_signals={
+            "constraint_pair_count": np.asarray([1.0, 1.0], dtype=np.float32),
+            "constraint_require_count": np.asarray([0.0, 0.0], dtype=np.float32),
+            "constraint_disallow_count": np.asarray([1.0, 1.0], dtype=np.float32),
+            "constraint_disallow_fraction": np.asarray([1.0, 1.0], dtype=np.float32),
+        },
+    )
+
+    assert result.decisions[0].action == "abstain"
+    assert result.decisions[0].component_key is None
+    assert result.decisions[0].row_index is None
+
+
+def test_compact_orcid_match_forces_link_and_beats_non_orcid_rows() -> None:
+    artifact = StaticArtifact(
+        np.asarray([0.95, 0.10], dtype=np.float64),
+        gate_config=_promoted_gate_config(0.99),
+    )
+    candidate_batch = LinkerCandidateBatch(
+        row_count=2,
+        left_signature_indices=np.zeros(0, dtype=np.uint32),
+        right_signature_indices=np.zeros(0, dtype=np.uint32),
+        pair_row_indices=np.zeros(0, dtype=np.uint32),
+        row_query_signature_indices=np.asarray([10, 10], dtype=np.uint32),
+        row_component_keys=("non_orcid_high_score", "orcid_low_score"),
+        retrieval_ranks=np.asarray([1, 2], dtype=np.uint16),
+    )
+
+    result = _predict_incremental_link_or_abstain_compact(
+        artifact,  # type: ignore[arg-type]
+        _empty_feature_matrix(candidate_batch),
+        row_signals={
+            "orcid_match": np.asarray([0.0, 1.0], dtype=np.float32),
+            "constraint_pair_count": np.asarray([1.0, 1.0], dtype=np.float32),
+            "constraint_require_count": np.asarray([0.0, 0.0], dtype=np.float32),
+            "constraint_disallow_count": np.asarray([0.0, 1.0], dtype=np.float32),
+            "constraint_disallow_fraction": np.asarray([0.0, 1.0], dtype=np.float32),
+        },
+    )
+
+    assert result.decisions[0].action == "link"
+    assert result.decisions[0].component_key == "orcid_low_score"
+    assert result.decisions[0].score == pytest.approx(0.10)
+    assert result.decisions[0].runner_up_score == pytest.approx(0.95)
+    assert result.decisions[0].score_margin == pytest.approx(-0.85)
+
+
 def test_private_retrieved_candidate_slice_scores_matrix_and_records_telemetry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1359,6 +1592,41 @@ def test_private_production_slice_preserves_partial_supervision_constraint_label
     )
 
 
+def test_private_production_slice_rejects_conflicting_partial_require_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = SimpleNamespace()
+    featurizer = FakeRuntimeFeaturizer(["q1", "s1", "s2"])
+    clusterer = FakeProductionClusterer({"s1": "c1", "s2": "c2"})
+    artifact = StaticArtifact(np.asarray([0.9, 0.8], dtype=np.float64), gate_config=_promoted_gate_config(0.0))
+    monkeypatch.setattr(
+        runtime_module,
+        "build_linker_retrieval_batch_rust",
+        lambda **_kwargs: _production_retrieval_batch(
+            row_query_signature_indices=np.asarray([0, 0], dtype=np.uint32),
+            row_component_keys=("c1", "c2"),
+            left_signature_indices=np.asarray([0, 0], dtype=np.uint32),
+            right_signature_indices=np.asarray([1, 2], dtype=np.uint32),
+            pair_row_indices=np.asarray([0, 1], dtype=np.uint32),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="partial_supervision_require_conflicting_seed_components"):
+        _predict_incremental_link_or_abstain_production_private(
+            clusterer,
+            artifact,  # type: ignore[arg-type]
+            dataset=dataset,  # type: ignore[arg-type]
+            featurizer=featurizer,
+            retriever=object(),
+            queries=[object()],
+            query_signature_ids=["q1"],
+            partial_supervision={
+                ("q1", "s1"): 0,
+                ("q1", "s2"): 0,
+            },
+        )
+
+
 def test_private_production_slice_keeps_seed_disallow_constraints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1414,6 +1682,7 @@ def test_private_production_slice_keeps_seed_disallow_constraints(
     assert "constraint_seed_bypass_pair_count" not in result.telemetry
     assert captured_pair_labels[0][0] == pytest.approx(disallow_label)
     assert captured_pair_labels[0][1] == pytest.approx(disallow_label)
+    assert result.linked_signature_clusters == {}
 
 
 def test_private_production_slice_rejects_require_outside_retrieval_window(

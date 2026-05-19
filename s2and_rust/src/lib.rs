@@ -203,6 +203,7 @@ const DEFAULT_HYBRID_CENTROID_WEIGHTS: [f64; 5] =
 const DEFAULT_INITIAL_ONLY_HYBRID_CENTROID_WEIGHTS: [f64; 5] =
     [0.520012, 0.220264, 0.109278, 0.150447, 0.0];
 const DEFAULT_HYBRID_EXEMPLAR_4_WEIGHTS: [f64; 5] = [0.40, 0.23, 0.12, 0.05, 0.07];
+const INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS: [&str; 1] = ["row_orcid_match"];
 const RETRIEVAL_MIDDLE_INITIAL_CONFLICT_SCORE: f64 = -0.25;
 const RETRIEVAL_YEAR_SCORE_DECAY_YEARS: f64 = 15.0;
 const RETRIEVAL_YEAR_SCORE_RANGE_GAP: i64 = 10;
@@ -297,6 +298,7 @@ struct RetrievalPairPlanQueryResult {
     row_query_year_missing: Vec<u8>,
     row_query_has_affiliations: Vec<u8>,
     row_query_has_coauthors: Vec<u8>,
+    row_orcid_match: Vec<u8>,
     row_middle_initial_compatibility: Vec<f32>,
     row_affiliation_overlap: Vec<f32>,
     row_coauthor_overlap: Vec<f32>,
@@ -306,6 +308,11 @@ struct RetrievalPairPlanQueryResult {
     row_specter_centroid_similarity: Vec<f32>,
     row_specter_exemplar_similarity: Vec<f32>,
     right_signature_indices_by_row: Vec<Vec<u32>>,
+}
+
+struct RetrievalCandidateSelection {
+    indices: Vec<usize>,
+    return_all: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -476,15 +483,21 @@ impl RustHybridCentroidRetriever {
         &self,
         query_data: &RetrievalQueryData,
         mut candidate_indices: Vec<usize>,
-    ) -> Vec<usize> {
+    ) -> RetrievalCandidateSelection {
         if let Some(orcid_hash) = query_data.orcid_hash {
-            let orcid_matches: Vec<usize> = candidate_indices
+            let orcid_matches: Vec<usize> = self
+                .summaries
                 .iter()
-                .copied()
-                .filter(|idx| contains_hashed_value(&self.summaries[*idx].orcid_hashes, orcid_hash))
+                .enumerate()
+                .filter_map(|(idx, summary)| {
+                    contains_hashed_value(&summary.orcid_hashes, orcid_hash).then_some(idx)
+                })
                 .collect();
             if !orcid_matches.is_empty() {
-                candidate_indices = orcid_matches;
+                return RetrievalCandidateSelection {
+                    indices: orcid_matches,
+                    return_all: true,
+                };
             }
         }
 
@@ -517,7 +530,10 @@ impl RustHybridCentroidRetriever {
             candidate_indices = year_filtered;
         }
 
-        candidate_indices
+        RetrievalCandidateSelection {
+            indices: candidate_indices,
+            return_all: false,
+        }
     }
 
     fn candidate_indices_for_pair_plan_query(
@@ -527,7 +543,7 @@ impl RustHybridCentroidRetriever {
         query_signature_id: Option<&str>,
         selector: Option<&RustNameCompatibleSubblockSelector>,
         global_backfill_count: usize,
-    ) -> Vec<usize> {
+    ) -> RetrievalCandidateSelection {
         let selected = if query_data.has_full_first {
             match (query_signature_id, selector) {
                 (Some(signature_id), Some(selector)) => selector
@@ -563,20 +579,25 @@ impl RustHybridCentroidRetriever {
         selector: Option<&RustNameCompatibleSubblockSelector>,
         global_backfill_count: usize,
     ) -> Result<RetrievalPairPlanQueryResult, String> {
-        let candidate_indices = self.candidate_indices_for_pair_plan_query(
+        let selection = self.candidate_indices_for_pair_plan_query(
             current_query,
             base_candidate_indices,
             query_signature_id,
             selector,
             global_backfill_count,
         );
-        if candidate_indices.is_empty() {
+        if selection.indices.is_empty() {
             return Ok(RetrievalPairPlanQueryResult::default());
         }
+        let effective_top_k = if selection.return_all {
+            selection.indices.len()
+        } else {
+            top_k
+        };
         let scored = self.score_top_k_candidate_indices_default_inner(
             current_query,
-            &candidate_indices,
-            top_k,
+            &selection.indices,
+            effective_top_k,
             self.max_block_component_size,
             None,
             None,
@@ -646,6 +667,11 @@ impl RustHybridCentroidRetriever {
                 .row_query_has_affiliations
                 .push(query_has_affiliations);
             result.row_query_has_coauthors.push(query_has_coauthors);
+            result
+                .row_orcid_match
+                .push(u8::from(current_query.orcid_hash.is_some_and(
+                    |orcid_hash| contains_hashed_value(&summary.orcid_hashes, orcid_hash),
+                )));
             result
                 .row_middle_initial_compatibility
                 .push(chooser_features[0]);
@@ -1741,6 +1767,31 @@ fn extract_string_hashes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
     Ok(hashes)
 }
 
+fn normalize_orcid_str(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn extract_orcid_hashes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
+    if obj.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut hashes = Vec::new();
+    for item in PyIterator::from_object(obj)? {
+        let value: String = item?.extract()?;
+        if let Some(orcid) = normalize_orcid_str(&value) {
+            hashes.push(fnv64(orcid.as_bytes()));
+        }
+    }
+    hashes.sort_unstable();
+    hashes.dedup();
+    Ok(hashes)
+}
+
 fn extract_query_terms(obj: &Bound<'_, PyAny>) -> PyResult<Vec<RetrievalQueryTerm>> {
     if obj.is_none() {
         return Ok(Vec::new());
@@ -1758,12 +1809,12 @@ fn extract_query_terms(obj: &Bound<'_, PyAny>) -> PyResult<Vec<RetrievalQueryTer
     Ok(terms)
 }
 
-fn extract_optional_string_hash(obj: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+fn extract_optional_orcid_hash(obj: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
     if obj.is_none() {
         return Ok(None);
     }
     let value: String = obj.extract()?;
-    Ok(Some(fnv64(value.as_bytes())))
+    Ok(normalize_orcid_str(&value).map(|orcid| fnv64(orcid.as_bytes())))
 }
 
 fn same_prefix_tokens_compat(a: &str, b: &str) -> bool {
@@ -2051,7 +2102,7 @@ fn extract_retrieval_summary(
     let year_min: Option<i64> = obj.getattr("year_min")?.extract()?;
     let year_max: Option<i64> = obj.getattr("year_max")?.extract()?;
     let year_mean: Option<f64> = obj.getattr("year_mean")?.extract()?;
-    let orcid_hashes = extract_string_hashes(&obj.getattr("orcid_values")?)?;
+    let orcid_hashes = extract_orcid_hashes(&obj.getattr("orcid_values")?)?;
     let specter_centroid = extract_specter_vec(&obj.getattr("specter_centroid")?)?;
     let specter_centroid_norm = specter_centroid.as_ref().map(|values| {
         values
@@ -2118,7 +2169,7 @@ fn extract_retrieval_query(obj: &Bound<'_, PyAny>) -> PyResult<RetrievalQueryDat
     let venue_hashes = extract_string_hashes(&obj.getattr("venue_terms")?)?;
     let title_hashes = extract_string_hashes(&obj.getattr("title_terms")?)?;
     let year: Option<i64> = obj.getattr("year")?.extract()?;
-    let orcid_hash = extract_optional_string_hash(&obj.getattr("orcid")?)?;
+    let orcid_hash = extract_optional_orcid_hash(&obj.getattr("orcid")?)?;
     let specter = extract_specter_vec(&obj.getattr("specter")?)?;
     let specter_norm = specter.as_ref().map(|values| {
         values
@@ -7735,20 +7786,25 @@ impl RustHybridCentroidRetriever {
         }
         let query_data = extract_retrieval_query(query)?;
 
-        let candidate_indices = self.hard_filtered_candidate_indices_for_query(
+        let selection = self.hard_filtered_candidate_indices_for_query(
             &query_data,
             (0..self.summaries.len()).collect(),
         );
 
-        if candidate_indices.is_empty() {
+        if selection.indices.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
+        let effective_top_k = if selection.return_all {
+            selection.indices.len()
+        } else {
+            top_k
+        };
 
         self.score_top_k_candidate_indices_experimental(
             py,
             &query_data,
-            &candidate_indices,
-            top_k,
+            &selection.indices,
+            effective_top_k,
             self.max_block_component_size,
             num_threads,
             None,
@@ -7852,6 +7908,7 @@ impl RustHybridCentroidRetriever {
         let mut row_query_year_missing = Vec::<u8>::new();
         let mut row_query_has_affiliations = Vec::<u8>::new();
         let mut row_query_has_coauthors = Vec::<u8>::new();
+        let mut row_orcid_match = Vec::<u8>::new();
         let mut row_middle_initial_compatibility = Vec::<f32>::new();
         let mut row_affiliation_overlap = Vec::<f32>::new();
         let mut row_coauthor_overlap = Vec::<f32>::new();
@@ -7942,6 +7999,7 @@ impl RustHybridCentroidRetriever {
             row_query_year_missing.append(&mut query_result.row_query_year_missing);
             row_query_has_affiliations.append(&mut query_result.row_query_has_affiliations);
             row_query_has_coauthors.append(&mut query_result.row_query_has_coauthors);
+            row_orcid_match.append(&mut query_result.row_orcid_match);
             row_middle_initial_compatibility
                 .append(&mut query_result.row_middle_initial_compatibility);
             row_affiliation_overlap.append(&mut query_result.row_affiliation_overlap);
@@ -8005,6 +8063,7 @@ impl RustHybridCentroidRetriever {
             "row_query_has_coauthors",
             row_query_has_coauthors.to_pyarray(py),
         )?;
+        payload.set_item("row_orcid_match", row_orcid_match.to_pyarray(py))?;
         payload.set_item(
             "middle_initial_compatibility",
             row_middle_initial_compatibility.to_pyarray(py),
@@ -8045,20 +8104,25 @@ impl RustHybridCentroidRetriever {
         let query_data = extract_retrieval_query(query)?;
         let weights_data = extract_retrieval_weights(weights)?;
 
-        let candidate_indices = self.hard_filtered_candidate_indices_for_query(
+        let selection = self.hard_filtered_candidate_indices_for_query(
             &query_data,
             (0..self.summaries.len()).collect(),
         );
 
-        if candidate_indices.is_empty() {
+        if selection.indices.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
+        let effective_top_k = if selection.return_all {
+            selection.indices.len()
+        } else {
+            top_k
+        };
 
         self.score_top_k_candidate_indices(
             py,
             &query_data,
-            &candidate_indices,
-            top_k,
+            &selection.indices,
+            effective_top_k,
             self.max_block_component_size,
             num_threads,
             None,
@@ -9059,6 +9123,10 @@ fn get_build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     build_info.set_item("target", option_env!("TARGET").unwrap_or("unknown"))?;
     build_info.set_item("host", option_env!("HOST").unwrap_or("unknown"))?;
     build_info.set_item("rustc", option_env!("RUSTC").unwrap_or("unknown"))?;
+    build_info.set_item(
+        "incremental_linking_pair_plan_row_signals",
+        INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS.to_vec(),
+    )?;
     Ok(build_info.unbind())
 }
 
@@ -9121,6 +9189,10 @@ fn _s2and_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "RETRIEVAL_HARD_FILTER_MAX_YEAR_GAP",
         RETRIEVAL_HARD_FILTER_MAX_YEAR_GAP,
+    )?;
+    m.add(
+        "INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS",
+        INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS.to_vec(),
     )?;
     m.add_function(wrap_pyfunction!(get_build_info, m)?)?;
     m.add_function(wrap_pyfunction!(promoted_linker_non_pairwise_features, m)?)?;

@@ -128,6 +128,184 @@ def _artifact_logistic_gate(artifact: IncrementalLinkingArtifact) -> NumpyLogist
     return load_logistic_gate_config(artifact.metadata.gate_config)
 
 
+def _orcid_match_signal(row_signals: Mapping[str, Any] | None, row_count: int) -> np.ndarray | None:
+    if row_signals is None or "orcid_match" not in row_signals:
+        return None
+    values = np.asarray(row_signals["orcid_match"])
+    if values.ndim != 1 or len(values) != int(row_count):
+        raise ValueError(f"orcid_match row signal must be 1D with row_count={row_count}, got {values.shape}")
+    return values.astype(bool, copy=False)
+
+
+def _optional_float_row_signal(
+    row_signals: Mapping[str, Any] | None,
+    name: str,
+    row_count: int,
+) -> np.ndarray | None:
+    if row_signals is None or name not in row_signals:
+        return None
+    values = np.asarray(row_signals[name], dtype=np.float64)
+    if values.ndim != 1 or len(values) != int(row_count):
+        raise ValueError(f"{name} row signal must be 1D with row_count={row_count}, got {values.shape}")
+    return values
+
+
+def _constraint_require_signal(row_signals: Mapping[str, Any] | None, row_count: int) -> np.ndarray | None:
+    require_count = _optional_float_row_signal(row_signals, "constraint_require_count", row_count)
+    if require_count is None:
+        return None
+    return require_count > 0
+
+
+def _constraint_disallow_veto_signal(row_signals: Mapping[str, Any] | None, row_count: int) -> np.ndarray | None:
+    disallow_count = _optional_float_row_signal(row_signals, "constraint_disallow_count", row_count)
+    if disallow_count is None:
+        return None
+    pair_count = _optional_float_row_signal(row_signals, "constraint_pair_count", row_count)
+    disallow_fraction = _optional_float_row_signal(row_signals, "constraint_disallow_fraction", row_count)
+    if pair_count is None or disallow_fraction is None:
+        missing = [
+            name
+            for name, value in (
+                ("constraint_pair_count", pair_count),
+                ("constraint_disallow_fraction", disallow_fraction),
+            )
+            if value is None
+        ]
+        raise ValueError(f"constraint disallow veto requires row signals: {missing}")
+
+    has_disallow = disallow_count > 0
+    single_pair_disallow = (pair_count <= 1) & has_disallow
+    all_pairs_disallow = (pair_count > 0) & (disallow_count >= pair_count)
+    mostly_disallow = (pair_count >= 3) & (disallow_fraction >= 0.8)
+    veto = has_disallow & (single_pair_disallow | all_pairs_disallow | mostly_disallow)
+
+    # Positive hard evidence is allowed to choose an identity-bearing row even if
+    # the candidate component also has incompatible historical members.
+    require_rows = _constraint_require_signal(row_signals, row_count)
+    if require_rows is not None:
+        veto &= ~require_rows
+    orcid_rows = _orcid_match_signal(row_signals, row_count)
+    if orcid_rows is not None:
+        veto &= ~orcid_rows
+    return veto
+
+
+def _validate_single_constraint_require_target(
+    *,
+    forced_constraint_rows: np.ndarray,
+    component_keys: tuple[object, ...] | None,
+    query_signature_index: int,
+) -> None:
+    if len(forced_constraint_rows) <= 1:
+        return
+    if component_keys is None:
+        raise ValueError(
+            "constraint_require_conflicting_candidate_components: "
+            f"query_signature_index={query_signature_index} require_row_count={len(forced_constraint_rows)} "
+            "component_keys_missing=True"
+        )
+    required_components = tuple(
+        sorted({str(component_keys[int(row_index)]) for row_index in forced_constraint_rows})
+    )
+    if len(required_components) > 1:
+        raise ValueError(
+            "constraint_require_conflicting_candidate_components: "
+            f"query_signature_index={query_signature_index} component_keys={required_components}"
+        )
+
+
+def _constraint_row_signals(candidate_batch: LinkerCandidateBatch, pair_labels: np.ndarray) -> dict[str, np.ndarray]:
+    row_count = int(candidate_batch.row_count)
+    labels = np.asarray(pair_labels, dtype=np.float64)
+    pair_count = int(candidate_batch.pair_count)
+    if labels.shape != (pair_count,):
+        raise ValueError(f"pair_labels must have shape ({pair_count},), got {labels.shape}")
+    row_indices = np.asarray(candidate_batch.pair_row_indices, dtype=np.int64)
+    if row_indices.shape != (pair_count,):
+        raise ValueError(f"pair_row_indices must have shape ({pair_count},), got {row_indices.shape}")
+
+    pair_counts = np.bincount(row_indices, minlength=row_count).astype(np.float32, copy=False)
+    require_counts = np.zeros(row_count, dtype=np.float32)
+    disallow_counts = np.zeros(row_count, dtype=np.float32)
+    hit_counts = np.zeros(row_count, dtype=np.float32)
+    finite = np.isfinite(labels)
+    if np.any(finite):
+        finite_rows = row_indices[finite]
+        distances = labels[finite] + float(LARGE_INTEGER)
+        hit_counts += np.bincount(finite_rows, minlength=row_count).astype(np.float32, copy=False)
+        require_rows = finite_rows[np.isclose(distances, 0.0)]
+        if len(require_rows):
+            require_counts += np.bincount(require_rows, minlength=row_count).astype(np.float32, copy=False)
+        disallow_rows = finite_rows[distances >= float(LARGE_DISTANCE)]
+        if len(disallow_rows):
+            disallow_counts += np.bincount(disallow_rows, minlength=row_count).astype(np.float32, copy=False)
+
+    disallow_fraction = np.zeros(row_count, dtype=np.float32)
+    np.divide(disallow_counts, pair_counts, out=disallow_fraction, where=pair_counts > 0)
+    return {
+        "constraint_pair_count": pair_counts,
+        "constraint_hit_count": hit_counts,
+        "constraint_require_count": require_counts,
+        "constraint_disallow_count": disallow_counts,
+        "constraint_disallow_fraction": disallow_fraction,
+    }
+
+
+def _subset_row_signals(
+    row_signals: Mapping[str, Any] | None,
+    row_indices: np.ndarray,
+    row_count: int,
+) -> dict[str, Any] | None:
+    if row_signals is None:
+        return None
+    subset: dict[str, Any] = {}
+    for name, values in row_signals.items():
+        array = np.asarray(values)
+        if array.ndim != 1 or len(array) != row_count:
+            raise ValueError(f"row signal {name!r} must be 1D with row_count={row_count}, got {array.shape}")
+        subset[name] = array[row_indices]
+    return subset
+
+
+def _subset_feature_matrix_for_rows(
+    feature_matrix: LinkerFeatureMatrix,
+    row_indices: np.ndarray,
+) -> LinkerFeatureMatrix:
+    candidate_batch = feature_matrix.candidate_batch
+    row_indices = np.asarray(row_indices, dtype=np.int64)
+    row_component_keys = (
+        None
+        if candidate_batch.row_component_keys is None
+        else tuple(candidate_batch.row_component_keys[int(row_index)] for row_index in row_indices)
+    )
+    retrieval_scores = (
+        None if candidate_batch.retrieval_scores is None else np.asarray(candidate_batch.retrieval_scores)[row_indices]
+    )
+    retrieval_ranks = (
+        None if candidate_batch.retrieval_ranks is None else np.asarray(candidate_batch.retrieval_ranks)[row_indices]
+    )
+    row_query_signature_indices = np.asarray(candidate_batch.row_query_signature_indices, dtype=np.uint32)[row_indices]
+    subset_batch = LinkerCandidateBatch(
+        row_count=len(row_indices),
+        left_signature_indices=np.zeros(0, dtype=np.uint32),
+        right_signature_indices=np.zeros(0, dtype=np.uint32),
+        pair_row_indices=np.zeros(0, dtype=np.uint32),
+        row_query_signature_indices=row_query_signature_indices,
+        row_component_keys=row_component_keys,
+        retrieval_scores=retrieval_scores,
+        retrieval_ranks=retrieval_ranks,
+    )
+    return LinkerFeatureMatrix(
+        matrix=np.asarray(feature_matrix.matrix)[row_indices],
+        feature_columns=feature_matrix.feature_columns,
+        candidate_batch=subset_batch,
+        # Pairwise aggregate columns are already materialized in matrix; keeping
+        # pairwise_stats would only overlay the same feature values during gating.
+        pairwise_stats=None,
+    )
+
+
 def _predict_incremental_link_or_abstain_compact(
     artifact: IncrementalLinkingArtifact,
     feature_matrix: LinkerFeatureMatrix,
@@ -157,12 +335,78 @@ def _predict_incremental_link_or_abstain_compact(
         row_signals=row_signals,
     )
     gate_links = gate.predict_link(gate_matrix)
+    orcid_matches = _orcid_match_signal(row_signals, candidate_batch.row_count)
+    constraint_requires = _constraint_require_signal(row_signals, candidate_batch.row_count)
+    constraint_vetoes = _constraint_disallow_veto_signal(row_signals, candidate_batch.row_count)
     decisions: list[LinkOrAbstainDecision] = []
-    for query_pos, best_row in enumerate(gate_query_rows.best_rows):
-        best_row = int(best_row)
-        runner_up_score = float(gate_query_rows.runner_up_scores[query_pos])
-        margin = None if np.isnan(runner_up_score) else float(gate_query_rows.score_margins[query_pos])
-        action: LinkAction = "link" if bool(gate_links[query_pos]) else "abstain"
+    for query_pos, group in enumerate(gate_query_rows.groups):
+        best_row = int(gate_query_rows.best_rows[query_pos])
+        forced_orcid_rows = np.asarray([], dtype=np.int64)
+        if orcid_matches is not None:
+            forced_orcid_rows = group[orcid_matches[group]]
+        forced_constraint_rows = np.asarray([], dtype=np.int64)
+        if constraint_requires is not None:
+            forced_constraint_rows = group[constraint_requires[group]]
+        if len(forced_orcid_rows):
+            best_row = _best_row_for_group(
+                forced_orcid_rows,
+                probabilities=probabilities,
+                retrieval_ranks=candidate_batch.retrieval_ranks,
+                component_keys=component_keys,
+            )
+            ranked_nonbest = [int(row) for row in gate_query_rows.ranked_groups[query_pos] if int(row) != best_row]
+            runner_up_score = float(probabilities[ranked_nonbest[0]]) if ranked_nonbest else float("nan")
+            margin = None if np.isnan(runner_up_score) else float(probabilities[best_row] - runner_up_score)
+            action: LinkAction = "link"
+        elif len(forced_constraint_rows):
+            _validate_single_constraint_require_target(
+                forced_constraint_rows=forced_constraint_rows,
+                component_keys=component_keys,
+                query_signature_index=int(query_indices[best_row]),
+            )
+            best_row = _best_row_for_group(
+                forced_constraint_rows,
+                probabilities=probabilities,
+                retrieval_ranks=candidate_batch.retrieval_ranks,
+                component_keys=component_keys,
+            )
+            ranked_nonbest = [int(row) for row in gate_query_rows.ranked_groups[query_pos] if int(row) != best_row]
+            runner_up_score = float(probabilities[ranked_nonbest[0]]) if ranked_nonbest else float("nan")
+            margin = None if np.isnan(runner_up_score) else float(probabilities[best_row] - runner_up_score)
+            action = "link"
+        elif constraint_vetoes is not None and np.any(constraint_vetoes[group]):
+            eligible_original_rows = group[~constraint_vetoes[group]]
+            if len(eligible_original_rows) == 0:
+                runner_up_score = float(gate_query_rows.runner_up_scores[query_pos])
+                margin = None if np.isnan(runner_up_score) else float(gate_query_rows.score_margins[query_pos])
+                action = "abstain"
+            else:
+                eligible_matrix = _subset_feature_matrix_for_rows(feature_matrix, eligible_original_rows)
+                eligible_row_signals = _subset_row_signals(
+                    row_signals,
+                    eligible_original_rows,
+                    candidate_batch.row_count,
+                )
+                eligible_gate_matrix, eligible_gate_rows = build_runtime_logistic_gate_matrix(
+                    gate,
+                    eligible_matrix,
+                    np.asarray(probabilities[eligible_original_rows], dtype=np.float64),
+                    row_signals=eligible_row_signals,
+                )
+                eligible_gate_links = gate.predict_link(eligible_gate_matrix)
+                eligible_ranked = eligible_gate_rows.ranked_groups[0]
+                best_row = int(eligible_original_rows[int(eligible_gate_rows.best_rows[0])])
+                runner_up_score = (
+                    float(probabilities[int(eligible_original_rows[int(eligible_ranked[1])])])
+                    if len(eligible_ranked) > 1
+                    else float("nan")
+                )
+                margin = None if np.isnan(runner_up_score) else float(probabilities[best_row] - runner_up_score)
+                action = "link" if bool(eligible_gate_links[0]) else "abstain"
+        else:
+            runner_up_score = float(gate_query_rows.runner_up_scores[query_pos])
+            margin = None if np.isnan(runner_up_score) else float(gate_query_rows.score_margins[query_pos])
+            action = "link" if bool(gate_links[query_pos]) else "abstain"
         component_key = None
         if action == "link" and component_keys is not None:
             component_key = str(component_keys[best_row])
@@ -497,6 +741,13 @@ def _merge_extra_row_signals(
     return row_signals
 
 
+def _merge_row_signal_sources(*sources: Mapping[str, Any] | None) -> dict[str, Any]:
+    row_signals: dict[str, Any] = {}
+    for source in sources:
+        row_signals = _merge_extra_row_signals(row_signals, source)
+    return row_signals
+
+
 def _query_author_for_gate(query: Any) -> str:
     value = getattr(query, "query_author", None)
     if value is not None and str(value).strip():
@@ -787,6 +1038,7 @@ def _validate_partial_supervision_window(
         "partial_supervision_ignored_outside_window": 0,
     }
     inside_window_pairs: set[tuple[str, str]] = set()
+    require_components_by_query: dict[str, set[str]] = {}
     for left, right in candidate_pair_ids:
         inside_window_pairs.add((left, right))
         inside_window_pairs.add((right, left))
@@ -821,10 +1073,18 @@ def _validate_partial_supervision_window(
         if query_signature_id is None or seed_signature_id is None:
             telemetry["partial_supervision_ignored_outside_window"] += 1
             continue
+        seed_component = seed_signature_to_component[seed_signature_id]
+        if kind == "require":
+            require_components = require_components_by_query.setdefault(query_signature_id, set())
+            require_components.add(str(seed_component))
+            if len(require_components) > 1:
+                raise ValueError(
+                    "partial_supervision_require_conflicting_seed_components: "
+                    f"query_signature_id={query_signature_id!r} components={tuple(sorted(require_components))}"
+                )
         if (query_signature_id, seed_signature_id) in inside_window_pairs:
             continue
         if kind == "require":
-            seed_component = seed_signature_to_component[seed_signature_id]
             raise ValueError(
                 "partial_supervision_require_outside_retrieval_window: "
                 f"query_signature_id={query_signature_id!r} seed_signature_id={seed_signature_id!r} "
@@ -1050,6 +1310,7 @@ def _predict_incremental_link_or_abstain_production_private(
         raise ValueError(
             "constraint label count must match pair_count: " f"{pair_labels.shape} != ({candidate_batch.pair_count},)"
         )
+    constraint_row_signals = _constraint_row_signals(candidate_batch, pair_labels)
 
     pairwise_model_result = compute_candidate_batch_pairwise_model_and_aggregate_stats(
         dataset,
@@ -1074,16 +1335,21 @@ def _predict_incremental_link_or_abstain_production_private(
         if extra_row_signal_builder is None
         else dict(extra_row_signal_builder(retrieval_batch, query_signature_id_by_index))
     )
-    merged_extra_row_signals = _merge_extra_row_signals(built_runtime_row_signals, built_extra_row_signals)
-    merged_extra_row_signals = _merge_extra_row_signals(merged_extra_row_signals, extra_row_signals)
+    merged_extra_row_signals = _merge_row_signal_sources(
+        built_runtime_row_signals,
+        built_extra_row_signals,
+        extra_row_signals,
+    )
+    decision_row_signals = _merge_row_signal_sources(
+        pairwise_model_result.row_signals,
+        constraint_row_signals,
+        merged_extra_row_signals,
+    )
     private_result = _predict_incremental_link_or_abstain_retrieved_candidates(
         artifact,
         retrieval_batch,
         dataset=dataset,
-        extra_row_signals=_merge_extra_row_signals(
-            pairwise_model_result.row_signals,
-            merged_extra_row_signals,
-        ),
+        extra_row_signals=decision_row_signals,
         pairwise_stats=pairwise_model_result.pairwise_stats,
         no_candidate_query_signature_indices=no_candidate_query_signature_indices,
         n_jobs=n_jobs_resolved,

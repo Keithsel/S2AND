@@ -246,6 +246,80 @@ def test_compute_promoted_phase_a_limits_uses_observed_probe_for_operational_bat
     assert int(observed.hard_predicted_pairs_per_batch) > int(observed.predicted_pairs_per_batch)
 
 
+def test_compute_promoted_phase_a_limits_lets_observed_rows_exceed_top_k():
+    limits = memory_budget.compute_promoted_phase_a_limits(
+        query_count=10,
+        component_sizes=[1] * 100,
+        retrieval_top_k=25,
+        total_ram_bytes=1_000_000_000,
+        stage_budget_fraction=0.50,
+        fixed_overhead_bytes=1024,
+        observed_query_count=1,
+        observed_candidate_rows_per_query=80,
+        observed_pairs_per_query=80,
+        detect_cgroup_fn=lambda: (None, "unavailable"),
+        detect_total_fn=lambda: (None, "unavailable"),
+        current_rss_fn=lambda _total: (100_000_000, "rss:test"),
+    )
+
+    assert int(limits.candidate_rows_per_query) == 80
+    assert int(limits.conservative_pairs_per_query) == 80
+    assert int(limits.operational_candidate_rows_per_query) == 80
+    assert int(limits.operational_pairs_per_query) == 80
+    assert str(limits.operational_estimate_source) == "observed_probe"
+
+
+def test_compute_promoted_phase_a_limits_uses_orcid_fanout_floor_above_top_k():
+    limits = memory_budget.compute_promoted_phase_a_limits(
+        query_count=10,
+        component_sizes=[1] * 100,
+        retrieval_top_k=25,
+        total_ram_bytes=1_000_000_000,
+        stage_budget_fraction=0.50,
+        fixed_overhead_bytes=1024,
+        candidate_rows_per_query_floor=80,
+        pairs_per_query_floor=80,
+        detect_cgroup_fn=lambda: (None, "unavailable"),
+        detect_total_fn=lambda: (None, "unavailable"),
+        current_rss_fn=lambda _total: (100_000_000, "rss:test"),
+    )
+
+    assert int(limits.candidate_rows_per_query) == 80
+    assert int(limits.conservative_pairs_per_query) == 80
+    assert int(limits.operational_candidate_rows_per_query) == 80
+    assert int(limits.operational_pairs_per_query) == 80
+    assert str(limits.operational_estimate_source) == "orcid_fanout"
+    assert int(limits.predicted_candidate_rows_per_batch) == 800
+
+
+def test_compute_promoted_phase_a_limits_uses_orcid_total_floor_for_mixed_batch():
+    limits = memory_budget.compute_promoted_phase_a_limits(
+        query_count=10,
+        component_sizes=[1] * 100,
+        retrieval_top_k=25,
+        total_ram_bytes=1_000_000_000,
+        stage_budget_fraction=0.50,
+        fixed_overhead_bytes=1024,
+        candidate_rows_per_query_floor=80,
+        pairs_per_query_floor=80,
+        candidate_rows_total_floor=305,
+        pairs_total_floor=305,
+        detect_cgroup_fn=lambda: (None, "unavailable"),
+        detect_total_fn=lambda: (None, "unavailable"),
+        current_rss_fn=lambda _total: (100_000_000, "rss:test"),
+    )
+
+    assert int(limits.candidate_rows_per_query) == 80
+    assert int(limits.conservative_pairs_per_query) == 80
+    assert int(limits.operational_candidate_rows_per_query) == 31
+    assert int(limits.operational_pairs_per_query) == 31
+    assert str(limits.operational_estimate_source) == "orcid_fanout"
+    assert int(limits.query_batch_size) == 10
+    assert int(limits.predicted_candidate_rows_per_batch) == 305
+    assert int(limits.predicted_pairs_per_batch) == 305
+    assert int(limits.hard_predicted_candidate_rows_per_batch) == 800
+
+
 def test_compute_promoted_phase_a_limits_fails_when_single_query_exceeds_budget():
     with pytest.raises(MemoryError, match="cannot fit a single query"):
         memory_budget.compute_promoted_phase_a_limits(

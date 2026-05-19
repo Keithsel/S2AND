@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable, Mapping
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,101 @@ def promoted_incremental_component_sizes(cluster_seeds_require: Mapping[str, int
     return component_sizes
 
 
+def _signature_orcid(dataset: ANDData, signature_id: str) -> str | None:
+    value = getattr(dataset.signatures[str(signature_id)], "author_info_orcid", None)
+    return query_adapter_module.normalize_orcid(value)
+
+
+def promoted_incremental_orcid_fanout_by_query(
+    dataset: ANDData,
+    query_signature_ids: Sequence[str],
+    cluster_seeds_require: Mapping[str, int | str],
+    *,
+    orcid_enabled: bool,
+) -> dict[str, tuple[int, int]]:
+    """Return known ORCID return-all row/pair floors by query signature id."""
+
+    if not orcid_enabled or not query_signature_ids or not cluster_seeds_require:
+        return {}
+
+    query_orcid_by_signature_id = {
+        str(query_signature_id): query_orcid
+        for query_signature_id in query_signature_ids
+        if (query_orcid := _signature_orcid(dataset, str(query_signature_id))) is not None
+    }
+    if not query_orcid_by_signature_id:
+        return {}
+
+    query_orcids = set(query_orcid_by_signature_id.values())
+    component_orcids: dict[str, set[str]] = {}
+    component_sizes: dict[str, int] = {}
+    for seed_signature_id, component in cluster_seeds_require.items():
+        component_key = str(component)
+        component_sizes[component_key] = component_sizes.get(component_key, 0) + 1
+        seed_orcid = _signature_orcid(dataset, str(seed_signature_id))
+        if seed_orcid in query_orcids:
+            component_orcids.setdefault(component_key, set()).add(str(seed_orcid))
+
+    if not component_orcids:
+        return {}
+
+    fanout_by_query: dict[str, tuple[int, int]] = {}
+    for query_signature_id, query_orcid in query_orcid_by_signature_id.items():
+        matching_components = [
+            component_key for component_key, orcids in component_orcids.items() if query_orcid in orcids
+        ]
+        if matching_components:
+            fanout_by_query[str(query_signature_id)] = (
+                len(matching_components),
+                sum(int(component_sizes[component_key]) for component_key in matching_components),
+            )
+    return fanout_by_query
+
+
+def _top_k_candidate_floors(component_sizes: Mapping[str, int], retrieval_top_k: int) -> tuple[int, int]:
+    candidate_rows = min(max(0, int(retrieval_top_k)), len(component_sizes))
+    pairs = int(sum(sorted((max(0, int(size)) for size in component_sizes.values()), reverse=True)[:candidate_rows]))
+    return candidate_rows, pairs
+
+
+def _orcid_fanout_floor_estimates(
+    fanout_by_query: Mapping[str, tuple[int, int]],
+    query_signature_ids: Sequence[str],
+) -> tuple[int | None, int | None]:
+    rows = 0
+    pairs = 0
+    for signature_id in query_signature_ids:
+        query_rows, query_pairs = fanout_by_query.get(str(signature_id), (0, 0))
+        rows = max(rows, int(query_rows))
+        pairs = max(pairs, int(query_pairs))
+    return (rows if rows > 0 else None, pairs if pairs > 0 else None)
+
+
+def _orcid_fanout_floor_totals(
+    fanout_by_query: Mapping[str, tuple[int, int]],
+    query_signature_ids: Sequence[str],
+    *,
+    base_candidate_rows_per_query: int,
+    base_pairs_per_query: int,
+) -> tuple[int | None, int | None]:
+    if not query_signature_ids:
+        return None, None
+    row_total = 0
+    pair_total = 0
+    base_rows = max(0, int(base_candidate_rows_per_query))
+    base_pairs = max(0, int(base_pairs_per_query))
+    for signature_id in query_signature_ids:
+        query_rows, query_pairs = fanout_by_query.get(str(signature_id), (0, 0))
+        row_total += max(base_rows, int(query_rows))
+        pair_total += max(base_pairs, int(query_pairs))
+    base_row_total = base_rows * len(query_signature_ids)
+    base_pair_total = base_pairs * len(query_signature_ids)
+    return (
+        row_total if row_total > base_row_total else None,
+        pair_total if pair_total > base_pair_total else None,
+    )
+
+
 def compute_promoted_incremental_limits(
     *,
     query_count: int,
@@ -65,6 +161,10 @@ def compute_promoted_incremental_limits(
     observed_query_count: int = 0,
     observed_candidate_rows_per_query: int | None = None,
     observed_pairs_per_query: int | None = None,
+    candidate_rows_per_query_floor: int | None = None,
+    pairs_per_query_floor: int | None = None,
+    candidate_rows_total_floor: int | None = None,
+    pairs_total_floor: int | None = None,
 ) -> memory_budget.PromotedPhaseALimits:
     return memory_budget.compute_promoted_phase_a_limits(
         query_count=query_count,
@@ -75,6 +175,10 @@ def compute_promoted_incremental_limits(
         observed_query_count=observed_query_count,
         observed_candidate_rows_per_query=observed_candidate_rows_per_query,
         observed_pairs_per_query=observed_pairs_per_query,
+        candidate_rows_per_query_floor=candidate_rows_per_query_floor,
+        pairs_per_query_floor=pairs_per_query_floor,
+        candidate_rows_total_floor=candidate_rows_total_floor,
+        pairs_total_floor=pairs_total_floor,
         detect_cgroup_fn=memory_budget.detect_cgroup_total_ram_bytes_best_effort,
         detect_total_fn=memory_budget.detect_total_ram_bytes_best_effort,
         current_rss_fn=memory_budget.current_rss_bytes_best_effort,
@@ -208,6 +312,15 @@ def merge_promoted_incremental_batch_telemetry(
     return merged
 
 
+def _summarize_query_views(query_views: tuple[str, ...]) -> str:
+    if not query_views:
+        return "none"
+    unique_views = set(query_views)
+    if len(unique_views) == 1:
+        return query_views[0]
+    return "mixed"
+
+
 def predict_incremental_promoted_linker(
     clusterer: Any,
     block_signatures: list[str],
@@ -226,7 +339,6 @@ def predict_incremental_promoted_linker(
 ) -> dict[str, Any]:
     """Run the promoted linker as the incremental seed-link provider."""
 
-    query_view = "initial_only"
     artifact = artifact_module.load_incremental_linking_artifact(artifact_dir)
     resolved_total_ram_bytes, _ = resolve_total_ram_bytes(total_ram_bytes)
     cluster_seeds_require, recluster_map, cluster_seeds_require_inverse = clusterer._build_incremental_seed_setup(
@@ -243,12 +355,34 @@ def predict_incremental_promoted_linker(
     ]
     component_sizes = promoted_incremental_component_sizes(cluster_seeds_require)
     retrieval_top_k = int(artifact.metadata.retrieval_top_k)
+    orcid_enabled = not bool(getattr(clusterer, "suppress_orcid", False))
+    orcid_fanout_by_query = promoted_incremental_orcid_fanout_by_query(
+        dataset,
+        unassigned_signature_ids,
+        cluster_seeds_require,
+        orcid_enabled=orcid_enabled,
+    )
+    base_candidate_rows_per_query, base_pairs_per_query = _top_k_candidate_floors(component_sizes, retrieval_top_k)
+    initial_row_floor, initial_pair_floor = _orcid_fanout_floor_estimates(
+        orcid_fanout_by_query,
+        unassigned_signature_ids,
+    )
+    initial_row_total_floor, initial_pair_total_floor = _orcid_fanout_floor_totals(
+        orcid_fanout_by_query,
+        unassigned_signature_ids,
+        base_candidate_rows_per_query=base_candidate_rows_per_query,
+        base_pairs_per_query=base_pairs_per_query,
+    )
     initial_limits = compute_promoted_incremental_limits(
         query_count=len(unassigned_signature_ids),
         component_sizes=component_sizes,
         retrieval_top_k=retrieval_top_k,
         total_ram_bytes=resolved_total_ram_bytes,
         max_query_batch_size=batching_threshold,
+        candidate_rows_per_query_floor=initial_row_floor,
+        pairs_per_query_floor=initial_pair_floor,
+        candidate_rows_total_floor=initial_row_total_floor,
+        pairs_total_floor=initial_pair_total_floor,
     )
     resolved_total_ram_bytes = int(initial_limits.total_ram_bytes)
     raise_if_promoted_incremental_batch_over_budget(initial_limits)
@@ -269,13 +403,16 @@ def predict_incremental_promoted_linker(
     final_limits = initial_limits
     calibration_applied = False
     observed_probe: tuple[int, int, int] | None = None
+    resolved_query_views: tuple[str, ...] = ()
     if unassigned_signature_ids:
         linker_inputs = query_adapter_module.build_incremental_linker_inputs(
             dataset=dataset,
             query_signature_ids=unassigned_signature_ids,
             cluster_seeds_require=cluster_seeds_require,
-            query_view=query_view,
+            query_view=None,
+            orcid_enabled=orcid_enabled,
         )
+        resolved_query_views = tuple(str(view) for view in linker_inputs.query_views)
 
         def _extra_row_signal_builder(retrieval_batch: Any, query_signature_id_by_index: Any) -> Any:
             return query_adapter_module.build_name_count_rarity_row_signals(
@@ -300,17 +437,34 @@ def predict_incremental_promoted_linker(
                     "observed_candidate_rows_per_query": observed_rows_per_query,
                     "observed_pairs_per_query": observed_pairs_per_query,
                 }
+            batch_row_floor, batch_pair_floor = _orcid_fanout_floor_estimates(orcid_fanout_by_query, query_batch)
+            batch_row_total_floor, batch_pair_total_floor = _orcid_fanout_floor_totals(
+                orcid_fanout_by_query,
+                query_batch,
+                base_candidate_rows_per_query=base_candidate_rows_per_query,
+                base_pairs_per_query=base_pairs_per_query,
+            )
             batch_limits = compute_promoted_incremental_limits(
                 query_count=len(query_batch),
                 component_sizes=component_sizes,
                 retrieval_top_k=retrieval_top_k,
                 total_ram_bytes=resolved_total_ram_bytes,
                 max_query_batch_size=len(query_batch),
+                candidate_rows_per_query_floor=batch_row_floor,
+                pairs_per_query_floor=batch_pair_floor,
+                candidate_rows_total_floor=batch_row_total_floor,
+                pairs_total_floor=batch_pair_total_floor,
                 **batch_limit_kwargs,
             )
+            if 0 < int(batch_limits.query_batch_size) < len(query_batch):
+                current_query_batch_size = int(batch_limits.query_batch_size)
+                continue
             raise_if_promoted_incremental_batch_over_budget(batch_limits)
             batch_queries = tuple(
                 linker_inputs.query_by_signature_id[str(signature_id)] for signature_id in query_batch
+            )
+            batch_query_views = tuple(
+                str(linker_inputs.query_view_by_signature_id[str(signature_id)]) for signature_id in query_batch
             )
             batch_rss_before_bytes = int(batch_limits.current_rss_bytes)
             private_result = runtime_module._predict_incremental_link_or_abstain_production_private(
@@ -321,7 +475,7 @@ def predict_incremental_promoted_linker(
                 retriever=linker_inputs.retriever,
                 queries=batch_queries,
                 query_signature_ids=query_batch,
-                query_view=query_view,
+                query_view=batch_query_views,
                 partial_supervision=partial_supervision,
                 constraint_backend=constraint_backend,
                 extra_row_signal_builder=_extra_row_signal_builder,
@@ -418,6 +572,16 @@ def predict_incremental_promoted_linker(
                 if observed_probe is not None:
                     remaining_after_probe = len(unassigned_signature_ids) - next_query_index
                     observed_query_count, observed_rows_per_query, observed_pairs_per_query = observed_probe
+                    remaining_row_floor, remaining_pair_floor = _orcid_fanout_floor_estimates(
+                        orcid_fanout_by_query,
+                        unassigned_signature_ids[next_query_index:],
+                    )
+                    remaining_row_total_floor, remaining_pair_total_floor = _orcid_fanout_floor_totals(
+                        orcid_fanout_by_query,
+                        unassigned_signature_ids[next_query_index:],
+                        base_candidate_rows_per_query=base_candidate_rows_per_query,
+                        base_pairs_per_query=base_pairs_per_query,
+                    )
                     calibrated_limits = compute_promoted_incremental_limits(
                         query_count=remaining_after_probe,
                         component_sizes=component_sizes,
@@ -427,6 +591,10 @@ def predict_incremental_promoted_linker(
                         observed_query_count=observed_query_count,
                         observed_candidate_rows_per_query=observed_rows_per_query,
                         observed_pairs_per_query=observed_pairs_per_query,
+                        candidate_rows_per_query_floor=remaining_row_floor,
+                        pairs_per_query_floor=remaining_pair_floor,
+                        candidate_rows_total_floor=remaining_row_total_floor,
+                        pairs_total_floor=remaining_pair_total_floor,
                     )
                     raise_if_promoted_incremental_batch_over_budget(calibrated_limits)
                     current_limits = calibrated_limits
@@ -458,6 +626,9 @@ def predict_incremental_promoted_linker(
         final_limits=final_limits,
         calibration_applied=calibration_applied,
     )
+    query_view_counts = Counter(resolved_query_views)
+    for query_view, count in query_view_counts.items():
+        merged_telemetry[f"query_view_{query_view}_count"] = int(count)
     logger.info(
         "Telemetry: incremental_promoted_query_batches query_count=%d batch_count=%d "
         "batch_size_min=%d batch_size_max=%d query_batch_size_configured=%d "
@@ -500,6 +671,6 @@ def predict_incremental_promoted_linker(
         phase_b_residual_count=residual_count,
     )
     payload["incremental_linker_artifact_path"] = str(artifact_dir)
-    payload["incremental_linker_query_view"] = str(query_view)
+    payload["incremental_linker_query_view"] = _summarize_query_views(resolved_query_views)
     payload["incremental_linker_telemetry"] = merged_telemetry
     return payload

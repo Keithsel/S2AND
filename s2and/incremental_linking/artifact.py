@@ -19,6 +19,7 @@ from s2and.incremental_linking.contracts import (
     MODEL_FAMILY_CLASSIC_LIGHTGBM_LINKER,
     production_contract_digest,
     promoted_linker_feature_schema_digest,
+    retrieval_constraint_decision_policy_payload,
     retrieval_stack_contract_digest,
     validate_artifact_contract_metadata,
     validate_required_rust_capabilities,
@@ -77,6 +78,11 @@ class IncrementalLinkingArtifactMetadata:
             raise ValueError("prediction_fixture_matrix row width must match feature_columns")
         if len(fixture_probabilities) != len(fixture_matrix):
             raise ValueError("prediction_fixture_expected_probabilities length must match fixture rows")
+        resolved_audit_metadata = dict(audit_metadata or {})
+        resolved_audit_metadata.setdefault(
+            "runtime_decision_policy",
+            retrieval_constraint_decision_policy_payload(),
+        )
         return cls(
             schema_version=ARTIFACT_SCHEMA_VERSION,
             model_family=MODEL_FAMILY_CLASSIC_LIGHTGBM_LINKER,
@@ -92,7 +98,7 @@ class IncrementalLinkingArtifactMetadata:
             required_rust_capabilities=tuple(str(value) for value in required_rust_capabilities),
             booster_sha256=str(booster_sha256),
             lightgbm_version=str(lightgbm_version),
-            audit_metadata=dict(audit_metadata or {}),
+            audit_metadata=resolved_audit_metadata,
         )
 
     @classmethod
@@ -200,6 +206,13 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _required_lightgbm_version() -> str:
+    version = getattr(lgb, "__version__", None)
+    if version is None:
+        raise RuntimeError("lightgbm.__version__ is required when writing incremental linker artifact metadata")
+    return str(version)
+
+
 def save_incremental_linking_artifact(
     model: Any,
     artifact_dir: Path,
@@ -229,6 +242,7 @@ def save_incremental_linking_artifact(
         raise ValueError("prediction fixture probability count does not match fixture rows")
     fixture_rows = tuple(tuple(float(value) for value in row) for row in fixture.tolist())
     expected_probability_values = tuple(float(value) for value in expected_probabilities.tolist())
+    lightgbm_version = _required_lightgbm_version()
 
     booster = _booster_from_model(model)
     booster_path = artifact_dir / BOOSTER_FILENAME
@@ -241,7 +255,7 @@ def save_incremental_linking_artifact(
         prediction_fixture_expected_probabilities=expected_probability_values,
         required_rust_capabilities=required_rust_capabilities,
         booster_sha256=_sha256_file(booster_path),
-        lightgbm_version=str(lgb.__version__),
+        lightgbm_version=lightgbm_version,
         audit_metadata=audit_metadata,
     )
     (artifact_dir / METADATA_FILENAME).write_text(

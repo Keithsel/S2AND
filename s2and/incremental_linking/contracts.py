@@ -22,6 +22,29 @@ CONTRACT_SCHEMA_VERSION = "incremental_linking_contract_v1"
 MODEL_FAMILY_CLASSIC_LIGHTGBM_LINKER = "classic_lightgbm_linker"
 GATE_SURFACE_PROMOTED_LOGISTIC = "promoted_numpy_logistic_gate"
 DEFAULT_RETRIEVAL_TOP_K = 25
+CONSTRAINT_DECISION_POLICY: dict[str, Any] = {
+    "same_orcid": {
+        "action": "force_link",
+        "return_all_matching_components": True,
+        "exempt_from_disallow_veto": True,
+        "beats_non_orcid_candidates": True,
+    },
+    "require_constraint": {
+        "action": "force_link",
+        "exempt_from_disallow_veto": True,
+    },
+    "disallow_constraint": {
+        "action": "veto_candidate_row",
+        "single_member_candidate": True,
+        "all_pairs_disallow": True,
+        "mostly_disallow_min_pair_count": 3,
+        "mostly_disallow_fraction": 0.8,
+    },
+    "top_row_veto": {
+        "action": "recompute_gate_over_eligible_rows",
+        "all_rows_vetoed_action": "abstain",
+    },
+}
 
 INCREMENTAL_LINKING_RUST_CAPABILITIES: tuple[str, ...] = (
     RUST_CAPABILITY_HYBRID_CENTROID_RETRIEVER_V1,
@@ -99,6 +122,12 @@ def production_contract_digest(feature_columns: Sequence[str] | None = None) -> 
     return canonical_json_digest(production_contract_payload(feature_columns))
 
 
+def retrieval_constraint_decision_policy_payload() -> dict[str, Any]:
+    """Return the post-retrieval constraint policy used by promoted linking."""
+
+    return json.loads(json.dumps(CONSTRAINT_DECISION_POLICY, sort_keys=True, ensure_ascii=True))
+
+
 def retrieval_stack_contract_payload(*, retrieval_top_k: int = DEFAULT_RETRIEVAL_TOP_K) -> dict[str, Any]:
     """Return the retrieval-stack contract covered by artifact metadata."""
 
@@ -106,8 +135,10 @@ def retrieval_stack_contract_payload(*, retrieval_top_k: int = DEFAULT_RETRIEVAL
         "contract_schema_version": CONTRACT_SCHEMA_VERSION,
         "retrieval_method": "global_hybrid_centroid",
         "retrieval_top_k": int(retrieval_top_k),
-        "query_view_policy": "caller_supplied_initial_only_or_full",
-        "candidate_filter_policy": "label_free_runtime_filters_only",
+        "query_view_policy": "caller_supplied_initial_only_or_full_or_production_auto",
+        "orcid_policy": "return_all_matches_force_link_exempt_from_disallow_veto",
+        "candidate_filter_policy": "post_retrieval_constraint_row_policy",
+        "constraint_decision_policy": retrieval_constraint_decision_policy_payload(),
         "tie_break": "score_descending_component_key_ascending",
     }
 

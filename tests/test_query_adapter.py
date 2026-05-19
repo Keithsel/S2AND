@@ -4,12 +4,16 @@ from types import SimpleNamespace
 
 import pytest
 
+import s2and.incremental_linking.query_adapter as query_adapter_module
 from s2and.incremental_linking.query_adapter import (
     build_cluster_summary,
     extract_query_features,
+    mask_query_features,
+    query_view_for_features,
     raw_paper_evidence_features,
 )
 from s2and.incremental_linking_training.query_support import counter_query_overlap, title_overlap
+from tests.helpers import build_dummy_dataset, build_query_features
 
 
 def _signature(paper_id: str) -> SimpleNamespace:
@@ -58,6 +62,151 @@ def test_title_and_venue_terms_keep_single_character_tokens() -> None:
     assert summary.venue_counts["a"] == 1
     assert title_overlap(query, summary) == pytest.approx(2.0 / 3.0)
     assert counter_query_overlap(query.venue_terms, summary.venue_counts, summary.size) == pytest.approx(0.5)
+
+
+def test_mask_query_features_keeps_orcid_only_when_enabled() -> None:
+    base = build_query_features(
+        first="alice",
+        middle_initials=frozenset({"q"}),
+        orcid="0000-0001",
+        has_full_first=True,
+        has_middle=True,
+        has_coauthors=True,
+        has_affiliations=True,
+    )
+
+    full_without_orcid = mask_query_features(base, "full", orcid_enabled=False)
+    full_with_orcid = mask_query_features(base, "full", orcid_enabled=True)
+    initial_with_orcid = mask_query_features(base, "initial_only", orcid_enabled=True)
+
+    assert full_without_orcid.orcid is None
+    assert full_with_orcid.orcid == "0000-0001"
+    assert full_with_orcid.middle_initials == frozenset({"q"})
+    assert initial_with_orcid.first == "a"
+    assert initial_with_orcid.orcid == "0000-0001"
+    assert initial_with_orcid.middle_initials == frozenset()
+
+
+def test_query_and_summary_orcids_are_stripped_and_empty_values_ignored() -> None:
+    dataset = SimpleNamespace(
+        signatures={
+            "q_blank": SimpleNamespace(**{**_signature("p_q_blank").__dict__, "author_info_orcid": "   "}),
+            "q_trim": SimpleNamespace(**{**_signature("p_q_trim").__dict__, "author_info_orcid": " 0000-0005 "}),
+            "seed_blank": SimpleNamespace(**{**_signature("p_seed_blank").__dict__, "author_info_orcid": "   "}),
+            "seed_trim": SimpleNamespace(**{**_signature("p_seed_trim").__dict__, "author_info_orcid": " 0000-0003 "}),
+        },
+        papers={
+            "p_q_blank": SimpleNamespace(title="Blank Query", venue=None, journal_name=None, year=2020, authors=[]),
+            "p_q_trim": SimpleNamespace(title="Trim Query", venue=None, journal_name=None, year=2020, authors=[]),
+            "p_seed_blank": SimpleNamespace(title="Blank Seed", venue=None, journal_name=None, year=2021, authors=[]),
+            "p_seed_trim": SimpleNamespace(title="Trim Seed", venue=None, journal_name=None, year=2021, authors=[]),
+        },
+        specter_embeddings=None,
+    )
+    feature_cache = {}
+
+    assert extract_query_features(dataset, "q_blank", feature_cache=feature_cache, orcid_enabled=True).orcid is None
+    assert (
+        extract_query_features(dataset, "q_trim", feature_cache=feature_cache, orcid_enabled=True).orcid
+        == "0000-0005"
+    )
+
+    summary = build_cluster_summary(
+        dataset,
+        cluster_id="cluster",
+        component_key="component",
+        signature_ids=("seed_blank", "seed_trim"),
+        max_exemplars=4,
+        feature_cache=feature_cache,
+        orcid_enabled=True,
+        block_key="block",
+    )
+    assert summary.orcid_values == frozenset({"0000-0003"})
+
+
+def test_query_view_for_features_uses_full_only_for_full_first_name() -> None:
+    assert query_view_for_features(build_query_features(first="alice", has_full_first=True)) == "full"
+    assert query_view_for_features(build_query_features(first="a", has_full_first=False)) == "initial_only"
+
+
+def test_build_incremental_linker_inputs_resolves_auto_and_per_query_views(monkeypatch) -> None:
+    dataset = build_dummy_dataset("dummy_query_view_resolution")
+
+    def fake_build_retriever(summaries, *, include_exemplars=True):
+        del include_exemplars
+        return SimpleNamespace(
+            retriever=object(),
+            summary_by_component={str(summary.component_key): summary for summary in summaries},
+        )
+
+    monkeypatch.setattr(query_adapter_module, "build_rust_hybrid_centroid_retriever", fake_build_retriever)
+
+    auto_inputs = query_adapter_module.build_incremental_linker_inputs(
+        dataset=dataset,
+        query_signature_ids=["5", "8"],
+        cluster_seeds_require={"3": "seed", "4": "seed"},
+        query_view=None,
+    )
+    assert auto_inputs.query_views == ("full", "full")
+    assert auto_inputs.query_view_by_signature_id == {"5": "full", "8": "full"}
+    assert auto_inputs.query_by_signature_id["5"].first == "alexander"
+    assert auto_inputs.query_by_signature_id["5"].has_full_first is True
+
+    explicit_inputs = query_adapter_module.build_incremental_linker_inputs(
+        dataset=dataset,
+        query_signature_ids=["5", "8"],
+        cluster_seeds_require={"3": "seed", "4": "seed"},
+        query_view=("full", "initial_only"),
+    )
+    assert explicit_inputs.query_views == ("full", "initial_only")
+    assert explicit_inputs.query_by_signature_id["5"].first == "alexander"
+    assert explicit_inputs.query_by_signature_id["8"].first == "a"
+    assert explicit_inputs.query_by_signature_id["8"].has_full_first is False
+
+
+def test_build_incremental_linker_inputs_threads_orcid_enabled_to_queries_and_summaries(monkeypatch) -> None:
+    dataset = SimpleNamespace(
+        signatures={
+            "q": SimpleNamespace(**{**_signature("p_q").__dict__, "author_info_orcid": "0000-0005"}),
+            "seed_a": SimpleNamespace(**{**_signature("p_seed_a").__dict__, "author_info_orcid": "0000-0003"}),
+            "seed_b": _signature("p_seed_b"),
+        },
+        papers={
+            "p_q": SimpleNamespace(title="Query Paper", venue=None, journal_name=None, year=2020, authors=[]),
+            "p_seed_a": SimpleNamespace(title="Seed Paper A", venue=None, journal_name=None, year=2020, authors=[]),
+            "p_seed_b": SimpleNamespace(title="Seed Paper B", venue=None, journal_name=None, year=2021, authors=[]),
+        },
+        specter_embeddings=None,
+    )
+
+    def fake_build_retriever(summaries, *, include_exemplars=True):
+        del include_exemplars
+        return SimpleNamespace(
+            retriever=object(),
+            summary_by_component={str(summary.component_key): summary for summary in summaries},
+        )
+
+    monkeypatch.setattr(query_adapter_module, "build_rust_hybrid_centroid_retriever", fake_build_retriever)
+
+    disabled_inputs = query_adapter_module.build_incremental_linker_inputs(
+        dataset=dataset,
+        query_signature_ids=["q"],
+        cluster_seeds_require={"seed_a": "seed", "seed_b": "seed"},
+        query_view="full",
+        orcid_enabled=False,
+    )
+    assert disabled_inputs.query_by_signature_id["q"].orcid is None
+    assert disabled_inputs.summary_by_component["seed"].orcid_values == frozenset()
+
+    enabled_inputs = query_adapter_module.build_incremental_linker_inputs(
+        dataset=dataset,
+        query_signature_ids=["q"],
+        cluster_seeds_require={"seed_a": "seed", "seed_b": "seed"},
+        query_view="full",
+        orcid_enabled=True,
+    )
+    assert enabled_inputs.query_by_signature_id["q"].orcid == "0000-0005"
+    assert enabled_inputs.summary_by_component["seed"].orcid_values == frozenset({"0000-0003"})
 
 
 def test_cluster_summary_tracks_non_mega_coauthors_separately() -> None:

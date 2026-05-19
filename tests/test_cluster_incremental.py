@@ -136,6 +136,37 @@ def test_predict_incremental_public_signature_has_no_promoted_override_args() ->
     assert "incremental_linker_query_view" not in signature.parameters
 
 
+def test_promoted_incremental_orcid_fanout_by_query_counts_matching_components() -> None:
+    dataset = SimpleNamespace(
+        signatures={
+            "q": SimpleNamespace(author_info_orcid=" 0000-0001 "),
+            "blank": SimpleNamespace(author_info_orcid="   "),
+            "other": SimpleNamespace(author_info_orcid="0000-0002"),
+            "seed_a": SimpleNamespace(author_info_orcid=" 0000-0001 "),
+            "seed_b": SimpleNamespace(author_info_orcid="0000-0001"),
+            "seed_c": SimpleNamespace(author_info_orcid="0000-0003"),
+            "seed_blank": SimpleNamespace(author_info_orcid="   "),
+        }
+    )
+    fanout = production_module.promoted_incremental_orcid_fanout_by_query(
+        dataset,  # type: ignore[arg-type]
+        ["q", "blank", "other"],
+        {"seed_a": "cluster_a", "seed_b": "cluster_b", "seed_c": "cluster_b", "seed_blank": "cluster_blank"},
+        orcid_enabled=True,
+    )
+
+    assert fanout == {"q": (2, 3)}
+    assert (
+        production_module.promoted_incremental_orcid_fanout_by_query(
+            dataset,  # type: ignore[arg-type]
+            ["q"],
+            {"seed_a": "cluster_a"},
+            orcid_enabled=False,
+        )
+        == {}
+    )
+
+
 def test_predict_incremental_rust_promoted_linker_uses_seed_link_seam(clusterer_dataset_factory, monkeypatch):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_rust_incremental_linker")
     block = ["3", "4", "5", "6", "7", "8"]
@@ -187,9 +218,14 @@ def test_predict_incremental_rust_promoted_linker_uses_seed_link_seam(clusterer_
         query_by_signature_id = {
             str(signature_id): f"query-{signature_id}" for signature_id in kwargs["query_signature_ids"]
         }
+        query_view_by_signature_id = {str(signature_id): "full" for signature_id in kwargs["query_signature_ids"]}
         return SimpleNamespace(
             queries=tuple(query_by_signature_id[signature_id] for signature_id in kwargs["query_signature_ids"]),
             query_by_signature_id=query_by_signature_id,
+            query_views=tuple(
+                query_view_by_signature_id[signature_id] for signature_id in kwargs["query_signature_ids"]
+            ),
+            query_view_by_signature_id=query_view_by_signature_id,
             retriever=retriever,
             summary_by_component={},
         )
@@ -223,7 +259,10 @@ def test_predict_incremental_rust_promoted_linker_uses_seed_link_seam(clusterer_
     )
 
     assert captured_inputs["query_signature_ids"] == ["5", "8"]
+    assert captured_inputs["query_view"] is None
+    assert captured_inputs["orcid_enabled"] is True
     assert captured_runtime["query_signature_ids"] == ["5", "8"]
+    assert captured_runtime["query_view"] == ("full", "full")
     assert captured_runtime["queries"] == ("query-5", "query-8")
     assert captured_runtime["retriever"] is retriever
     assert captured_runtime["artifact"] is artifact
@@ -233,7 +272,198 @@ def test_predict_incremental_rust_promoted_linker_uses_seed_link_seam(clusterer_
     assert residual_total_ram_bytes == [1_000_000_000]
     assert any(set(signatures) == {"3", "4", "5"} for signatures in result["clusters"].values())
     assert any(set(signatures) == {"8"} for signatures in result["clusters"].values())
+    assert result["incremental_linker_query_view"] == "full"
+    assert result["incremental_linker_telemetry"]["query_view_full_count"] == 2
     assert result["incremental_linker_telemetry"]["link_count"] == 1
+
+
+def test_predict_incremental_promoted_linker_respects_suppress_orcid(
+    clusterer_dataset_factory,
+    monkeypatch,
+):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_rust_incremental_linker_suppress_orcid")
+    clusterer.suppress_orcid = True
+    runtime_context = SimpleNamespace(
+        operation="cluster_predict_incremental",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="test-rust-promoted-suppress-orcid",
+        source="S2AND_BACKEND",
+    )
+    captured_inputs: dict[str, Any] = {}
+
+    def fake_predict_helper(block_dict, dataset_arg, partial_supervision, runtime_context, total_ram_bytes=None):
+        del dataset_arg, partial_supervision, runtime_context, total_ram_bytes
+        return {"residual_cluster": list(block_dict["block"])}, None
+
+    clusterer.predict_helper = cast(Any, fake_predict_helper)
+    monkeypatch.setattr(
+        model_module,
+        "_resolve_total_ram_bytes_for_incremental",
+        lambda _total=None: (1_000_000_000, "test"),
+    )
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module.memory_budget, "current_rss_bytes_best_effort", lambda _total: (1_000, "rss:test"))
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_module, "_get_rust_featurizer", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        model_module,
+        "_build_incremental_constraint_backend",
+        lambda *args, **kwargs: SimpleNamespace(rust_featurizer=None),
+    )
+
+    import s2and.incremental_linking.artifact as artifact_module
+    import s2and.incremental_linking.query_adapter as query_adapter_module
+    import s2and.incremental_linking.runtime as runtime_module
+
+    monkeypatch.setattr(
+        artifact_module,
+        "load_incremental_linking_artifact",
+        lambda _path: SimpleNamespace(metadata=SimpleNamespace(retrieval_top_k=25)),
+    )
+
+    def fake_build_inputs(**kwargs):
+        captured_inputs.update(kwargs)
+        query_by_signature_id = {
+            str(signature_id): f"query-{signature_id}" for signature_id in kwargs["query_signature_ids"]
+        }
+        return SimpleNamespace(
+            queries=tuple(query_by_signature_id[signature_id] for signature_id in kwargs["query_signature_ids"]),
+            query_by_signature_id=query_by_signature_id,
+            query_views=tuple("full" for _signature_id in kwargs["query_signature_ids"]),
+            query_view_by_signature_id={str(signature_id): "full" for signature_id in kwargs["query_signature_ids"]},
+            retriever=object(),
+            summary_by_component={},
+        )
+
+    monkeypatch.setattr(query_adapter_module, "build_incremental_linker_inputs", fake_build_inputs)
+    monkeypatch.setattr(query_adapter_module, "build_name_count_rarity_row_signals", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        runtime_module,
+        "_predict_incremental_link_or_abstain_production_private",
+        lambda *args, **kwargs: SimpleNamespace(
+            linked_signature_clusters={},
+            telemetry={"query_count": 1, "link_count": 0, "abstain_count": 1},
+        ),
+    )
+
+    clusterer.predict_incremental(["3", "4", "5"], dataset, batching_threshold=None)
+
+    assert captured_inputs["orcid_enabled"] is False
+
+
+def test_predict_incremental_promoted_linker_passes_orcid_fanout_floor_to_limits(
+    clusterer_dataset_factory,
+    monkeypatch,
+):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_rust_incremental_linker_orcid_fanout_floor")
+    block = ["3", "4", "5", "6", "7", "8"]
+    for signature_id in ("3", "5", "6"):
+        dataset.signatures[signature_id] = dataset.signatures[signature_id]._replace(author_info_orcid="0000-0001")
+    runtime_context = SimpleNamespace(
+        operation="cluster_predict_incremental",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="test-rust-promoted-orcid-fanout-floor",
+        source="S2AND_BACKEND",
+    )
+    limit_calls: list[dict[str, Any]] = []
+
+    def fake_predict_helper(block_dict, dataset_arg, partial_supervision, runtime_context, total_ram_bytes=None):
+        del dataset_arg, partial_supervision, runtime_context, total_ram_bytes
+        return {"residual_cluster": list(block_dict["block"])}, None
+
+    def fake_limits(**kwargs):
+        limit_calls.append(dict(kwargs))
+        query_count = int(kwargs["query_count"])
+        return _mock_promoted_limits(query_count=query_count, query_batch_size=max(1, query_count))
+
+    clusterer.predict_helper = cast(Any, fake_predict_helper)
+    monkeypatch.setattr(
+        model_module,
+        "_resolve_total_ram_bytes_for_incremental",
+        lambda _total=None: (1_000_000_000, "test"),
+    )
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module.memory_budget, "current_rss_bytes_best_effort", lambda _total: (1_000, "rss:test"))
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_module, "_get_rust_featurizer", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        model_module,
+        "_build_incremental_constraint_backend",
+        lambda *args, **kwargs: SimpleNamespace(rust_featurizer=None),
+    )
+    monkeypatch.setattr(production_module, "compute_promoted_incremental_limits", fake_limits)
+
+    import s2and.incremental_linking.artifact as artifact_module
+    import s2and.incremental_linking.query_adapter as query_adapter_module
+    import s2and.incremental_linking.runtime as runtime_module
+
+    monkeypatch.setattr(
+        artifact_module,
+        "load_incremental_linking_artifact",
+        lambda _path: SimpleNamespace(metadata=SimpleNamespace(retrieval_top_k=1)),
+    )
+
+    def fake_build_inputs(**kwargs):
+        query_by_signature_id = {
+            str(signature_id): f"query-{signature_id}" for signature_id in kwargs["query_signature_ids"]
+        }
+        return SimpleNamespace(
+            queries=tuple(query_by_signature_id[signature_id] for signature_id in kwargs["query_signature_ids"]),
+            query_by_signature_id=query_by_signature_id,
+            query_views=tuple("full" for _signature_id in kwargs["query_signature_ids"]),
+            query_view_by_signature_id={str(signature_id): "full" for signature_id in kwargs["query_signature_ids"]},
+            retriever=object(),
+            summary_by_component={},
+        )
+
+    monkeypatch.setattr(query_adapter_module, "build_incremental_linker_inputs", fake_build_inputs)
+    monkeypatch.setattr(query_adapter_module, "build_name_count_rarity_row_signals", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        runtime_module,
+        "_predict_incremental_link_or_abstain_production_private",
+        lambda *args, **kwargs: SimpleNamespace(
+            linked_signature_clusters={},
+            telemetry={"query_count": len(kwargs["query_signature_ids"]), "link_count": 0, "abstain_count": 0},
+        ),
+    )
+
+    clusterer.predict_incremental(block, dataset, batching_threshold=None)
+
+    assert limit_calls[0]["retrieval_top_k"] == 1
+    assert limit_calls[0]["candidate_rows_per_query_floor"] == 2
+    assert limit_calls[0]["pairs_per_query_floor"] == 4
+    assert limit_calls[0]["candidate_rows_total_floor"] == 3
+    assert limit_calls[0]["pairs_total_floor"] == 6
+    assert limit_calls[1]["candidate_rows_per_query_floor"] == 2
+    assert limit_calls[1]["pairs_per_query_floor"] == 4
+    assert limit_calls[1]["candidate_rows_total_floor"] == 3
+    assert limit_calls[1]["pairs_total_floor"] == 6
+
+
+def test_promoted_incremental_orcid_fanout_skips_seed_scan_without_query_orcids(monkeypatch):
+    calls: list[str] = []
+
+    def fake_signature_orcid(_dataset, signature_id):
+        calls.append(str(signature_id))
+        if str(signature_id).startswith("seed"):
+            raise AssertionError("seed scan should be skipped when no query has an ORCID")
+        return None
+
+    monkeypatch.setattr(production_module, "_signature_orcid", fake_signature_orcid)
+
+    fanout = production_module.promoted_incremental_orcid_fanout_by_query(
+        SimpleNamespace(),
+        ["query-1", "query-2"],
+        {"seed-1": "component-1"},
+        orcid_enabled=True,
+    )
+
+    assert fanout == {}
+    assert calls == ["query-1", "query-2"]
 
 
 def test_predict_incremental_explicit_rust_backend_uses_promoted_linker_by_default(
@@ -419,9 +649,14 @@ def test_predict_incremental_promoted_linker_batches_queries(
         query_by_signature_id = {
             str(signature_id): f"query-{signature_id}" for signature_id in kwargs["query_signature_ids"]
         }
+        query_view_by_signature_id = {str(signature_id): "full" for signature_id in kwargs["query_signature_ids"]}
         return SimpleNamespace(
             queries=tuple(query_by_signature_id[signature_id] for signature_id in kwargs["query_signature_ids"]),
             query_by_signature_id=query_by_signature_id,
+            query_views=tuple(
+                query_view_by_signature_id[signature_id] for signature_id in kwargs["query_signature_ids"]
+            ),
+            query_view_by_signature_id=query_view_by_signature_id,
             retriever=object(),
             summary_by_component={},
         )
@@ -437,6 +672,7 @@ def test_predict_incremental_promoted_linker_batches_queries(
         del clusterer_arg, artifact_arg
         batch = [str(signature_id) for signature_id in kwargs["query_signature_ids"]]
         runtime_batches.append(batch)
+        assert kwargs["query_view"] == tuple("full" for _signature_id in batch)
         return SimpleNamespace(
             linked_signature_clusters={"5": "1"} if batch == ["5"] else {},
             telemetry={
@@ -460,6 +696,8 @@ def test_predict_incremental_promoted_linker_batches_queries(
     result = clusterer.predict_incremental(block, dataset, batching_threshold=1)
 
     assert captured_inputs["query_signature_ids"] == ["5", "8"]
+    assert captured_inputs["query_view"] is None
+    assert captured_inputs["orcid_enabled"] is True
     assert runtime_batches == [["5"], ["8"]]
     assert residual_blocks == [["8"]]
     assert any(set(signatures) == {"3", "4", "5"} for signatures in result["clusters"].values())
@@ -476,6 +714,8 @@ def test_predict_incremental_promoted_linker_batches_queries(
     assert telemetry["query_batch_size_configured"] == 1
     assert telemetry["query_batch_size_min"] == 1
     assert telemetry["query_batch_size_max"] == 1
+    assert telemetry["query_view_full_count"] == 2
+    assert result["incremental_linker_query_view"] == "full"
 
 
 def test_predict_incremental_promoted_linker_recalibrates_query_batch_size(
@@ -541,12 +781,18 @@ def test_predict_incremental_promoted_linker_recalibrates_query_batch_size(
     )
 
     def fake_build_inputs(**kwargs):
+        assert kwargs["orcid_enabled"] is True
         query_by_signature_id = {
             str(signature_id): f"query-{signature_id}" for signature_id in kwargs["query_signature_ids"]
         }
+        query_view_by_signature_id = {str(signature_id): "full" for signature_id in kwargs["query_signature_ids"]}
         return SimpleNamespace(
             queries=tuple(query_by_signature_id[signature_id] for signature_id in kwargs["query_signature_ids"]),
             query_by_signature_id=query_by_signature_id,
+            query_views=tuple(
+                query_view_by_signature_id[signature_id] for signature_id in kwargs["query_signature_ids"]
+            ),
+            query_view_by_signature_id=query_view_by_signature_id,
             retriever=object(),
             summary_by_component={},
         )
@@ -564,6 +810,7 @@ def test_predict_incremental_promoted_linker_recalibrates_query_batch_size(
         del clusterer_arg, artifact_arg
         batch = [str(signature_id) for signature_id in kwargs["query_signature_ids"]]
         runtime_batches.append(batch)
+        assert kwargs["query_view"] == tuple("full" for _signature_id in batch)
         return SimpleNamespace(
             linked_signature_clusters={},
             telemetry={

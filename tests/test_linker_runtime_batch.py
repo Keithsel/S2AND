@@ -10,6 +10,7 @@ from s2and.incremental_linking import (
     build_linker_retrieval_batch_rust,
     build_promoted_non_pairwise_row_features,
 )
+from s2and.incremental_linking.query_adapter import mask_query_features
 from s2and.incremental_linking.row_features import build_promoted_non_pairwise_row_features_with_telemetry
 from tests.helpers import build_cluster_summary, build_query_features
 from tests.linker_row_feature_reference import build_promoted_non_pairwise_row_features_python_reference
@@ -210,7 +211,57 @@ def test_rust_retrieval_batch_rejects_unknown_per_query_view_before_retrieval() 
         )
 
 
-def test_rust_retrieval_batch_direct_and_pair_plan_share_hard_filters() -> None:
+def test_rust_retrieval_batch_rejects_stale_pair_plan_schema() -> None:
+    class StaleRetriever:
+        def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):
+            del args, kwargs
+            return {"row_count": 0}
+
+    with pytest.raises(RuntimeError, match="stale pair-plan schema.*row_orcid_match"):
+        build_linker_retrieval_batch_rust(
+            retriever=StaleRetriever(),
+            queries=[],
+            query_signature_indices=np.asarray([], dtype=np.uint32),
+            component_member_indices_by_key={},
+            top_k=1,
+            query_view="initial_only",
+            n_jobs=1,
+        )
+
+
+def test_full_query_view_changes_same_initial_retrieval_order() -> None:
+    if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
+        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+    base_query = build_query_features(first="alice", has_full_first=True)
+    initial_query = mask_query_features(base_query, "initial_only")
+    full_query = mask_query_features(base_query, "full")
+    summaries = [
+        build_cluster_summary(component_key="c_adam", size=1, first_name_counts=Counter({"adam": 1})),
+        build_cluster_summary(component_key="c_alice", size=1, first_name_counts=Counter({"alice": 1})),
+    ]
+    retriever = s2and_rust.RustHybridCentroidRetriever(summaries, include_exemplars=True)
+
+    initial_keys, initial_scores = retriever.top_k_hybrid_centroid(initial_query, 2, 1)
+    assert initial_keys == ["c_adam", "c_alice"]
+    np.testing.assert_allclose(initial_scores, [0.0, 0.0], rtol=1e-6, atol=1e-6)
+
+    batch = build_linker_retrieval_batch_rust(
+        retriever=retriever,
+        queries=[full_query],
+        query_signature_indices=np.asarray([9], dtype=np.uint32),
+        component_member_indices_by_key={"c_adam": [1], "c_alice": [2]},
+        top_k=2,
+        query_view="full",
+        n_jobs=1,
+    )
+
+    assert batch.candidate_batch.row_component_keys == ("c_alice", "c_adam")
+    assert batch.row_signals["query_view"].tolist() == ["full", "full"]
+    assert batch.row_signals["query_first_token"].tolist() == ["alice", "alice"]
+    assert float(batch.candidate_batch.retrieval_scores[0]) > float(batch.candidate_batch.retrieval_scores[1])
+
+
+def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_or_year_filters() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
         pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
     query = build_query_features(
@@ -230,38 +281,54 @@ def test_rust_retrieval_batch_direct_and_pair_plan_share_hard_filters() -> None:
             orcid_values=frozenset({"0000-0001"}),
         ),
         build_cluster_summary(
-            component_key="middle_conflict",
+            component_key="orcid_middle_conflict",
             first_name_counts=Counter({"alice": 1}),
             middle_initial_counts=Counter({"z": 1}),
             year_min=2024,
             year_max=2024,
+            orcid_values=frozenset({"0000-0001"}),
         ),
         build_cluster_summary(
-            component_key="year_conflict",
+            component_key="orcid_year_conflict",
             first_name_counts=Counter({"alice": 1}),
             middle_initial_counts=Counter({"q": 1}),
             year_min=1900,
             year_max=1900,
+            orcid_values=frozenset({"0000-0001"}),
+        ),
+        build_cluster_summary(
+            component_key="non_orcid_candidate",
+            first_name_counts=Counter({"alice": 1}),
+            middle_initial_counts=Counter({"q": 1}),
+            year_min=2024,
+            year_max=2024,
         ),
     ]
     retriever = s2and_rust.RustHybridCentroidRetriever(summaries, include_exemplars=True)
 
-    direct_keys, _direct_scores = retriever.top_k_hybrid_centroid(query, 3, 1)
+    direct_keys, _direct_scores = retriever.top_k_hybrid_centroid(query, 1, 1)
     batch = build_linker_retrieval_batch_rust(
         retriever=retriever,
         queries=[query],
         query_signature_indices=np.asarray([9], dtype=np.uint32),
+        query_signature_ids=["q1"],
         component_member_indices_by_key={
             "orcid_match": [1],
-            "middle_conflict": [2],
-            "year_conflict": [3],
+            "orcid_middle_conflict": [2],
+            "orcid_year_conflict": [3],
+            "non_orcid_candidate": [4],
         },
-        top_k=3,
+        top_k=1,
         query_view="full",
         n_jobs=1,
+        query_candidate_component_keys_by_signature_id={"q1": ["non_orcid_candidate"]},
     )
 
-    assert list(batch.candidate_batch.row_component_keys) == [str(key) for key in direct_keys]
+    expected = {"orcid_match", "orcid_middle_conflict", "orcid_year_conflict"}
+    assert set(direct_keys) == expected
+    assert set(batch.candidate_batch.row_component_keys) == expected
+    assert "non_orcid_candidate" not in batch.candidate_batch.row_component_keys
+    assert batch.row_signals["orcid_match"].tolist() == [1.0, 1.0, 1.0]
 
 
 def test_rust_experimental_retrieval_rescues_high_coverage_mega_candidates() -> None:

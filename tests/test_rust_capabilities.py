@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 import s2and.rust_capabilities as rust_capabilities
@@ -249,6 +250,7 @@ def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():
 
     class Module:
         __version__ = "0.50.0"
+        INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS = ("row_orcid_match",)
         RustFeaturizer = NamedRustFeaturizer
         RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
 
@@ -293,6 +295,40 @@ def test_detect_rust_runtime_capabilities_rejects_stale_incremental_pair_plan_ab
     assert "incremental_linking_pair_plan_v1" not in capabilities.named_capabilities
 
 
+def test_detect_rust_runtime_capabilities_requires_pair_plan_orcid_signal_marker():
+    class NamedRustFeaturizer(_make_core_rust_featurizer()):
+        def linker_pair_index_arrays_aggregate_stats(self, *args, **kwargs):
+            return None
+
+    class PairPlanMethod:
+        __text_signature__ = (
+            "($self, queries, query_signature_indices, component_member_indices_by_key, top_k, "
+            "num_threads=None, query_signature_ids=None, retrieval_subblock_index=None, "
+            "query_candidate_component_keys_by_signature_id=None, full_first_global_backfill_count=0)"
+        )
+
+        def __call__(self, *args, **kwargs):
+            return None
+
+    class NamedRustHybridCentroidRetriever:
+        def top_k_hybrid_centroid(self, *args, **kwargs):
+            return None
+
+        top_k_hybrid_centroid_pair_plan = PairPlanMethod()
+
+    class Module:
+        __version__ = "0.50.0"
+        INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS = ()
+        RustFeaturizer = NamedRustFeaturizer
+        RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
+
+    capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
+
+    assert "hybrid_centroid_retriever_v1" in capabilities.named_capabilities
+    assert "indexed_pair_array_featurization_v1" in capabilities.named_capabilities
+    assert "incremental_linking_pair_plan_v1" not in capabilities.named_capabilities
+
+
 def test_rust_get_build_info_contract():
     s2and_rust = pytest.importorskip("s2and_rust")
 
@@ -304,3 +340,14 @@ def test_rust_get_build_info_contract():
     assert isinstance(info, dict)
     for key in ("crate_version", "profile", "debug_assertions", "opt_level", "target"):
         assert key in info
+    row_signals = tuple(info.get("incremental_linking_pair_plan_row_signals", ()))
+    if not row_signals:
+        plan = s2and_rust.RustHybridCentroidRetriever([], include_exemplars=True).top_k_hybrid_centroid_pair_plan(
+            [],
+            np.asarray([], dtype=np.uint32),
+            {},
+            1,
+            1,
+        )
+        row_signals = tuple(plan)
+    assert "row_orcid_match" in row_signals

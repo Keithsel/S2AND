@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from s2and.data import ANDData
+from s2and.incremental_linking.gate_buckets import QueryView, normalize_query_views
 from s2and.incremental_linking.retrieval import LinkerRetrievalBatch
 from s2and.subblocking import signature_affiliation_feature_keys, signature_name_parts_for_subblocking
 from s2and.text import compute_block, normalize_text, same_prefix_tokens
@@ -38,6 +39,15 @@ NAME_COUNT_RARITY_FEATURE_COLUMNS: tuple[str, ...] = (
     "candidate_last_name_count_min_rarity",
     "candidate_last_first_initial_count_min_rarity",
 )
+
+
+def normalize_orcid(value: Any) -> str | None:
+    """Return a non-empty stripped ORCID value, or None."""
+
+    if value is None:
+        return None
+    orcid = str(value).strip()
+    return orcid or None
 
 
 @dataclass(frozen=True)
@@ -115,6 +125,8 @@ class IncrementalLinkerInputs:
 
     queries: tuple[QueryFeatures, ...]
     query_by_signature_id: dict[str, QueryFeatures]
+    query_views: tuple[QueryView, ...]
+    query_view_by_signature_id: dict[str, QueryView]
     retriever: RustHybridCentroidRetrieverHandle
     summary_by_component: dict[str, ClusterSummary]
 
@@ -279,7 +291,7 @@ def extract_query_features(
             affiliation_terms=affiliation_terms,
             venue_terms=venue_terms,
             year=year,
-            orcid=signature.author_info_orcid or None,
+            orcid=normalize_orcid(signature.author_info_orcid),
             specter=specter,
             has_specter=specter is not None,
             has_coauthors=bool(coauthor_blocks),
@@ -358,6 +370,28 @@ def mask_query_features(base: QueryFeatures, view: str, *, orcid_enabled: bool =
             has_affiliations=False,
         )
     raise ValueError(f"Unknown query view: {view}")
+
+
+def query_view_for_features(base: QueryFeatures) -> QueryView:
+    """Return the production query view implied by extracted query evidence."""
+
+    return "full" if bool(base.has_full_first) else "initial_only"
+
+
+def _resolve_query_views(
+    query_signature_ids: Sequence[str],
+    base_query_by_signature_id: Mapping[str, QueryFeatures],
+    query_view: str | Sequence[str] | None,
+) -> tuple[QueryView, ...]:
+    if query_view is None:
+        return tuple(
+            query_view_for_features(base_query_by_signature_id[str(signature_id)])
+            for signature_id in query_signature_ids
+        )
+    normalized = normalize_query_views(query_view, len(query_signature_ids))
+    if isinstance(normalized, str):
+        return tuple(normalized for _signature_id in query_signature_ids)
+    return normalized
 
 
 def _safe_mean(values: list[int]) -> float | None:
@@ -594,24 +628,38 @@ def build_incremental_linker_inputs(
     dataset: ANDData,
     query_signature_ids: Sequence[str],
     cluster_seeds_require: Mapping[str, int | str],
-    query_view: str = "initial_only",
+    query_view: str | Sequence[str] | None = "initial_only",
     max_exemplars: int = 4,
+    orcid_enabled: bool = False,
 ) -> IncrementalLinkerInputs:
-    """Build queries and the seed-cluster retriever for private incremental linking."""
+    """Build queries and the seed-cluster retriever for private incremental linking.
+
+    `orcid_enabled` is disabled by default for labeled calibration/evaluation
+    callers. Production promoted linking passes it explicitly as enabled.
+    """
 
     feature_cache: dict[str, QueryFeatures] = {}
     paper_author_name_cache: dict[str, frozenset[str]] = {}
+    base_query_by_signature_id = {
+        str(signature_id): extract_query_features(
+            dataset,
+            str(signature_id),
+            feature_cache=feature_cache,
+            paper_author_name_cache=paper_author_name_cache,
+            orcid_enabled=orcid_enabled,
+        )
+        for signature_id in query_signature_ids
+    }
+    query_views = _resolve_query_views(query_signature_ids, base_query_by_signature_id, query_view)
+    query_view_by_signature_id = {
+        str(signature_id): current_query_view
+        for signature_id, current_query_view in zip(query_signature_ids, query_views, strict=True)
+    }
     query_by_signature_id = {
         str(signature_id): mask_query_features(
-            extract_query_features(
-                dataset,
-                str(signature_id),
-                feature_cache=feature_cache,
-                paper_author_name_cache=paper_author_name_cache,
-                orcid_enabled=False,
-            ),
-            query_view,
-            orcid_enabled=False,
+            base_query_by_signature_id[str(signature_id)],
+            query_view_by_signature_id[str(signature_id)],
+            orcid_enabled=orcid_enabled,
         )
         for signature_id in query_signature_ids
     }
@@ -624,7 +672,7 @@ def build_incremental_linker_inputs(
             max_exemplars=max_exemplars,
             feature_cache=feature_cache,
             paper_author_name_cache=paper_author_name_cache,
-            orcid_enabled=False,
+            orcid_enabled=orcid_enabled,
         )
         for component_key, signature_ids in _seed_members_by_cluster(cluster_seeds_require).items()
     ]
@@ -632,6 +680,8 @@ def build_incremental_linker_inputs(
     return IncrementalLinkerInputs(
         queries=tuple(query_by_signature_id[str(signature_id)] for signature_id in query_signature_ids),
         query_by_signature_id=query_by_signature_id,
+        query_views=query_views,
+        query_view_by_signature_id=query_view_by_signature_id,
         retriever=retriever,
         summary_by_component=retriever.summary_by_component,
     )

@@ -28,6 +28,7 @@ This directory holds both user-facing guides and internal engineering notes.
 - Threading and parallelism: [threading.md](threading.md)
 - Subblocking for large blocks: [subclustering.md](subclustering.md)
 - Rust promotion baselines and gate commands: [rust/baselines.md](rust/baselines.md)
+- Rust-only raw block candidate-plan shortcut: [rust/raw_block_query_candidate_plan.md](rust/raw_block_query_candidate_plan.md)
 - Historical profiling snapshots: [rust/profiling/README.md](rust/profiling/README.md)
 
 ## Deep dives and engineering notes

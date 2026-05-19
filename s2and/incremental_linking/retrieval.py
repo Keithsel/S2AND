@@ -11,6 +11,8 @@ import numpy as np
 from s2and.incremental_linking.gate_buckets import first_name_bucket_array, normalize_query_views
 from s2and.incremental_linking.linker_pairwise import LinkerCandidateBatch
 
+_REQUIRED_RUST_PAIR_PLAN_KEYS: tuple[str, ...] = ("row_orcid_match",)
+
 
 @dataclass(frozen=True)
 class LinkerRetrievalBatch:
@@ -29,6 +31,15 @@ def _as_uint32_mapping(component_member_indices_by_key: Mapping[str, Sequence[in
         str(component_key): np.ascontiguousarray(member_indices, dtype=np.uint32)
         for component_key, member_indices in component_member_indices_by_key.items()
     }
+
+
+def _validate_rust_pair_plan_schema(plan: Mapping[str, Any]) -> None:
+    missing = sorted(key for key in _REQUIRED_RUST_PAIR_PLAN_KEYS if key not in plan)
+    if missing:
+        raise RuntimeError(
+            "RustHybridCentroidRetriever.top_k_hybrid_centroid_pair_plan returned a stale pair-plan schema; "
+            f"missing keys={missing}. Rebuild/install the current s2and-rust extension."
+        )
 
 
 def build_linker_retrieval_batch_rust(
@@ -88,6 +99,7 @@ def build_linker_retrieval_batch_rust(
             int(top_k),
             None if n_jobs is None else int(n_jobs),
         )
+    _validate_rust_pair_plan_schema(plan)
     row_count = int(plan["row_count"])
     candidate_batch = LinkerCandidateBatch(
         row_count=row_count,
@@ -131,6 +143,7 @@ def build_linker_retrieval_batch_rust(
         "query_year_missing": np.asarray(plan["row_query_year_missing"], dtype=np.uint8),
         "query_has_affiliations": np.asarray(plan["row_query_has_affiliations"], dtype=np.float32),
         "query_has_coauthors": np.asarray(plan["row_query_has_coauthors"], dtype=np.float32),
+        "orcid_match": np.asarray(plan["row_orcid_match"], dtype=np.float32),
         "middle_initial_compatibility": np.asarray(plan["middle_initial_compatibility"], dtype=np.float32),
         "affiliation_overlap": np.asarray(plan["affiliation_overlap"], dtype=np.float32),
         "coauthor_overlap": np.asarray(plan["coauthor_overlap"], dtype=np.float32),

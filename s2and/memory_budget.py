@@ -661,6 +661,10 @@ def compute_promoted_phase_a_limits(
     observed_query_count: int = 0,
     observed_candidate_rows_per_query: int | None = None,
     observed_pairs_per_query: int | None = None,
+    candidate_rows_per_query_floor: int | None = None,
+    pairs_per_query_floor: int | None = None,
+    candidate_rows_total_floor: int | None = None,
+    pairs_total_floor: int | None = None,
     observed_safety_multiplier: float = 2.0,
     detect_cgroup_fn: Callable[[], tuple[int | None, str]] | None = None,
     detect_total_fn: Callable[[], tuple[int | None, str]] | None = None,
@@ -685,8 +689,8 @@ def compute_promoted_phase_a_limits(
     sizes = [max(0, int(value)) for value in size_values]
     sizes = [size for size in sizes if size > 0]
     component_count = len(sizes)
-    candidate_rows_per_query = min(parsed_top_k, component_count)
-    conservative_pairs_per_query = _largest_sum(sizes, candidate_rows_per_query)
+    top_k_candidate_rows_per_query = min(parsed_top_k, component_count)
+    top_k_pairs_per_query = _largest_sum(sizes, top_k_candidate_rows_per_query)
     max_component_size = max(sizes, default=0)
     parsed_observed_query_count = max(0, int(observed_query_count))
     multiplier = float(observed_safety_multiplier)
@@ -694,19 +698,64 @@ def compute_promoted_phase_a_limits(
         raise ValueError(f"observed_safety_multiplier must be finite and >= 1.0, got {observed_safety_multiplier}")
     observed_rows = 0 if observed_candidate_rows_per_query is None else max(0, int(observed_candidate_rows_per_query))
     observed_pairs = 0 if observed_pairs_per_query is None else max(0, int(observed_pairs_per_query))
+    row_floor = 0 if candidate_rows_per_query_floor is None else max(0, int(candidate_rows_per_query_floor))
+    pair_floor = 0 if pairs_per_query_floor is None else max(0, int(pairs_per_query_floor))
+    row_total_floor = 0 if candidate_rows_total_floor is None else max(0, int(candidate_rows_total_floor))
+    pair_total_floor = 0 if pairs_total_floor is None else max(0, int(pairs_total_floor))
+    row_total_per_query_floor = (
+        int(math.ceil(float(row_total_floor) / float(parsed_query_count)))
+        if parsed_query_count > 0 and row_total_floor > 0
+        else 0
+    )
+    pair_total_per_query_floor = (
+        int(math.ceil(float(pair_total_floor) / float(parsed_query_count)))
+        if parsed_query_count > 0 and pair_total_floor > 0
+        else 0
+    )
+    candidate_rows_per_query = min(
+        component_count,
+        max(
+            top_k_candidate_rows_per_query,
+            row_floor,
+            observed_rows if parsed_observed_query_count > 0 and observed_candidate_rows_per_query is not None else 0,
+        ),
+    )
+    conservative_pairs_per_query = max(
+        top_k_pairs_per_query,
+        pair_floor,
+        observed_pairs if parsed_observed_query_count > 0 and observed_pairs_per_query is not None else 0,
+    )
     if parsed_observed_query_count > 0 and observed_candidate_rows_per_query is not None:
+        observed_operational_rows = int(math.ceil(float(observed_rows) * multiplier))
+        row_floor_for_operational = row_floor if row_total_per_query_floor == 0 else row_total_per_query_floor
         operational_candidate_rows_per_query = min(
             candidate_rows_per_query,
-            int(math.ceil(float(observed_rows) * multiplier)),
+            max(row_floor_for_operational, observed_operational_rows),
         )
+    elif row_total_per_query_floor > 0:
+        operational_candidate_rows_per_query = max(top_k_candidate_rows_per_query, row_total_per_query_floor)
     else:
         operational_candidate_rows_per_query = candidate_rows_per_query
     if parsed_observed_query_count > 0 and observed_pairs_per_query is not None:
+        observed_operational_pairs = int(math.ceil(float(observed_pairs) * multiplier))
+        pair_floor_for_operational = pair_floor if pair_total_per_query_floor == 0 else pair_total_per_query_floor
         operational_pairs_per_query = min(
             conservative_pairs_per_query,
-            int(math.ceil(float(observed_pairs) * multiplier)),
+            max(pair_floor_for_operational, observed_operational_pairs),
         )
         operational_estimate_source = "observed_probe"
+    elif (
+        row_floor > top_k_candidate_rows_per_query
+        or pair_floor > top_k_pairs_per_query
+        or row_total_floor > parsed_query_count * top_k_candidate_rows_per_query
+        or pair_total_floor > parsed_query_count * top_k_pairs_per_query
+    ):
+        operational_pairs_per_query = (
+            max(top_k_pairs_per_query, pair_total_per_query_floor)
+            if pair_total_per_query_floor > 0
+            else conservative_pairs_per_query
+        )
+        operational_estimate_source = "orcid_fanout"
     else:
         operational_pairs_per_query = conservative_pairs_per_query
         operational_estimate_source = "top_k_largest_components"
@@ -767,6 +816,17 @@ def compute_promoted_phase_a_limits(
     predicted_pairs_per_batch = int(query_batch_size) * operational_pairs_per_query
     hard_predicted_candidate_rows_per_batch = int(query_batch_size) * candidate_rows_per_query
     hard_predicted_pairs_per_batch = int(query_batch_size) * conservative_pairs_per_query
+    if int(query_batch_size) == parsed_query_count:
+        if row_total_floor > 0 and str(operational_estimate_source) == "orcid_fanout":
+            predicted_candidate_rows_per_batch = row_total_floor
+        else:
+            predicted_candidate_rows_per_batch = max(predicted_candidate_rows_per_batch, row_total_floor)
+        if pair_total_floor > 0 and str(operational_estimate_source) == "orcid_fanout":
+            predicted_pairs_per_batch = pair_total_floor
+        else:
+            predicted_pairs_per_batch = max(predicted_pairs_per_batch, pair_total_floor)
+        hard_predicted_candidate_rows_per_batch = max(hard_predicted_candidate_rows_per_batch, row_total_floor)
+        hard_predicted_pairs_per_batch = max(hard_predicted_pairs_per_batch, pair_total_floor)
     predicted_retrieval_pair_arrays_bytes = predicted_pairs_per_batch * int(retrieval_pair_bytes)
     predicted_retrieval_row_bytes = predicted_candidate_rows_per_batch * int(retrieval_row_bytes)
     predicted_pair_label_bytes = predicted_pairs_per_batch * int(pair_label_bytes)

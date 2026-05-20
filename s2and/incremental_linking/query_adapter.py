@@ -6,16 +6,27 @@ import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 
 from s2and.data import ANDData
+from s2and.incremental_linking.feature_block import FeatureBlock
 from s2and.incremental_linking.gate_buckets import QueryView, normalize_query_views
 from s2and.incremental_linking.retrieval import LinkerRetrievalBatch
 from s2and.subblocking import signature_affiliation_feature_keys, signature_name_parts_for_subblocking
-from s2and.text import compute_block, normalize_text, same_prefix_tokens
-from s2and.text import name_counts as pairwise_name_counts
+from s2and.text import (
+    AFFILIATIONS_STOP_WORDS,
+    compute_block,
+    get_text_ngrams_words,
+    normalize_text,
+    same_prefix_tokens,
+    split_first_middle_hyphen_aware,
+)
+from s2and.text import (
+    name_counts as pairwise_name_counts,
+)
 
 EMPTY_STRING_SET: frozenset[str] = frozenset()
 PAIRWISE_NAME_COUNT_FEATURE_NAMES: tuple[str, ...] = (
@@ -242,6 +253,159 @@ def _signature_query_author(signature: Any) -> str:
     return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
 
 
+def _feature_block_paper_by_id(feature_block: FeatureBlock) -> dict[str, Any]:
+    return {paper.paper_id: paper for paper in feature_block.papers}
+
+
+def _feature_block_signature_by_id(feature_block: FeatureBlock) -> dict[str, Any]:
+    return {signature.signature_id: signature for signature in feature_block.signatures}
+
+
+def _feature_block_author_records_by_paper(feature_block: FeatureBlock) -> dict[str, tuple[tuple[int, str], ...]]:
+    rows: dict[str, list[tuple[int, str]]] = {}
+    for author in feature_block.paper_authors:
+        rows.setdefault(author.paper_id, []).append((int(author.position), normalize_text(author.author_name)))
+    return {paper_id: tuple(sorted(authors, key=lambda item: item[0])) for paper_id, authors in rows.items()}
+
+
+def _feature_block_specter_by_paper(feature_block: FeatureBlock) -> dict[str, np.ndarray]:
+    if feature_block.specter_embeddings is None:
+        return {}
+    return {
+        paper_id: np.ascontiguousarray(feature_block.specter_embeddings[index], dtype=np.float32)
+        for index, paper_id in enumerate(feature_block.specter_paper_ids)
+    }
+
+
+def _feature_block_affiliation_terms(signature: Any) -> frozenset[str]:
+    if not signature.author_affiliations:
+        return EMPTY_STRING_SET
+    normalized = " ".join(normalize_text(value) for value in signature.author_affiliations)
+    tokens = [word for word in normalized.split() if word not in AFFILIATIONS_STOP_WORDS and len(word) > 1]
+    if not tokens:
+        return EMPTY_STRING_SET
+    return frozenset(get_text_ngrams_words(" ".join(tokens), stopwords=set()).keys())
+
+
+def _feature_block_name_counts(signature: Any) -> Any | None:
+    return SimpleNamespace(
+        first=signature.name_count_first,
+        last=signature.name_count_last,
+        first_last=signature.name_count_first_last,
+        last_first_initial=signature.name_count_last_first_initial,
+    )
+
+
+def _feature_block_author_records(
+    author_records_by_paper: Mapping[str, tuple[tuple[int, str], ...]],
+    paper_id: str,
+) -> tuple[tuple[int, str], ...]:
+    return author_records_by_paper.get(str(paper_id), ())
+
+
+def _feature_block_coauthor_blocks(
+    author_records_by_paper: Mapping[str, tuple[tuple[int, str], ...]],
+    *,
+    paper_id: str,
+    author_position: int | None,
+) -> frozenset[str]:
+    if author_position is None:
+        return EMPTY_STRING_SET
+    return frozenset(
+        _safe_compute_block(author_name)
+        for position, author_name in _feature_block_author_records(author_records_by_paper, paper_id)
+        if author_name and int(position) != int(author_position)
+    )
+
+
+def _feature_block_query_author(signature: Any) -> str:
+    parts = [
+        signature.author_first,
+        signature.author_middle,
+        signature.author_last,
+        signature.author_suffix,
+    ]
+    return normalize_text(" ".join(str(part).strip() for part in parts if part is not None and str(part).strip()))
+
+
+def extract_query_features_from_feature_block(
+    feature_block: FeatureBlock,
+    signature_id: str,
+    *,
+    feature_cache: dict[str, QueryFeatures] | None = None,
+    orcid_enabled: bool = False,
+) -> QueryFeatures:
+    """Extract production query features directly from a `FeatureBlock`."""
+
+    if feature_cache is not None and signature_id in feature_cache:
+        features = feature_cache[signature_id]
+    else:
+        signatures_by_id = _feature_block_signature_by_id(feature_block)
+        papers_by_id = _feature_block_paper_by_id(feature_block)
+        author_records_by_paper = _feature_block_author_records_by_paper(feature_block)
+        specter_by_paper = _feature_block_specter_by_paper(feature_block)
+        signature = signatures_by_id[str(signature_id)]
+        paper = papers_by_id.get(signature.paper_id)
+        first, middle = split_first_middle_hyphen_aware(signature.author_first or "", signature.author_middle or "")
+        author_position = None if signature.author_position is None else int(signature.author_position)
+        author_records = _feature_block_author_records(author_records_by_paper, signature.paper_id)
+        paper_author_names = frozenset(name for _position, name in author_records if name)
+        local10_author_names = (
+            EMPTY_STRING_SET
+            if author_position is None
+            else frozenset(
+                name
+                for position, name in author_records
+                if name and int(position) != author_position and abs(int(position) - author_position) <= 10
+            )
+        )
+        venue_terms = EMPTY_STRING_SET
+        title_terms = EMPTY_STRING_SET
+        year = None
+        if paper is not None:
+            venue_terms = _normalize_term_set(" ".join(part for part in [paper.venue, paper.journal_name] if part))
+            title_terms = _normalize_term_set(paper.title)
+            year = paper.year
+        specter = specter_by_paper.get(signature.paper_id)
+        middle_tokens = [token for token in middle.split() if token]
+        coauthor_blocks = _feature_block_coauthor_blocks(
+            author_records_by_paper,
+            paper_id=signature.paper_id,
+            author_position=author_position,
+        )
+        features = QueryFeatures(
+            first=first,
+            middle=middle,
+            first_initial=first[:1],
+            middle_initials=frozenset(token[0] for token in middle_tokens),
+            coauthor_blocks=coauthor_blocks,
+            affiliation_terms=_feature_block_affiliation_terms(signature),
+            venue_terms=venue_terms,
+            year=year,
+            orcid=normalize_orcid(signature.author_orcid),
+            specter=specter,
+            has_specter=specter is not None,
+            has_coauthors=bool(coauthor_blocks),
+            has_affiliations=bool(signature.author_affiliations),
+            has_full_first=len(first) > 1,
+            has_middle=bool(middle_tokens),
+            title_terms=title_terms,
+            name_counts=_feature_block_name_counts(signature),
+            paper_author_count=len(author_records),
+            paper_author_names=paper_author_names,
+            author_position=author_position,
+            local10_author_names=local10_author_names,
+            signature_id=str(signature_id),
+            query_author=_feature_block_query_author(signature),
+        )
+        if feature_cache is not None:
+            feature_cache[signature_id] = features
+
+    if orcid_enabled or features.orcid is None:
+        return features
+    return replace(features, orcid=None)
+
+
 def extract_query_features(
     dataset: ANDData,
     signature_id: str,
@@ -465,6 +629,109 @@ def build_cluster_summary(
             str(signature_id),
             feature_cache=feature_cache,
             paper_author_name_cache=paper_author_name_cache,
+            orcid_enabled=orcid_enabled,
+        )
+        if len(features.first) > 1:
+            first_name_counts[features.first] += 1
+        for initial in features.middle_initials:
+            middle_initial_counts[initial] += 1
+        for block in features.coauthor_blocks:
+            coauthor_counts[block] += 1
+            if int(features.paper_author_count) < 50:
+                non_mega_coauthor_counts[block] += 1
+        for term in features.affiliation_terms:
+            affiliation_counts[term] += 1
+        for term in features.venue_terms:
+            venue_counts[term] += 1
+        for term in features.title_terms:
+            title_counts[term] += 1
+        if features.year is not None:
+            year_values.append(int(features.year))
+        if features.orcid is not None:
+            orcid_values.add(features.orcid)
+        if features.specter is not None:
+            specter_vectors.append(features.specter)
+        if features.name_counts is not None:
+            name_counts_values.append(features.name_counts)
+        paper_author_counts.append(int(features.paper_author_count))
+        member_paper_author_names.append(features.paper_author_names)
+        member_paper_author_counts.append(int(features.paper_author_count))
+        member_author_positions.append(features.author_position)
+        member_local10_author_names.append(features.local10_author_names)
+        member_signature_ids.append(str(signature_id))
+        member_title_terms.append(features.title_terms)
+
+    centroid = None
+    if specter_vectors:
+        centroid = np.mean(np.vstack(specter_vectors), axis=0).astype(np.float32)
+
+    return ClusterSummary(
+        component_key=component_key,
+        cluster_id=cluster_id,
+        block_key=str(block_key),
+        size=len(signature_ids),
+        first_name_counts=first_name_counts,
+        middle_initial_counts=middle_initial_counts,
+        coauthor_counts=coauthor_counts,
+        non_mega_coauthor_counts=non_mega_coauthor_counts,
+        affiliation_counts=affiliation_counts,
+        venue_counts=venue_counts,
+        year_values=year_values,
+        year_min=min(year_values) if year_values else None,
+        year_max=max(year_values) if year_values else None,
+        year_mean=_safe_mean(year_values),
+        orcid_values=frozenset(orcid_values),
+        specter_centroid=centroid,
+        exemplar_vectors=_select_exemplars(specter_vectors, max_exemplars=max_exemplars),
+        title_counts=title_counts,
+        name_counts_values=tuple(name_counts_values),
+        max_paper_author_count=max(paper_author_counts) if paper_author_counts else 0,
+        member_paper_author_names=tuple(member_paper_author_names),
+        member_paper_author_counts=tuple(member_paper_author_counts),
+        member_author_positions=tuple(member_author_positions),
+        member_local10_author_names=tuple(member_local10_author_names),
+        member_signature_ids=tuple(member_signature_ids),
+        member_title_terms=tuple(member_title_terms),
+    )
+
+
+def build_cluster_summary_from_feature_block(
+    feature_block: FeatureBlock,
+    *,
+    cluster_id: str,
+    component_key: str,
+    signature_ids: Sequence[str],
+    max_exemplars: int,
+    feature_cache: dict[str, QueryFeatures] | None = None,
+    orcid_enabled: bool = False,
+    block_key: str = "incremental",
+) -> ClusterSummary:
+    """Build one seed-cluster summary directly from a `FeatureBlock`."""
+
+    first_name_counts: Counter[str] = Counter()
+    middle_initial_counts: Counter[str] = Counter()
+    coauthor_counts: Counter[str] = Counter()
+    non_mega_coauthor_counts: Counter[str] = Counter()
+    affiliation_counts: Counter[str] = Counter()
+    venue_counts: Counter[str] = Counter()
+    title_counts: Counter[str] = Counter()
+    year_values: list[int] = []
+    orcid_values: set[str] = set()
+    specter_vectors: list[np.ndarray] = []
+    name_counts_values: list[Any] = []
+    paper_author_counts: list[int] = []
+    member_paper_author_names: list[frozenset[str]] = []
+    member_paper_author_counts: list[int] = []
+    member_author_positions: list[int | None] = []
+    member_local10_author_names: list[frozenset[str]] = []
+    member_signature_ids: list[str] = []
+    member_title_terms: list[frozenset[str]] = []
+
+    for signature_id in signature_ids:
+        features = extract_query_features_from_feature_block(
+            feature_block,
+            str(signature_id),
+            feature_cache=feature_cache,
             orcid_enabled=orcid_enabled,
         )
         if len(features.first) > 1:

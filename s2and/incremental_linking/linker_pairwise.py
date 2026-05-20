@@ -338,7 +338,7 @@ def _chunk_plan_pairs(plan: memory_budget.RustBatchChunkPlan) -> int:
 
 
 def iter_candidate_batch_pair_feature_chunks_rust(
-    dataset: ANDData,
+    dataset: ANDData | None,
     candidate_batch: LinkerCandidateBatch,
     *,
     matrix_indices: Sequence[int] | None = None,
@@ -372,6 +372,8 @@ def iter_candidate_batch_pair_feature_chunks_rust(
         )
     chunk_pairs = _chunk_plan_pairs(plan)
     if featurizer is None:
+        if dataset is None:
+            raise ValueError("dataset is required when featurizer is not provided")
         featurizer = feature_port._get_rust_featurizer(  # noqa: SLF001
             dataset,
             runtime_context=runtime_context,
@@ -417,7 +419,7 @@ def iter_candidate_batch_pair_feature_chunks_rust(
 
 
 def compute_candidate_batch_pairwise_aggregate_stats_rust(
-    dataset: ANDData,
+    dataset: ANDData | None,
     candidate_batch: LinkerCandidateBatch,
     *,
     aggregate_feature_names: Sequence[str] = PROMOTED_PAIRWISE_AGG_BASE_FEATURE_NAMES,

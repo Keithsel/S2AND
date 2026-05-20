@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import time
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Literal
 
 import numpy as np
 
+import s2and.incremental_linking.query_adapter as query_adapter_module
 from s2and import feature_port
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.artifact import IncrementalLinkingArtifact
+from s2and.incremental_linking.feature_block import (
+    FeatureBlock,
+    feature_block_for_signature_order,
+    feature_block_from_raw_payloads,
+    feature_block_signature_order_from_raw_candidate_plan,
+)
 from s2and.incremental_linking.features import LinkerFeatureMatrix, assemble_linker_feature_matrix
 from s2and.incremental_linking.linker_pairwise import (
     PROMOTED_PAIRWISE_AGG_BASE_FEATURE_NAMES,
@@ -32,7 +39,11 @@ from s2and.incremental_linking.logistic_gate import (
     build_runtime_logistic_gate_matrix,
     load_logistic_gate_config,
 )
-from s2and.incremental_linking.retrieval import LinkerRetrievalBatch, build_linker_retrieval_batch_rust
+from s2and.incremental_linking.retrieval import (
+    LinkerRetrievalBatch,
+    build_linker_retrieval_batch_from_raw_candidate_plan,
+    build_linker_retrieval_batch_rust,
+)
 from s2and.incremental_linking.row_features import build_promoted_non_pairwise_row_features_with_telemetry
 from s2and.runtime import build_runtime_context
 from s2and.thread_config import resolve_n_jobs
@@ -518,7 +529,7 @@ def _distance_row_signals(
 
 def _accumulate_pairwise_distance_chunk(
     *,
-    dataset: ANDData,
+    dataset: ANDData | None,
     row_indices: np.ndarray,
     row_count: int,
     model_distances: np.ndarray,
@@ -545,7 +556,7 @@ def _accumulate_pairwise_distance_chunk(
 
 
 def compute_candidate_batch_pairwise_model_and_aggregate_stats(
-    dataset: ANDData,
+    dataset: ANDData | None,
     candidate_batch: LinkerCandidateBatch,
     *,
     classifier: Any,
@@ -610,6 +621,8 @@ def compute_candidate_batch_pairwise_model_and_aggregate_stats(
     top_distances = np.full((row_count, 5), np.inf, dtype=np.float64)
     hard_disallow_distance_pair_count = 0
     if featurizer is None:
+        if dataset is None:
+            raise ValueError("dataset is required when featurizer is not provided")
         featurizer = feature_port._get_rust_featurizer(  # noqa: SLF001
             dataset,
             runtime_context=runtime_context,
@@ -946,7 +959,7 @@ def _candidate_pair_ids(
 
 def _resolve_candidate_batch_pair_labels_rust(
     *,
-    dataset: ANDData,
+    dataset: ANDData | None,
     candidate_batch: LinkerCandidateBatch,
     signature_ids_by_index: Sequence[Any],
     partial_supervision: Mapping[tuple[str, str], int | float],
@@ -1200,6 +1213,7 @@ def _predict_incremental_link_or_abstain_production_private(
     runtime_context: Any | None = None,
     n_jobs: int | None = None,
     total_ram_bytes: int | None = None,
+    retrieval_top_k: int | None = None,
 ) -> LinkOrAbstainProductionResult:
     """Run the private M3a production-shaped link-or-abstain slice.
 
@@ -1237,19 +1251,11 @@ def _predict_incremental_link_or_abstain_production_private(
     recluster_map = dict(recluster_map)
 
     signature_id_to_index = signature_id_to_index_map(featurizer)
-    signature_ids_by_index = tuple(str(signature_id) for signature_id in featurizer.signature_ids())
     query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
     query_signature_indices = np.asarray(
         [_signature_id_to_index(signature_id_to_index, signature_id) for signature_id in query_signature_id_strings],
         dtype=np.uint32,
     )
-    query_signature_id_by_index = {
-        int(query_index): query_signature_id
-        for query_index, query_signature_id in zip(query_signature_indices, query_signature_id_strings, strict=True)
-    }
-    query_by_signature_id = {
-        query_signature_id: query for query_signature_id, query in zip(query_signature_id_strings, queries, strict=True)
-    }
     component_member_indices_by_key = _build_component_member_indices_by_key(
         cluster_seeds_require,
         signature_id_to_index,
@@ -1266,6 +1272,91 @@ def _predict_incremental_link_or_abstain_production_private(
             query_view=query_view,
             n_jobs=n_jobs_resolved,
         )
+    return _predict_incremental_link_or_abstain_production_from_retrieval_private(
+        clusterer,
+        artifact,
+        dataset=dataset,
+        featurizer=featurizer,
+        retrieval_batch=retrieval_batch,
+        queries=queries,
+        query_signature_ids=query_signature_ids,
+        partial_supervision=partial_supervision_dict,
+        constraint_backend=constraint_backend,
+        extra_row_signals=extra_row_signals,
+        extra_row_signal_builder=extra_row_signal_builder,
+        seed_setup=(cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse),
+        runtime_context=resolved_runtime_context,
+        n_jobs=n_jobs_resolved,
+        total_ram_bytes=total_ram_bytes,
+        retrieval_top_k=retrieval_top_k,
+    )
+
+
+def _predict_incremental_link_or_abstain_production_from_retrieval_private(
+    clusterer: Any,
+    artifact: IncrementalLinkingArtifact,
+    *,
+    dataset: ANDData | None,
+    featurizer: Any,
+    retrieval_batch: LinkerRetrievalBatch,
+    queries: Sequence[Any],
+    query_signature_ids: Sequence[Any],
+    partial_supervision: Mapping[tuple[Any, Any], int | float] | None = None,
+    constraint_backend: Any | None = None,
+    extra_row_signals: Mapping[str, Any] | None = None,
+    extra_row_signal_builder: Callable[[LinkerRetrievalBatch, Mapping[int, str]], Mapping[str, Any]] | None = None,
+    seed_setup: tuple[
+        Mapping[str, int | str],
+        Mapping[int | str, int | str],
+        Mapping[int | str, Sequence[str]],
+    ]
+    | None = None,
+    runtime_context: Any | None = None,
+    n_jobs: int | None = None,
+    total_ram_bytes: int | None = None,
+    retrieval_top_k: int | None = None,
+) -> LinkOrAbstainProductionResult:
+    """Run production scoring/gating from an already retrieved candidate batch."""
+
+    if len(queries) != len(query_signature_ids):
+        raise ValueError(
+            "queries and query_signature_ids must have equal length: " f"{len(queries)} != {len(query_signature_ids)}"
+        )
+    resolved_runtime_context = runtime_context or build_runtime_context(
+        "incremental_link_or_abstain_from_retrieval_private"
+    )
+    partial_supervision_dict = {
+        (str(left), str(right)): value for (left, right), value in (partial_supervision or {}).items()
+    }
+    n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
+    if seed_setup is None:
+        build_seed_setup = getattr(clusterer, "_build_incremental_seed_setup", None)
+        if not callable(build_seed_setup):
+            raise TypeError("clusterer must expose _build_incremental_seed_setup for the private M3a slice")
+        cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = build_seed_setup(
+            dataset,
+            partial_supervision_dict,
+            resolved_runtime_context,
+        )
+    else:
+        cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = seed_setup
+    cluster_seeds_require = dict(cluster_seeds_require)
+    recluster_map = dict(recluster_map)
+
+    signature_id_to_index = signature_id_to_index_map(featurizer)
+    signature_ids_by_index = tuple(str(signature_id) for signature_id in featurizer.signature_ids())
+    query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
+    query_signature_indices = np.asarray(
+        [_signature_id_to_index(signature_id_to_index, signature_id) for signature_id in query_signature_id_strings],
+        dtype=np.uint32,
+    )
+    query_signature_id_by_index = {
+        int(query_index): query_signature_id
+        for query_index, query_signature_id in zip(query_signature_indices, query_signature_id_strings, strict=True)
+    }
+    query_by_signature_id = {
+        query_signature_id: query for query_signature_id, query in zip(query_signature_id_strings, queries, strict=True)
+    }
 
     candidate_batch = retrieval_batch.candidate_batch
     retrieved_query_indices = (
@@ -1281,15 +1372,23 @@ def _predict_incremental_link_or_abstain_production_private(
         ],
         dtype=np.uint32,
     )
-    pair_ids = _candidate_pair_ids(signature_ids_by_index, candidate_batch)
-    partial_telemetry = _validate_partial_supervision_window(
-        partial_supervision=partial_supervision_dict,
-        query_signature_ids=set(query_signature_id_strings),
-        seed_signature_to_component={
-            str(signature_id): component for signature_id, component in cluster_seeds_require.items()
-        },
-        candidate_pair_ids=pair_ids,
-    )
+    if partial_supervision_dict:
+        pair_ids = _candidate_pair_ids(signature_ids_by_index, candidate_batch)
+        partial_telemetry = _validate_partial_supervision_window(
+            partial_supervision=partial_supervision_dict,
+            query_signature_ids=set(query_signature_id_strings),
+            seed_signature_to_component={
+                str(signature_id): component for signature_id, component in cluster_seeds_require.items()
+            },
+            candidate_pair_ids=pair_ids,
+        )
+    else:
+        partial_telemetry = {
+            "partial_supervision_pair_count": 0,
+            "partial_supervision_disallow_outside_retrieval_window": 0,
+            "partial_supervision_disallow_between_residual_queries": 0,
+            "partial_supervision_ignored_outside_window": 0,
+        }
 
     constraint_featurizer = getattr(constraint_backend, "rust_featurizer", None) or featurizer
     pair_labels, constraint_telemetry = _resolve_candidate_batch_pair_labels_rust(
@@ -1365,6 +1464,7 @@ def _predict_incremental_link_or_abstain_production_private(
         and decision.query_signature_index in query_signature_id_by_index
     }
     linked_signature_clusters = naturalize_incremental_clusters(raw_linked_clusters, recluster_map)
+    component_keys = candidate_batch.row_component_keys or ()
     telemetry: dict[str, int | float | str] = {
         **private_result.telemetry,
         **{f"pairwise_{key}": value for key, value in pairwise_model_result.telemetry.items()},
@@ -1372,8 +1472,11 @@ def _predict_incremental_link_or_abstain_production_private(
         **partial_telemetry,
         "query_count": int(len(query_signature_id_strings)),
         "seed_signature_count": int(len(cluster_seeds_require)),
-        "seed_component_count": int(len(component_member_indices_by_key)),
-        "retrieval_top_k": int(retrieval_top_k),
+        "seed_component_count": int(len({str(value) for value in cluster_seeds_require.values()})),
+        "retrieval_top_k": int(
+            retrieval_top_k if retrieval_top_k is not None else _max_retrieval_rank(candidate_batch)
+        ),
+        "retrieved_component_count": int(len(component_keys)),
     }
     return LinkOrAbstainProductionResult(
         feature_matrix=private_result.feature_matrix,
@@ -1383,6 +1486,419 @@ def _predict_incremental_link_or_abstain_production_private(
         pairwise_model_result=pairwise_model_result,
         linked_signature_clusters=linked_signature_clusters,
     )
+
+
+def _raw_plan_query_views(raw_candidate_plan: Mapping[str, Any], query_count: int) -> tuple[str, ...]:
+    raw_views = raw_candidate_plan.get("query_views", raw_candidate_plan.get("query_views_resolved"))
+    if raw_views is None:
+        raise KeyError("raw candidate plan is missing query_views")
+    views = tuple(str(value) for value in raw_views)
+    if len(views) != int(query_count):
+        raise ValueError(f"raw candidate plan query_views length must match query count: {len(views)} != {query_count}")
+    return views
+
+
+def _max_retrieval_rank(candidate_batch: LinkerCandidateBatch) -> int:
+    retrieval_ranks = candidate_batch.retrieval_ranks
+    if retrieval_ranks is None:
+        return 0
+    return max((int(rank) for rank in retrieval_ranks), default=0)
+
+
+def _identity_seed_setup(
+    cluster_seeds_require: Mapping[str, int | str],
+) -> tuple[dict[str, int | str], dict[int | str, int | str], dict[int | str, list[str]]]:
+    recluster_map: dict[int | str, int | str] = {
+        component_id: component_id for component_id in cluster_seeds_require.values()
+    }
+    inverse: dict[int | str, list[str]] = {}
+    for signature_id, component_id in cluster_seeds_require.items():
+        inverse.setdefault(component_id, []).append(str(signature_id))
+    return (
+        {str(signature_id): component_id for signature_id, component_id in cluster_seeds_require.items()},
+        recluster_map,
+        inverse,
+    )
+
+
+def _raw_candidate_plan_telemetry_fields(raw_candidate_plan: Mapping[str, Any]) -> dict[str, int | float | str]:
+    telemetry = raw_candidate_plan.get("telemetry")
+    if not isinstance(telemetry, Mapping):
+        return {}
+    fields: dict[str, int | float | str] = {}
+    for key, value in telemetry.items():
+        if key == "timings":
+            continue
+        if isinstance(value, bool):
+            fields[f"raw_arrow_plan_{key}"] = int(value)
+        elif isinstance(value, int | float | str):
+            fields[f"raw_arrow_plan_{key}"] = value
+    timings = telemetry.get("timings")
+    if isinstance(timings, Mapping):
+        for key, value in timings.items():
+            if isinstance(value, int | float):
+                fields[f"raw_arrow_plan_{key}"] = float(value)
+    return fields
+
+
+def _raw_candidate_plan_seed_setup(
+    raw_candidate_plan: Mapping[str, Any],
+) -> tuple[dict[str, int | str], dict[int | str, int | str], dict[int | str, list[str]]]:
+    seed_signature_ids = raw_candidate_plan.get("seed_signature_ids")
+    seed_component_keys = raw_candidate_plan.get("seed_component_keys")
+    if isinstance(seed_signature_ids, Sequence) and not isinstance(seed_signature_ids, str | bytes):
+        if not isinstance(seed_component_keys, Sequence) or isinstance(seed_component_keys, str | bytes):
+            raise ValueError("raw candidate plan seed_component_keys must accompany seed_signature_ids")
+        if len(seed_signature_ids) != len(seed_component_keys):
+            raise ValueError(
+                "raw candidate plan seed_signature_ids and seed_component_keys must have equal length: "
+                f"{len(seed_signature_ids)} != {len(seed_component_keys)}"
+            )
+        return _identity_seed_setup(
+            {
+                str(signature_id): str(component_key)
+                for signature_id, component_key in zip(seed_signature_ids, seed_component_keys, strict=True)
+            }
+        )
+
+    component_members = raw_candidate_plan.get("component_members")
+    if not isinstance(component_members, Mapping):
+        raise ValueError("raw candidate plan must include component_members for scoring")
+    cluster_seeds_require = {
+        str(signature_id): str(component_key)
+        for component_key, members in component_members.items()
+        for signature_id in members
+    }
+    return _identity_seed_setup(cluster_seeds_require)
+
+
+def _raw_candidate_plan_query_placeholders(
+    raw_candidate_plan: Mapping[str, Any],
+    query_signature_ids: Sequence[str],
+) -> tuple[SimpleNamespace, ...]:
+    query_authors = raw_candidate_plan.get("query_authors")
+    if not isinstance(query_authors, Sequence) or isinstance(query_authors, str | bytes):
+        raise ValueError("raw Arrow candidate plan must include query_authors")
+    if len(query_authors) != len(query_signature_ids):
+        raise ValueError(
+            "raw Arrow candidate plan query_authors length must match query_signature_ids: "
+            f"{len(query_authors)} != {len(query_signature_ids)}"
+        )
+    return tuple(SimpleNamespace(query_author=str(value or "")) for value in query_authors)
+
+
+def predict_incremental_link_or_abstain_from_raw_feature_block(
+    clusterer: Any,
+    artifact: IncrementalLinkingArtifact,
+    *,
+    feature_block: FeatureBlock,
+    raw_candidate_plan: Mapping[str, Any],
+    partial_supervision: Mapping[tuple[Any, Any], int | float] | None = None,
+    runtime_context: Any | None = None,
+    n_jobs: int | None = None,
+    total_ram_bytes: int | None = None,
+    max_exemplars: int = 4,
+    load_name_counts: bool | dict[str, Any] = False,
+    name_tuples: set[tuple[str, str]] | str | None = "filtered",
+) -> LinkOrAbstainProductionResult:
+    """Score a raw candidate plan through `FeatureBlock` without full-block `ANDData`.
+
+    This is the production bridge for raw retrieval output. It keeps the hot
+    request bounded to the query plus returned candidate members, builds the
+    Rust featurizer directly from `FeatureBlock`, and does not rerun retrieval.
+    """
+
+    if isinstance(load_name_counts, dict):
+        raise ValueError("raw FeatureBlock scoring accepts load_name_counts as a bool, not a dict")
+    resolved_runtime_context = runtime_context or build_runtime_context("incremental_link_or_abstain_raw_feature_block")
+    n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
+    stage_start = time.perf_counter()
+    signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
+    mini_feature_block = feature_block_for_signature_order(feature_block, signature_order)
+    order_seconds = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    featurizer = feature_port.build_rust_featurizer_from_feature_block(
+        mini_feature_block,
+        name_tuples=name_tuples,
+        load_name_counts=bool(load_name_counts),
+        preprocess=True,
+        compute_reference_features=False,
+        num_threads=n_jobs_resolved,
+    )
+    feature_block_featurizer_seconds = time.perf_counter() - stage_start
+    featurizer_signature_ids = tuple(str(signature_id) for signature_id in featurizer.signature_ids())
+    missing_plan_signature_ids = sorted(set(signature_order.signature_ids).difference(featurizer_signature_ids))
+    if missing_plan_signature_ids:
+        raise ValueError(
+            "mini FeatureBlock featurizer is missing raw candidate plan signatures: "
+            f"{missing_plan_signature_ids[:10]}"
+        )
+    featurizer_signature_id_to_index = signature_id_to_index_map(featurizer)
+
+    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
+        raw_candidate_plan,
+        signature_id_to_index=featurizer_signature_id_to_index,
+    )
+    query_signature_ids = tuple(signature_order.query_signature_ids)
+    query_views = _raw_plan_query_views(raw_candidate_plan, len(query_signature_ids))
+
+    stage_start = time.perf_counter()
+    feature_cache: dict[str, query_adapter_module.QueryFeatures] = {}
+    base_query_by_signature_id = {
+        query_signature_id: query_adapter_module.extract_query_features_from_feature_block(
+            mini_feature_block,
+            query_signature_id,
+            feature_cache=feature_cache,
+            orcid_enabled=True,
+        )
+        for query_signature_id in query_signature_ids
+    }
+    query_by_signature_id = {
+        query_signature_id: query_adapter_module.mask_query_features(
+            base_query_by_signature_id[query_signature_id],
+            query_view,
+            orcid_enabled=True,
+        )
+        for query_signature_id, query_view in zip(query_signature_ids, query_views, strict=True)
+    }
+
+    component_members = mini_feature_block.seed_component_members
+    summary_by_component = {
+        component_key: query_adapter_module.build_cluster_summary_from_feature_block(
+            mini_feature_block,
+            cluster_id=component_key,
+            component_key=component_key,
+            signature_ids=member_signature_ids,
+            max_exemplars=max_exemplars,
+            feature_cache=feature_cache,
+            orcid_enabled=True,
+        )
+        for component_key, member_signature_ids in component_members.items()
+    }
+    feature_block_signal_seconds = time.perf_counter() - stage_start
+
+    def extra_row_signal_builder(
+        current_retrieval_batch: LinkerRetrievalBatch,
+        query_signature_id_by_index: Mapping[int, str],
+    ) -> Mapping[str, Any]:
+        return query_adapter_module.build_name_count_rarity_row_signals(
+            current_retrieval_batch,
+            query_signature_id_by_index=query_signature_id_by_index,
+            query_by_signature_id=query_by_signature_id,
+            summary_by_component=summary_by_component,
+        )
+
+    result = _predict_incremental_link_or_abstain_production_from_retrieval_private(
+        clusterer,
+        artifact,
+        dataset=None,
+        featurizer=featurizer,
+        retrieval_batch=retrieval_batch,
+        queries=tuple(query_by_signature_id[query_signature_id] for query_signature_id in query_signature_ids),
+        query_signature_ids=query_signature_ids,
+        partial_supervision=partial_supervision,
+        constraint_backend=None,
+        extra_row_signal_builder=extra_row_signal_builder,
+        seed_setup=_identity_seed_setup(dict(mini_feature_block.cluster_seeds_require)),
+        runtime_context=resolved_runtime_context,
+        n_jobs=n_jobs_resolved,
+        total_ram_bytes=total_ram_bytes,
+        retrieval_top_k=int(artifact.metadata.retrieval_top_k),
+    )
+    telemetry = {
+        **result.telemetry,
+        "feature_block_order_seconds": float(order_seconds),
+        "feature_block_rust_featurizer_seconds": float(feature_block_featurizer_seconds),
+        "feature_block_signal_seconds": float(feature_block_signal_seconds),
+        "feature_block_signature_count": int(len(mini_feature_block.signatures)),
+        "feature_block_paper_count": int(len(mini_feature_block.papers)),
+        "feature_block_paper_author_count": int(len(mini_feature_block.paper_authors)),
+        "feature_block_seed_signature_count": int(len(mini_feature_block.cluster_seeds_require)),
+        "feature_block_seed_component_count": int(len(component_members)),
+    }
+    return LinkOrAbstainProductionResult(
+        feature_matrix=result.feature_matrix,
+        compact_result=result.compact_result,
+        telemetry=telemetry,
+        retrieval_batch=result.retrieval_batch,
+        pairwise_model_result=result.pairwise_model_result,
+        linked_signature_clusters=result.linked_signature_clusters,
+    )
+
+
+def predict_incremental_link_or_abstain_from_raw_arrow_paths(
+    clusterer: Any,
+    artifact: IncrementalLinkingArtifact,
+    *,
+    arrow_paths: Mapping[str, Any],
+    query_signature_ids: Sequence[Any],
+    query_view: str = "auto",
+    top_k: int | None = None,
+    partial_supervision: Mapping[tuple[Any, Any], int | float] | None = None,
+    runtime_context: Any | None = None,
+    n_jobs: int | None = None,
+    total_ram_bytes: int | None = None,
+    max_exemplars: int = 4,
+    load_name_counts: bool | dict[str, Any] = False,
+    name_tuples: set[tuple[str, str]] | str | None = "filtered",
+    orcid_enabled: bool = True,
+) -> LinkOrAbstainProductionResult:
+    """Retrieve and score raw Arrow IPC inputs through Rust without `ANDData`."""
+
+    if isinstance(load_name_counts, dict):
+        raise ValueError("raw Arrow scoring accepts load_name_counts as a bool, not a dict")
+    resolved_runtime_context = runtime_context or build_runtime_context("incremental_link_or_abstain_raw_arrow")
+    n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
+    top_k_resolved = int(artifact.metadata.retrieval_top_k if top_k is None else top_k)
+    arrow_path_payload = {str(key): str(value) for key, value in arrow_paths.items()}
+    query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
+
+    stage_start = time.perf_counter()
+    rust_module = feature_port._require_rust_runtime()  # noqa: SLF001
+    raw_candidate_plan = rust_module.raw_block_query_candidate_plan_arrow(
+        arrow_path_payload,
+        list(query_signature_id_strings),
+        top_k=top_k_resolved,
+        query_view=str(query_view),
+        orcid_enabled=bool(orcid_enabled),
+        num_threads=n_jobs_resolved,
+        max_exemplars=int(max_exemplars),
+        include_seed_assignments=bool(partial_supervision),
+    )
+    raw_arrow_retrieval_seconds = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
+    featurizer = feature_port.build_rust_featurizer_from_arrow_paths(
+        arrow_path_payload,
+        signature_ids=signature_order.signature_ids,
+        name_tuples=name_tuples,
+        load_name_counts=bool(load_name_counts),
+        preprocess=True,
+        compute_reference_features=False,
+        num_threads=n_jobs_resolved,
+    )
+    raw_arrow_featurizer_seconds = time.perf_counter() - stage_start
+    featurizer_signature_id_to_index = signature_id_to_index_map(featurizer)
+
+    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
+        raw_candidate_plan,
+        signature_id_to_index=featurizer_signature_id_to_index,
+    )
+    _raw_plan_query_views(raw_candidate_plan, len(query_signature_id_strings))
+    stage_start = time.perf_counter()
+    query_placeholders = _raw_candidate_plan_query_placeholders(raw_candidate_plan, query_signature_id_strings)
+    seed_setup = _raw_candidate_plan_seed_setup(raw_candidate_plan)
+    seed_signature_ids = raw_candidate_plan.get("seed_signature_ids", ())
+    seed_signature_count = len(seed_signature_ids) if isinstance(seed_signature_ids, Sequence) else 0
+    plan_telemetry = raw_candidate_plan.get("telemetry")
+    if seed_signature_count == 0 and isinstance(plan_telemetry, Mapping):
+        seed_signature_count = int(plan_telemetry.get("seed_signature_count", 0) or 0)
+    seed_component_count = len(seed_setup[1])
+    if isinstance(plan_telemetry, Mapping):
+        seed_component_count = int(plan_telemetry.get("cluster_count", seed_component_count) or seed_component_count)
+    raw_arrow_signal_seconds = time.perf_counter() - stage_start
+
+    result = _predict_incremental_link_or_abstain_production_from_retrieval_private(
+        clusterer,
+        artifact,
+        dataset=None,
+        featurizer=featurizer,
+        retrieval_batch=retrieval_batch,
+        queries=query_placeholders,
+        query_signature_ids=query_signature_id_strings,
+        partial_supervision=partial_supervision,
+        constraint_backend=None,
+        extra_row_signal_builder=None,
+        seed_setup=seed_setup,
+        runtime_context=resolved_runtime_context,
+        n_jobs=n_jobs_resolved,
+        total_ram_bytes=total_ram_bytes,
+        retrieval_top_k=top_k_resolved,
+    )
+    raw_plan_telemetry_fields = _raw_candidate_plan_telemetry_fields(raw_candidate_plan)
+    telemetry = {
+        **result.telemetry,
+        **raw_plan_telemetry_fields,
+        "seed_signature_count": int(seed_signature_count),
+        "seed_component_count": int(seed_component_count),
+        "raw_arrow_retrieval_seconds": float(raw_arrow_retrieval_seconds),
+        "raw_arrow_featurizer_seconds": float(raw_arrow_featurizer_seconds),
+        "raw_arrow_signal_seconds": float(raw_arrow_signal_seconds),
+        "raw_arrow_signature_count": int(len(signature_order.signature_ids)),
+        "raw_arrow_seed_signature_count": int(seed_signature_count),
+        "raw_arrow_seed_component_count": int(seed_component_count),
+    }
+    return LinkOrAbstainProductionResult(
+        feature_matrix=result.feature_matrix,
+        compact_result=result.compact_result,
+        telemetry=telemetry,
+        retrieval_batch=result.retrieval_batch,
+        pairwise_model_result=result.pairwise_model_result,
+        linked_signature_clusters=result.linked_signature_clusters,
+    )
+
+
+def predict_incremental_link_or_abstain_from_raw_payloads(
+    clusterer: Any,
+    artifact: IncrementalLinkingArtifact,
+    *,
+    signatures: Mapping[str, Mapping[str, Any]],
+    papers: Mapping[str, Mapping[str, Any]],
+    raw_candidate_plan: Mapping[str, Any],
+    cluster_seeds_require: Mapping[Any, Any],
+    cluster_seeds_disallow: Iterable[tuple[Any, Any]] | None = None,
+    specter_embeddings: Mapping[Any, Any] | tuple[Any, Any] | None = None,
+    partial_supervision: Mapping[tuple[Any, Any], int | float] | None = None,
+    runtime_context: Any | None = None,
+    n_jobs: int | None = None,
+    total_ram_bytes: int | None = None,
+    max_exemplars: int = 4,
+    load_name_counts: bool | dict[str, Any] = False,
+    name_tuples: set[tuple[str, str]] | str | None = "filtered",
+) -> LinkOrAbstainProductionResult:
+    """Build a raw `FeatureBlock` from payloads and score a raw candidate plan."""
+
+    stage_start = time.perf_counter()
+    feature_block = feature_block_from_raw_payloads(
+        signatures=signatures,
+        papers=papers,
+        raw_candidate_plan=raw_candidate_plan,
+        cluster_seeds_require=cluster_seeds_require,
+        cluster_seeds_disallow=cluster_seeds_disallow,
+        specter_embeddings=specter_embeddings,
+    )
+    raw_payload_build_seconds = time.perf_counter() - stage_start
+    result = predict_incremental_link_or_abstain_from_raw_feature_block(
+        clusterer,
+        artifact,
+        feature_block=feature_block,
+        raw_candidate_plan=raw_candidate_plan,
+        partial_supervision=partial_supervision,
+        runtime_context=runtime_context,
+        n_jobs=n_jobs,
+        total_ram_bytes=total_ram_bytes,
+        max_exemplars=max_exemplars,
+        load_name_counts=load_name_counts,
+        name_tuples=name_tuples,
+    )
+    return LinkOrAbstainProductionResult(
+        feature_matrix=result.feature_matrix,
+        compact_result=result.compact_result,
+        telemetry={
+            **result.telemetry,
+            "feature_block_raw_payload_build_seconds": float(raw_payload_build_seconds),
+        },
+        retrieval_batch=result.retrieval_batch,
+        pairwise_model_result=result.pairwise_model_result,
+        linked_signature_clusters=result.linked_signature_clusters,
+    )
+
+
+_predict_incremental_link_or_abstain_raw_feature_block_private = (
+    predict_incremental_link_or_abstain_from_raw_feature_block
+)
 
 
 def naturalize_incremental_clusters(

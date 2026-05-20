@@ -541,6 +541,94 @@ def test_predict_incremental_auto_backend_uses_promoted_linker_when_auto_resolve
     assert clusterer.predict_incremental(block, dataset, batching_threshold=None) == promoted_payload
 
 
+def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exists(
+    clusterer_dataset_factory,
+    monkeypatch,
+    tmp_path,
+):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_auto_incremental_arrow")
+    block = ["3", "4", "5", "6", "7", "8"]
+    runtime_context = SimpleNamespace(
+        operation="cluster_predict_incremental",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="test-rust-promoted-incremental-arrow",
+        source="S2AND_BACKEND",
+    )
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+        "cluster_seeds": "cluster_seeds.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
+    dataset.arrow_paths = arrow_paths
+    captured: dict[str, Any] = {}
+
+    class FakeArtifact:
+        metadata = SimpleNamespace(retrieval_top_k=25)
+
+    def fake_raw_arrow_linker(clusterer_arg, artifact_arg, **kwargs):
+        captured["clusterer"] = clusterer_arg
+        captured["artifact"] = artifact_arg
+        captured["arrow_paths"] = dict(kwargs["arrow_paths"])
+        captured["query_signature_ids"] = tuple(kwargs["query_signature_ids"])
+        return SimpleNamespace(
+            linked_signature_clusters={str(kwargs["query_signature_ids"][0]): "6"}
+            if kwargs["query_signature_ids"]
+            else {},
+            telemetry={"candidate_row_count": 1, "pair_count": 1, "query_count": len(kwargs["query_signature_ids"])},
+        )
+
+    def fake_finish_incremental(
+        self,
+        unassigned_signature_ids,
+        dataset_arg,
+        linked_signature_clusters,
+        recluster_map,
+        cluster_seeds_require_inverse,
+        prevent_new_incompatibilities,
+        partial_supervision,
+        runtime_context_arg,
+        total_ram_bytes=None,
+    ):
+        del self, recluster_map, cluster_seeds_require_inverse, prevent_new_incompatibilities, partial_supervision
+        captured["finish_unassigned"] = list(unassigned_signature_ids)
+        captured["finish_dataset"] = dataset_arg
+        captured["finish_linked"] = dict(linked_signature_clusters)
+        captured["finish_runtime_context"] = runtime_context_arg
+        captured["finish_total_ram_bytes"] = total_ram_bytes
+        return {"finished": list(unassigned_signature_ids)}
+
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        production_module.artifact_module,
+        "load_incremental_linking_artifact",
+        lambda _path: FakeArtifact(),
+    )
+    monkeypatch.setattr(
+        production_module.runtime_module,
+        "predict_incremental_link_or_abstain_from_raw_arrow_paths",
+        fake_raw_arrow_linker,
+    )
+    monkeypatch.setattr(Clusterer, "_finish_incremental_with_seed_links", fake_finish_incremental)
+
+    result = clusterer.predict_incremental(block, dataset, batching_threshold=None)
+
+    assert result["clusters"] == {"finished": captured["finish_unassigned"]}
+    assert result["incremental_linker_query_view"] == "raw_arrow"
+    assert result["incremental_linker_telemetry"]["arrow_promoted_incremental"] == 1
+    assert captured["arrow_paths"] == arrow_paths
+    assert captured["finish_dataset"] is dataset
+    assert captured["finish_runtime_context"] is runtime_context
+    assert captured["finish_linked"]
+
+
 def test_predict_incremental_rust_empty_seeds_uses_monolithic_fallback(clusterer_dataset_factory, monkeypatch):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_rust_empty_seeds")
     dataset.cluster_seeds_require = {}

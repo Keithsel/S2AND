@@ -1,0 +1,1346 @@
+"""Narrow inference-block contract for incremental linking.
+
+`ANDData` remains the broad reference object. This module defines the smaller
+shape that fast inference paths should target before entering Rust.
+"""
+
+from __future__ import annotations
+
+import json
+import struct
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+FEATURE_BLOCK_SCHEMA_VERSION = "feature_block_v1"
+
+FEATURE_BLOCK_INCLUDED_RESPONSIBILITIES: tuple[str, ...] = (
+    "signature_identity_and_author_fields",
+    "paper_metadata_used_by_inference",
+    "paper_author_rows_used_by_inference",
+    "seed_component_membership",
+    "constraint_seed_pairs",
+    "specter_embeddings",
+    "name_count_values_for_scoring",
+)
+
+FEATURE_BLOCK_EXCLUDED_ANDDATA_RESPONSIBILITIES: tuple[str, ...] = (
+    "train_eval_test_split_construction",
+    "pair_sampling_policy",
+    "legacy_artifact_migration",
+    "sinonym_overwrite_execution",
+    "reference_feature_generation",
+    "general_anddata_mutation_lifecycle",
+)
+
+NAME_COUNTS_INDEX_SCHEMA_VERSION = "name_counts_index_v1"
+_NAME_COUNTS_INDEX_MAGIC = b"S2NCI001"
+_NAME_COUNTS_INDEX_HASH_DOMAIN = b"s2and-name-counts-index-v1\x00"
+_NAME_COUNTS_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQ")
+_NAME_COUNTS_INDEX_RECORD_STRUCT = struct.Struct("<QQQIId")
+_FNV64_OFFSET = 14695981039346656037
+_FNV64_PRIME = 1099511628211
+
+
+@dataclass(frozen=True)
+class FeatureBlockSignature:
+    """One signature row in the inference contract."""
+
+    signature_id: str
+    paper_id: str
+    author_first: str | None
+    author_middle: str | None
+    author_last: str | None
+    author_suffix: str | None
+    author_affiliations: tuple[str, ...]
+    author_orcid: str | None
+    author_position: int | None
+    author_block: str | None = None
+    author_email: str | None = None
+    source_author_ids: tuple[str, ...] = ()
+    name_count_first: float | None = None
+    name_count_last: float | None = None
+    name_count_first_last: float | None = None
+    name_count_last_first_initial: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "signature_id", str(self.signature_id))
+        object.__setattr__(self, "paper_id", str(self.paper_id))
+        object.__setattr__(self, "author_affiliations", tuple(str(value) for value in self.author_affiliations))
+        object.__setattr__(self, "source_author_ids", tuple(str(value) for value in self.source_author_ids))
+        if not self.signature_id:
+            raise ValueError("FeatureBlockSignature.signature_id must be non-empty")
+        if not self.paper_id:
+            raise ValueError(f"FeatureBlockSignature.paper_id must be non-empty for {self.signature_id!r}")
+        if self.author_position is not None:
+            object.__setattr__(self, "author_position", int(self.author_position))
+
+
+@dataclass(frozen=True)
+class FeatureBlockPaper:
+    """One paper row in the inference contract."""
+
+    paper_id: str
+    title: str | None
+    abstract: str | None
+    venue: str | None
+    journal_name: str | None
+    year: int | None
+    predicted_language: str | None = None
+    is_reliable: bool | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "paper_id", str(self.paper_id))
+        if not self.paper_id:
+            raise ValueError("FeatureBlockPaper.paper_id must be non-empty")
+        if self.year is not None:
+            object.__setattr__(self, "year", int(self.year))
+        if self.is_reliable is not None:
+            object.__setattr__(self, "is_reliable", bool(self.is_reliable))
+
+
+@dataclass(frozen=True)
+class FeatureBlockPaperAuthor:
+    """One paper-author child row in the inference contract."""
+
+    paper_id: str
+    position: int
+    author_name: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "paper_id", str(self.paper_id))
+        object.__setattr__(self, "position", int(self.position))
+        object.__setattr__(self, "author_name", str(self.author_name))
+        if not self.paper_id:
+            raise ValueError("FeatureBlockPaperAuthor.paper_id must be non-empty")
+
+
+@dataclass(frozen=True)
+class FeatureBlockSignatureOrder:
+    """Deterministic mini-block signature order for numeric linker arrays."""
+
+    signature_ids: tuple[str, ...]
+    query_signature_ids: tuple[str, ...] = ()
+    schema_version: str = FEATURE_BLOCK_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        signature_ids = tuple(str(value) for value in self.signature_ids)
+        query_signature_ids = tuple(str(value) for value in self.query_signature_ids)
+        if len(set(signature_ids)) != len(signature_ids):
+            raise ValueError("FeatureBlockSignatureOrder.signature_ids must be unique")
+        missing_queries = sorted(set(query_signature_ids) - set(signature_ids))
+        if missing_queries:
+            raise ValueError(f"query_signature_ids are missing from signature_ids: {missing_queries}")
+        object.__setattr__(self, "signature_ids", signature_ids)
+        object.__setattr__(self, "query_signature_ids", query_signature_ids)
+
+    @property
+    def signature_id_to_index(self) -> dict[str, int]:
+        """Return this order as the numeric linker index map."""
+
+        return {signature_id: index for index, signature_id in enumerate(self.signature_ids)}
+
+
+@dataclass(frozen=True)
+class FeatureBlock:
+    """Typed inference inputs, smaller than full `ANDData`."""
+
+    signatures: tuple[FeatureBlockSignature, ...]
+    papers: tuple[FeatureBlockPaper, ...] = ()
+    paper_authors: tuple[FeatureBlockPaperAuthor, ...] = ()
+    cluster_seeds_require: tuple[tuple[str, str], ...] = ()
+    cluster_seeds_disallow: tuple[tuple[str, str], ...] = ()
+    query_signature_ids: tuple[str, ...] = ()
+    specter_paper_ids: tuple[str, ...] = ()
+    specter_embeddings: np.ndarray | None = None
+    schema_version: str = FEATURE_BLOCK_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        signature_ids = self.signature_ids
+        if len(set(signature_ids)) != len(signature_ids):
+            raise ValueError("FeatureBlock signatures must have unique signature_id values")
+        paper_ids = tuple(paper.paper_id for paper in self.papers)
+        if len(set(paper_ids)) != len(paper_ids):
+            raise ValueError("FeatureBlock papers must have unique paper_id values")
+
+        signature_id_set = set(signature_ids)
+        query_signature_ids = tuple(str(value) for value in self.query_signature_ids)
+        missing_queries = sorted(set(query_signature_ids) - signature_id_set)
+        if missing_queries:
+            raise ValueError(f"query_signature_ids are missing from FeatureBlock signatures: {missing_queries}")
+        object.__setattr__(self, "query_signature_ids", query_signature_ids)
+
+        require_pairs = tuple(
+            (str(signature_id), str(component_id)) for signature_id, component_id in self.cluster_seeds_require
+        )
+        missing_require = sorted(
+            signature_id for signature_id, _component_id in require_pairs if signature_id not in signature_id_set
+        )
+        if missing_require:
+            raise ValueError(f"cluster_seeds_require contains signatures missing from FeatureBlock: {missing_require}")
+        object.__setattr__(self, "cluster_seeds_require", require_pairs)
+
+        disallow_pairs = tuple((str(left), str(right)) for left, right in self.cluster_seeds_disallow)
+        object.__setattr__(self, "cluster_seeds_disallow", disallow_pairs)
+
+        specter_paper_ids = tuple(str(value) for value in self.specter_paper_ids)
+        if self.specter_embeddings is None:
+            if specter_paper_ids:
+                raise ValueError("specter_paper_ids requires specter_embeddings")
+        else:
+            embeddings = np.asarray(self.specter_embeddings, dtype=np.float32)
+            if embeddings.ndim != 2:
+                raise ValueError(f"specter_embeddings must be 2D, got shape={embeddings.shape}")
+            if embeddings.shape[0] != len(specter_paper_ids):
+                raise ValueError(
+                    "specter_embeddings row count must match specter_paper_ids: "
+                    f"{embeddings.shape[0]} != {len(specter_paper_ids)}"
+                )
+            object.__setattr__(self, "specter_embeddings", np.ascontiguousarray(embeddings, dtype=np.float32))
+        object.__setattr__(self, "specter_paper_ids", specter_paper_ids)
+
+    @property
+    def signature_ids(self) -> tuple[str, ...]:
+        """Return signature ids in this block's deterministic order."""
+
+        return tuple(signature.signature_id for signature in self.signatures)
+
+    @property
+    def signature_order(self) -> FeatureBlockSignatureOrder:
+        """Return the signature order used by numeric linker arrays."""
+
+        return FeatureBlockSignatureOrder(
+            signature_ids=self.signature_ids,
+            query_signature_ids=self.query_signature_ids,
+        )
+
+    @property
+    def signature_id_to_index(self) -> dict[str, int]:
+        """Return a signature-id to row-index map."""
+
+        return self.signature_order.signature_id_to_index
+
+    @property
+    def seed_component_members(self) -> dict[str, tuple[str, ...]]:
+        """Return require-seed members grouped by component id."""
+
+        members: dict[str, list[str]] = {}
+        for signature_id, component_id in self.cluster_seeds_require:
+            members.setdefault(component_id, []).append(signature_id)
+        return {component_id: tuple(signature_ids) for component_id, signature_ids in members.items()}
+
+    def to_arrow_tables(self) -> dict[str, Any]:
+        """Return Arrow tables for the current Rust raw-candidate schema."""
+
+        import pyarrow as pa
+
+        tables: dict[str, Any] = {
+            "signatures": pa.table(
+                {
+                    "signature_id": pa.array([row.signature_id for row in self.signatures], type=pa.string()),
+                    "paper_id": pa.array([row.paper_id for row in self.signatures], type=pa.string()),
+                    "author_first": pa.array([row.author_first for row in self.signatures], type=pa.string()),
+                    "author_middle": pa.array([row.author_middle for row in self.signatures], type=pa.string()),
+                    "author_last": pa.array([row.author_last for row in self.signatures], type=pa.string()),
+                    "author_suffix": pa.array([row.author_suffix for row in self.signatures], type=pa.string()),
+                    "author_affiliations": pa.array(
+                        [list(row.author_affiliations) for row in self.signatures],
+                        type=pa.list_(pa.string()),
+                    ),
+                    "author_orcid": pa.array([row.author_orcid for row in self.signatures], type=pa.string()),
+                    "author_position": pa.array([row.author_position for row in self.signatures], type=pa.int64()),
+                    "author_block": pa.array([row.author_block for row in self.signatures], type=pa.string()),
+                    "author_email": pa.array([row.author_email for row in self.signatures], type=pa.string()),
+                    "source_author_ids": pa.array(
+                        [list(row.source_author_ids) for row in self.signatures],
+                        type=pa.list_(pa.string()),
+                    ),
+                    "name_count_first": pa.array(
+                        [row.name_count_first for row in self.signatures],
+                        type=pa.float64(),
+                    ),
+                    "name_count_last": pa.array([row.name_count_last for row in self.signatures], type=pa.float64()),
+                    "name_count_first_last": pa.array(
+                        [row.name_count_first_last for row in self.signatures],
+                        type=pa.float64(),
+                    ),
+                    "name_count_last_first_initial": pa.array(
+                        [row.name_count_last_first_initial for row in self.signatures],
+                        type=pa.float64(),
+                    ),
+                }
+            ),
+            "papers": pa.table(
+                {
+                    "paper_id": pa.array([row.paper_id for row in self.papers], type=pa.string()),
+                    "title": pa.array([row.title for row in self.papers], type=pa.string()),
+                    "abstract": pa.array([row.abstract for row in self.papers], type=pa.string()),
+                    "venue": pa.array([row.venue for row in self.papers], type=pa.string()),
+                    "journal_name": pa.array([row.journal_name for row in self.papers], type=pa.string()),
+                    "year": pa.array([row.year for row in self.papers], type=pa.int64()),
+                    "predicted_language": pa.array(
+                        [row.predicted_language for row in self.papers],
+                        type=pa.string(),
+                    ),
+                    "is_reliable": pa.array([row.is_reliable for row in self.papers], type=pa.bool_()),
+                }
+            ),
+            "paper_authors": pa.table(
+                {
+                    "paper_id": pa.array([row.paper_id for row in self.paper_authors], type=pa.string()),
+                    "position": pa.array([row.position for row in self.paper_authors], type=pa.int64()),
+                    "author_name": pa.array([row.author_name for row in self.paper_authors], type=pa.string()),
+                }
+            ),
+            "cluster_seeds": pa.table(
+                {
+                    "signature_id": pa.array(
+                        [signature_id for signature_id, _component_id in self.cluster_seeds_require],
+                        type=pa.string(),
+                    ),
+                    "cluster_id": pa.array(
+                        [component_id for _signature_id, component_id in self.cluster_seeds_require],
+                        type=pa.string(),
+                    ),
+                }
+            ),
+        }
+        if self.specter_embeddings is not None:
+            flat = pa.array(np.ravel(self.specter_embeddings), type=pa.float32())
+            tables["specter"] = pa.table(
+                {
+                    "paper_id": list(self.specter_paper_ids),
+                    "embedding": pa.FixedSizeListArray.from_arrays(flat, int(self.specter_embeddings.shape[1])),
+                }
+            )
+        return tables
+
+
+def write_arrow_ipc_table(table: Any, path: str | Path) -> str:
+    """Write one Arrow IPC file and return its path."""
+
+    import pyarrow as pa
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with pa.OSFile(str(output_path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+    return str(output_path)
+
+
+def _drop_embedded_signature_name_counts(table: Any) -> Any:
+    name_count_columns = [
+        "name_count_first",
+        "name_count_last",
+        "name_count_first_last",
+        "name_count_last_first_initial",
+    ]
+    drop_columns = [column for column in name_count_columns if column in table.column_names]
+    return table if not drop_columns else table.drop(drop_columns)
+
+
+def write_feature_block_arrow_tables(
+    feature_block: FeatureBlock,
+    output_dir: str | Path,
+    *,
+    include_empty_cluster_seeds: bool = False,
+    drop_embedded_name_counts: bool = False,
+    overwrite: bool = True,
+) -> dict[str, str]:
+    """Write `FeatureBlock` Arrow IPC tables and return paths keyed by table name."""
+
+    output_path = Path(output_dir)
+    tables = feature_block.to_arrow_tables()
+    if drop_embedded_name_counts:
+        tables["signatures"] = _drop_embedded_signature_name_counts(tables["signatures"])
+    paths: dict[str, str] = {}
+    for name, table in tables.items():
+        if name == "cluster_seeds" and table.num_rows == 0 and not include_empty_cluster_seeds:
+            continue
+        path = output_path / f"{name}.arrow"
+        if overwrite or not path.exists():
+            write_arrow_ipc_table(table, path)
+        paths[name] = str(path)
+    return paths
+
+
+def write_feature_block_arrow_from_anddata(
+    dataset: Any,
+    output_dir: str | Path,
+    *,
+    signature_ids: Sequence[Any] | None = None,
+    query_signature_ids: Sequence[Any] = (),
+    cluster_seeds_require: Mapping[Any, Any] | None = None,
+    include_specter: bool = True,
+    include_empty_cluster_seeds: bool = False,
+    drop_embedded_name_counts: bool = False,
+    overwrite: bool = True,
+) -> dict[str, str]:
+    """Build a `FeatureBlock` from `ANDData` and write complete Arrow IPC tables."""
+
+    feature_block = feature_block_from_anddata(
+        dataset,
+        signature_ids=signature_ids,
+        query_signature_ids=query_signature_ids,
+        cluster_seeds_require=cluster_seeds_require,
+        include_specter=include_specter,
+    )
+    return write_feature_block_arrow_tables(
+        feature_block,
+        output_dir,
+        include_empty_cluster_seeds=include_empty_cluster_seeds,
+        drop_embedded_name_counts=drop_embedded_name_counts,
+        overwrite=overwrite,
+    )
+
+
+def write_name_counts_arrow(output_dir: str | Path, *, overwrite: bool = False) -> tuple[str, dict[str, int | bool]]:
+    """Write the global name-count lookup as a Rust-readable Arrow IPC table."""
+
+    import pyarrow as pa
+
+    from s2and.data import _load_name_counts_cached
+
+    output_path = Path(output_dir) / "name_counts.arrow"
+    if output_path.exists() and not overwrite:
+        return str(output_path), {"reused": True}
+
+    first_dict, last_dict, first_last_dict, last_first_initial_dict = _load_name_counts_cached()
+    kinds: list[str] = []
+    names: list[str] = []
+    counts: list[float] = []
+    metrics: dict[str, int | bool] = {"reused": False}
+    for kind, mapping in (
+        ("first", first_dict),
+        ("last", last_dict),
+        ("first_last", first_last_dict),
+        ("last_first_initial", last_first_initial_dict),
+    ):
+        metrics[f"{kind}_count"] = len(mapping)
+        for name, count in mapping.items():
+            kinds.append(kind)
+            names.append(str(name))
+            counts.append(float(count))
+
+    table = pa.table(
+        {
+            "kind": pa.array(kinds, type=pa.string()),
+            "name": pa.array(names, type=pa.string()),
+            "count": pa.array(counts, type=pa.float64()),
+        }
+    )
+    write_arrow_ipc_table(table, output_path)
+    metrics["row_count"] = table.num_rows
+    return str(output_path), metrics
+
+
+def _fnv64_bytes(value: bytes) -> int:
+    digest = _FNV64_OFFSET
+    for byte in value:
+        digest ^= byte
+        digest = (digest * _FNV64_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return digest
+
+
+def _name_counts_index_hashes(kind: str, name_bytes: bytes) -> tuple[int, int]:
+    return (
+        _fnv64_bytes(name_bytes),
+        _fnv64_bytes(_NAME_COUNTS_INDEX_HASH_DOMAIN + kind.encode("utf-8") + b"\x00" + name_bytes),
+    )
+
+
+def _write_name_count_index_file(path: Path, kind: str, mapping: Mapping[Any, Any]) -> dict[str, int]:
+    records: list[tuple[int, int, bytes, float]] = []
+    for raw_name, raw_count in mapping.items():
+        name_bytes = str(raw_name).encode("utf-8")
+        hash_1, hash_2 = _name_counts_index_hashes(kind, name_bytes)
+        records.append((hash_1, hash_2, name_bytes, float(raw_count)))
+    records.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    blob = bytearray()
+    packed_records = bytearray()
+    for hash_1, hash_2, name_bytes, count in records:
+        name_offset = len(blob)
+        blob.extend(name_bytes)
+        packed_records.extend(
+            _NAME_COUNTS_INDEX_RECORD_STRUCT.pack(
+                hash_1,
+                hash_2,
+                name_offset,
+                len(name_bytes),
+                0,
+                count,
+            )
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob_offset = _NAME_COUNTS_INDEX_HEADER_STRUCT.size + len(packed_records)
+    with path.open("wb") as output:
+        output.write(
+            _NAME_COUNTS_INDEX_HEADER_STRUCT.pack(
+                _NAME_COUNTS_INDEX_MAGIC,
+                len(records),
+                blob_offset,
+                len(blob),
+            )
+        )
+        output.write(packed_records)
+        output.write(blob)
+    return {"record_count": len(records), "byte_count": path.stat().st_size}
+
+
+def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) -> tuple[str, dict[str, int | bool]]:
+    """Write the global name-count lookup as exact-verified sorted binary indexes."""
+
+    from s2and.data import _load_name_counts_cached
+
+    index_dir = Path(output_dir) / "name_counts_index"
+    files = {
+        "first": index_dir / "first.bin",
+        "last": index_dir / "last.bin",
+        "first_last": index_dir / "first_last.bin",
+        "last_first_initial": index_dir / "last_first_initial.bin",
+    }
+    manifest_path = index_dir / "manifest.json"
+    if manifest_path.exists() and all(path.exists() for path in files.values()) and not overwrite:
+        return str(index_dir), {"reused": True}
+
+    first_dict, last_dict, first_last_dict, last_first_initial_dict = _load_name_counts_cached()
+    metrics: dict[str, int | bool] = {"reused": False}
+    total_records = 0
+    total_bytes = 0
+    manifest_files: dict[str, dict[str, int | str]] = {}
+    for kind, mapping in (
+        ("first", first_dict),
+        ("last", last_dict),
+        ("first_last", first_last_dict),
+        ("last_first_initial", last_first_initial_dict),
+    ):
+        file_metrics = _write_name_count_index_file(files[kind], kind, mapping)
+        record_count = file_metrics["record_count"]
+        byte_count = file_metrics["byte_count"]
+        metrics[f"{kind}_count"] = record_count
+        metrics[f"{kind}_bytes"] = byte_count
+        total_records += record_count
+        total_bytes += byte_count
+        manifest_files[kind] = {
+            "path": files[kind].name,
+            "record_count": record_count,
+            "byte_count": byte_count,
+        }
+
+    manifest = {
+        "schema_version": NAME_COUNTS_INDEX_SCHEMA_VERSION,
+        "magic": _NAME_COUNTS_INDEX_MAGIC.decode("ascii"),
+        "record_layout": "hash1:u64,hash2:u64,name_offset:u64,name_len:u32,reserved:u32,count:f64",
+        "sort_order": "hash1,hash2,utf8_name_bytes",
+        "hash": "fnv1a64(name_bytes), fnv1a64(domain + kind + NUL + name_bytes)",
+        "exact_string_verification": True,
+        "files": manifest_files,
+    }
+    index_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    metrics["row_count"] = total_records
+    metrics["byte_count"] = total_bytes
+    return str(index_dir), metrics
+
+
+def _resolve_name_pairs(name_tuples: set[tuple[str, str]] | str | None) -> set[tuple[str, str]]:
+    from s2and.data import _load_name_tuples_from_file
+
+    if name_tuples == "filtered":
+        return _load_name_tuples_from_file("s2and_name_tuples_filtered.txt")
+    if name_tuples is None:
+        return _load_name_tuples_from_file("s2and_name_tuples.txt")
+    if isinstance(name_tuples, set):
+        return name_tuples
+    raise ValueError("name_tuples must be None, 'filtered', or a set of (first_a, first_b) tuples")
+
+
+def write_name_pairs_arrow(
+    name_tuples: set[tuple[str, str]] | str | None,
+    output_dir: str | Path,
+    *,
+    overwrite: bool = False,
+) -> tuple[str, dict[str, int | bool]]:
+    """Write name-alias pairs as a Rust-readable Arrow IPC table."""
+
+    import pyarrow as pa
+
+    output_path = Path(output_dir) / "name_pairs.arrow"
+    if output_path.exists() and not overwrite:
+        return str(output_path), {"reused": True}
+
+    pairs = sorted((str(left), str(right)) for left, right in _resolve_name_pairs(name_tuples))
+    table = pa.table(
+        {
+            "name_1": pa.array([left for left, _right in pairs], type=pa.string()),
+            "name_2": pa.array([right for _left, right in pairs], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(table, output_path)
+    return str(output_path), {"reused": False, "row_count": table.num_rows}
+
+
+def feature_block_signature_order_from_raw_candidate_plan(plan: Mapping[str, Any]) -> FeatureBlockSignatureOrder:
+    """Build a deterministic mini-block signature order from a raw candidate plan."""
+
+    query_signature_ids = tuple(str(value) for value in _required_plan_sequence(plan, "query_signature_ids"))
+    ordered_ids: list[str] = []
+    seen: set[str] = set()
+    for value in (
+        *query_signature_ids,
+        *_required_plan_sequence(plan, "left_signature_ids"),
+        *_required_plan_sequence(plan, "right_signature_ids"),
+    ):
+        signature_id = str(value)
+        if signature_id in seen:
+            continue
+        seen.add(signature_id)
+        ordered_ids.append(signature_id)
+    return FeatureBlockSignatureOrder(signature_ids=tuple(ordered_ids), query_signature_ids=query_signature_ids)
+
+
+def feature_block_from_anddata(
+    dataset: Any,
+    *,
+    signature_ids: Sequence[Any] | None = None,
+    query_signature_ids: Sequence[Any] = (),
+    cluster_seeds_require: Mapping[Any, Any] | None = None,
+    include_specter: bool = True,
+) -> FeatureBlock:
+    """Build a `FeatureBlock` view from an existing `ANDData`-like object."""
+
+    resolved_signature_ids = tuple(
+        str(value) for value in (dataset.signatures.keys() if signature_ids is None else signature_ids)
+    )
+    signatures = tuple(
+        _feature_block_signature_from_anddata(dataset, signature_id) for signature_id in resolved_signature_ids
+    )
+    papers = _feature_block_papers_from_anddata(dataset, signatures)
+    paper_authors = _feature_block_paper_authors_from_papers(
+        papers_by_id={paper.paper_id: paper for paper in papers}, dataset=dataset
+    )
+
+    signature_id_set = set(resolved_signature_ids)
+    source_cluster_seeds = dict(
+        getattr(dataset, "cluster_seeds_require", {}) if cluster_seeds_require is None else cluster_seeds_require
+    )
+    require_pairs = tuple(
+        (str(signature_id), str(component_id))
+        for signature_id, component_id in source_cluster_seeds.items()
+        if str(signature_id) in signature_id_set
+    )
+    disallow_pairs = tuple(
+        (str(left), str(right))
+        for left, right in getattr(dataset, "cluster_seeds_disallow", set())
+        if str(left) in signature_id_set and str(right) in signature_id_set
+    )
+    specter_paper_ids, specter_embeddings = _feature_block_specter_from_anddata(
+        dataset,
+        papers,
+        include_specter=include_specter,
+    )
+    return FeatureBlock(
+        signatures=signatures,
+        papers=papers,
+        paper_authors=paper_authors,
+        cluster_seeds_require=require_pairs,
+        cluster_seeds_disallow=disallow_pairs,
+        query_signature_ids=tuple(str(value) for value in query_signature_ids),
+        specter_paper_ids=specter_paper_ids,
+        specter_embeddings=specter_embeddings,
+    )
+
+
+def feature_block_from_raw_payloads(
+    *,
+    signatures: Mapping[str, Mapping[str, Any]],
+    papers: Mapping[str, Mapping[str, Any]],
+    raw_candidate_plan: Mapping[str, Any],
+    cluster_seeds_require: Mapping[Any, Any],
+    cluster_seeds_disallow: Iterable[tuple[Any, Any]] | None = None,
+    specter_embeddings: Mapping[Any, Any] | tuple[Any, Any] | None = None,
+) -> FeatureBlock:
+    """Build a mini `FeatureBlock` directly from raw JSON-shaped payloads."""
+
+    signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
+    selected_signature_ids = signature_order.signature_ids
+    signature_rows = tuple(
+        _feature_block_signature_from_raw_payload(signature_id, signatures[str(signature_id)])
+        for signature_id in selected_signature_ids
+    )
+    paper_ids = tuple(dict.fromkeys(row.paper_id for row in signature_rows))
+    paper_rows = tuple(
+        _feature_block_paper_from_raw_payload(paper_id, papers[str(paper_id)])
+        for paper_id in paper_ids
+        if str(paper_id) in papers
+    )
+    paper_author_rows = tuple(
+        row
+        for paper_id in paper_ids
+        if str(paper_id) in papers
+        for row in _feature_block_paper_authors_from_raw_payload(paper_id, papers[str(paper_id)])
+    )
+    selected_signature_id_set = set(selected_signature_ids)
+    require_pairs = tuple(
+        (str(signature_id), str(component_id))
+        for signature_id, component_id in cluster_seeds_require.items()
+        if str(signature_id) in selected_signature_id_set
+    )
+    disallow_pairs = tuple(
+        (str(left), str(right))
+        for left, right in (cluster_seeds_disallow or ())
+        if str(left) in selected_signature_id_set and str(right) in selected_signature_id_set
+    )
+    specter_paper_ids, specter_matrix = _feature_block_specter_from_mapping(
+        paper_ids,
+        specter_embeddings,
+    )
+    return FeatureBlock(
+        signatures=signature_rows,
+        papers=paper_rows,
+        paper_authors=paper_author_rows,
+        cluster_seeds_require=require_pairs,
+        cluster_seeds_disallow=disallow_pairs,
+        query_signature_ids=signature_order.query_signature_ids,
+        specter_paper_ids=specter_paper_ids,
+        specter_embeddings=specter_matrix,
+    )
+
+
+def feature_block_from_arrow_paths(
+    paths: Mapping[str, Any],
+    *,
+    raw_candidate_plan: Mapping[str, Any],
+    include_specter: bool = False,
+) -> FeatureBlock:
+    """Build a mini signal-only `FeatureBlock` from Arrow IPC inputs."""
+
+    del include_specter
+    pa = __import__("pyarrow")
+    pc = __import__("pyarrow.compute").compute
+
+    signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
+    selected_signature_ids = tuple(signature_order.signature_ids)
+    selected_signature_id_set = set(selected_signature_ids)
+
+    signatures_table = _read_arrow_ipc_table(pa, paths["signatures"])
+    signatures_table = _filter_arrow_table_by_values(pa, pc, signatures_table, "signature_id", selected_signature_ids)
+    signatures_by_id = {str(row["signature_id"]): row for row in signatures_table.to_pylist()}
+    missing_signatures = [
+        signature_id for signature_id in selected_signature_ids if signature_id not in signatures_by_id
+    ]
+    if missing_signatures:
+        raise ValueError(f"Arrow signatures are missing raw-plan signature ids: {missing_signatures[:10]}")
+    signature_rows = tuple(
+        _feature_block_signature_from_arrow_row(signature_id, signatures_by_id[signature_id])
+        for signature_id in selected_signature_ids
+    )
+
+    paper_ids = tuple(dict.fromkeys(row.paper_id for row in signature_rows))
+    papers_table = _read_arrow_ipc_table(pa, paths["papers"])
+    papers_table = _filter_arrow_table_by_values(pa, pc, papers_table, "paper_id", paper_ids)
+    papers_by_id = {str(row["paper_id"]): row for row in papers_table.to_pylist()}
+    paper_rows = tuple(
+        _feature_block_paper_from_arrow_row(paper_id, papers_by_id[paper_id])
+        for paper_id in paper_ids
+        if paper_id in papers_by_id
+    )
+
+    paper_author_rows: tuple[FeatureBlockPaperAuthor, ...] = ()
+    paper_authors_path = paths.get("paper_authors")
+    if paper_authors_path is not None:
+        paper_authors_table = _read_arrow_ipc_table(pa, paper_authors_path)
+        paper_authors_table = _filter_arrow_table_by_values(pa, pc, paper_authors_table, "paper_id", paper_ids)
+        paper_author_rows = tuple(
+            FeatureBlockPaperAuthor(
+                paper_id=str(row["paper_id"]),
+                position=0 if row.get("position") is None else int(row["position"]),
+                author_name=str(row.get("author_name") or ""),
+            )
+            for row in paper_authors_table.to_pylist()
+        )
+
+    seed_signature_ids = raw_candidate_plan.get("seed_signature_ids")
+    seed_component_keys = raw_candidate_plan.get("seed_component_keys")
+    if seed_signature_ids is not None or seed_component_keys is not None:
+        if seed_signature_ids is None or seed_component_keys is None:
+            raise ValueError("raw candidate plan seed_signature_ids and seed_component_keys must both be present")
+        if len(seed_signature_ids) != len(seed_component_keys):
+            raise ValueError(
+                "raw candidate plan seed_signature_ids and seed_component_keys must have equal length: "
+                f"{len(seed_signature_ids)} != {len(seed_component_keys)}"
+            )
+        require_pairs = tuple(
+            (str(signature_id), str(component_key))
+            for signature_id, component_key in zip(seed_signature_ids, seed_component_keys, strict=True)
+            if str(signature_id) in selected_signature_id_set
+        )
+    else:
+        component_members = raw_candidate_plan.get("component_members", {})
+        require_pairs = tuple(
+            (str(signature_id), str(component_key))
+            for component_key, members in component_members.items()
+            for signature_id in members
+            if str(signature_id) in selected_signature_id_set
+        )
+    return FeatureBlock(
+        signatures=signature_rows,
+        papers=paper_rows,
+        paper_authors=paper_author_rows,
+        cluster_seeds_require=require_pairs,
+        cluster_seeds_disallow=(),
+        query_signature_ids=signature_order.query_signature_ids,
+        specter_paper_ids=(),
+        specter_embeddings=None,
+    )
+
+
+def feature_block_for_signature_order(
+    feature_block: FeatureBlock,
+    signature_order: FeatureBlockSignatureOrder,
+) -> FeatureBlock:
+    """Return a `FeatureBlock` subset ordered for numeric raw-plan scoring."""
+
+    signatures_by_id = {row.signature_id: row for row in feature_block.signatures}
+    missing = [signature_id for signature_id in signature_order.signature_ids if signature_id not in signatures_by_id]
+    if missing:
+        raise ValueError(f"FeatureBlock is missing raw-plan signatures: {missing}")
+
+    signatures = tuple(signatures_by_id[signature_id] for signature_id in signature_order.signature_ids)
+    paper_ids = set(row.paper_id for row in signatures)
+    papers = tuple(row for row in feature_block.papers if row.paper_id in paper_ids)
+    paper_id_set = set(row.paper_id for row in papers)
+    paper_authors = tuple(row for row in feature_block.paper_authors if row.paper_id in paper_id_set)
+    signature_id_set = set(signature_order.signature_ids)
+    require_pairs = tuple(
+        (signature_id, component_id)
+        for signature_id, component_id in feature_block.cluster_seeds_require
+        if signature_id in signature_id_set
+    )
+    disallow_pairs = tuple(
+        (left, right)
+        for left, right in feature_block.cluster_seeds_disallow
+        if left in signature_id_set and right in signature_id_set
+    )
+    specter_paper_ids: list[str] = []
+    specter_rows: list[np.ndarray] = []
+    if feature_block.specter_embeddings is not None:
+        specter_by_paper_id = {
+            paper_id: np.asarray(feature_block.specter_embeddings[index], dtype=np.float32)
+            for index, paper_id in enumerate(feature_block.specter_paper_ids)
+        }
+        for paper_id in feature_block.specter_paper_ids:
+            if paper_id in paper_id_set and paper_id in specter_by_paper_id:
+                specter_paper_ids.append(paper_id)
+                specter_rows.append(specter_by_paper_id[paper_id])
+    return FeatureBlock(
+        signatures=signatures,
+        papers=papers,
+        paper_authors=paper_authors,
+        cluster_seeds_require=require_pairs,
+        cluster_seeds_disallow=disallow_pairs,
+        query_signature_ids=signature_order.query_signature_ids,
+        specter_paper_ids=tuple(specter_paper_ids),
+        specter_embeddings=None if not specter_rows else np.vstack(specter_rows).astype(np.float32),
+    )
+
+
+def feature_block_to_mini_anddata(
+    feature_block: FeatureBlock,
+    *,
+    name: str = "feature_block_mini",
+    n_jobs: int = 1,
+    preprocess: bool = True,
+    name_tuples: set[tuple[str, str]] | str | None = "filtered",
+    load_name_counts: bool | dict[str, Any] = False,
+) -> Any:
+    """Materialize a small compatibility `ANDData` from a `FeatureBlock`.
+
+    This is a bridge for scoring wrappers that still call existing pairwise and
+    constraint code. It is intended for query plus retrieved candidate members,
+    not for full-block Arrow-to-Python materialization.
+    """
+
+    from s2and.data import ANDData, NameCounts
+
+    dataset = ANDData(
+        signatures=_feature_block_signatures_payload(feature_block),
+        papers=_feature_block_papers_payload(feature_block),
+        name=name,
+        mode="inference",
+        specter_embeddings=_feature_block_specter_payload(feature_block),
+        load_name_counts=load_name_counts,
+        n_jobs=n_jobs,
+        preprocess=preprocess,
+        name_tuples=name_tuples,
+        use_orcid_id=True,
+        use_sinonym_overwrite=False,
+    )
+    dataset.cluster_seeds_require = dict(feature_block.cluster_seeds_require)
+    dataset.cluster_seeds_disallow = set(feature_block.cluster_seeds_disallow)
+
+    for row in feature_block.signatures:
+        if row.signature_id not in dataset.signatures:
+            continue
+        if not _signature_row_has_name_counts(row):
+            continue
+        dataset.signatures[row.signature_id] = dataset.signatures[row.signature_id]._replace(
+            author_info_name_counts=NameCounts(
+                first=row.name_count_first,
+                last=row.name_count_last,
+                first_last=row.name_count_first_last,
+                last_first_initial=row.name_count_last_first_initial,
+            )
+        )
+    return dataset
+
+
+def _read_arrow_ipc_table(pa: Any, path: Any) -> Any:
+    with pa.memory_map(str(path), "r") as source:
+        return pa.ipc.open_file(source).read_all()
+
+
+def _filter_arrow_table_by_values(pa: Any, pc: Any, table: Any, column: str, values: Sequence[str]) -> Any:
+    value_list = [str(value) for value in values]
+    if not value_list:
+        return table.slice(0, 0)
+    mask = pc.is_in(table[column], value_set=pa.array(value_list, type=table[column].type))
+    return table.filter(mask)
+
+
+def _arrow_name_count(row: Mapping[str, Any], key: str) -> float | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _feature_block_signature_from_arrow_row(signature_id: str, row: Mapping[str, Any]) -> FeatureBlockSignature:
+    return FeatureBlockSignature(
+        signature_id=str(row.get("signature_id", signature_id)),
+        paper_id=str(row["paper_id"]),
+        author_first=_optional_str(row.get("author_first")),
+        author_middle=_optional_str(row.get("author_middle")),
+        author_last=_optional_str(row.get("author_last")),
+        author_suffix=_optional_str(row.get("author_suffix")),
+        author_affiliations=tuple(str(value) for value in (row.get("author_affiliations") or ())),
+        author_orcid=_optional_str(row.get("author_orcid")),
+        author_position=_optional_int(row.get("author_position")),
+        author_block=_optional_str(row.get("author_block")),
+        author_email=_optional_str(row.get("author_email")),
+        source_author_ids=tuple(str(value) for value in (row.get("source_author_ids") or ()) if value is not None),
+        name_count_first=_arrow_name_count(row, "name_count_first"),
+        name_count_last=_arrow_name_count(row, "name_count_last"),
+        name_count_first_last=_arrow_name_count(row, "name_count_first_last"),
+        name_count_last_first_initial=_arrow_name_count(row, "name_count_last_first_initial"),
+    )
+
+
+def _feature_block_paper_from_arrow_row(paper_id: str, row: Mapping[str, Any]) -> FeatureBlockPaper:
+    return FeatureBlockPaper(
+        paper_id=str(row.get("paper_id", paper_id)),
+        title=_optional_str(row.get("title")),
+        abstract=_optional_str(row.get("abstract")),
+        venue=_optional_str(row.get("venue")),
+        journal_name=_optional_str(row.get("journal_name")),
+        year=_optional_int(row.get("year")),
+        predicted_language=_optional_str(row.get("predicted_language")),
+        is_reliable=_optional_bool(row.get("is_reliable")),
+    )
+
+
+def _required_plan_sequence(plan: Mapping[str, Any], key: str) -> tuple[Any, ...]:
+    if key not in plan:
+        raise KeyError(f"raw candidate plan is missing required key: {key}")
+    value = plan[key]
+    if isinstance(value, np.ndarray):
+        return tuple(value.tolist())
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return tuple(value)
+    raise TypeError(f"raw candidate plan key {key!r} must be a sequence")
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _source_author_ids_payload(values: Sequence[str]) -> list[str]:
+    return [str(value) for value in values]
+
+
+def _raw_author_info(raw_signature: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = raw_signature.get("author_info", {})
+    if not isinstance(value, Mapping):
+        raise TypeError("raw signature author_info must be a mapping")
+    return value
+
+
+def _raw_orcid(author_info: Mapping[str, Any]) -> str | None:
+    source = author_info.get("source_id_source")
+    source_ids = author_info.get("source_ids") or []
+    if source == "ORCID" and source_ids:
+        return _optional_str(source_ids[0])
+    return _optional_str(author_info.get("orcid"))
+
+
+def _raw_name_counts(author_info: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = author_info.get("name_counts") or author_info.get("author_info_name_counts") or {}
+    return value if isinstance(value, Mapping) else {}
+
+
+def _name_count_mapping_attr(counts: Mapping[str, Any], *names: str) -> float | None:
+    for name in names:
+        value = counts.get(name)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(numeric):
+            return numeric
+    return None
+
+
+def _feature_block_signature_from_raw_payload(
+    signature_id: str,
+    raw_signature: Mapping[str, Any],
+) -> FeatureBlockSignature:
+    author_info = _raw_author_info(raw_signature)
+    counts = _raw_name_counts(author_info)
+    return FeatureBlockSignature(
+        signature_id=str(raw_signature.get("signature_id", signature_id)),
+        paper_id=str(raw_signature["paper_id"]),
+        author_first=_optional_str(author_info.get("first")),
+        author_middle=_optional_str(author_info.get("middle")),
+        author_last=_optional_str(author_info.get("last")),
+        author_suffix=_optional_str(author_info.get("suffix")),
+        author_affiliations=tuple(str(value) for value in (author_info.get("affiliations") or ())),
+        author_orcid=_raw_orcid(author_info),
+        author_position=_optional_int(author_info.get("position")),
+        author_block=_optional_str(author_info.get("block")),
+        author_email=_optional_str(author_info.get("email")),
+        source_author_ids=tuple(str(value) for value in (raw_signature.get("sourced_author_ids") or ())),
+        name_count_first=_name_count_mapping_attr(counts, "first", "name_count_first"),
+        name_count_last=_name_count_mapping_attr(counts, "last", "name_count_last"),
+        name_count_first_last=_name_count_mapping_attr(counts, "first_last", "name_count_first_last"),
+        name_count_last_first_initial=_name_count_mapping_attr(
+            counts,
+            "last_first_initial",
+            "name_count_last_first_initial",
+        ),
+    )
+
+
+def _feature_block_paper_from_raw_payload(
+    paper_id: str,
+    raw_paper: Mapping[str, Any],
+) -> FeatureBlockPaper:
+    return FeatureBlockPaper(
+        paper_id=str(raw_paper.get("paper_id", paper_id)),
+        title=_optional_str(raw_paper.get("title")),
+        abstract=_optional_str(raw_paper.get("abstract")),
+        venue=_optional_str(raw_paper.get("venue")),
+        journal_name=_optional_str(raw_paper.get("journal_name")),
+        year=_optional_int(raw_paper.get("year")),
+        predicted_language=_optional_str(raw_paper.get("predicted_language")),
+        is_reliable=_optional_bool(raw_paper.get("is_reliable")),
+    )
+
+
+def _feature_block_paper_authors_from_raw_payload(
+    paper_id: str,
+    raw_paper: Mapping[str, Any],
+) -> tuple[FeatureBlockPaperAuthor, ...]:
+    rows: list[FeatureBlockPaperAuthor] = []
+    for index, author in enumerate(raw_paper.get("authors") or ()):
+        if not isinstance(author, Mapping):
+            continue
+        position = _optional_int(author.get("position"))
+        rows.append(
+            FeatureBlockPaperAuthor(
+                paper_id=str(paper_id),
+                position=index if position is None else position,
+                author_name=str(author.get("author_name") or author.get("name") or ""),
+            )
+        )
+    return tuple(rows)
+
+
+def _feature_block_signatures_payload(feature_block: FeatureBlock) -> dict[str, dict[str, Any]]:
+    payload: dict[str, dict[str, Any]] = {}
+    for row in feature_block.signatures:
+        source_ids = [row.author_orcid] if row.author_orcid else []
+        author_info: dict[str, Any] = {
+            "first": row.author_first or "",
+            "middle": row.author_middle or "",
+            "last": row.author_last or "",
+            "suffix": row.author_suffix or "",
+            "affiliations": list(row.author_affiliations),
+            "email": row.author_email or "",
+            "source_ids": source_ids,
+            "position": 0 if row.author_position is None else int(row.author_position),
+            "block": row.author_block or "",
+        }
+        if row.author_orcid:
+            author_info["source_id_source"] = "ORCID"
+        payload[row.signature_id] = {
+            "signature_id": row.signature_id,
+            "paper_id": row.paper_id,
+            "author_info": author_info,
+            "sourced_author_ids": _source_author_ids_payload(row.source_author_ids),
+        }
+    return payload
+
+
+def _feature_block_papers_payload(feature_block: FeatureBlock) -> dict[str, dict[str, Any]]:
+    authors_by_paper_id: dict[str, list[dict[str, Any]]] = {}
+    for row in feature_block.paper_authors:
+        authors_by_paper_id.setdefault(row.paper_id, []).append(
+            {
+                "position": int(row.position),
+                "author_name": row.author_name,
+            }
+        )
+    return {
+        row.paper_id: {
+            "paper_id": row.paper_id,
+            "title": row.title or "",
+            "abstract": row.abstract or "",
+            "venue": row.venue or "",
+            "journal_name": row.journal_name or "",
+            "year": row.year,
+            "predicted_language": row.predicted_language,
+            "is_reliable": row.is_reliable,
+            "references": [],
+            "authors": sorted(authors_by_paper_id.get(row.paper_id, []), key=lambda item: int(item["position"])),
+        }
+        for row in feature_block.papers
+    }
+
+
+def _feature_block_specter_payload(feature_block: FeatureBlock) -> dict[str, np.ndarray] | None:
+    if feature_block.specter_embeddings is None:
+        return None
+    return {
+        paper_id: np.ascontiguousarray(feature_block.specter_embeddings[index], dtype=np.float32)
+        for index, paper_id in enumerate(feature_block.specter_paper_ids)
+    }
+
+
+def _signature_row_has_name_counts(row: FeatureBlockSignature) -> bool:
+    return any(
+        value is not None
+        for value in (
+            row.name_count_first,
+            row.name_count_last,
+            row.name_count_first_last,
+            row.name_count_last_first_initial,
+        )
+    )
+
+
+def _feature_block_specter_from_mapping(
+    paper_ids: Sequence[str],
+    specter_embeddings: Mapping[Any, Any] | tuple[Any, Any] | None,
+) -> tuple[tuple[str, ...], np.ndarray | None]:
+    if not specter_embeddings:
+        return (), None
+    if isinstance(specter_embeddings, tuple):
+        if len(specter_embeddings) != 2:
+            raise ValueError("SPECTER tuple payload must be (matrix, paper_ids)")
+        matrix, keys = specter_embeddings
+        matrix_array = np.asarray(matrix, dtype=np.float32)
+        if matrix_array.ndim != 2:
+            raise ValueError(f"SPECTER tuple matrix must be 2D, got shape={matrix_array.shape}")
+        key_list = list(keys)
+        if len(key_list) != int(matrix_array.shape[0]):
+            raise ValueError(
+                "SPECTER tuple key count must match matrix rows: " f"keys={len(key_list)}, rows={matrix_array.shape[0]}"
+            )
+        specter_mapping: Mapping[Any, Any] = {
+            str(key): np.ascontiguousarray(matrix_array[index], dtype=np.float32) for index, key in enumerate(key_list)
+        }
+    else:
+        specter_mapping = specter_embeddings
+    selected_paper_ids: list[str] = []
+    vectors: list[np.ndarray] = []
+    expected_dim: int | None = None
+    for paper_id in paper_ids:
+        vector = specter_mapping.get(str(paper_id))
+        if vector is None:
+            vector = specter_mapping.get(paper_id)
+        if vector is None:
+            continue
+        array = np.asarray(vector, dtype=np.float32)
+        if array.ndim != 1:
+            raise ValueError(f"SPECTER vector for paper_id={paper_id!r} must be 1D, got shape={array.shape}")
+        if expected_dim is None:
+            expected_dim = int(array.shape[0])
+        elif int(array.shape[0]) != expected_dim:
+            raise ValueError(
+                "SPECTER vectors in a FeatureBlock must have equal dimensions: "
+                f"expected {expected_dim}, got {array.shape[0]} for paper_id={paper_id!r}"
+            )
+        selected_paper_ids.append(str(paper_id))
+        vectors.append(array)
+    if not vectors:
+        return (), None
+    return tuple(selected_paper_ids), np.ascontiguousarray(np.vstack(vectors), dtype=np.float32)
+
+
+def _name_count_attr(signature: Any, name: str) -> float | None:
+    counts = getattr(signature, "author_info_name_counts", None)
+    value = getattr(counts, name, None)
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _feature_block_signature_from_anddata(dataset: Any, signature_id: str) -> FeatureBlockSignature:
+    signature = dataset.signatures[str(signature_id)]
+    return FeatureBlockSignature(
+        signature_id=str(signature_id),
+        paper_id=str(signature.paper_id),
+        author_first=_optional_str(getattr(signature, "author_info_first", None)),
+        author_middle=_optional_str(getattr(signature, "author_info_middle", None)),
+        author_last=_optional_str(getattr(signature, "author_info_last", None)),
+        author_suffix=_optional_str(getattr(signature, "author_info_suffix", None)),
+        author_affiliations=tuple(str(value) for value in (getattr(signature, "author_info_affiliations", None) or ())),
+        author_orcid=_optional_str(getattr(signature, "author_info_orcid", None)),
+        author_position=_optional_int(getattr(signature, "author_info_position", None)),
+        author_block=_optional_str(getattr(signature, "author_info_block", None)),
+        author_email=_optional_str(getattr(signature, "author_info_email", None)),
+        source_author_ids=tuple(str(value) for value in (getattr(signature, "sourced_author_ids", None) or ())),
+        name_count_first=_name_count_attr(signature, "first"),
+        name_count_last=_name_count_attr(signature, "last"),
+        name_count_first_last=_name_count_attr(signature, "first_last"),
+        name_count_last_first_initial=_name_count_attr(signature, "last_first_initial"),
+    )
+
+
+def _feature_block_papers_from_anddata(
+    dataset: Any,
+    signatures: Sequence[FeatureBlockSignature],
+) -> tuple[FeatureBlockPaper, ...]:
+    papers: list[FeatureBlockPaper] = []
+    seen: set[str] = set()
+    for signature in signatures:
+        paper_id = str(signature.paper_id)
+        if paper_id in seen:
+            continue
+        paper = getattr(dataset, "papers", {}).get(paper_id)
+        if paper is None:
+            continue
+        seen.add(paper_id)
+        papers.append(
+            FeatureBlockPaper(
+                paper_id=paper_id,
+                title=_optional_str(getattr(paper, "title", None)),
+                abstract="Has Abstract" if bool(getattr(paper, "has_abstract", False)) else "",
+                venue=_optional_str(getattr(paper, "venue", None)),
+                journal_name=_optional_str(getattr(paper, "journal_name", None)),
+                year=_optional_int(getattr(paper, "year", None)),
+                predicted_language=_optional_str(getattr(paper, "predicted_language", None)),
+                is_reliable=_optional_bool(getattr(paper, "is_reliable", None)),
+            )
+        )
+    return tuple(papers)
+
+
+def _feature_block_paper_authors_from_papers(
+    *,
+    papers_by_id: Mapping[str, FeatureBlockPaper],
+    dataset: Any,
+) -> tuple[FeatureBlockPaperAuthor, ...]:
+    rows: list[FeatureBlockPaperAuthor] = []
+    for paper_id in papers_by_id:
+        paper = getattr(dataset, "papers", {}).get(str(paper_id))
+        if paper is None:
+            continue
+        for index, author in enumerate(getattr(paper, "authors", None) or ()):
+            position = _optional_int(getattr(author, "position", index))
+            rows.append(
+                FeatureBlockPaperAuthor(
+                    paper_id=paper_id,
+                    position=index if position is None else position,
+                    author_name=str(getattr(author, "author_name", "") or ""),
+                )
+            )
+    return tuple(rows)
+
+
+def _feature_block_specter_from_anddata(
+    dataset: Any,
+    papers: Sequence[FeatureBlockPaper],
+    *,
+    include_specter: bool,
+) -> tuple[tuple[str, ...], np.ndarray | None]:
+    if not include_specter:
+        return (), None
+    specter = getattr(dataset, "specter_embeddings", None)
+    if not specter:
+        return (), None
+    paper_ids: list[str] = []
+    vectors: list[np.ndarray] = []
+    expected_dim: int | None = None
+    for paper in papers:
+        vector = specter.get(str(paper.paper_id))
+        if vector is None:
+            continue
+        array = np.asarray(vector, dtype=np.float32)
+        if array.ndim != 1:
+            raise ValueError(f"SPECTER vector for paper_id={paper.paper_id!r} must be 1D, got shape={array.shape}")
+        if expected_dim is None:
+            expected_dim = int(array.shape[0])
+        elif int(array.shape[0]) != expected_dim:
+            raise ValueError(
+                "SPECTER vectors in a FeatureBlock must have equal dimensions: "
+                f"expected {expected_dim}, got {array.shape[0]} for paper_id={paper.paper_id!r}"
+            )
+        paper_ids.append(str(paper.paper_id))
+        vectors.append(array)
+    if not vectors:
+        return (), None
+    return tuple(paper_ids), np.ascontiguousarray(np.vstack(vectors), dtype=np.float32)

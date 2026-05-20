@@ -471,8 +471,10 @@ class ANDData:
     ):
         init_start = time.perf_counter()
         self.runtime_context = build_runtime_context("dataset_build")
-        self.signatures_path = signatures if isinstance(signatures, str) else None
-        self.papers_path = papers if isinstance(papers, str) else None
+        self.original_signatures_path = signatures if isinstance(signatures, str) else None
+        self.original_papers_path = papers if isinstance(papers, str) else None
+        self.signatures_path = self.original_signatures_path
+        self.papers_path = self.original_papers_path
         self._rust_ingest_tmpdir = None  # TemporaryDirectory; prevent leak
         self._s2and_python_pair_ngrams_ready: bool = False
         self._rust_cluster_seeds_require_id: int | None = None

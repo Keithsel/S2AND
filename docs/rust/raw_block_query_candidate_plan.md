@@ -1,6 +1,6 @@
 # Rust-Only Raw Block Candidate Plan
 
-Status: design spec
+Status: design spec + implemented direct Arrow/raw scoring evidence
 
 ## Use Case
 
@@ -25,9 +25,13 @@ This spec defines a maximum-speed, minimum-memory Rust API for:
 raw query + raw block + seed map -> current-linker candidate plan
 ```
 
-The output is only the retrieved candidate plan. Final pairwise scoring, 53-feature
-assembly, promoted linker prediction, and logistic link/abstain can be wired as a
-separate follow-up.
+The Rust API output is the retrieved candidate plan plus the row signals needed
+by downstream link/abstain scoring. A Python bridge proves that the id-based raw
+candidate plan can feed existing pairwise scoring, 53-feature assembly,
+promoted linker prediction, and logistic link/abstain without rerunning
+retrieval. Public raw scoring wrappers now remove the incumbent full-block
+`ANDData`/linker-input setup from that handoff by scoring only the query plus
+retrieved candidate members.
 
 ## Baseline Measurement (Prerequisite)
 
@@ -108,34 +112,465 @@ block (e.g. `a_silva`, `s_park`) to confirm the qualitative shape holds.
 The conclusion that `ANDData` dominates and pure retrieval is sub-2 s is
 very unlikely to flip, but the exact ratios will move.
 
+### Forward-Looking Baseline (Sinonym Off, n_jobs=20)
+
+Sinonym overwrite is expected to be disabled by default going forward, so the
+most relevant baseline is the same h_wang single-query fixture with Sinonym off,
+`n_jobs=20`, release Rust, and an explicit large RAM budget
+(`total_ram_bytes=1000000000000`) to avoid memory-budget throttling. Harness:
+[scratch/baseline/profile_predict_incremental.py](../../scratch/baseline/profile_predict_incremental.py).
+Raw report:
+[profile.json](../../scratch/baseline/h_wang_single_query/njobs20_no_sinonym_unbounded_20260519/profile.json).
+
+End-to-end (total 335.5 s, peak RSS 29.6 GB):
+
+| Stage | Seconds | % of total |
+|---|---:|---:|
+| Raw payload deserialization (sigs + papers + specter + seeds) | 8.8 | 2.6% |
+| **`ANDData` construction** | **202.7** | **60.4%** |
+| Load production model | 1.6 | 0.5% |
+| `predict_incremental` total | 120.3 | 35.9% |
+
+Inside `predict_incremental` (120.3 s):
+
+| Internal stage | Seconds | n | % of predict |
+|---|---:|---:|---:|
+| `build_incremental_linker_inputs` (total) | 95.5 | 1 | 79.3% |
+| -> `extract_query_features` | 74.8 | 418,750 | 62.1% |
+| -> `build_cluster_summary` | 92.0 | 37,152 | 76.4% |
+| -> `build_rust_hybrid_centroid_retriever` | 2.6 | 1 | 2.1% |
+| `build_linker_retrieval_batch_rust` (the actual top-k call) | **0.2** | 1 | **0.2%** |
+| `get_rust_featurizer` | ~0 | 2 | 0.0% |
+| Unaccounted (pairwise scoring + promoted linker + logistic gate) | ~24.7 | - | ~20.5% |
+
+Updated implications:
+
+- **The shortcut premise still holds with Sinonym off.** The skip-target stages
+  are no longer 20+ minutes, but they still dominate: `ANDData` construction
+  plus linker input construction cost about 298 s while actual retrieval is
+  0.2 s.
+- **The most urgent Rust work is feature/summary construction, not nearest-neighbor
+  search.** Retrieval is already effectively free for the single-query request
+  shape; query feature extraction and seed cluster summary construction are the
+  hot stages inside `predict_incremental`.
+- **End-to-end scoring is smaller than originally measured under this
+  configuration.** The remaining non-setup work is roughly 25 s, so a retrieval
+  candidate-plan shortcut can plausibly make the whole request fast enough to
+  be useful before an all-Rust scoring port.
+- **File loading is not the biggest bottleneck, but it is worth fixing if it is
+  cheap.** JSON/pickle deserialization is about 9 s here. That is small beside
+  `ANDData`, but large enough to matter once the raw shortcut removes the
+  preprocessing stages.
+
+### Arrow IPC Load Probe
+
+A scratch Arrow IPC probe was run on the same full h_wang fixture, including
+419,641 signatures, 412,708 papers, 5,788,327 paper-author rows, 418,749
+cluster-seed rows, and 349,430 SPECTER rows. Python conversion report:
+[report.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/report.json).
+Rust IPC read report:
+[rust_read_report.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/rust_read_report.json).
+
+| Path | Seconds |
+|---|---:|
+| Current JSON + pickle load | 8.9 |
+| Python Arrow IPC table read | 0.2 |
+| Rust Arrow IPC table read | 0.5 |
+| Arrow tables converted back to Python objects | 164.7 |
+
+Implication: **Arrow is a good hot-path format only when Rust consumes Arrow
+columns directly.** Reading Arrow and then rebuilding Python dict/list objects
+defeats the purpose and is slower than the current JSON/pickle load. Arrow
+should therefore be validated as an input adapter to the Rust typed structs, not
+as an early Python `ANDData` materialization format.
+
+### Direct Rust Arrow Candidate-Plan Probe
+
+A first retrieval-only prototype now exists in
+[`s2and_rust/src/lib.rs`](../../s2and_rust/src/lib.rs):
+`raw_block_query_candidate_plan_arrow(...)`. It reads the Arrow IPC signature,
+paper, paper-author, cluster-seed, and SPECTER tables directly in Rust; builds
+the same retrieval query and seed-summary structs used by
+`RustHybridCentroidRetriever`; and returns the flat pair-plan schema plus
+signature-id strings and telemetry.
+
+Focused regression tests:
+[`tests/test_raw_block_candidate_plan_arrow.py`](../../tests/test_raw_block_candidate_plan_arrow.py).
+They now cover:
+
+- tiny Arrow IPC parity against the existing Rust retriever;
+- ORCID override behavior;
+- multi-query batching with `query_view="auto"` and SPECTER exemplars;
+- query-as-seed exclusion plus missing optional metadata.
+
+Full h_wang probe command:
+
+```powershell
+uv run python scratch\baseline\run_raw_arrow_candidate_plan.py `
+  --fixture-dir scratch\baseline\h_wang_single_query\arrow_full_specter `
+  --query-signature-id 100036391-4 `
+  --output-json scratch\baseline\h_wang_single_query\arrow_full_specter\raw_candidate_plan_njobs20_orcid_on_all25_20260519.json `
+  --top-k 25 `
+  --query-view auto `
+  --n-jobs 20 `
+  --orcid-enabled `
+  --max-exemplars 4
+```
+
+Full h_wang results:
+[raw_candidate_plan_njobs20_orcid_on_all25_20260519.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/raw_candidate_plan_njobs20_orcid_on_all25_20260519.json).
+
+| Stage | Seconds |
+|---|---:|
+| Read signatures Arrow | 0.48 |
+| Read papers Arrow | 0.30 |
+| Read paper-authors Arrow | 1.40 |
+| Read cluster seeds Arrow | 0.13 |
+| Read SPECTER Arrow | 1.04 |
+| Build text/unidecode context | 0.75 |
+| Build query/seed features | 0.96 |
+| Build seed summaries + retriever state | 2.84 |
+| Retrieval pair plan | 0.14 |
+| **Rust-reported total** | **8.47** |
+| **Harness wall time** | **11.92** |
+
+Counts: 419,641 signatures, 412,708 papers, 5,788,327 paper-author rows
+(grouped under 412,708 papers), 418,749 seed signatures, 37,152 seed
+components, and 349,430 SPECTER rows. The raw path returned 25 candidate rows
+and 318 candidate pairs.
+
+Parity check against the current Python-built retrieval path:
+[raw_candidate_plan_compare_current_orcid_on_all25_20260519.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/raw_candidate_plan_compare_current_orcid_on_all25_20260519.json).
+
+| Check | Result |
+|---|---:|
+| Current `ANDData` construction | 199.1 s |
+| Current `build_incremental_linker_inputs` | 93.4 s |
+| Current Rust retrieval batch | 0.3 s |
+| Current candidate rows / pairs | 25 / 318 |
+| Raw candidate rows / pairs | 25 / 318 |
+| Top-25 component order parity | exact |
+| Top-25 retrieval score max abs diff | 0.0 |
+
+Deeper multi-query h_wang parity check:
+[raw_candidate_plan_njobs20_orcid_on_3query_deep_20260520.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/raw_candidate_plan_njobs20_orcid_on_3query_deep_20260520.json)
+and
+[raw_candidate_plan_compare_current_orcid_on_3query_deep_20260520.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/raw_candidate_plan_compare_current_orcid_on_3query_deep_20260520.json).
+
+Queries: `100036391-4`, `104839473-2`, and `115155813-0`; `query_view="auto"`;
+ORCID enabled; `n_jobs=20`; top-k 25.
+
+| Check | Result |
+|---|---:|
+| Rust Arrow candidate rows / pairs | 75 / 1213 |
+| Current candidate rows / pairs | 75 / 1213 |
+| Row count parity | exact |
+| Pair count parity | exact |
+| Component order parity | exact |
+| Retrieval rank parity | exact |
+| Row query-offset parity | exact |
+| Row component-size parity | exact |
+| Pair row-index parity | exact |
+| Left signature-id parity | exact |
+| Right signature-id parity | exact |
+| Retrieval score max abs diff | 0.0 |
+| Row-signal max abs diff | 0.0 for ORCID, middle, affiliation, coauthor, venue, year, title, SPECTER centroid, and SPECTER exemplar signals |
+
+Current-path timings for this deeper compare:
+
+| Stage | Seconds |
+|---|---:|
+| Current `ANDData` construction | 198.3 |
+| Current `build_incremental_linker_inputs` | 93.4 |
+| Current Rust retrieval batch | 0.4 |
+
+The matching pair signature ids matter: this does not only prove that the same
+75 component rows were ranked the same way. It also proves that the flat
+query-to-member pair plan handed to downstream scoring is identical for this
+three-query full-block request.
+
+No-SPECTER h_wang parity check:
+[raw_candidate_plan_njobs20_orcid_on_all25_no_specter_20260520.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/raw_candidate_plan_njobs20_orcid_on_all25_no_specter_20260520.json)
+and
+[raw_candidate_plan_compare_current_orcid_on_all25_no_specter_20260520.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/raw_candidate_plan_compare_current_orcid_on_all25_no_specter_20260520.json).
+
+Query: `100036391-4`; `query_view="auto"`; ORCID enabled; `n_jobs=20`; top-k
+25; SPECTER omitted from both the Rust Arrow path and the current Python-built
+path.
+
+| Check | Result |
+|---|---:|
+| Rust Arrow candidate rows / pairs | 25 / 228 |
+| Current candidate rows / pairs | 25 / 228 |
+| Row count parity | exact |
+| Pair count parity | exact |
+| Component order parity | exact |
+| Retrieval rank parity | exact |
+| Row query-offset parity | exact |
+| Row component-size parity | exact |
+| Pair signature-plan parity | exact |
+| Retrieval score max abs diff | 0.0 |
+| Row-signal max abs diff | 0.0 for ORCID, middle, affiliation, coauthor, venue, year, title, SPECTER centroid, and SPECTER exemplar signals |
+| Rust Arrow `specter_count` | 0 |
+
+Current-path timings for this no-SPECTER compare:
+
+| Stage | Seconds |
+|---|---:|
+| Current `ANDData` construction | 205.1 |
+| Current `build_incremental_linker_inputs` | 84.8 |
+| Current Rust retrieval batch | 0.2 |
+
+Non-h_wang block parity check:
+[raw_candidate_plan_njobs20_orcid_on_all25_20260520.json](../../scratch/baseline/a_silva_single_query/arrow_full_specter/raw_candidate_plan_njobs20_orcid_on_all25_20260520.json)
+and
+[raw_candidate_plan_compare_current_orcid_on_all25_20260520.json](../../scratch/baseline/a_silva_single_query/arrow_full_specter/raw_candidate_plan_compare_current_orcid_on_all25_20260520.json).
+
+Fixture: `a_silva`, query `10027229-7` ("Arlindo da Silva"), 88,933
+signatures, 88,552 seed signatures, 9,687 seed components, and 67,003 SPECTER
+rows. `query_view="auto"` resolved to `full`; ORCID enabled; `n_jobs=20`;
+top-k 25.
+
+| Check | Result |
+|---|---:|
+| Rust Arrow candidate rows / pairs | 25 / 570 |
+| Current candidate rows / pairs | 25 / 570 |
+| Row count parity | exact |
+| Pair count parity | exact |
+| Component order parity | exact |
+| Retrieval rank parity | exact |
+| Row query-offset parity | exact |
+| Row component-size parity | exact |
+| Pair signature-plan parity | exact |
+| Retrieval score max abs diff | 0.0 |
+
+Rust Arrow timings for this a_silva check:
+
+| Stage | Seconds |
+|---|---:|
+| Rust-reported total | 1.66 |
+| Harness wall time | 2.03 |
+| Build seed summaries + retriever state | 0.51 |
+| Retrieval pair plan | 0.03 |
+
+Current-path timings for this a_silva compare:
+
+| Stage | Seconds |
+|---|---:|
+| Current `ANDData` construction | 49.8 |
+| Current `build_incremental_linker_inputs` | 16.6 |
+| Current Rust retrieval batch | 0.08 |
+
+### Downstream Scoring Bridge Probe
+
+A Python bridge now converts the raw id-based candidate plan into the numeric
+`LinkerRetrievalBatch` expected by the existing scoring runtime. This bridge
+maps request-local query offsets through `query_signature_ids` and maps
+`left_signature_ids` / `right_signature_ids` through the active featurizer's
+signature-id order. It does not rerun retrieval.
+
+The first comparison harness runs the current production private path and the
+raw-plan bridge path against the same `ANDData`, seed setup, featurizer,
+constraint backend, pairwise model, promoted linker, and logistic gate. This
+proves downstream parity for the candidate-plan handoff. The public wrapper now
+builds a `FeatureBlock` directly from raw payloads, or consumes raw Arrow inputs
+directly through `RustFeaturizer.from_arrow_paths(...)`. The raw Arrow plan now
+carries the remaining row signals itself, so that path no longer builds a
+Python signal `FeatureBlock`. Both wrappers then run the same Rust
+pairwise-feature and constraint-label kernels. That proves the raw scoring path
+can skip full-block `ANDData`, full linker-input construction, full constraint
+backend setup, and the earlier mini-`ANDData` compatibility layer while
+preserving exact scoring semantics.
+
+Non-h_wang a_silva link/abstain bridge check:
+[raw_candidate_plan_njobs20_orcid_on_all25_link_abstain_20260520.json](../../scratch/baseline/a_silva_single_query/arrow_full_specter/raw_candidate_plan_njobs20_orcid_on_all25_link_abstain_20260520.json)
+and
+[raw_candidate_plan_compare_link_abstain_orcid_on_all25_20260520.json](../../scratch/baseline/a_silva_single_query/arrow_full_specter/raw_candidate_plan_compare_link_abstain_orcid_on_all25_20260520.json).
+
+| Check | Result |
+|---|---:|
+| Current candidate rows / pairs | 25 / 570 |
+| Raw bridge candidate rows / pairs | 25 / 570 |
+| Linked signature clusters | exact |
+| Final link/abstain decisions | exact |
+| Probability max abs diff | 0.0 |
+| 53-feature matrix max abs diff | 0.0 |
+| Current retrieval + scoring | 0.46 s |
+| Raw-plan bridge scoring | 0.33 s |
+| Shared `ANDData` setup still paid | 50.3 s |
+| Shared linker inputs for current path + extra signals | 17.4 s |
+
+Full h_wang link/abstain bridge check:
+[raw_candidate_plan_njobs20_orcid_on_all25_link_abstain_20260520.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/raw_candidate_plan_njobs20_orcid_on_all25_link_abstain_20260520.json)
+and
+[raw_candidate_plan_compare_link_abstain_orcid_on_all25_20260520.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/raw_candidate_plan_compare_link_abstain_orcid_on_all25_20260520.json).
+
+| Check | Result |
+|---|---:|
+| Current candidate rows / pairs | 25 / 318 |
+| Raw bridge candidate rows / pairs | 25 / 318 |
+| Linked signature clusters | exact |
+| Final link/abstain decisions | exact |
+| Probability max abs diff | 0.0 |
+| 53-feature matrix max abs diff | 0.0 |
+| Current retrieval + scoring | 2.27 s |
+| Raw-plan bridge scoring | 1.34 s |
+| Shared `ANDData` setup still paid | 220.3 s |
+| Shared linker inputs for current path + extra signals | 103.5 s |
+
+Mini-`FeatureBlock` raw scoring wrapper checks:
+
+a_silva:
+[raw_candidate_plan_compare_link_abstain_mini_feature_block_20260520.json](../../scratch/baseline/a_silva_single_query/arrow_full_specter/raw_candidate_plan_compare_link_abstain_mini_feature_block_20260520.json).
+
+| Check | Result |
+|---|---:|
+| Current candidate rows / pairs | 25 / 570 |
+| Raw mini candidate rows / pairs | 25 / 570 |
+| Linked signature clusters | exact |
+| Normalized final link/abstain decisions | exact |
+| Probability max abs diff | 0.0 |
+| 53-feature matrix max abs diff | 0.0 |
+| Current full `ANDData` setup | 50.88 s |
+| Current seed/featurizer/constraint setup | 3.86 s |
+| Current linker-input + extra-signal setup | 17.50 s |
+| Current retrieval + scoring | 0.40 s |
+| Raw `FeatureBlock` build | 0.098 s |
+| Raw mini scoring wrapper | 0.614 s |
+| Mini `ANDData` inside wrapper | 0.262 s |
+| Mini Rust featurizer inside wrapper | 0.061 s |
+| Current vs raw pairwise feature seconds | 0.042 / 0.00067 |
+| Current vs raw constraint seconds | 0.042 / 0.00062 |
+
+h_wang:
+[raw_candidate_plan_compare_link_abstain_mini_feature_block_20260520.json](../../scratch/baseline/h_wang_single_query/arrow_full_specter/raw_candidate_plan_compare_link_abstain_mini_feature_block_20260520.json).
+
+| Check | Result |
+|---|---:|
+| Current candidate rows / pairs | 25 / 318 |
+| Raw mini candidate rows / pairs | 25 / 318 |
+| Linked signature clusters | exact |
+| Normalized final link/abstain decisions | exact |
+| Probability max abs diff | 0.0 |
+| 53-feature matrix max abs diff | 0.0 |
+| Current full `ANDData` setup | 209.70 s |
+| Current seed/featurizer/constraint setup | 21.90 s |
+| Current linker-input + extra-signal setup | 97.98 s |
+| Current retrieval + scoring | 1.84 s |
+| Raw `FeatureBlock` build | 0.256 s |
+| Raw mini scoring wrapper | 0.429 s |
+| Mini `ANDData` inside wrapper | 0.173 s |
+| Mini Rust featurizer inside wrapper | 0.039 s |
+| Current vs raw pairwise feature seconds | 0.209 / 0.0013 |
+| Current vs raw constraint seconds | 0.208 / 0.00050 |
+
+`decisions_exact_match` remains false in those JSON reports only because the
+numeric query signature index is local to the active featurizer. The normalized
+decision payload maps that index back to `query_signature_id`, and that semantic
+decision payload matches exactly.
+
+### Complete Arrow Full-Predict Parity
+
+The direct Arrow path has also been checked outside the single-query raw
+incremental shape. The complete-Arrow harness builds a bounded incumbent
+`ANDData`, writes typed Arrow tables from the same bounded payload, attaches
+name-count artifacts, uses the packaged filtered name-alias default, builds
+`RustFeaturizer.from_arrow_paths(...)`, and compares:
+
+- the full 39-feature matrix for every upper-triangle pair;
+- NaN placement in the feature matrix;
+- upper-triangle constraint labels;
+- distance matrices;
+- final cluster assignments.
+
+All runs used `n_jobs=20`, `total_ram_bytes=1000000000000`, and 1000-signature
+blocks (499,500 pairs), except the earlier 50-signature smoke check.
+
+| Fixture | Variant | Report | Result |
+|---|---|---|---|
+| a_silva | complete schema, SPECTER | [report](../../scratch/baseline/a_silva_single_query/complete_arrow_subset1000_arrow_name_artifacts/compare_full_predict_complete_arrow_subset1000_featurecheck_20260520.json) | exact features, constraints, distances, clusters |
+| a_silva | seeded, 997 required assignments | [report](../../scratch/baseline/a_silva_single_query/complete_arrow_subset1000_seeded_arrow_name_artifacts/compare_full_predict_complete_arrow_subset1000_seeded_featurecheck_20260520.json) | exact features, constraints, distances, clusters |
+| a_silva | no SPECTER | [report](../../scratch/baseline/a_silva_single_query/complete_arrow_subset1000_no_specter_arrow_name_artifacts/compare_full_predict_complete_arrow_subset1000_no_specter_featurecheck_20260520.json) | exact features, constraints, distances, clusters |
+| h_wang | complete schema, SPECTER | [report](../../scratch/baseline/h_wang_single_query/complete_arrow_subset1000_arrow_name_artifacts/compare_full_predict_complete_arrow_subset1000_featurecheck_20260520.json) | exact features, constraints, distances, clusters |
+| h_wang | seeded, 999 required assignments | [report](../../scratch/baseline/h_wang_single_query/complete_arrow_subset1000_seeded_arrow_name_artifacts/compare_full_predict_complete_arrow_subset1000_seeded_featurecheck_20260520.json) | exact features, constraints, distances, clusters |
+| h_wang | no SPECTER | [report](../../scratch/baseline/h_wang_single_query/complete_arrow_subset1000_no_specter_arrow_name_artifacts/compare_full_predict_complete_arrow_subset1000_no_specter_featurecheck_20260520.json) | exact features, constraints, distances, clusters |
+
+The remaining explicit boundary is `reference_features`: production models do
+not use them, and `Clusterer.predict_from_arrow_paths(...)` now fails fast if a
+model requests them. Supporting them in the Arrow path would require carrying
+the citation-derived reference artifacts as part of the narrow inference schema.
+
+Updated implication: **the central idea is good, and the retrieval-to-scoring
+handoff is now proven on the checked fixtures.** The direct Arrow Rust path
+reproduces the current top-25 retrieval candidate plan exactly on h_wang
+single-query, h_wang three-query, h_wang without SPECTER, and a_silva
+non-h_wang block checks while cutting retrieval-input construction by one to two
+orders of magnitude. The raw candidate plan also drives the existing downstream
+pairwise scoring, promoted linker, and link/abstain gate with exact parity on
+both h_wang and a_silva single-query checks. The remaining unproved part is no
+longer retrieval or scoring parity, nor full-block setup removal. The public raw
+endpoint now removes the mini-`ANDData` compatibility bridge as well:
+`RustFeaturizer.from_feature_block(...)` builds the existing Rust featurizer
+state directly from the narrow `FeatureBlock` contract. The open optimization is
+whether more row-signal or transport setup should move into Rust after profiling
+production-like request traffic.
+
+The profiling evidence says direct `FeatureBlock` scoring is a useful cleanup
+but not the dominant win. In the checked fixtures, the earlier mini `ANDData`
+plus mini Rust featurizer setup was 0.323 s for a_silva and 0.212 s for h_wang,
+while the full-block setup removed by the wrapper was 72.24 s and 329.58 s
+respectively. Removing the mini layer is still the right simplification now that
+we have the boundary, but the next work should be driven by a fresh wrapper
+profile rather than by intuition.
+
 ## Strategic Direction
 
 The shortcut's unique contribution is narrow: **skip full `ANDData`
 construction for raw small-N requests**. The rest of the work should be built as
-shared S2AND inference infrastructure wherever practical.
+shared S2AND inference infrastructure wherever practical, but that must not mean
+reimplementing all of `ANDData` in Rust.
 
-Build the reusable part as a Rust-native inference core:
+`ANDData` is intentionally broad. It owns legacy artifact loading, train/eval
+splits, pair sampling, Sinonym mutation, name-count compatibility semantics,
+SPECTER shaping, paper/signature preprocessing, cluster bookkeeping, and many
+debugging/reproducibility behaviors. The Rust work should carve out the smaller
+inference contract hidden inside it, tentatively called `FeatureBlock`.
+
+Build the reusable part around a Rust-native inference core:
 
 ```text
-raw or ANDData-backed signature/paper/seeds
-  -> typed Rust request structs
+raw request or ANDData adapter
+  -> FeatureBlock
+  -> typed Rust inference structs
   -> query feature extraction
   -> seed component summaries
   -> temporary hybrid centroid retriever
   -> candidate component plan
+  -> optional mini-block pair scoring inputs
 ```
 
-Then expose two adapters:
+Then expose two adapters into the same contract:
 
 - a raw-payload adapter for the small-N production request shape, which avoids
   constructing `ANDData`;
-- an incumbent `ANDData` adapter so existing `predict_incremental(...)` callers
-  can use the same Rust feature/summary/retrieval core.
+- an incumbent `ANDData -> FeatureBlock` adapter so existing callers can use the
+  same Rust feature/summary/retrieval core and so `ANDData` remains the parity
+  oracle while the Rust path is hardened.
 
 This avoids building a parallel one-off implementation. The raw path gets the
 large latency win from skipping `ANDData`, while the existing path can still
 benefit from the Rust port of `extract_query_features(...)` and
 `build_cluster_summary(...)`.
+
+Explicitly out of scope for the Rust shortcut:
+
+- training/validation/test split construction;
+- pair sampling policy;
+- legacy cluster artifact migration;
+- Sinonym overwrite execution, beyond accepting already-mutated input when a
+  caller opts into that non-default mode;
+- reference-feature generation unless a future model requires it;
+- general-purpose `ANDData` object lifecycle or mutation semantics.
 
 Treat these as separate decisions:
 
@@ -145,42 +580,73 @@ Treat these as separate decisions:
 - **Faster `ANDData`:** investigate and optimize as a general S2AND project.
   The baseline shows this is the biggest incumbent-path lever, but the raw
   shortcut should not wait for a lazy/incremental `ANDData` redesign.
-- **Post-retrieval scoring:** first bridge raw candidate plans into the existing
-  `LinkerCandidateBatch` scoring path. Only port the full scoring/gate pipeline
-  to Rust after profiling proves Python orchestration still dominates.
-- **Arrow IPC:** keep it as the preferred durable/runtime schema direction, but
-  do not make it a Phase 1 gate. Start with a compatibility adapter from the
-  existing JSON-shaped payload into the same typed Rust structs.
+- **Post-retrieval scoring:** keep using the existing `LinkerCandidateBatch`
+  scoring path for now; the bridge has exact parity. Full-block
+  `ANDData`/linker-input setup is now removable through the mini-`FeatureBlock`
+  wrapper, and the wrapper now builds the Rust featurizer directly from
+  `FeatureBlock`. The next scoring task is production-traffic profiling to
+  decide whether more row-signal or transport setup should move into Rust.
+- **Arrow IPC:** make direct Rust Arrow consumption an early adapter target,
+  because the full-block Rust read probe is already sub-second. Keep the
+  JSON-shaped adapter for compatibility and parity tests, but do not treat
+  Arrow-to-Python materialization as a performance path.
 
 ## ASAP Work Items
 
-1. **Build a shared Rust feature/summary/candidate-plan core.**
-   Implement typed Rust request structs and the production-equivalent
-   normalizer/feature extractor once. Both the raw shortcut and incumbent
-   `ANDData` path should call this core.
+1. **Freeze the `FeatureBlock` boundary before adding more Rust surface.**
+   List required retrieval/scoring fields, optional precomputed fields, schema
+   versioning, and the `ANDData` responsibilities that are intentionally out of
+   scope. This is the guardrail against rebuilding all of `ANDData` in Rust.
+   Initial Python boundary and tests live in
+   [`s2and/incremental_linking/feature_block.py`](../../s2and/incremental_linking/feature_block.py)
+   and [`tests/test_feature_block.py`](../../tests/test_feature_block.py).
 
-2. **Prototype the retrieval-only raw small-N candidate-plan API.**
-   Add `raw_block_query_candidate_plan(...)` as the fastest path for raw
-   production requests. Keep v1 narrow: parse raw signatures/papers/seeds,
-   build summaries, retrieve candidate components, return ids and telemetry.
-   Do not block this on Arrow or all-Rust scoring.
+2. **Profile the public raw-only downstream scoring wrappers.**
+   The public wrappers now build a mini `FeatureBlock` from the raw candidate
+   plan or raw payloads, build `RustFeaturizer` state directly from
+   `FeatureBlock`, map raw ids into the Rust featurizer order, and reuse the
+   existing Rust pairwise-feature and constraint-label kernels. The previous
+   mini-`ANDData` proof had exact feature matrix, probability,
+   normalized-decision, linked-cluster, candidate-row, and pair-count parity on
+   a_silva and h_wang. The production work is now live/request-shaped profiling
+   and deciding whether more row-signal or transport setup should move into
+   Rust.
 
-3. **Add stage-level telemetry and parity gates.**
-   Report payload parse, `ANDData`, query feature extraction, seed summary
-   build, retriever build, retrieval, pairwise scoring, linker/gate time, and
-   RSS. Add parity tests for dummy data, missing metadata, ORCID override,
-   query exclusion, and multi-query batching.
+3. **Promote the retrieval and downstream parity evidence into stable gates.**
+   The local tests and scratch full-block checks now cover missing metadata,
+   query-as-seed exclusion, multi-query batching, ORCID fanout, SPECTER
+   operation, no-SPECTER operation, a non-h_wang block, and exact downstream
+   link/abstain parity on h_wang plus a_silva. Keep the acceptance target as
+   exact candidate ids, pair ids, row signals, retrieval scores, probabilities,
+   feature matrices, and final decisions unless a deliberate scoring-policy
+   change is approved. Convert the scratch commands that should be rerun
+   regularly into a bounded pytest or documented CI/manual gate.
 
-4. **Bridge raw candidate plans into existing downstream scoring.**
-   Build the Phase 2 mini-dataset wrapper that maps returned signature ids into
-   deterministic mini-dataset numeric indices and constructs
-   `LinkerCandidateBatch` without rerunning retrieval.
+4. **Harden the direct Arrow IPC API boundary.**
+   Promote the scratch Arrow schema into the `FeatureBlock` schema, add explicit
+   schema validation errors, and decide whether the public function is
+   Arrow-only or a small dispatcher over Arrow plus JSON compatibility inputs.
 
-5. **Scope `ANDData` fast/lazy construction independently.**
+5. **Profile before moving more scoring internals.**
+   Full-block `ANDData`, full featurizer order, constraint backend setup, and
+   current linker-input construction are no longer required by the raw scoring
+   wrapper. The mini-`ANDData` compatibility bridge has been replaced by
+   direct `RustFeaturizer.from_feature_block(...)` construction. Move more
+   row-signal or scoring orchestration into Rust only if production request
+   profiling still shows it is material.
+
+6. **Scope `ANDData` fast/lazy construction independently.**
    Measure `ANDData` initialization sub-stages first: JSON load, namedtuple
    materialization, paper preprocessing, signature preprocessing, Sinonym,
    specter filtering, name counts, and block/signature indexing. Optimize or
    defer the expensive pieces only after the measurements identify them.
+
+7. **Only then consider a broader Rust scoring port.**
+   The retrieval candidate plan is fast, and the bridge checks show existing
+   scoring/gating is near 1-2 s once incumbent setup has already happened. Port
+   more scoring logic to Rust only after the raw-only wrapper removes `ANDData`
+   and linker-input setup and profiling still shows Python orchestration is
+   material.
 
 ## Goals
 
@@ -206,14 +672,16 @@ Treat these as separate decisions:
   infra.
 - Return enough information for a follow-up scoring wrapper to construct a
   mini-dataset and run the existing downstream scoring path without rerunning
-  retrieval.
+  retrieval. The current proof bridge does this against the incumbent featurizer
+  order; the production wrapper should use a mini-dataset or raw-slice order.
 
 ## Non-Goals
 
 - This is not a global ANN service or cross-block index.
 - This does not guarantee identical results to the full end-to-end linker if the
   input omits fields that the current retriever uses.
-- This does not return a final cluster assignment.
+- The Rust candidate-plan API itself does not return a final cluster assignment;
+  final link/abstain remains a downstream bridge/wrapper responsibility.
 - This does not replace the promoted linker model, pairwise model, or logistic
   gate.
 - This does not load millions of blocks or maintain a live index across random
@@ -323,13 +791,22 @@ top-level keys and pass raw mappings/lists through to Rust without building
 
 The shared runtime format should be **Apache Arrow IPC**. Use Arrow IPC/Feather
 for durable local files and Arrow `RecordBatch`/table objects for request-local
-payloads. This should become the common schema family for Python `ANDData`, Rust
-runtime readers, and the raw-block candidate-plan shortcut.
+payloads. This should become the common schema family for the narrow
+`FeatureBlock` inference contract, Rust runtime readers, and the raw-block
+candidate-plan shortcut. `ANDData` can derive or validate a `FeatureBlock`, but
+the Arrow schema should not attempt to serialize every `ANDData` field or
+mutation behavior.
 
 The fastest path should avoid parsing large nested Python dictionaries inside
 Rust for every request. The logical contract above can be exposed first for
 compatibility, but the target production input is a compact request-local,
 columnar Arrow payload.
+
+Do not validate Arrow performance by reading Arrow into Python objects and then
+feeding those objects through the JSON-shaped compatibility adapter. The h_wang
+probe showed that table reads are sub-second, while Arrow-to-Python
+materialization is much slower than the current JSON/pickle load. Arrow's value
+comes from keeping the data columnar across the Rust boundary.
 
 ### Shared Runtime Format Recommendation
 
@@ -342,8 +819,8 @@ Use one Arrow IPC file or stream per logical table:
 | Specter embeddings | Arrow IPC table | `paper_id` plus fixed-size `float32` vector |
 | Cluster seeds | Arrow IPC table | `signature_id`, `cluster_id`, optional constraint type |
 | Clusters | Arrow IPC table | One `cluster_id`, `signature_id` member row per membership |
-| Name counts | Arrow IPC table | `count_type`, `key`, `count` |
-| Name tuples | Arrow IPC table | `first`, `second` |
+| Name counts | Arrow IPC table | `kind`, `name`, `count` |
+| Name pairs | Arrow IPC table | `name_1`, `name_2` |
 
 Parquet can remain useful for analytics and offline data inspection, but it
 should not be the hot request/runtime format. Protobuf, MessagePack, and CBOR are
@@ -358,8 +835,8 @@ Why Arrow IPC:
 - Columns avoid per-row Python dict/list traversal across PyO3.
 - Nullable primitive columns and list columns map cleanly to current S2AND data.
 - Specter embeddings can be stored as contiguous `float32` vectors.
-- The same schemas can feed `ANDData`, Rust featurizer construction, and the new
-  raw-block retrieval shortcut.
+- The same schemas can feed the raw path and an `ANDData -> FeatureBlock`
+  parity adapter without making Rust own full `ANDData` semantics.
 
 ### Preferred Request Shape
 
@@ -442,6 +919,7 @@ metadata is available:
 ```text
 paper_id: string
 title: string
+abstract: string | null       # needed for scoring; retrieval-only callers may omit it
 venue: string
 journal_name: string
 year: int32 | null
@@ -455,8 +933,11 @@ position: int32
 author_name: string
 ```
 
-References and abstract text are not required for the current retrieval-only
-candidate plan unless a future retriever feature explicitly uses them.
+References are not required for the current retrieval-only candidate plan unless
+a future retriever feature explicitly uses them. `abstract` is not consumed by
+retrieval, but it is required for exact downstream scoring because the promoted
+pairwise feature set includes `abstract_count`. If the source only has an
+abstract-presence marker, a non-empty string is sufficient.
 
 ### Embedding Columns
 
@@ -497,25 +978,37 @@ the Python/Rust boundary.
 
 ### Format Preference Order
 
-1. Typed columnar arrays with optional pre-normalized fields and contiguous
-   Arrow `fixed_size_list<float32>` embeddings.
-2. Typed columnar arrays with raw fields normalized in Rust.
+1. Arrow IPC / typed columnar arrays consumed directly by Rust, with optional
+   pre-normalized fields and contiguous Arrow `fixed_size_list<float32>`
+   embeddings.
+2. Typed columnar arrays held in process and consumed directly by Rust.
 3. Existing JSON-shaped Python dictionaries, accepted as a compatibility shim.
+
+Do not add "Arrow read -> Python dict/list -> Rust" as an optimization path; the
+measured Arrow-to-Python materialization cost is too high.
 
 The Rust core should be implemented against the typed columnar structs. The
 JSON-shaped API should be a thin adapter that converts into those structs.
 
 ### Migration Order
 
-1. Define and test Arrow schemas for signatures, papers, paper authors, specter,
-   cluster seeds, clusters, name counts, and name tuples.
-2. Add Python `ANDData` loaders that accept Arrow IPC paths while preserving the
-   current in-memory `ANDData` contract.
-3. Add Rust readers for the same Arrow schemas.
-4. Use the same Arrow request tables in `raw_block_query_candidate_plan(...)`.
-5. Migrate specter first because pickle is the largest cross-language startup
-   and compatibility problem.
-6. Migrate signatures, papers, and seeds after specter parity is stable.
+1. Define the `FeatureBlock` schema first, including the exact fields required
+   for retrieval, constraints, pair features, and link/abstain scoring.
+2. Add an `ANDData -> FeatureBlock` adapter for parity tests and incumbent-path
+   measurement. This adapter may read Python objects, but it is not the
+   production speed path.
+3. Add Rust Arrow readers for the same `FeatureBlock` tables and validate row
+   counts, required columns, null handling, SPECTER vector shape, and ID
+   alignment.
+4. Add `raw_block_query_candidate_plan(...)` adapters for both direct Arrow IPC
+   and JSON-shaped compatibility input, backed by the same typed structs.
+5. Migrate specter first in production request construction because it is the
+   largest contiguous numeric payload and should not be rebuilt as Python lists.
+6. Migrate signatures, papers, paper authors, seeds, and name-count inputs after
+   retrieval and downstream scoring parity are stable.
+7. Treat Python `ANDData` Arrow loaders as a separate incumbent-path project.
+   They are useful only if they avoid expensive Python object materialization or
+   replace enough `ANDData` preprocessing to justify the added path.
 
 ### Output Contract
 
@@ -523,13 +1016,14 @@ Return a JSON/Python-mapping-compatible object. Multi-query results share one
 flat candidate-row array; each row is tagged with its originating query via
 `row_query_offsets` (an index into `query_signature_ids`).
 
-Important: `row_query_offsets` are request-local query offsets, not full-dataset
+Important: `row_query_offsets` are request-local query offsets, not numeric
 signature indices. Do not feed them directly into `LinkerCandidateBatch`.
 `LinkerCandidateBatch.row_query_signature_indices`, `left_signature_indices`,
-and `right_signature_indices` are numeric indices in the dataset/featurizer
-signature order. The Phase 2 wrapper must build a mini-dataset signature order
-from the query plus retrieved component members, map signature ids to those
-mini-dataset indices, and only then construct `LinkerCandidateBatch`.
+and `right_signature_indices` are numeric indices in the active scoring
+signature order. The proof bridge maps through the incumbent featurizer's full
+signature order. The production Phase 2 wrapper should build a mini-dataset
+signature order from the query plus retrieved component members, map signature
+ids to those mini-dataset indices, and only then construct `LinkerCandidateBatch`.
 
 ```text
 {
@@ -673,7 +1167,8 @@ Use explicit typed failures surfaced through PyO3 exceptions:
 - `InvalidSpecterVector`
 
 For optional metadata, including missing query or seed papers, prefer
-current-linker missing-value semantics over fallback-heavy behavior. The
+current-linker missing-value semantics over adapter-specific compatibility
+behavior. The
 current Python path treats absent papers as explicit missing metadata for year,
 title, venue, paper authors, and local author windows. Log telemetry counts for
 missing papers, missing specter vectors, empty coauthors, and empty
@@ -804,14 +1299,23 @@ component id, and enough packet evidence to support manual adjudication.
 
 ## Integration Plan
 
-Phase 0: shared Rust inference core and measurement gates
+Phase 0: `FeatureBlock` boundary, adapters, and measurement gates
 
-- Define typed Rust request structs for query signatures, seed signatures,
-  papers, paper authors, specter vectors, and seed membership.
+- Define the narrow `FeatureBlock` contract for query signatures, seed
+  signatures, papers, paper authors, specter vectors, seed membership, name
+  counts needed for scoring, and optional clusters/constraints.
+  Initial Python contract: `s2and/incremental_linking/feature_block.py`.
+- Document the `ANDData` responsibilities that are explicitly out of scope for
+  this Rust path so the implementation does not become a full `ANDData` port.
+- Add an `ANDData -> FeatureBlock` adapter that can feed the same Rust core
+  without changing public incumbent surfaces.
+- Add typed Rust request structs behind `FeatureBlock`; the Rust core should not
+  depend on Python namedtuples or raw JSON object layout.
 - Port the production retrieval feature extractor and seed summary aggregation
   into Rust against those structs.
-- Add an `ANDData` adapter that can feed the same Rust core without changing
-  the public `predict_incremental(...)` surface.
+- Add direct Arrow IPC readers for the same typed structs, starting with the
+  schema slices needed for retrieval parity. Validate read-time row counts and
+  SPECTER vector shape before wiring retrieval semantics.
 - Add stage telemetry in the incumbent path before and after the core is wired
   in, so general-path wins are measurable separately from raw-shortcut wins.
 - Keep the Arrow IPC schema work behind the same typed structs rather than
@@ -819,7 +1323,9 @@ Phase 0: shared Rust inference core and measurement gates
 
 Phase 1: retrieval-only Rust API
 
-- Add a JSON-shaped raw-payload adapter for the shared Rust core.
+- Add direct Arrow IPC and JSON-shaped raw-payload adapters for the shared Rust
+  core. Use JSON compatibility tests to simplify parity setup, but use Arrow
+  for max-speed evidence.
 - Add `raw_block_query_candidate_plan(...)`.
 - Add Python tests comparing output to current linker retrieval.
 - Add telemetry to report normalization, summary, retriever build, and retrieval
@@ -827,54 +1333,177 @@ Phase 1: retrieval-only Rust API
 
 Phase 2: downstream scoring wrapper
 
-- Add a Python wrapper that converts the candidate plan into a
-  `LinkerCandidateBatch` without rerunning retrieval.
-- Materialize a mini dataset containing the query plus returned component
-  members, build a deterministic mini-dataset signature order, and map
-  `left_signature_ids`, `right_signature_ids`, and `row_query_offsets` into the
-  numeric `left_signature_indices`, `right_signature_indices`, and
+- Current proof bridge: convert the raw candidate plan into the existing
+  numeric `LinkerRetrievalBatch` without rerunning retrieval, using the incumbent
+  featurizer's signature-id order. This has exact downstream parity on h_wang
+  and a_silva single-query checks.
+- Current mini-order bridge: derive `FeatureBlockSignatureOrder` from the raw
+  candidate plan and map ids into deterministic mini-block numeric indices.
+- Current direct `FeatureBlock` scoring bridge: build `RustFeaturizer` state
+  directly from `FeatureBlock` through
+  `RustFeaturizer.from_feature_block(...)` so existing pairwise/constraint code
+  can be reused while full-block and mini-`ANDData` setup are removed.
+- Production raw-only wrapper status: the public wrappers
+  `predict_incremental_link_or_abstain_from_raw_feature_block(...)` and
+  `predict_incremental_link_or_abstain_from_raw_payloads(...)` build a mini
+  `FeatureBlock` containing the query plus returned component members, build the
+  Rust featurizer directly from that contract, and map `left_signature_ids`,
+  `right_signature_ids`, and request-local row query offsets into the numeric
+  `left_signature_indices`, `right_signature_indices`, and
   `row_query_signature_indices` expected by `LinkerCandidateBatch`.
+- Direct raw Arrow wrapper status:
+  `predict_incremental_link_or_abstain_from_raw_arrow_paths(...)` now performs
+  raw Arrow retrieval, builds the filtered scoring featurizer through
+  `RustFeaturizer.from_arrow_paths(...)`, and then reuses the same Rust
+  pairwise/constraint/link-abstain scoring path. Rust now emits the remaining
+  row signals that previously required a Python signal `FeatureBlock`:
+  name-count rarity, candidate max paper-author count, paper-author-list
+  overlap, local author-window overlap, and author-count delta. There is no
+  full-block `ANDData`, no mini-`ANDData` fallback, and no Python signal
+  `FeatureBlock` in the raw Arrow wrapper.
+- Full predict generalization:
+  `Clusterer.predict_from_arrow_paths(...)` uses the same Arrow featurizer
+  constructor for ordinary full-block `predict`, then runs the existing Rust
+  block upper-triangle feature and constraint APIs directly from that featurizer.
+  This applies the raw-path lesson to general S2AND Rust predict, not only
+  `predict_incremental`.
 - Reuse existing pairwise scoring, 53-feature assembly, promoted linker, and
-  logistic gate.
+  logistic gate until profiling shows this orchestration is still a material
+  bottleneck after `ANDData` and current linker-input construction are gone.
+
+Latest direct Arrow performance evidence, release build, n_jobs=20,
+total_ram_bytes=1e12:
+
+- h_wang raw incremental, embedded per-signature name-count columns and the
+  default packaged filtered `name_tuples` aliases:
+  `scratch/baseline/h_wang_single_query/arrow_full_specter_embedded_counts/direct_raw_arrow_wrapper_native_signals_embedded_counts_20260520.json`
+  reports 17.41s direct wrapper predict time after model load, including
+  16.04s raw retrieval/summary build, 1.34s filtered Arrow scoring-featurizer
+  build, and `raw_arrow_signal_seconds=0.00019`. The output linked the query to
+  the same component as the exact raw FeatureBlock parity report.
+- h_wang raw incremental with the old signatures table lacking embedded counts
+  but with the 1.4GB global `name_counts.arrow` present:
+  `direct_raw_arrow_wrapper_native_signals_external_name_artifacts_20260520.json`
+  reports 85.86s predict time. The global lookup read costs 25.73s in raw
+  retrieval and 35.51s in filtered featurizer construction. This is now treated
+  as a fallback/build-time path, not the hot-path target.
+- h_wang raw incremental with the same old signatures table lacking embedded
+  counts but with a sorted exact-verified `name_counts_index/` sidecar:
+  `scratch/baseline/h_wang_single_query/arrow_full_specter/direct_raw_arrow_wrapper_native_signals_name_counts_index_20260520.json`
+  reports 17.04s predict time. The global name-count setup step drops from
+  25.73s to 0.028s in raw retrieval, and filtered Arrow scoring-featurizer
+  construction drops from 35.51s to 1.27s.
+- h_wang full predict, 1000 signatures / 499,500 pairs, embedded counts and the
+  default packaged filtered `name_tuples` aliases:
+  `scratch/baseline/h_wang_single_query/arrow_full_specter_embedded_counts/direct_predict_embedded_counts_subset1000_20260520.json`
+  reports 2.23s for `predict_from_arrow_paths(...)` after model load.
+- h_wang full predict, 1000 signatures / 499,500 pairs, old signatures table
+  plus `name_counts_index/`:
+  `scratch/baseline/h_wang_single_query/arrow_full_specter/direct_predict_name_counts_index_subset1000_20260520.json`
+  reports 2.31s for `predict_from_arrow_paths(...)` after model load.
+- Older a_silva full predict, 1000 signatures / 499,500 pairs, direct Arrow,
+  no global name-count load: 1.31s for `predict_from_arrow_paths(...)` after
+  model load. The prior incumbent full-scope profile for the same pair count
+  spent 50.86s in `ANDData` construction plus 6.19s in predict.
+
+Hot-path rule: prefer embedded per-signature name counts in `signatures.arrow`
+when producing request/block bundles. When embedding is impractical, provide the
+sorted binary `name_counts_index/` sidecar. Keep `name_counts.arrow` for
+artifact generation, parity fallback, and inspection; do not cold-read it per
+request.
+
+Complete Arrow full-predict parity update:
+
+- The older `arrow_full_specter` scratch fixtures remain speed probes, but the
+  complete Arrow fixture path now carries abstract presence, paper language
+  fields, SPECTER fixed-size-list embeddings, and name-count artifacts. Name
+  aliases are no longer treated as dataset-local Arrow artifacts; the hot path
+  uses the default packaged filtered `name_tuples` file unless a parity
+  experiment explicitly passes an override path.
+- Tracked 50-signature a_silva embedded-count gate:
+  `scratch/baseline/a_silva_single_query/tracked_gate_subset50_embedded_counts_20260520/compare_full_predict_arrow_parity_subset50_embedded_counts_20260520.json`
+  reports exact feature-matrix parity, exact constraint parity,
+  `max_absdiff=0.0` distance parity, and exact clusters.
+- Tracked 50-signature a_silva index-count gate:
+  `scratch/baseline/a_silva_single_query/tracked_gate_subset50_index_counts_20260520/compare_full_predict_arrow_parity_subset50_index_counts_20260520.json`
+  exercises `name_counts_index/` explicitly and reports exact feature-matrix
+  parity, exact constraint parity, `max_absdiff=0.0` distance parity, and exact
+  clusters.
+- 50-signature a_silva complete-Arrow full-predict parity:
+  `scratch/baseline/a_silva_single_query/complete_arrow_subset50_arrow_name_artifacts/compare_full_predict_complete_arrow_subset50_20260520.json`
+  reports `max_absdiff=0.0`, `nonzero_absdiff_count=0`, and exact clusters.
+- 1000-signature a_silva complete-Arrow full-predict parity:
+  `scratch/baseline/a_silva_single_query/complete_arrow_subset1000_arrow_name_artifacts/compare_full_predict_complete_arrow_subset1000_featurecheck_20260520.json`
+  reports exact 39-feature matrix parity, exact constraint parity,
+  `max_absdiff=0.0`, `nonzero_absdiff_count=0`, and exact clusters over
+  499,500 pairs.
+- The 50-signature run first generated `name_counts.arrow` with 35,419,433
+  rows. The 1000-signature run reused the name-count artifacts and measured
+  31.18s for Arrow featurizer construction plus 1.65s for Arrow distance
+  construction. A later mini `zbmath` microbenchmark measured the packaged
+  filtered text alias fallback at ~22ms over no aliases, while `name_pairs.arrow`
+  was slower, so a name-count-style mmap/index sidecar is not justified for name
+  aliases.
 
 Phase 3: incumbent-path `ANDData` optimization
 
 - Profile and optimize `ANDData` construction sub-stages: JSON loading,
   namedtuple materialization, paper preprocessing, signature preprocessing,
-  Sinonym, specter filtering, name counts, and indexing.
+  specter filtering, name counts, and indexing. Treat Sinonym as an explicit
+  non-default mode rather than the forward-looking baseline.
 - Consider lazy/incremental `ANDData` construction only where the caller still
   needs an `ANDData` object and the measured sub-stage costs justify the
   additional complexity.
+- Keep this separate from the raw shortcut. Improving `ANDData` is worthwhile
+  for broad S2AND functionality, but it is not a prerequisite for raw requests
+  that can enter through `FeatureBlock` directly.
 
-Phase 4: optional all-Rust scoring
+Phase 4: further Rust-native raw scoring cleanup
 
-- Only after Phase 2 profiling shows Python mini-dataset/scoring orchestration
-  still dominates, port the final scoring path into Rust-native raw-slice APIs.
+- Raw row-signal construction and row-level name-count rarity are now emitted by
+  Rust for the direct Arrow candidate plan. Further Rust work should target
+  reusable/raw component-summary artifacts or faster full-block Arrow summary
+  setup if production-like profiles still show raw retrieval/summary as
+  material.
+- Keep the same parity gate: exact normalized decisions, linked clusters,
+  probabilities, 53-feature matrix, candidate-row counts, and pair counts.
 
 ## Acceptance Criteria
 
 - The Baseline Measurement profile exists, is checked in alongside the
   implementation, and shows the skipped stages dominate end-to-end latency on
   the target request shape.
-- The raw shortcut and incumbent `ANDData` adapter both use the same Rust
-  feature/summary/candidate-plan core, or the doc explicitly records why one
-  adapter is blocked.
+- The `FeatureBlock` contract exists and explicitly lists which `ANDData`
+  responsibilities are out of scope.
+- The raw shortcut and incumbent `ANDData -> FeatureBlock` adapter both use the
+  same Rust feature/summary/candidate-plan core, or the doc explicitly records
+  why one adapter is blocked.
+- Direct Rust Arrow IPC input reads the full h_wang fixture schema slices in
+  sub-second order and does not materialize Python dict/list objects on the hot
+  path.
 - The raw-block API returns the same top candidate components as the current
   promoted retrieval path on parity fixtures.
-- A single-query request does not construct `ANDData`.
-- A single-query raw request does not build `RustFeaturizer`.
+- The raw candidate-plan bridge returns the same final normalized link/abstain
+  decisions, probabilities, 53-feature matrix, candidate-row counts, and pair
+  counts as the current promoted path on h_wang and a non-h_wang fixture.
+- A production single-query raw request does not construct full-block `ANDData`.
+- A production single-query raw request does not build a full-block scoring
+  `RustFeaturizer`; it builds only the filtered query-plus-candidate scoring
+  featurizer after raw retrieval. Retrieval summary construction still scans
+  the full seed block unless/until precomputed component summaries are added.
 - Telemetry separates summary construction from retriever build and retrieval.
 - Incumbent-path telemetry reports `ANDData` construction sub-stages separately
   enough to decide whether lazy/incremental construction is worthwhile.
 - Memory is bounded by the request block and top candidate output.
 - Phase 2 can pass the output to downstream scoring without invoking retrieval
-  again by constructing the mini-dataset and numeric `LinkerCandidateBatch`
-  index arrays explicitly.
+  again by constructing numeric `LinkerCandidateBatch` index arrays explicitly;
+  the final production version should do this against a deterministic
+  mini-dataset/raw-slice signature order rather than the full incumbent
+  featurizer order.
 
 ## Open Questions
 
 - Should output arrays use NumPy arrays, Python lists, or a mixed transport based
   on size?
-- Should the candidate plan include enough row signals for immediate 53-feature
-  assembly, or should some row signals be rebuilt during downstream scoring from
-  the mini dataset?
+- Which remaining scoring inputs should be carried directly by the raw candidate
+  plan, and which should be rebuilt from a mini dataset or raw-slice view?

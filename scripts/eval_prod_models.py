@@ -61,6 +61,7 @@ Usage:
 
     # Evaluate on s2and_mini datasets
     uv run python scripts/eval_prod_models.py --dataset mini
+    # Uses s2and/data/s2and_mini_arrow automatically when complete Arrow artifacts exist.
 
     # Retrain from scratch instead of using prod models
     uv run python scripts/eval_prod_models.py --train
@@ -70,7 +71,9 @@ Usage:
 """
 
 import argparse
+import json
 import os
+from collections import defaultdict
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -89,9 +92,40 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--n_jobs", type=int, default=4, help="Number of parallel jobs (default: 4)")
     parser.add_argument(
+        "--datasets",
+        nargs="*",
+        default=None,
+        help="Optional subset of dataset names to evaluate, e.g. --datasets zbmath qian.",
+    )
+    parser.add_argument(
+        "--specter-suffixes",
+        nargs="*",
+        choices=list(MODELS.keys()),
+        default=None,
+        help="Optional subset of embedding suffixes to evaluate.",
+    )
+    parser.add_argument(
         "--train",
         action="store_true",
         help="Retrain models from scratch instead of loading prod pickles",
+    )
+    parser.add_argument(
+        "--use-arrow",
+        action="store_true",
+        help=(
+            "Force production-model evaluation through direct Arrow/Rust predict_from_arrow_paths. "
+            "Arrow is used automatically for mini evals when complete artifacts exist. Not supported with --train."
+        ),
+    )
+    parser.add_argument(
+        "--no-arrow",
+        action="store_true",
+        help="Disable automatic Arrow/Rust evaluation even when Arrow artifacts exist.",
+    )
+    parser.add_argument(
+        "--arrow-data-root",
+        default=None,
+        help="Arrow mini data root. Defaults to s2and/data/s2and_mini_arrow when --use-arrow is set.",
     )
     return parser
 
@@ -114,6 +148,162 @@ def resolve_dataset_file(data_root: str, dataset_name: str, preferred_name: str,
     if os.path.exists(fallback_path):
         return fallback_path
     raise FileNotFoundError(f"Missing dataset file. Tried '{preferred_path}' and '{fallback_path}'.")
+
+
+def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suffix: str) -> dict[str, str]:
+    dataset_root = os.path.join(arrow_root, dataset_name)
+    specter_name = "specter2.arrow" if specter_suffix == "_specter2.pkl" else "specter.arrow"
+    paths = {
+        "signatures": os.path.join(dataset_root, "signatures.arrow"),
+        "papers": os.path.join(dataset_root, "papers.arrow"),
+        "paper_authors": os.path.join(dataset_root, "paper_authors.arrow"),
+        "specter": os.path.join(dataset_root, specter_name),
+        "clusters": os.path.join(dataset_root, f"{dataset_name}_clusters.json"),
+    }
+    missing = {key: path for key, path in paths.items() if not os.path.exists(path)}
+    if missing:
+        formatted = ", ".join(f"{key}={path}" for key, path in missing.items())
+        raise FileNotFoundError(f"Missing Arrow dataset files for {dataset_name}: {formatted}")
+    return paths
+
+
+def arrow_datasets_available(arrow_root: str | None, datasets: list[str], specter_suffixes: list[str]) -> bool:
+    if arrow_root is None:
+        return False
+    for dataset_name in datasets:
+        for specter_suffix in specter_suffixes:
+            try:
+                resolve_arrow_dataset_paths(arrow_root, dataset_name, specter_suffix)
+            except FileNotFoundError:
+                return False
+    return True
+
+
+def read_arrow_s2_blocks(signatures_arrow_path: str) -> dict[str, list[str]]:
+    import pyarrow as pa
+
+    with pa.memory_map(signatures_arrow_path, "r") as source:
+        table = pa.ipc.open_file(source).read_all().select(["signature_id", "author_block"])
+    block_dict: dict[str, list[str]] = defaultdict(list)
+    for row in table.to_pylist():
+        block_dict[str(row["author_block"])].append(str(row["signature_id"]))
+    return dict(block_dict)
+
+
+def split_blocks_like_anddata(
+    blocks_dict: dict[str, list[str]],
+    *,
+    random_seed: int,
+    num_clusters_for_block_size: int = 1,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]]:
+    import numpy as np
+    from sklearn.cluster import KMeans
+    from sklearn.model_selection import train_test_split
+
+    block_ids = []
+    block_sizes = []
+    for block_id, signatures in blocks_dict.items():
+        block_ids.append(block_id)
+        block_sizes.append(len(signatures))
+    y_group = KMeans(n_clusters=num_clusters_for_block_size, random_state=random_seed, n_init=10).fit(
+        np.array(block_sizes).reshape(-1, 1)
+    ).labels_
+    train_blocks, val_test_blocks, _, val_test_length = train_test_split(
+        block_ids,
+        y_group,
+        test_size=val_ratio + test_ratio,
+        stratify=y_group,
+        random_state=random_seed,
+    )
+    val_blocks, test_blocks = train_test_split(
+        val_test_blocks,
+        test_size=test_ratio / (val_ratio + test_ratio),
+        stratify=val_test_length,
+        random_state=random_seed,
+    )
+    return (
+        {block_id: blocks_dict[block_id] for block_id in train_blocks},
+        {block_id: blocks_dict[block_id] for block_id in val_blocks},
+        {block_id: blocks_dict[block_id] for block_id in test_blocks},
+    )
+
+
+def read_signature_to_cluster_id(clusters_path: str) -> dict[str, str]:
+    with open(clusters_path, encoding="utf-8") as infile:
+        clusters = json.load(infile)
+    signature_to_cluster_id = {}
+    for cluster_id, cluster_info in clusters.items():
+        for signature_id in cluster_info["signature_ids"]:
+            signature_to_cluster_id[str(signature_id)] = str(cluster_id)
+    return signature_to_cluster_id
+
+
+def construct_cluster_to_signatures(
+    signature_to_cluster_id: dict[str, str],
+    block_dict: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    cluster_to_signatures: dict[str, list[str]] = defaultdict(list)
+    for signatures in block_dict.values():
+        for signature_id in signatures:
+            cluster_to_signatures[signature_to_cluster_id[str(signature_id)]].append(str(signature_id))
+    return dict(cluster_to_signatures)
+
+
+def cluster_eval_arrow(
+    arrow_paths: dict[str, str],
+    clusterer,
+    *,
+    random_seed: int,
+    n_jobs: int,
+) -> tuple[dict[str, tuple], dict[str, tuple[float, float, float]]]:
+    import numpy as np
+
+    from s2and.eval import b3_precision_recall_fscore, pairwise_precision_recall_fscore
+
+    _train_block_dict, _val_block_dict, test_block_dict = split_blocks_like_anddata(
+        read_arrow_s2_blocks(arrow_paths["signatures"]),
+        random_seed=random_seed,
+    )
+    signature_to_cluster_id = read_signature_to_cluster_id(arrow_paths["clusters"])
+    cluster_to_signatures = construct_cluster_to_signatures(signature_to_cluster_id, test_block_dict)
+    pred_clusters, _ = clusterer.predict_from_arrow_paths(
+        test_block_dict,
+        {
+            "signatures": arrow_paths["signatures"],
+            "papers": arrow_paths["papers"],
+            "paper_authors": arrow_paths["paper_authors"],
+            "specter": arrow_paths["specter"],
+        },
+        total_ram_bytes=1_000_000_000_000,
+        load_name_counts=False,
+        name_tuples="filtered",
+    )
+    (
+        b3_p,
+        b3_r,
+        b3_f1,
+        b3_metrics_per_signature,
+        pred_bigger_ratios,
+        true_bigger_ratios,
+    ) = b3_precision_recall_fscore(cluster_to_signatures, pred_clusters)
+    metrics: dict[str, tuple] = {"B3 (P, R, F1)": (b3_p, b3_r, b3_f1)}
+    metrics["Cluster (P, R F1)"] = pairwise_precision_recall_fscore(
+        cluster_to_signatures, pred_clusters, test_block_dict, "clusters"
+    )
+    metrics["Cluster Macro (P, R, F1)"] = pairwise_precision_recall_fscore(
+        cluster_to_signatures, pred_clusters, test_block_dict, "cmacro"
+    )
+
+    def _mean_or_nan(xs):
+        if len(xs) == 0:
+            return float("nan")
+        return float(np.round(np.mean(xs), 2))
+
+    metrics["Pred bigger ratio (mean, count)"] = (_mean_or_nan(pred_bigger_ratios), len(pred_bigger_ratios))
+    metrics["True bigger ratio (mean, count)"] = (_mean_or_nan(true_bigger_ratios), len(true_bigger_ratios))
+    return metrics, b3_metrics_per_signature
 
 
 # feature categories (all except reference_features)
@@ -155,21 +345,54 @@ def main() -> None:
     n_jobs = args.n_jobs
     random_seed = args.seed
     train_flag = bool(args.train)
+    if args.use_arrow and args.no_arrow:
+        raise ValueError("Pass only one of --use-arrow or --no-arrow")
+    if args.use_arrow and train_flag:
+        raise ValueError("--use-arrow is for production-model evaluation and cannot be combined with --train")
     os.environ["OMP_NUM_THREADS"] = str(n_jobs)
 
     if args.dataset == "mini":
         data_original = os.path.join(PROJECT_ROOT_PATH, "s2and", "data", "s2and_mini")
+        arrow_data_root = args.arrow_data_root or os.path.join(PROJECT_ROOT_PATH, "s2and", "data", "s2and_mini_arrow")
         # aminer has too much variance; medline is pairwise only
         datasets = ["arnetminer", "inspire", "kisti", "pubmed", "qian", "zbmath"]
     elif args.dataset == "full":
         data_original = os.path.join(PROJECT_ROOT_PATH, "s2and", "data")
+        arrow_data_root = args.arrow_data_root
+        if args.use_arrow:
+            raise ValueError("--use-arrow currently supports --dataset mini only")
         datasets = ["arnetminer", "inspire", "kisti", "pubmed", "qian", "zbmath"]
     else:
         data_original = os.path.join(PROJECT_ROOT_PATH, "s2and", "data")
+        arrow_data_root = args.arrow_data_root
+        if args.use_arrow:
+            raise ValueError("--use-arrow currently supports --dataset mini only")
         datasets = ["inventors_s2and"]
+    if args.datasets is not None:
+        requested_datasets = [str(dataset_name) for dataset_name in args.datasets]
+        unknown_datasets = sorted(set(requested_datasets) - set(datasets))
+        if unknown_datasets:
+            raise ValueError(f"Unknown dataset(s) for --dataset {args.dataset}: {unknown_datasets}")
+        datasets = requested_datasets
+    active_specter_suffixes = [str(suffix) for suffix in (args.specter_suffixes or specter_suffixes)]
+    arrow_available = args.dataset == "mini" and not train_flag and arrow_datasets_available(
+        arrow_data_root,
+        datasets,
+        active_specter_suffixes,
+    )
+    if args.use_arrow and not arrow_available:
+        # Raise the precise missing-file error for the first requested combination.
+        resolve_arrow_dataset_paths(arrow_data_root, datasets[0], active_specter_suffixes[0])
+    use_arrow = bool(args.use_arrow or (arrow_available and not args.no_arrow))
 
-    print(f"Config: dataset={args.dataset}, seed={random_seed}, n_jobs={n_jobs}, train={train_flag}")
+    print(
+        f"Config: dataset={args.dataset}, seed={random_seed}, n_jobs={n_jobs}, "
+        f"train={train_flag}, use_arrow={use_arrow}"
+    )
     print(f"Datasets: {datasets}")
+    print(f"SPECTER suffixes: {active_specter_suffixes}")
+    if use_arrow:
+        print(f"Arrow data root: {arrow_data_root}")
     print()
 
     featurization_info = FeaturizationInfo(features_to_use=features_to_use, featurizer_version=FEATURIZER_VERSION)
@@ -179,7 +402,7 @@ def main() -> None:
     )
 
     results = {}
-    for specter_suffix in specter_suffixes:
+    for specter_suffix in active_specter_suffixes:
         clusterer = None
 
         if not train_flag:
@@ -200,6 +423,20 @@ def main() -> None:
         cluster_metrics_all = []
         for dataset_name in datasets:
             print(f"-- dataset: {dataset_name} --")
+            if use_arrow:
+                if clusterer is None:
+                    raise RuntimeError("Arrow evaluation requires a loaded production Clusterer")
+                arrow_paths = resolve_arrow_dataset_paths(arrow_data_root, dataset_name, specter_suffix)
+                cluster_metrics, _b3_metrics_per_signature = cluster_eval_arrow(
+                    arrow_paths,
+                    clusterer,
+                    random_seed=random_seed,
+                    n_jobs=n_jobs,
+                )
+                print(cluster_metrics)
+                cluster_metrics_all.append(cluster_metrics)
+                continue
+
             signatures_path = resolve_dataset_file(
                 data_original, dataset_name, f"{dataset_name}_signatures.json", "signatures.json"
             )
@@ -297,13 +534,22 @@ def main() -> None:
     print("=" * 60)
     print("Summary")
     print("=" * 60)
-    result_specter1 = results["_specter.pickle"]
-    result_specter2 = results["_specter2.pkl"]
+    if "_specter.pickle" in results and "_specter2.pkl" in results:
+        result_specter1 = results["_specter.pickle"]
+        result_specter2 = results["_specter2.pkl"]
 
-    for i, dataset_name in enumerate(datasets):
-        print(f"Performance with SPECTERv1 data, on {dataset_name} (B3): {result_specter1[i]['B3 (P, R, F1)']}")
-        print(f"Performance with SPECTERv2 data, on {dataset_name} (B3): {result_specter2[i]['B3 (P, R, F1)']}")
-        print()
+        for i, dataset_name in enumerate(datasets):
+            print(f"Performance with SPECTERv1 data, on {dataset_name} (B3): {result_specter1[i]['B3 (P, R, F1)']}")
+            print(f"Performance with SPECTERv2 data, on {dataset_name} (B3): {result_specter2[i]['B3 (P, R, F1)']}")
+            print()
+    else:
+        for specter_suffix, metrics_by_dataset in results.items():
+            for i, dataset_name in enumerate(datasets):
+                print(
+                    f"Performance with {specter_suffix} data, on {dataset_name} (B3): "
+                    f"{metrics_by_dataset[i]['B3 (P, R, F1)']}"
+                )
+            print()
 
 
 if __name__ == "__main__":

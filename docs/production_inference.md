@@ -393,6 +393,13 @@ pred_clusters, _ = clusterer.predict(
 )
 ```
 
+When `S2AND_BACKEND` resolves to Rust and complete FeatureBlock Arrow artifacts
+are available, `Clusterer.predict(...)` routes through the direct Arrow/Rust
+featurizer by default. Callers can provide explicit paths by setting
+`dataset.arrow_paths` to at least `signatures`, `papers`, and `paper_authors`
+paths; models that use SPECTER features also require `specter`. If no Arrow
+artifacts are available, the normal `ANDData` path remains the fallback.
+
 Incremental prediction with explicit RAM budget:
 
 ```python
@@ -428,6 +435,13 @@ includes a current promoted-53 4k real-block run: 3,000,000 broad seed/query
 pairs reduced to 150,000 promoted scored pairs, 354 exact residual queries,
 499,848 residual-tail bytes, 8.202s `predict_incremental` time, 9.288s
 setup-inclusive runtime, and 0.621 GiB process-tree peak RSS.
+
+If seed-bearing FeatureBlock Arrow artifacts are available, promoted
+`predict_incremental(...)` uses the raw Arrow/Rust retrieval and scoring bridge
+by default for Phase A, then finishes residual abstains through the normal
+incremental completion path. Incremental Arrow routing requires
+`cluster_seeds.arrow`; artifacts without seed assignments fall back to the
+existing promoted `ANDData` path.
 
 Supporting docs:
 

@@ -1,6 +1,16 @@
+use arrow::array::{
+    Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    LargeListArray, LargeStringArray, ListArray, StringArray, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::DataType;
+use arrow::ipc::reader::FileReader as ArrowFileReader;
+use arrow::record_batch::RecordBatch;
 use cld2::{detect_language_ext as cld2_detect_language_ext, Format as Cld2Format};
 use fasttext::FastText;
-use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, ToPyArray};
+use memmap2::Mmap;
+use numpy::{
+    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyUntypedArrayMethods, ToPyArray,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyIterator, PyModule, PyTuple};
 use pyo3::Bound;
@@ -12,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -27,6 +37,9 @@ const DROPPED_AFFIXES: [&str; 48] = [
     "ds", "du", "el", "ibn", "im", "jr", "la", "las", "le", "los", "mac", "mc", "mhic", "mic",
     "ter", "und", "van", "vom", "von", "zu", "zum", "zur",
 ];
+
+const FNV_OFFSET: u64 = 14695981039346656037;
+const FNV_PRIME: u64 = 1099511628211;
 
 fn is_dropped_affix(token: &str) -> bool {
     DROPPED_AFFIXES.contains(&token)
@@ -44,9 +57,16 @@ struct CounterData {
 
 #[inline(always)]
 fn fnv64(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
     let mut h = FNV_OFFSET;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+#[inline(always)]
+fn fnv64_update(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(FNV_PRIME);
@@ -68,6 +88,299 @@ struct RawNameCountMaps {
     last: HashMap<String, f64>,
     first_last: HashMap<String, f64>,
     last_first_initial: HashMap<String, f64>,
+    index: Option<RawNameCountIndex>,
+}
+
+#[derive(Clone, Copy)]
+enum RawNameCountKind {
+    First,
+    Last,
+    FirstLast,
+    LastFirstInitial,
+}
+
+impl RawNameCountKind {
+    fn key(self) -> &'static str {
+        match self {
+            RawNameCountKind::First => "first",
+            RawNameCountKind::Last => "last",
+            RawNameCountKind::FirstLast => "first_last",
+            RawNameCountKind::LastFirstInitial => "last_first_initial",
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            RawNameCountKind::First => "first.bin",
+            RawNameCountKind::Last => "last.bin",
+            RawNameCountKind::FirstLast => "first_last.bin",
+            RawNameCountKind::LastFirstInitial => "last_first_initial.bin",
+        }
+    }
+}
+
+const NAME_COUNTS_INDEX_MAGIC: &[u8; 8] = b"S2NCI001";
+const NAME_COUNTS_INDEX_HASH_DOMAIN: &[u8] = b"s2and-name-counts-index-v1\0";
+const NAME_COUNTS_INDEX_HEADER_LEN: usize = 32;
+const NAME_COUNTS_INDEX_RECORD_LEN: usize = 40;
+
+struct RawNameCountIndex {
+    first: RawNameCountIndexFile,
+    last: RawNameCountIndexFile,
+    first_last: RawNameCountIndexFile,
+    last_first_initial: RawNameCountIndexFile,
+}
+
+impl RawNameCountIndex {
+    fn open(path: &str) -> PyResult<Self> {
+        let dir = resolve_name_counts_index_dir(path)?;
+        Ok(Self {
+            first: RawNameCountIndexFile::open(
+                &dir.join(RawNameCountKind::First.file_name()),
+                RawNameCountKind::First,
+            )?,
+            last: RawNameCountIndexFile::open(
+                &dir.join(RawNameCountKind::Last.file_name()),
+                RawNameCountKind::Last,
+            )?,
+            first_last: RawNameCountIndexFile::open(
+                &dir.join(RawNameCountKind::FirstLast.file_name()),
+                RawNameCountKind::FirstLast,
+            )?,
+            last_first_initial: RawNameCountIndexFile::open(
+                &dir.join(RawNameCountKind::LastFirstInitial.file_name()),
+                RawNameCountKind::LastFirstInitial,
+            )?,
+        })
+    }
+
+    fn get(&self, kind: RawNameCountKind, name: &str) -> Option<f64> {
+        match kind {
+            RawNameCountKind::First => self.first.get(kind, name),
+            RawNameCountKind::Last => self.last.get(kind, name),
+            RawNameCountKind::FirstLast => self.first_last.get(kind, name),
+            RawNameCountKind::LastFirstInitial => self.last_first_initial.get(kind, name),
+        }
+    }
+}
+
+struct RawNameCountIndexFile {
+    mmap: Mmap,
+    record_count: usize,
+    blob_offset: usize,
+    blob_len: usize,
+}
+
+impl RawNameCountIndexFile {
+    fn open(path: &Path, kind: RawNameCountKind) -> PyResult<Self> {
+        let file = File::open(path).map_err(|err| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "failed to open name-count index file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+        // The writer produces immutable binary sidecars. Mapping avoids reading
+        // the multi-GB global name-count artifact into Rust heap memory.
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|err| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "failed to mmap name-count index file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+        if mmap.len() < NAME_COUNTS_INDEX_HEADER_LEN {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index file {} is shorter than the header",
+                path.display()
+            )));
+        }
+        if &mmap[0..8] != NAME_COUNTS_INDEX_MAGIC {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index file {} has unsupported magic for kind {}",
+                path.display(),
+                kind.key(),
+            )));
+        }
+        let record_count = read_u64_le(&mmap, 8)? as usize;
+        let blob_offset = read_u64_le(&mmap, 16)? as usize;
+        let blob_len = read_u64_le(&mmap, 24)? as usize;
+        let records_end = NAME_COUNTS_INDEX_HEADER_LEN
+            .checked_add(
+                record_count
+                    .checked_mul(NAME_COUNTS_INDEX_RECORD_LEN)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyOverflowError::new_err(format!(
+                            "name-count index file {} has too many records",
+                            path.display()
+                        ))
+                    })?,
+            )
+            .ok_or_else(|| {
+                pyo3::exceptions::PyOverflowError::new_err(format!(
+                    "name-count index file {} record section overflows",
+                    path.display()
+                ))
+            })?;
+        let blob_end = blob_offset.checked_add(blob_len).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err(format!(
+                "name-count index file {} blob section overflows",
+                path.display()
+            ))
+        })?;
+        if blob_offset < records_end || blob_end > mmap.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index file {} has invalid record/blob offsets",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            mmap,
+            record_count,
+            blob_offset,
+            blob_len,
+        })
+    }
+
+    fn record_offset(&self, index: usize) -> usize {
+        NAME_COUNTS_INDEX_HEADER_LEN + index * NAME_COUNTS_INDEX_RECORD_LEN
+    }
+
+    fn record_hash_pair(&self, index: usize) -> (u64, u64) {
+        let offset = self.record_offset(index);
+        (
+            read_u64_le_unchecked(&self.mmap, offset),
+            read_u64_le_unchecked(&self.mmap, offset + 8),
+        )
+    }
+
+    fn get(&self, kind: RawNameCountKind, name: &str) -> Option<f64> {
+        let name_bytes = name.as_bytes();
+        let (hash_1, hash_2) = name_counts_index_hashes(kind, name_bytes);
+        let mut lower = 0usize;
+        let mut upper = self.record_count;
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            let (middle_hash_1, middle_hash_2) = self.record_hash_pair(middle);
+            if middle_hash_1 < hash_1 || (middle_hash_1 == hash_1 && middle_hash_2 < hash_2) {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+
+        let mut index = lower;
+        while index < self.record_count {
+            let (record_hash_1, record_hash_2) = self.record_hash_pair(index);
+            if record_hash_1 != hash_1 || record_hash_2 != hash_2 {
+                break;
+            }
+            let offset = self.record_offset(index);
+            let name_offset = read_u64_le_unchecked(&self.mmap, offset + 16) as usize;
+            let name_len = read_u32_le_unchecked(&self.mmap, offset + 24) as usize;
+            if name_offset
+                .checked_add(name_len)
+                .map_or(false, |end| end <= self.blob_len)
+            {
+                let start = self.blob_offset + name_offset;
+                let end = start + name_len;
+                if &self.mmap[start..end] == name_bytes {
+                    return Some(read_f64_le_unchecked(&self.mmap, offset + 32));
+                }
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
+impl RawNameCountMaps {
+    fn from_index(index: RawNameCountIndex) -> Self {
+        Self {
+            first: HashMap::new(),
+            last: HashMap::new(),
+            first_last: HashMap::new(),
+            last_first_initial: HashMap::new(),
+            index: Some(index),
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        self.index.is_some()
+            || !self.first.is_empty()
+            || !self.last.is_empty()
+            || !self.first_last.is_empty()
+            || !self.last_first_initial.is_empty()
+    }
+
+    fn get(&self, kind: RawNameCountKind, name: &str) -> Option<f64> {
+        if let Some(index) = self.index.as_ref() {
+            return index.get(kind, name);
+        }
+        match kind {
+            RawNameCountKind::First => self.first.get(name),
+            RawNameCountKind::Last => self.last.get(name),
+            RawNameCountKind::FirstLast => self.first_last.get(name),
+            RawNameCountKind::LastFirstInitial => self.last_first_initial.get(name),
+        }
+        .copied()
+    }
+}
+
+fn resolve_name_counts_index_dir(path: &str) -> PyResult<PathBuf> {
+    let direct = PathBuf::from(path);
+    if direct.join(RawNameCountKind::First.file_name()).exists() {
+        return Ok(direct);
+    }
+    let nested = direct.join("name_counts_index");
+    if nested.join(RawNameCountKind::First.file_name()).exists() {
+        return Ok(nested);
+    }
+    Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
+        "name-count index path {} does not contain first.bin",
+        path
+    )))
+}
+
+fn name_counts_index_hashes(kind: RawNameCountKind, name_bytes: &[u8]) -> (u64, u64) {
+    let first = fnv64(name_bytes);
+    let mut second = FNV_OFFSET;
+    second = fnv64_update(second, NAME_COUNTS_INDEX_HASH_DOMAIN);
+    second = fnv64_update(second, kind.key().as_bytes());
+    second = fnv64_update(second, b"\0");
+    second = fnv64_update(second, name_bytes);
+    (first, second)
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> PyResult<u64> {
+    let end = offset.checked_add(8).ok_or_else(|| {
+        pyo3::exceptions::PyOverflowError::new_err("u64 offset overflows while reading index")
+    })?;
+    let slice = bytes.get(offset..end).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("u64 offset is outside name-count index")
+    })?;
+    Ok(read_u64_le_unchecked(slice, 0))
+}
+
+#[inline(always)]
+fn read_u64_le_unchecked(bytes: &[u8], offset: usize) -> u64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(raw)
+}
+
+#[inline(always)]
+fn read_u32_le_unchecked(bytes: &[u8], offset: usize) -> u32 {
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_le_bytes(raw)
+}
+
+#[inline(always)]
+fn read_f64_le_unchecked(bytes: &[u8], offset: usize) -> f64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes[offset..offset + 8]);
+    f64::from_le_bytes(raw)
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +478,7 @@ struct RetrievalQueryTerm {
     token_count: u8,
 }
 
+#[derive(Clone)]
 struct RetrievalQueryData {
     first: String,
     has_full_first: bool,
@@ -1124,6 +1438,13 @@ fn extract_cluster_seeds_require(obj: &Bound<'_, PyAny>) -> PyResult<HashMap<Str
     Ok(out)
 }
 
+fn cluster_id_to_string(cluster_id: &ClusterId) -> String {
+    match cluster_id {
+        ClusterId::Int(value) => value.to_string(),
+        ClusterId::Str(value) => value.clone(),
+    }
+}
+
 fn extract_id_string(obj: &Bound<'_, PyAny>) -> PyResult<String> {
     if let Ok(s) = obj.extract::<String>() {
         return Ok(s);
@@ -1583,6 +1904,1528 @@ fn counter_data_from_usize_map(counter_map: HashMap<String, usize>) -> Option<Co
     Some(CounterData { entries, sum })
 }
 
+fn counter_data_from_hash_count_map(counter_map: HashMap<u64, usize>) -> Option<CounterData> {
+    if counter_map.is_empty() {
+        return None;
+    }
+    let mut entries: Vec<(u64, f32)> = counter_map
+        .into_iter()
+        .map(|(hash, count)| (hash, count as f32))
+        .collect();
+    entries.sort_unstable_by_key(|entry| entry.0);
+    let sum: f32 = entries.iter().map(|entry| entry.1).sum();
+    Some(CounterData { entries, sum })
+}
+
+fn increment_df_from_counter(counter: &Option<CounterData>, df_map: &mut HashMap<u64, usize>) {
+    if let Some(counter_data) = counter.as_ref() {
+        for (hash, _count) in counter_data.entries.iter() {
+            *df_map.entry(*hash).or_insert(0) += 1;
+        }
+    }
+}
+
+fn hash_string_values(values: &HashSet<String>) -> Vec<u64> {
+    let mut hashes: Vec<u64> = values.iter().map(|value| fnv64(value.as_bytes())).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    hashes
+}
+
+fn query_terms_from_values(values: &HashSet<String>) -> Vec<RetrievalQueryTerm> {
+    let mut terms: Vec<RetrievalQueryTerm> = values
+        .iter()
+        .map(|value| RetrievalQueryTerm {
+            hash: fnv64(value.as_bytes()),
+            token_count: term_token_count(value),
+        })
+        .collect();
+    terms.sort_unstable_by_key(|term| term.hash);
+    terms.dedup_by_key(|term| term.hash);
+    terms
+}
+
+fn term_set_from_normalized_text(text: &str) -> HashSet<String> {
+    text.split_whitespace()
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .collect()
+}
+
+fn normalize_orcid_owned(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[derive(Clone)]
+struct RawArrowSignature {
+    paper_id: String,
+    author_first: String,
+    author_middle: String,
+    author_last: String,
+    author_suffix: String,
+    affiliations: Vec<String>,
+    email: Option<String>,
+    orcid: Option<String>,
+    position: Option<i64>,
+    name_counts: Option<NameCountsData>,
+}
+
+#[derive(Clone)]
+struct RawArrowPaper {
+    title: String,
+    abstract_text: String,
+    venue: String,
+    journal_name: String,
+    year: Option<i64>,
+    predicted_language: Option<String>,
+    is_reliable: Option<bool>,
+}
+
+#[derive(Clone)]
+struct RawArrowFeature {
+    query: RetrievalQueryData,
+    name_counts: Option<NameCountsData>,
+    paper_author_count: usize,
+    paper_author_names: HashSet<String>,
+    local10_author_names: HashSet<String>,
+    query_author: String,
+}
+
+struct RawArrowSummarySignalData {
+    name_counts_values: Vec<NameCountsData>,
+    member_paper_author_names: Vec<HashSet<String>>,
+    member_paper_author_counts: Vec<usize>,
+    member_local10_author_names: Vec<HashSet<String>>,
+    member_signature_ids: Vec<String>,
+}
+
+struct RawArrowNameCountRarityRow {
+    last_name_count_min_rarity: f32,
+    candidate_last_name_count_min_rarity: f32,
+    candidate_last_first_name_count_min_rarity: f32,
+    last_first_name_count_min_rarity: f32,
+    first_prefix_x_last_first_name_count_min_rarity: f32,
+}
+
+struct RawArrowPaperEvidenceRow {
+    paper_author_list_max_jaccard: f32,
+    paper_author_list_max_containment: f32,
+    paper_author_list_max_overlap_count: f32,
+    local_author_window10_jaccard_max: f32,
+    local_author_window10_overlap_count_max: f32,
+    best_author_count_log_absdiff: f32,
+}
+
+fn io_error_to_py(context: &str, path: &str, err: impl std::fmt::Display) -> PyErr {
+    pyo3::exceptions::PyIOError::new_err(format!("{context} '{}': {err}", path))
+}
+
+fn arrow_error_to_py(context: &str, path: &str, err: impl std::fmt::Display) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(format!("{context} '{}': {err}", path))
+}
+
+fn read_arrow_batches(path: &str) -> PyResult<Vec<RecordBatch>> {
+    let file = File::open(path)
+        .map_err(|err| io_error_to_py("failed to open Arrow IPC file", path, err))?;
+    let reader = ArrowFileReader::try_new(file, None)
+        .map_err(|err| arrow_error_to_py("failed to read Arrow IPC schema from", path, err))?;
+    reader
+        .map(|batch| {
+            batch.map_err(|err| {
+                arrow_error_to_py("failed to read Arrow IPC record batch from", path, err)
+            })
+        })
+        .collect()
+}
+
+fn arrow_column_index(batch: &RecordBatch, name: &str, path: &str) -> PyResult<usize> {
+    batch.schema().index_of(name).map_err(|err| {
+        pyo3::exceptions::PyKeyError::new_err(format!(
+            "missing Arrow column '{name}' in '{path}': {err}"
+        ))
+    })
+}
+
+fn arrow_optional_column_index(batch: &RecordBatch, name: &str) -> Option<usize> {
+    batch.schema().index_of(name).ok()
+}
+
+fn arrow_first_existing_column_index(
+    batch: &RecordBatch,
+    path: &str,
+    names: &[&str],
+) -> PyResult<usize> {
+    for name in names {
+        if let Ok(index) = batch.schema().index_of(name) {
+            return Ok(index);
+        }
+    }
+    Err(pyo3::exceptions::PyKeyError::new_err(format!(
+        "missing Arrow column in '{path}'; expected one of {names:?}"
+    )))
+}
+
+fn arrow_required_string(array: &dyn Array, row: usize, context: &str) -> PyResult<String> {
+    if array.is_null(row) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{context} is null at row {row}"
+        )));
+    }
+    arrow_optional_string(array, row, context).and_then(|value| {
+        value.ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("{context} is null at row {row}"))
+        })
+    })
+}
+
+fn arrow_optional_string(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<String>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!("{context} is not a Utf8 array"))
+                })?;
+            Ok(Some(values.value(row).to_string()))
+        }
+        DataType::LargeUtf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a LargeUtf8 array"
+                    ))
+                })?;
+            Ok(Some(values.value(row).to_string()))
+        }
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                pyo3::exceptions::PyTypeError::new_err(format!("{context} is not an Int64 array"))
+            })?;
+            Ok(Some(values.value(row).to_string()))
+        }
+        DataType::Int32 => {
+            let values = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                pyo3::exceptions::PyTypeError::new_err(format!("{context} is not an Int32 array"))
+            })?;
+            Ok(Some(values.value(row).to_string()))
+        }
+        DataType::UInt64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a UInt64 array"
+                    ))
+                })?;
+            Ok(Some(values.value(row).to_string()))
+        }
+        DataType::UInt32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a UInt32 array"
+                    ))
+                })?;
+            Ok(Some(values.value(row).to_string()))
+        }
+        DataType::Null => Ok(None),
+        other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "{context} must be a string or integer column, got {other:?}"
+        ))),
+    }
+}
+
+fn arrow_optional_i64(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<i64>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                pyo3::exceptions::PyTypeError::new_err(format!("{context} is not an Int64 array"))
+            })?;
+            Ok(Some(values.value(row)))
+        }
+        DataType::Int32 => {
+            let values = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                pyo3::exceptions::PyTypeError::new_err(format!("{context} is not an Int32 array"))
+            })?;
+            Ok(Some(values.value(row) as i64))
+        }
+        DataType::UInt64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a UInt64 array"
+                    ))
+                })?;
+            i64::try_from(values.value(row)).map(Some).map_err(|_| {
+                pyo3::exceptions::PyOverflowError::new_err(format!(
+                    "{context} value at row {row} exceeds i64"
+                ))
+            })
+        }
+        DataType::UInt32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a UInt32 array"
+                    ))
+                })?;
+            Ok(Some(values.value(row) as i64))
+        }
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            let Some(value) = arrow_optional_string(array, row, context)? else {
+                return Ok(None);
+            };
+            value.parse::<i64>().map(Some).map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "{context} string value at row {row} is not an integer: {err}"
+                ))
+            })
+        }
+        DataType::Null => Ok(None),
+        other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "{context} must be an integer column, got {other:?}"
+        ))),
+    }
+}
+
+fn arrow_optional_f64(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<f64>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a Float64 array"
+                    ))
+                })?;
+            Ok(Some(values.value(row)))
+        }
+        DataType::Float32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a Float32 array"
+                    ))
+                })?;
+            Ok(Some(values.value(row) as f64))
+        }
+        DataType::Int64
+        | DataType::Int32
+        | DataType::UInt64
+        | DataType::UInt32
+        | DataType::Utf8
+        | DataType::LargeUtf8 => {
+            arrow_optional_i64(array, row, context).map(|value| value.map(|integer| integer as f64))
+        }
+        DataType::Null => Ok(None),
+        other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "{context} must be a numeric column, got {other:?}"
+        ))),
+    }
+}
+
+fn arrow_required_f64(array: &dyn Array, row: usize, context: &str) -> PyResult<f64> {
+    arrow_optional_f64(array, row, context)?.ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("{context} is null at row {row}"))
+    })
+}
+
+fn arrow_optional_bool(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<bool>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a Boolean array"
+                    ))
+                })?;
+            Ok(Some(values.value(row)))
+        }
+        DataType::Int64 | DataType::Int32 | DataType::UInt64 | DataType::UInt32 => {
+            arrow_optional_i64(array, row, context).map(|value| value.map(|integer| integer != 0))
+        }
+        DataType::Null => Ok(None),
+        other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "{context} must be a boolean column, got {other:?}"
+        ))),
+    }
+}
+
+fn arrow_string_array_values(array: &dyn Array, context: &str) -> PyResult<Vec<String>> {
+    match array.data_type() {
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!("{context} is not a Utf8 array"))
+                })?;
+            Ok((0..values.len())
+                .filter(|idx| !values.is_null(*idx))
+                .map(|idx| values.value(idx).to_string())
+                .collect())
+        }
+        DataType::LargeUtf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a LargeUtf8 array"
+                    ))
+                })?;
+            Ok((0..values.len())
+                .filter(|idx| !values.is_null(*idx))
+                .map(|idx| values.value(idx).to_string())
+                .collect())
+        }
+        DataType::Null => Ok(Vec::new()),
+        other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "{context} list values must be strings, got {other:?}"
+        ))),
+    }
+}
+
+fn arrow_optional_string_list(
+    array: &dyn Array,
+    row: usize,
+    context: &str,
+) -> PyResult<Vec<String>> {
+    if array.is_null(row) {
+        return Ok(Vec::new());
+    }
+    match array.data_type() {
+        DataType::List(_) => {
+            let values = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                pyo3::exceptions::PyTypeError::new_err(format!("{context} is not a List array"))
+            })?;
+            let item_values = values.value(row);
+            arrow_string_array_values(item_values.as_ref(), context)
+        }
+        DataType::LargeList(_) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a LargeList array"
+                    ))
+                })?;
+            let item_values = values.value(row);
+            arrow_string_array_values(item_values.as_ref(), context)
+        }
+        other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "{context} must be a list<string> column, got {other:?}"
+        ))),
+    }
+}
+
+fn arrow_optional_f32_vector(
+    array: &dyn Array,
+    row: usize,
+    context: &str,
+) -> PyResult<Option<Vec<f32>>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::FixedSizeList(_, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not a FixedSizeList array"
+                    ))
+                })?;
+            let item_values = values.value(row);
+            let floats = item_values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} FixedSizeList values must be float32"
+                    ))
+                })?;
+            let mut out = Vec::with_capacity(floats.len());
+            for idx in 0..floats.len() {
+                if floats.is_null(idx) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{context} has null float value at row {row}, offset {idx}"
+                    )));
+                }
+                out.push(floats.value(idx));
+            }
+            Ok(Some(out))
+        }
+        other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "{context} must be a fixed_size_list<float32> column, got {other:?}"
+        ))),
+    }
+}
+
+fn raw_arrow_optional_name_counts(
+    first_col: Option<&dyn Array>,
+    first_last_col: Option<&dyn Array>,
+    last_col: Option<&dyn Array>,
+    last_first_initial_col: Option<&dyn Array>,
+    row: usize,
+) -> PyResult<Option<NameCountsData>> {
+    let first = match first_col {
+        Some(col) => arrow_optional_f64(col, row, "name_count_first")?,
+        None => None,
+    };
+    let first_last = match first_last_col {
+        Some(col) => arrow_optional_f64(col, row, "name_count_first_last")?,
+        None => None,
+    };
+    let last = match last_col {
+        Some(col) => arrow_optional_f64(col, row, "name_count_last")?,
+        None => None,
+    };
+    let last_first_initial = match last_first_initial_col {
+        Some(col) => arrow_optional_f64(col, row, "name_count_last_first_initial")?,
+        None => None,
+    };
+    if first.is_none() && first_last.is_none() && last.is_none() && last_first_initial.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(NameCountsData {
+        first: first.unwrap_or(f64::NAN),
+        first_last: first_last.unwrap_or(f64::NAN),
+        last: last.unwrap_or(f64::NAN),
+        last_first_initial: last_first_initial.unwrap_or(f64::NAN),
+    }))
+}
+
+fn read_raw_arrow_signatures_filtered(
+    path: &str,
+    keep_signature_ids: Option<&HashSet<String>>,
+) -> PyResult<HashMap<String, RawArrowSignature>> {
+    let mut out = HashMap::new();
+    for batch in read_arrow_batches(path)? {
+        let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
+        let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
+        let first_col = batch.column(arrow_column_index(&batch, "author_first", path)?);
+        let middle_col = batch.column(arrow_column_index(&batch, "author_middle", path)?);
+        let last_col = batch.column(arrow_column_index(&batch, "author_last", path)?);
+        let suffix_col = batch.column(arrow_column_index(&batch, "author_suffix", path)?);
+        let affiliations_col =
+            batch.column(arrow_column_index(&batch, "author_affiliations", path)?);
+        let orcid_col = batch.column(arrow_column_index(&batch, "author_orcid", path)?);
+        let position_col = batch.column(arrow_column_index(&batch, "author_position", path)?);
+        let email_col = arrow_optional_column_index(&batch, "author_email")
+            .map(|index| batch.column(index).as_ref());
+        let name_count_first_col = arrow_optional_column_index(&batch, "name_count_first")
+            .map(|index| batch.column(index).as_ref());
+        let name_count_first_last_col =
+            arrow_optional_column_index(&batch, "name_count_first_last")
+                .map(|index| batch.column(index).as_ref());
+        let name_count_last_col = arrow_optional_column_index(&batch, "name_count_last")
+            .map(|index| batch.column(index).as_ref());
+        let name_count_last_first_initial_col =
+            arrow_optional_column_index(&batch, "name_count_last_first_initial")
+                .map(|index| batch.column(index).as_ref());
+        for row in 0..batch.num_rows() {
+            let signature_id =
+                arrow_required_string(signature_id_col.as_ref(), row, "signature_id")?;
+            if keep_signature_ids.map_or(false, |keep| !keep.contains(&signature_id)) {
+                continue;
+            }
+            let paper_id = arrow_required_string(paper_id_col.as_ref(), row, "paper_id")?;
+            out.insert(
+                signature_id.clone(),
+                RawArrowSignature {
+                    paper_id,
+                    author_first: arrow_optional_string(first_col.as_ref(), row, "author_first")?
+                        .unwrap_or_default(),
+                    author_middle: arrow_optional_string(
+                        middle_col.as_ref(),
+                        row,
+                        "author_middle",
+                    )?
+                    .unwrap_or_default(),
+                    author_last: arrow_optional_string(last_col.as_ref(), row, "author_last")?
+                        .unwrap_or_default(),
+                    author_suffix: arrow_optional_string(
+                        suffix_col.as_ref(),
+                        row,
+                        "author_suffix",
+                    )?
+                    .unwrap_or_default(),
+                    affiliations: arrow_optional_string_list(
+                        affiliations_col.as_ref(),
+                        row,
+                        "author_affiliations",
+                    )?,
+                    email: match email_col {
+                        Some(col) => arrow_optional_string(col, row, "author_email")?,
+                        None => None,
+                    },
+                    orcid: arrow_optional_string(orcid_col.as_ref(), row, "author_orcid")?
+                        .and_then(|value| normalize_orcid_owned(&value)),
+                    position: arrow_optional_i64(position_col.as_ref(), row, "author_position")?,
+                    name_counts: raw_arrow_optional_name_counts(
+                        name_count_first_col,
+                        name_count_first_last_col,
+                        name_count_last_col,
+                        name_count_last_first_initial_col,
+                        row,
+                    )?,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn read_raw_arrow_signatures(path: &str) -> PyResult<HashMap<String, RawArrowSignature>> {
+    read_raw_arrow_signatures_filtered(path, None)
+}
+
+fn read_raw_arrow_papers_filtered(
+    path: &str,
+    keep_paper_ids: Option<&HashSet<String>>,
+) -> PyResult<HashMap<String, RawArrowPaper>> {
+    let mut out = HashMap::new();
+    for batch in read_arrow_batches(path)? {
+        let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
+        let title_col = batch.column(arrow_column_index(&batch, "title", path)?);
+        let abstract_col = arrow_optional_column_index(&batch, "abstract")
+            .map(|index| batch.column(index).as_ref());
+        let venue_col = batch.column(arrow_column_index(&batch, "venue", path)?);
+        let journal_col = batch.column(arrow_column_index(&batch, "journal_name", path)?);
+        let year_col = batch.column(arrow_column_index(&batch, "year", path)?);
+        let predicted_language_col = arrow_optional_column_index(&batch, "predicted_language")
+            .map(|index| batch.column(index).as_ref());
+        let is_reliable_col = arrow_optional_column_index(&batch, "is_reliable")
+            .map(|index| batch.column(index).as_ref());
+        for row in 0..batch.num_rows() {
+            let paper_id = arrow_required_string(paper_id_col.as_ref(), row, "paper_id")?;
+            if keep_paper_ids.map_or(false, |keep| !keep.contains(&paper_id)) {
+                continue;
+            }
+            out.insert(
+                paper_id,
+                RawArrowPaper {
+                    title: arrow_optional_string(title_col.as_ref(), row, "title")?
+                        .unwrap_or_default(),
+                    abstract_text: match abstract_col {
+                        Some(col) => {
+                            arrow_optional_string(col, row, "abstract")?.unwrap_or_default()
+                        }
+                        None => String::new(),
+                    },
+                    venue: arrow_optional_string(venue_col.as_ref(), row, "venue")?
+                        .unwrap_or_default(),
+                    journal_name: arrow_optional_string(journal_col.as_ref(), row, "journal_name")?
+                        .unwrap_or_default(),
+                    year: arrow_optional_i64(year_col.as_ref(), row, "year")?,
+                    predicted_language: match predicted_language_col {
+                        Some(col) => arrow_optional_string(col, row, "predicted_language")?,
+                        None => None,
+                    },
+                    is_reliable: match is_reliable_col {
+                        Some(col) => arrow_optional_bool(col, row, "is_reliable")?,
+                        None => None,
+                    },
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn read_raw_arrow_papers(path: &str) -> PyResult<HashMap<String, RawArrowPaper>> {
+    read_raw_arrow_papers_filtered(path, None)
+}
+
+fn read_raw_arrow_paper_authors_filtered(
+    path: &str,
+    keep_paper_ids: Option<&HashSet<String>>,
+) -> PyResult<HashMap<String, Vec<(i64, String)>>> {
+    let mut out: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    for batch in read_arrow_batches(path)? {
+        let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
+        let position_col = batch.column(arrow_column_index(&batch, "position", path)?);
+        let author_name_col = batch.column(arrow_column_index(&batch, "author_name", path)?);
+        for row in 0..batch.num_rows() {
+            let paper_id = arrow_required_string(paper_id_col.as_ref(), row, "paper_id")?;
+            if keep_paper_ids.map_or(false, |keep| !keep.contains(&paper_id)) {
+                continue;
+            }
+            let position =
+                arrow_optional_i64(position_col.as_ref(), row, "position")?.unwrap_or(i64::MAX);
+            let author_name = arrow_optional_string(author_name_col.as_ref(), row, "author_name")?
+                .unwrap_or_default();
+            out.entry(paper_id)
+                .or_default()
+                .push((position, author_name));
+        }
+    }
+    for authors in out.values_mut() {
+        authors.sort_by_key(|(position, _name)| *position);
+    }
+    Ok(out)
+}
+
+fn read_raw_arrow_paper_authors(path: &str) -> PyResult<HashMap<String, Vec<(i64, String)>>> {
+    read_raw_arrow_paper_authors_filtered(path, None)
+}
+
+fn read_raw_arrow_cluster_seeds(
+    path: &str,
+) -> PyResult<(Vec<String>, HashMap<String, Vec<String>>)> {
+    let mut component_order = Vec::new();
+    let mut members_by_component: HashMap<String, Vec<String>> = HashMap::new();
+    for batch in read_arrow_batches(path)? {
+        let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
+        let cluster_id_col = batch.column(arrow_column_index(&batch, "cluster_id", path)?);
+        for row in 0..batch.num_rows() {
+            let signature_id =
+                arrow_required_string(signature_id_col.as_ref(), row, "signature_id")?;
+            let component_key = arrow_required_string(cluster_id_col.as_ref(), row, "cluster_id")?;
+            if !members_by_component.contains_key(&component_key) {
+                component_order.push(component_key.clone());
+            }
+            members_by_component
+                .entry(component_key)
+                .or_default()
+                .push(signature_id);
+        }
+    }
+    Ok((component_order, members_by_component))
+}
+
+fn read_raw_arrow_specter_filtered(
+    path: &str,
+    keep_paper_ids: Option<&HashSet<String>>,
+) -> PyResult<HashMap<String, Vec<f32>>> {
+    let mut out = HashMap::new();
+    for batch in read_arrow_batches(path)? {
+        let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
+        let embedding_col = batch.column(arrow_column_index(&batch, "embedding", path)?);
+        for row in 0..batch.num_rows() {
+            let paper_id = arrow_required_string(paper_id_col.as_ref(), row, "paper_id")?;
+            if keep_paper_ids.map_or(false, |keep| !keep.contains(&paper_id)) {
+                continue;
+            }
+            if let Some(vector) =
+                arrow_optional_f32_vector(embedding_col.as_ref(), row, "embedding")?
+            {
+                if !vector.is_empty() {
+                    out.insert(paper_id, vector);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn read_raw_arrow_specter(path: &str) -> PyResult<HashMap<String, Vec<f32>>> {
+    read_raw_arrow_specter_filtered(path, None)
+}
+
+fn insert_raw_arrow_name_count(
+    raw_name_counts: &mut RawNameCountMaps,
+    kind: &str,
+    name: String,
+    count: f64,
+    path: &str,
+    row: usize,
+) -> PyResult<()> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "first" | "first_dict" => {
+            raw_name_counts.first.insert(name, count);
+            Ok(())
+        }
+        "last" | "last_dict" => {
+            raw_name_counts.last.insert(name, count);
+            Ok(())
+        }
+        "first_last" | "first_last_dict" => {
+            raw_name_counts.first_last.insert(name, count);
+            Ok(())
+        }
+        "last_first_initial" | "last_first_initial_dict" => {
+            raw_name_counts.last_first_initial.insert(name, count);
+            Ok(())
+        }
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown name_counts kind '{other}' in '{path}' at row {row}"
+        ))),
+    }
+}
+
+fn read_raw_arrow_name_counts(path: &str) -> PyResult<RawNameCountMaps> {
+    let mut raw_name_counts = RawNameCountMaps::default();
+    for batch in read_arrow_batches(path)? {
+        let kind_col = batch.column(arrow_first_existing_column_index(
+            &batch,
+            path,
+            &["kind", "count_type", "name_count_type"],
+        )?);
+        let name_col = batch.column(arrow_first_existing_column_index(
+            &batch,
+            path,
+            &["name", "key"],
+        )?);
+        let count_col = batch.column(arrow_first_existing_column_index(
+            &batch,
+            path,
+            &["count", "value"],
+        )?);
+        for row in 0..batch.num_rows() {
+            let kind = arrow_required_string(kind_col.as_ref(), row, "name_counts.kind")?;
+            let name = arrow_required_string(name_col.as_ref(), row, "name_counts.name")?;
+            let count = arrow_required_f64(count_col.as_ref(), row, "name_counts.count")?;
+            insert_raw_arrow_name_count(&mut raw_name_counts, &kind, name, count, path, row)?;
+        }
+    }
+    Ok(raw_name_counts)
+}
+
+fn read_raw_name_counts_index(path: &str) -> PyResult<RawNameCountMaps> {
+    Ok(RawNameCountMaps::from_index(RawNameCountIndex::open(path)?))
+}
+
+fn read_raw_arrow_name_tuples(path: &str) -> PyResult<HashMap<String, HashSet<String>>> {
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    for batch in read_arrow_batches(path)? {
+        let left_col = batch.column(arrow_first_existing_column_index(
+            &batch,
+            path,
+            &["name_1", "left", "name_a", "first_name"],
+        )?);
+        let right_col = batch.column(arrow_first_existing_column_index(
+            &batch,
+            path,
+            &["name_2", "right", "name_b", "second_name"],
+        )?);
+        for row in 0..batch.num_rows() {
+            let left = arrow_required_string(left_col.as_ref(), row, "name_pairs.name_1")?;
+            let right = arrow_required_string(right_col.as_ref(), row, "name_pairs.name_2")?;
+            insert_name_tuple_alias(&mut out, left, right);
+        }
+    }
+    Ok(out)
+}
+
+fn extract_path_mapping_string(
+    paths: &Bound<'_, PyAny>,
+    key: &str,
+    required: bool,
+) -> PyResult<Option<String>> {
+    let dict = paths.downcast::<PyDict>().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err("Arrow path bundle must be a dict-like mapping")
+    })?;
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => Ok(Some(value.extract::<String>()?)),
+        _ if required => Err(pyo3::exceptions::PyKeyError::new_err(format!(
+            "Arrow path bundle is missing required key: {key}"
+        ))),
+        _ => Ok(None),
+    }
+}
+
+fn extract_name_counts_index_path(paths: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    match extract_path_mapping_string(paths, "name_counts_index", false)? {
+        Some(path) => Ok(Some(path)),
+        None => extract_path_mapping_string(paths, "name_counts_index_dir", false),
+    }
+}
+
+fn ensure_unidecode_for_raw_arrow_inputs(
+    unidecode_fn: &Bound<'_, PyAny>,
+    signatures: &HashMap<String, RawArrowSignature>,
+    papers: &HashMap<String, RawArrowPaper>,
+    paper_authors: &HashMap<String, Vec<(i64, String)>>,
+    unidecode_char_map: &mut HashMap<char, String>,
+) -> PyResult<()> {
+    for signature in signatures.values() {
+        ensure_unidecode_for_text(unidecode_fn, &signature.author_first, unidecode_char_map)?;
+        ensure_unidecode_for_text(unidecode_fn, &signature.author_middle, unidecode_char_map)?;
+        ensure_unidecode_for_text(unidecode_fn, &signature.author_last, unidecode_char_map)?;
+        ensure_unidecode_for_text(unidecode_fn, &signature.author_suffix, unidecode_char_map)?;
+        for affiliation in signature.affiliations.iter() {
+            ensure_unidecode_for_text(unidecode_fn, affiliation, unidecode_char_map)?;
+        }
+    }
+    for paper in papers.values() {
+        ensure_unidecode_for_text(unidecode_fn, &paper.title, unidecode_char_map)?;
+        ensure_unidecode_for_text(unidecode_fn, &paper.venue, unidecode_char_map)?;
+        ensure_unidecode_for_text(unidecode_fn, &paper.journal_name, unidecode_char_map)?;
+    }
+    for authors in paper_authors.values() {
+        for (_position, author_name) in authors.iter() {
+            ensure_unidecode_for_text(unidecode_fn, author_name, unidecode_char_map)?;
+        }
+    }
+    Ok(())
+}
+
+fn build_raw_arrow_feature(
+    signature: &RawArrowSignature,
+    paper: Option<&RawArrowPaper>,
+    paper_authors: Option<&Vec<(i64, String)>>,
+    specter_by_paper_id: Option<&HashMap<String, Vec<f32>>>,
+    raw_name_counts: &RawNameCountMaps,
+    name_prefixes: &HashSet<String>,
+    affiliation_stopwords: &HashSet<String>,
+    unidecode_char_map: &HashMap<char, String>,
+    orcid_enabled: bool,
+) -> RawArrowFeature {
+    let (first, middle) = split_first_middle_hyphen_aware_compat(
+        &signature.author_first,
+        &signature.author_middle,
+        name_prefixes,
+        unidecode_char_map,
+    );
+    let last_normalized =
+        normalize_text_compat_from_map(&signature.author_last, false, unidecode_char_map);
+    let name_counts = signature.name_counts.clone().or_else(|| {
+        build_name_counts_data_from_artifact(
+            raw_name_counts,
+            &signature.author_first,
+            &first,
+            &first,
+            &signature.author_last,
+            &last_normalized,
+        )
+        .data
+    });
+    let middle_initials: HashSet<String> = middle
+        .split_whitespace()
+        .filter_map(|token| token.chars().next().map(|ch| ch.to_string()))
+        .collect();
+
+    let mut coauthor_blocks = HashSet::new();
+    let mut paper_author_count = 0usize;
+    let mut paper_author_names = HashSet::new();
+    let mut local10_author_names = HashSet::new();
+    if let Some(authors) = paper_authors {
+        paper_author_count = authors.len();
+        for (position, author_name) in authors.iter() {
+            let normalized = normalize_text_compat_from_map(author_name, false, unidecode_char_map);
+            if !normalized.is_empty() {
+                paper_author_names.insert(normalized.clone());
+                if let Some(author_position) = signature.position {
+                    if *position != author_position && (*position - author_position).abs() <= 10 {
+                        local10_author_names.insert(normalized.clone());
+                    }
+                }
+            }
+            if Some(*position) == signature.position {
+                continue;
+            }
+            if normalized.is_empty() {
+                continue;
+            }
+            let block = compute_block_compat(&normalized);
+            if !block.is_empty() {
+                coauthor_blocks.insert(block);
+            }
+        }
+    }
+
+    let mut normalized_affiliations = Vec::with_capacity(signature.affiliations.len());
+    for affiliation in signature.affiliations.iter() {
+        let normalized = normalize_text_compat_from_map(affiliation, false, unidecode_char_map);
+        if !normalized.is_empty() {
+            normalized_affiliations.push(normalized);
+        }
+    }
+    let affiliation_text =
+        prefilter_affiliation_text(&normalized_affiliations, affiliation_stopwords);
+    let affiliation_terms: HashSet<String> =
+        word_ngrams_counter(&affiliation_text).into_keys().collect();
+
+    let (venue_terms, title_terms, year) = if let Some(paper_data) = paper {
+        let venue_text = [paper_data.venue.as_str(), paper_data.journal_name.as_str()]
+            .iter()
+            .filter(|part| !part.trim().is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let normalized_venue =
+            normalize_text_compat_from_map(&venue_text, false, unidecode_char_map);
+        let normalized_title =
+            normalize_text_compat_from_map(&paper_data.title, false, unidecode_char_map);
+        (
+            term_set_from_normalized_text(&normalized_venue),
+            term_set_from_normalized_text(&normalized_title),
+            paper_data.year,
+        )
+    } else {
+        (HashSet::new(), HashSet::new(), None)
+    };
+
+    let coauthor_terms = query_terms_from_values(&coauthor_blocks);
+    let coauthor_hashes = coauthor_terms.iter().map(|term| term.hash).collect();
+    let affiliation_query_terms = query_terms_from_values(&affiliation_terms);
+    let affiliation_hashes = affiliation_query_terms
+        .iter()
+        .map(|term| term.hash)
+        .collect();
+    let venue_hashes = hash_string_values(&venue_terms);
+    let title_hashes = hash_string_values(&title_terms);
+    let middle_initial_hashes = hash_string_values(&middle_initials);
+    let orcid_hash = if orcid_enabled {
+        signature
+            .orcid
+            .as_ref()
+            .and_then(|value| normalize_orcid_str(value).map(|orcid| fnv64(orcid.as_bytes())))
+    } else {
+        None
+    };
+    let specter = specter_by_paper_id
+        .and_then(|values| values.get(&signature.paper_id))
+        .cloned();
+    let specter_norm = specter.as_ref().map(|values| {
+        values
+            .iter()
+            .map(|value| {
+                let val = *value as f64;
+                val * val
+            })
+            .sum::<f64>()
+            .sqrt()
+    });
+    let query_author = normalize_text_compat_from_map(
+        &[
+            signature.author_first.as_str(),
+            signature.author_middle.as_str(),
+            signature.author_last.as_str(),
+            signature.author_suffix.as_str(),
+        ]
+        .iter()
+        .filter(|value| !value.trim().is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" "),
+        false,
+        unidecode_char_map,
+    );
+
+    RawArrowFeature {
+        query: RetrievalQueryData {
+            has_full_first: py_len(&first) > 1,
+            first,
+            middle_initial_hashes,
+            coauthor_hashes,
+            coauthor_terms,
+            affiliation_hashes,
+            affiliation_terms: affiliation_query_terms,
+            venue_hashes,
+            title_hashes,
+            year,
+            orcid_hash,
+            specter,
+            specter_norm,
+        },
+        name_counts,
+        paper_author_count,
+        paper_author_names,
+        local10_author_names,
+        query_author,
+    }
+}
+
+fn mask_raw_arrow_query(
+    base: &RetrievalQueryData,
+    requested_view: &str,
+) -> Result<(RetrievalQueryData, String), String> {
+    let resolved_view = if requested_view == "auto" {
+        if base.has_full_first {
+            "full"
+        } else {
+            "initial_only"
+        }
+    } else {
+        requested_view
+    };
+    if resolved_view == "full" {
+        return Ok((base.clone(), resolved_view.to_string()));
+    }
+
+    let mut masked = RetrievalQueryData {
+        first: base
+            .first
+            .chars()
+            .next()
+            .map(|ch| ch.to_string())
+            .unwrap_or_default(),
+        has_full_first: false,
+        middle_initial_hashes: Vec::new(),
+        coauthor_hashes: base.coauthor_hashes.clone(),
+        coauthor_terms: base.coauthor_terms.clone(),
+        affiliation_hashes: base.affiliation_hashes.clone(),
+        affiliation_terms: base.affiliation_terms.clone(),
+        venue_hashes: base.venue_hashes.clone(),
+        title_hashes: base.title_hashes.clone(),
+        year: base.year,
+        orcid_hash: base.orcid_hash,
+        specter: base.specter.clone(),
+        specter_norm: base.specter_norm,
+    };
+    match resolved_view {
+        "initial_only" => {}
+        "initial_only_no_specter" => {
+            masked.specter = None;
+            masked.specter_norm = None;
+        }
+        "initial_only_sparse_metadata" => {
+            masked.coauthor_hashes.clear();
+            masked.coauthor_terms.clear();
+            masked.affiliation_hashes.clear();
+            masked.affiliation_terms.clear();
+        }
+        "initial_only_nearly_empty" => {
+            masked.coauthor_hashes.clear();
+            masked.coauthor_terms.clear();
+            masked.affiliation_hashes.clear();
+            masked.affiliation_terms.clear();
+            masked.specter = None;
+            masked.specter_norm = None;
+        }
+        _ => return Err(format!("Unknown query view: {requested_view}")),
+    }
+    Ok((masked, resolved_view.to_string()))
+}
+
+fn vector_norm_f32(values: &[f32]) -> f64 {
+    values
+        .iter()
+        .map(|value| {
+            let val = *value as f64;
+            val * val
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn euclidean_distance_f32(left: &[f32], right: &[f32]) -> f64 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(left_value, right_value)| {
+            let diff = (*left_value as f64) - (*right_value as f64);
+            diff * diff
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn select_raw_arrow_exemplars(vectors: &[Vec<f32>], max_exemplars: usize) -> Vec<Vec<f32>> {
+    if max_exemplars == 0 || vectors.is_empty() {
+        return Vec::new();
+    }
+    if vectors.len() <= max_exemplars {
+        return vectors.to_vec();
+    }
+    let dim = vectors[0].len();
+    let mut centroid = vec![0.0f32; dim];
+    for vector in vectors.iter() {
+        for (idx, value) in vector.iter().enumerate() {
+            centroid[idx] += *value;
+        }
+    }
+    for value in centroid.iter_mut() {
+        *value /= vectors.len() as f32;
+    }
+
+    let mut selected = Vec::<usize>::new();
+    let mut best_index = 0usize;
+    let mut best_distance = f64::NEG_INFINITY;
+    for (idx, vector) in vectors.iter().enumerate() {
+        let distance = euclidean_distance_f32(vector, &centroid);
+        if distance > best_distance {
+            best_distance = distance;
+            best_index = idx;
+        }
+    }
+    selected.push(best_index);
+
+    while selected.len() < max_exemplars {
+        let mut next_index = None;
+        let mut next_distance = f64::NEG_INFINITY;
+        for (idx, vector) in vectors.iter().enumerate() {
+            if selected.contains(&idx) {
+                continue;
+            }
+            let min_distance = selected
+                .iter()
+                .map(|selected_idx| euclidean_distance_f32(vector, &vectors[*selected_idx]))
+                .fold(f64::INFINITY, f64::min);
+            if min_distance > next_distance {
+                next_distance = min_distance;
+                next_index = Some(idx);
+            }
+        }
+        let Some(idx) = next_index else {
+            break;
+        };
+        selected.push(idx);
+    }
+    selected
+        .into_iter()
+        .map(|idx| vectors[idx].clone())
+        .collect()
+}
+
+fn build_raw_arrow_summary(
+    component_key: &str,
+    signature_ids: &[String],
+    features_by_signature_id: &HashMap<String, RawArrowFeature>,
+    max_exemplars: usize,
+) -> Result<RetrievalSummaryData, String> {
+    let mut first_name_counts: HashMap<String, usize> = HashMap::new();
+    let mut middle_initial_counts: HashMap<u64, usize> = HashMap::new();
+    let mut coauthor_counts: HashMap<u64, usize> = HashMap::new();
+    let mut non_mega_coauthor_counts: HashMap<u64, usize> = HashMap::new();
+    let mut affiliation_counts: HashMap<u64, usize> = HashMap::new();
+    let mut venue_counts: HashMap<u64, usize> = HashMap::new();
+    let mut title_counts: HashMap<u64, usize> = HashMap::new();
+    let mut years = Vec::<i64>::new();
+    let mut orcid_hashes = Vec::<u64>::new();
+    let mut specter_vectors = Vec::<Vec<f32>>::new();
+    let mut max_paper_author_count = 0usize;
+
+    for signature_id in signature_ids {
+        let feature = features_by_signature_id.get(signature_id).ok_or_else(|| {
+            format!(
+                "cluster seed signature_id '{}' is missing from computed raw Arrow features",
+                signature_id
+            )
+        })?;
+        if py_len(&feature.query.first) > 1 {
+            *first_name_counts
+                .entry(feature.query.first.clone())
+                .or_insert(0) += 1;
+        }
+        for hash in feature.query.middle_initial_hashes.iter() {
+            *middle_initial_counts.entry(*hash).or_insert(0) += 1;
+        }
+        for hash in feature.query.coauthor_hashes.iter() {
+            *coauthor_counts.entry(*hash).or_insert(0) += 1;
+            if feature.paper_author_count < RETRIEVAL_MEGA_AUTHOR_THRESHOLD {
+                *non_mega_coauthor_counts.entry(*hash).or_insert(0) += 1;
+            }
+        }
+        for hash in feature.query.affiliation_hashes.iter() {
+            *affiliation_counts.entry(*hash).or_insert(0) += 1;
+        }
+        for hash in feature.query.venue_hashes.iter() {
+            *venue_counts.entry(*hash).or_insert(0) += 1;
+        }
+        for hash in feature.query.title_hashes.iter() {
+            *title_counts.entry(*hash).or_insert(0) += 1;
+        }
+        if let Some(year) = feature.query.year {
+            years.push(year);
+        }
+        if let Some(orcid_hash) = feature.query.orcid_hash {
+            orcid_hashes.push(orcid_hash);
+        }
+        if let Some(specter) = feature.query.specter.as_ref() {
+            specter_vectors.push(specter.clone());
+        }
+        max_paper_author_count = max_paper_author_count.max(feature.paper_author_count);
+    }
+
+    let mut first_name_pairs: Vec<(String, f32)> = first_name_counts
+        .into_iter()
+        .map(|(name, count)| (name, count as f32))
+        .collect();
+    first_name_pairs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    years.sort_unstable();
+    orcid_hashes.sort_unstable();
+    orcid_hashes.dedup();
+    let year_min = years.first().copied();
+    let year_max = years.last().copied();
+    let year_mean = if years.is_empty() {
+        None
+    } else {
+        Some(years.iter().sum::<i64>() as f64 / years.len() as f64)
+    };
+
+    let specter_centroid = if specter_vectors.is_empty() {
+        None
+    } else {
+        let dim = specter_vectors[0].len();
+        let mut centroid = vec![0.0f32; dim];
+        for vector in specter_vectors.iter() {
+            for (idx, value) in vector.iter().enumerate() {
+                centroid[idx] += *value;
+            }
+        }
+        for value in centroid.iter_mut() {
+            *value /= specter_vectors.len() as f32;
+        }
+        Some(centroid)
+    };
+    let specter_centroid_norm = specter_centroid
+        .as_ref()
+        .map(|values| vector_norm_f32(values));
+    let exemplar_vectors = select_raw_arrow_exemplars(&specter_vectors, max_exemplars);
+    let exemplar_norms = exemplar_vectors
+        .iter()
+        .map(|values| vector_norm_f32(values))
+        .collect();
+
+    Ok(RetrievalSummaryData {
+        component_key: component_key.to_string(),
+        size: signature_ids.len(),
+        first_name_counts: first_name_pairs,
+        middle_initial_counts: counter_data_from_hash_count_map(middle_initial_counts),
+        coauthor_counts: counter_data_from_hash_count_map(coauthor_counts),
+        non_mega_coauthor_counts: counter_data_from_hash_count_map(non_mega_coauthor_counts),
+        affiliation_counts: counter_data_from_hash_count_map(affiliation_counts),
+        venue_counts: counter_data_from_hash_count_map(venue_counts),
+        title_counts: counter_data_from_hash_count_map(title_counts),
+        max_paper_author_count,
+        year_min,
+        year_max,
+        year_mean,
+        orcid_hashes,
+        specter_centroid,
+        specter_centroid_norm,
+        exemplar_vectors,
+        exemplar_norms,
+    })
+}
+
+fn build_raw_arrow_summary_signals(
+    signature_ids: &[String],
+    features_by_signature_id: &HashMap<String, RawArrowFeature>,
+) -> Result<RawArrowSummarySignalData, String> {
+    let mut name_counts_values = Vec::<NameCountsData>::new();
+    let mut member_paper_author_names = Vec::<HashSet<String>>::with_capacity(signature_ids.len());
+    let mut member_paper_author_counts = Vec::<usize>::with_capacity(signature_ids.len());
+    let mut member_local10_author_names =
+        Vec::<HashSet<String>>::with_capacity(signature_ids.len());
+    let mut member_signature_ids = Vec::<String>::with_capacity(signature_ids.len());
+
+    for signature_id in signature_ids {
+        let feature = features_by_signature_id.get(signature_id).ok_or_else(|| {
+            format!(
+                "cluster seed signature_id '{}' is missing from computed raw Arrow features",
+                signature_id
+            )
+        })?;
+        if let Some(name_counts) = feature.name_counts.as_ref() {
+            name_counts_values.push(name_counts.clone());
+        }
+        member_paper_author_names.push(feature.paper_author_names.clone());
+        member_paper_author_counts.push(feature.paper_author_count);
+        member_local10_author_names.push(feature.local10_author_names.clone());
+        member_signature_ids.push(signature_id.clone());
+    }
+
+    Ok(RawArrowSummarySignalData {
+        name_counts_values,
+        member_paper_author_names,
+        member_paper_author_counts,
+        member_local10_author_names,
+        member_signature_ids,
+    })
+}
+
+fn round_six(value: f64) -> f32 {
+    ((value * 1_000_000.0).round() / 1_000_000.0) as f32
+}
+
+fn valid_positive_finite(value: f64) -> Option<f64> {
+    if value.is_finite() && value > 0.0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn update_minimum(target: &mut Option<f64>, value: f64) {
+    let Some(valid_value) = valid_positive_finite(value) else {
+        return;
+    };
+    *target = Some(match target {
+        Some(current) => current.min(valid_value),
+        None => valid_value,
+    });
+}
+
+fn name_count_rarity(value: Option<f64>) -> f32 {
+    match value {
+        Some(count) if count.is_finite() && count > 0.0 => round_six(1.0 / count.sqrt()),
+        _ => 0.0,
+    }
+}
+
+fn raw_arrow_name_count_rarity_row(
+    query: &RetrievalQueryData,
+    query_name_counts: &Option<NameCountsData>,
+    summary: &RetrievalSummaryData,
+    summary_signals: &RawArrowSummarySignalData,
+) -> RawArrowNameCountRarityRow {
+    let mut candidate_first_last_min = None;
+    let mut candidate_last_min = None;
+    for candidate_counts in summary_signals.name_counts_values.iter() {
+        update_minimum(&mut candidate_first_last_min, candidate_counts.first_last);
+        update_minimum(&mut candidate_last_min, candidate_counts.last);
+    }
+    let candidate_last_name_count_min_rarity = name_count_rarity(candidate_last_min);
+    let candidate_last_first_name_count_min_rarity = name_count_rarity(candidate_first_last_min);
+
+    let mut last_name_count_min_rarity = 0.0f32;
+    let mut last_first_name_count_min_rarity = 0.0f32;
+    if let Some(query_counts) = query_name_counts.as_ref() {
+        let mut observed_minima: [Option<f64>; 6] = [None, None, None, None, None, None];
+        for candidate_counts in summary_signals.name_counts_values.iter() {
+            let candidate_option = Some(candidate_counts.clone());
+            let query_option = Some(query_counts.clone());
+            let values = compute_name_counts_data(&query_option, &candidate_option);
+            for (index, value) in values.iter().enumerate() {
+                update_minimum(&mut observed_minima[index], *value);
+            }
+        }
+        last_name_count_min_rarity = name_count_rarity(observed_minima[2]);
+        if query.has_full_first {
+            last_first_name_count_min_rarity = name_count_rarity(observed_minima[1]);
+        }
+    }
+
+    let mut first_prefix_match = 0.0f64;
+    if py_len(&query.first) > 1 && summary.size > 0 {
+        for (candidate_first, count) in summary.first_name_counts.iter() {
+            if py_len(candidate_first) > 1
+                && same_prefix_tokens_compat(&query.first, candidate_first)
+            {
+                first_prefix_match =
+                    first_prefix_match.max((*count as f64) / (summary.size as f64));
+            }
+        }
+    }
+
+    RawArrowNameCountRarityRow {
+        last_name_count_min_rarity,
+        candidate_last_name_count_min_rarity,
+        candidate_last_first_name_count_min_rarity,
+        last_first_name_count_min_rarity,
+        first_prefix_x_last_first_name_count_min_rarity: round_six(
+            first_prefix_match * (last_first_name_count_min_rarity as f64),
+        ),
+    }
+}
+
+fn set_intersection_count(left: &HashSet<String>, right: &HashSet<String>) -> usize {
+    if left.len() <= right.len() {
+        left.iter().filter(|value| right.contains(*value)).count()
+    } else {
+        right.iter().filter(|value| left.contains(*value)).count()
+    }
+}
+
+fn raw_arrow_paper_evidence_row(
+    query_signature_id: &str,
+    query_feature: &RawArrowFeature,
+    summary_signals: &RawArrowSummarySignalData,
+) -> RawArrowPaperEvidenceRow {
+    let mut best_author_jaccard = 0.0f64;
+    let mut best_author_containment = 0.0f64;
+    let mut best_author_overlap = 0.0f64;
+    let mut best_local10_jaccard = 0.0f64;
+    let mut best_local10_overlap_count = 0.0f64;
+    let mut best_author_count_log_absdiff: Option<f64> = None;
+
+    for (((candidate_names, candidate_count), candidate_local10_names), candidate_signature_id) in
+        summary_signals
+            .member_paper_author_names
+            .iter()
+            .zip(summary_signals.member_paper_author_counts.iter())
+            .zip(summary_signals.member_local10_author_names.iter())
+            .zip(summary_signals.member_signature_ids.iter())
+    {
+        let intersection =
+            set_intersection_count(&query_feature.paper_author_names, candidate_names);
+        let union = query_feature.paper_author_names.len() + candidate_names.len() - intersection;
+        if union > 0 {
+            best_author_jaccard = best_author_jaccard.max((intersection as f64) / (union as f64));
+        }
+        let denominator = query_feature
+            .paper_author_names
+            .len()
+            .min(candidate_names.len());
+        if denominator > 0 {
+            best_author_containment =
+                best_author_containment.max((intersection as f64) / (denominator as f64));
+        }
+        best_author_overlap = best_author_overlap.max(intersection as f64);
+
+        if query_signature_id != candidate_signature_id {
+            let local10_intersection = set_intersection_count(
+                &query_feature.local10_author_names,
+                candidate_local10_names,
+            );
+            let local10_union = query_feature.local10_author_names.len()
+                + candidate_local10_names.len()
+                - local10_intersection;
+            if local10_union > 0 {
+                best_local10_jaccard = best_local10_jaccard
+                    .max((local10_intersection as f64) / (local10_union as f64));
+            }
+            best_local10_overlap_count =
+                best_local10_overlap_count.max(local10_intersection as f64);
+        }
+
+        let count_delta = ((query_feature.paper_author_count as f64).ln_1p()
+            - (*candidate_count as f64).ln_1p())
+        .abs();
+        best_author_count_log_absdiff = Some(match best_author_count_log_absdiff {
+            Some(current) => current.min(count_delta),
+            None => count_delta,
+        });
+    }
+
+    RawArrowPaperEvidenceRow {
+        paper_author_list_max_jaccard: round_six(best_author_jaccard),
+        paper_author_list_max_containment: round_six(best_author_containment),
+        paper_author_list_max_overlap_count: round_six(best_author_overlap),
+        local_author_window10_jaccard_max: round_six(best_local10_jaccard),
+        local_author_window10_overlap_count_max: round_six(best_local10_overlap_count),
+        best_author_count_log_absdiff: round_six(best_author_count_log_absdiff.unwrap_or(0.0)),
+    }
+}
+
 fn extract_specter_for_paper_id(
     spec_dict: &Bound<'_, PyDict>,
     paper_id: &str,
@@ -1619,6 +3462,25 @@ fn extract_name_counts_data(obj: &Bound<'_, PyAny>) -> PyResult<Option<NameCount
     let first_last: Option<f64> = obj.getattr("first_last")?.extract()?;
     let last: Option<f64> = obj.getattr("last")?.extract()?;
     let last_first_initial: Option<f64> = obj.getattr("last_first_initial")?.extract()?;
+    Ok(Some(NameCountsData {
+        first: first.unwrap_or(f64::NAN),
+        first_last: first_last.unwrap_or(f64::NAN),
+        last: last.unwrap_or(f64::NAN),
+        last_first_initial: last_first_initial.unwrap_or(f64::NAN),
+    }))
+}
+
+fn extract_feature_block_name_counts_data(
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<Option<NameCountsData>> {
+    let first: Option<f64> = obj.getattr("name_count_first")?.extract()?;
+    let first_last: Option<f64> = obj.getattr("name_count_first_last")?.extract()?;
+    let last: Option<f64> = obj.getattr("name_count_last")?.extract()?;
+    let last_first_initial: Option<f64> =
+        obj.getattr("name_count_last_first_initial")?.extract()?;
+    if first.is_none() && first_last.is_none() && last.is_none() && last_first_initial.is_none() {
+        return Ok(None);
+    }
     Ok(Some(NameCountsData {
         first: first.unwrap_or(f64::NAN),
         first_last: first_last.unwrap_or(f64::NAN),
@@ -1664,6 +3526,132 @@ fn extract_specter_vec(obj: &Bound<'_, PyAny>) -> PyResult<Option<Vec<f32>>> {
         out.push(v as f32);
     }
     Ok(Some(out))
+}
+
+fn insert_nonzero_specter_row(out: &mut HashMap<String, Vec<f32>>, paper_id: &str, values: &[f32]) {
+    if values.iter().all(|value| *value == 0.0) {
+        return;
+    }
+    out.insert(paper_id.to_string(), values.to_vec());
+}
+
+fn extract_feature_block_specter_by_paper(
+    feature_block: &Bound<'_, PyAny>,
+) -> PyResult<HashMap<String, Vec<f32>>> {
+    let paper_ids_obj = feature_block.getattr("specter_paper_ids")?;
+    let paper_ids: Vec<String> = PyIterator::from_object(&paper_ids_obj)?
+        .map(|item| item.and_then(|value| value.extract::<String>()))
+        .collect::<PyResult<Vec<_>>>()?;
+    let embeddings_obj = feature_block.getattr("specter_embeddings")?;
+    if embeddings_obj.is_none() {
+        if paper_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "FeatureBlock specter_paper_ids requires specter_embeddings",
+        ));
+    }
+    if paper_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut out = HashMap::with_capacity(paper_ids.len());
+    if let Ok(arr) = embeddings_obj.downcast::<PyArray2<f32>>() {
+        let shape = arr.shape();
+        if shape.len() != 2 || shape[0] != paper_ids.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "FeatureBlock specter_embeddings shape must be ({}, d), got {:?}",
+                paper_ids.len(),
+                shape
+            )));
+        }
+        let cols = shape[1];
+        let readonly = arr.readonly();
+        let slice = readonly.as_slice()?;
+        for (row_index, paper_id) in paper_ids.iter().enumerate() {
+            let start = row_index * cols;
+            insert_nonzero_specter_row(&mut out, paper_id, &slice[start..start + cols]);
+        }
+        return Ok(out);
+    }
+    if let Ok(arr) = embeddings_obj.downcast::<PyArray2<f64>>() {
+        let shape = arr.shape();
+        if shape.len() != 2 || shape[0] != paper_ids.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "FeatureBlock specter_embeddings shape must be ({}, d), got {:?}",
+                paper_ids.len(),
+                shape
+            )));
+        }
+        let cols = shape[1];
+        let readonly = arr.readonly();
+        let slice = readonly.as_slice()?;
+        for (row_index, paper_id) in paper_ids.iter().enumerate() {
+            let start = row_index * cols;
+            let values = slice[start..start + cols]
+                .iter()
+                .map(|value| *value as f32)
+                .collect::<Vec<_>>();
+            insert_nonzero_specter_row(&mut out, paper_id, &values);
+        }
+        return Ok(out);
+    }
+
+    let rows: Vec<Vec<f64>> = embeddings_obj.extract()?;
+    if rows.len() != paper_ids.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "FeatureBlock specter_embeddings row count must match specter_paper_ids: {} != {}",
+            rows.len(),
+            paper_ids.len()
+        )));
+    }
+    for (paper_id, row) in paper_ids.iter().zip(rows.iter()) {
+        let values = row.iter().map(|value| *value as f32).collect::<Vec<_>>();
+        insert_nonzero_specter_row(&mut out, paper_id, &values);
+    }
+    Ok(out)
+}
+
+fn extract_feature_block_name_tuples(
+    py: Python<'_>,
+    name_tuples: Option<&Bound<'_, PyAny>>,
+) -> PyResult<HashMap<String, HashSet<String>>> {
+    let Some(obj) = name_tuples else {
+        return load_name_tuples_from_text_path(py, None);
+    };
+    if obj.is_none() {
+        return Ok(HashMap::new());
+    }
+    if let Ok(value) = obj.extract::<String>() {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized.is_empty() || normalized == "none" {
+            return Ok(HashMap::new());
+        }
+        if normalized == "filtered" {
+            return load_name_tuples_from_text_path(py, None);
+        }
+        return load_name_tuples_from_text_path(py, Some(value.as_str()));
+    }
+    extract_name_tuples_map(obj)
+}
+
+fn extract_feature_block_cluster_seeds_require(
+    feature_block: &Bound<'_, PyAny>,
+) -> PyResult<HashMap<String, ClusterId>> {
+    let obj = feature_block.getattr("cluster_seeds_require")?;
+    let mut out = HashMap::new();
+    for item in PyIterator::from_object(&obj)? {
+        let (signature_id, component_id): (String, String) = item?.extract()?;
+        out.insert(signature_id, ClusterId::Str(component_id));
+    }
+    Ok(out)
+}
+
+fn extract_feature_block_cluster_seeds_disallow(
+    feature_block: &Bound<'_, PyAny>,
+) -> PyResult<HashSet<(String, String)>> {
+    let obj = feature_block.getattr("cluster_seeds_disallow")?;
+    extract_pair_set(&obj)
 }
 
 fn extract_u32_vec(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
@@ -2788,6 +4776,7 @@ fn load_raw_name_counts_from_json_path(
         last,
         first_last,
         last_first_initial,
+        index: None,
     })
 }
 
@@ -2833,10 +4822,7 @@ fn load_name_tuples_from_text_path(
 }
 
 fn has_name_counts_artifact(raw_name_counts: &RawNameCountMaps) -> bool {
-    !raw_name_counts.first.is_empty()
-        || !raw_name_counts.last.is_empty()
-        || !raw_name_counts.first_last.is_empty()
-        || !raw_name_counts.last_first_initial.is_empty()
+    raw_name_counts.has_data()
 }
 
 fn canonical_last_for_counts(raw_last: &str, normalized_last: &str) -> String {
@@ -2911,8 +4897,8 @@ fn build_name_counts_data_from_artifact(
         .to_string();
 
     let first = if py_len(&first_for_counts) > 1 {
-        match raw_name_counts.first.get(&first_for_counts) {
-            Some(value) => *value,
+        match raw_name_counts.get(RawNameCountKind::First, &first_for_counts) {
+            Some(value) => value,
             None => {
                 telemetry.first = true;
                 1.0
@@ -2922,8 +4908,8 @@ fn build_name_counts_data_from_artifact(
         f64::NAN
     };
     let first_last = if py_len(&first_for_counts) > 1 {
-        match raw_name_counts.first_last.get(&first_last_key) {
-            Some(value) => *value,
+        match raw_name_counts.get(RawNameCountKind::FirstLast, &first_last_key) {
+            Some(value) => value,
             None => {
                 telemetry.first_last = true;
                 1.0
@@ -2932,23 +4918,21 @@ fn build_name_counts_data_from_artifact(
     } else {
         f64::NAN
     };
-    let last = match raw_name_counts.last.get(&last_for_counts) {
-        Some(value) => *value,
+    let last = match raw_name_counts.get(RawNameCountKind::Last, &last_for_counts) {
+        Some(value) => value,
         None => {
             telemetry.last = true;
             1.0
         }
     };
-    let last_first_initial = match raw_name_counts
-        .last_first_initial
-        .get(&last_first_initial_key)
-    {
-        Some(value) => *value,
-        None => {
-            telemetry.last_first_initial = true;
-            1.0
-        }
-    };
+    let last_first_initial =
+        match raw_name_counts.get(RawNameCountKind::LastFirstInitial, &last_first_initial_key) {
+            Some(value) => value,
+            None => {
+                telemetry.last_first_initial = true;
+                1.0
+            }
+        };
 
     NameCountsBuildResult {
         data: Some(NameCountsData {
@@ -4603,9 +6587,10 @@ impl RustFeaturizer {
             "Paper",
         )?;
         let specter_obj = dataset.getattr("specter_embeddings").ok();
-        let specter_dict = specter_obj
-            .as_ref()
-            .and_then(|v| v.downcast::<PyDict>().ok());
+        let specter_dict = match specter_obj.as_ref() {
+            Some(value) if !value.is_none() => Some(specter_payload_to_dict(py, value)?),
+            _ => None,
+        };
 
         let mut papers = HashMap::with_capacity(papers_dict.len());
         let mut paper_authors_by_id: HashMap<PaperId, Vec<(i64, String)>> =
@@ -5235,6 +7220,1261 @@ impl RustFeaturizer {
             cluster_seed_require_value,
             cluster_seed_disallow_value,
             json_ingest_telemetry: None,
+            cached_signature_id_order: OnceLock::new(),
+            cluster_seeds_disallow_index: OnceLock::new(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(
+        signature = (
+            paths,
+            signature_ids = None,
+            name_tuples = None,
+            name_counts_path = None,
+            preprocess = true,
+            compute_reference_features = false,
+            cluster_seed_require_value = 0.0,
+            cluster_seed_disallow_value = 10000.0,
+            num_threads = None
+        )
+    )]
+    fn from_arrow_paths(
+        py: Python<'_>,
+        paths: &Bound<'_, PyAny>,
+        signature_ids: Option<&Bound<'_, PyAny>>,
+        name_tuples: Option<&Bound<'_, PyAny>>,
+        name_counts_path: Option<&str>,
+        preprocess: bool,
+        compute_reference_features: bool,
+        cluster_seed_require_value: f64,
+        cluster_seed_disallow_value: f64,
+        num_threads: Option<usize>,
+    ) -> PyResult<Self> {
+        if compute_reference_features {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "RustFeaturizer.from_arrow_paths does not support reference features",
+            ));
+        }
+
+        let signatures_path =
+            extract_path_mapping_string(paths, "signatures", true)?.ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err("missing signatures Arrow path")
+            })?;
+        let papers_path = extract_path_mapping_string(paths, "papers", true)?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing papers Arrow path"))?;
+        let paper_authors_path = extract_path_mapping_string(paths, "paper_authors", true)?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err("missing paper_authors Arrow path")
+            })?;
+        let cluster_seeds_path = extract_path_mapping_string(paths, "cluster_seeds", false)?;
+        let specter_path = extract_path_mapping_string(paths, "specter", false)?;
+        let name_counts_arrow_path = extract_path_mapping_string(paths, "name_counts", false)?;
+        let name_counts_index_path = extract_name_counts_index_path(paths)?;
+        let name_tuples_arrow_path = match extract_path_mapping_string(paths, "name_pairs", false)?
+        {
+            Some(path) => Some(path),
+            None => extract_path_mapping_string(paths, "name_tuples", false)?,
+        };
+
+        let requested_signature_ids = match signature_ids {
+            Some(obj) if !obj.is_none() => Some(
+                PyIterator::from_object(obj)?
+                    .map(|item| item.and_then(|value| value.extract::<String>()))
+                    .collect::<PyResult<Vec<_>>>()?,
+            ),
+            _ => None,
+        };
+        let keep_signature_ids: Option<HashSet<String>> = requested_signature_ids
+            .as_ref()
+            .map(|ids| ids.iter().cloned().collect());
+
+        let parse_start = Instant::now();
+        let raw_signatures =
+            read_raw_arrow_signatures_filtered(&signatures_path, keep_signature_ids.as_ref())?;
+        let mut signature_ids = match requested_signature_ids {
+            Some(ids) => ids,
+            None => {
+                let mut ids = raw_signatures.keys().cloned().collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids
+            }
+        };
+        signature_ids.dedup();
+        let missing_signature_ids = signature_ids
+            .iter()
+            .filter(|signature_id| !raw_signatures.contains_key(*signature_id))
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_signature_ids.is_empty() {
+            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                "Arrow signatures input is missing requested signature ids: {missing_signature_ids:?}"
+            )));
+        }
+        let selected_signature_id_set = signature_ids.iter().cloned().collect::<HashSet<_>>();
+        let needed_paper_ids = signature_ids
+            .iter()
+            .filter_map(|signature_id| raw_signatures.get(signature_id))
+            .map(|signature| signature.paper_id.clone())
+            .collect::<HashSet<_>>();
+        let raw_papers = read_raw_arrow_papers_filtered(&papers_path, Some(&needed_paper_ids))?;
+        let mut raw_authors_by_paper =
+            read_raw_arrow_paper_authors_filtered(&paper_authors_path, Some(&needed_paper_ids))?;
+        let specter_by_paper = match specter_path.as_ref() {
+            Some(path) => read_raw_arrow_specter_filtered(path, Some(&needed_paper_ids))?,
+            None => HashMap::new(),
+        };
+        let mut cluster_seeds_require = HashMap::<String, ClusterId>::new();
+        if let Some(path) = cluster_seeds_path.as_ref() {
+            let (_component_order, members_by_component) = read_raw_arrow_cluster_seeds(path)?;
+            for (component_key, members) in members_by_component {
+                for signature_id in members {
+                    if selected_signature_id_set.contains(&signature_id) {
+                        cluster_seeds_require
+                            .insert(signature_id, ClusterId::Str(component_key.clone()));
+                    }
+                }
+            }
+        }
+        let parse_seconds = parse_start.elapsed().as_secs_f64();
+
+        let text_module = py.import("s2and.text")?;
+        let unidecode = text_module.getattr("unidecode")?;
+        let stop_words = extract_required_string_set(&text_module.getattr("STOPWORDS")?)?;
+        let venue_stop_words =
+            extract_required_string_set(&text_module.getattr("VENUE_STOP_WORDS")?)?;
+        let name_prefixes = extract_required_string_set(&text_module.getattr("NAME_PREFIXES")?)?;
+        let affiliation_stopwords = extract_affiliation_stopwords(py)?;
+        let needs_name_counts_artifact = raw_signatures
+            .values()
+            .any(|signature| signature.name_counts.is_none());
+        let raw_name_counts = if needs_name_counts_artifact {
+            match name_counts_index_path.as_ref() {
+                Some(path) => read_raw_name_counts_index(path)?,
+                None => match name_counts_arrow_path.as_ref() {
+                    Some(path) => read_raw_arrow_name_counts(path)?,
+                    None => load_raw_name_counts_from_json_path(name_counts_path, None, false)?,
+                },
+            }
+        } else {
+            RawNameCountMaps::default()
+        };
+        let language_detector = if preprocess {
+            Some(LanguageDetectorCompat::new(py))
+        } else {
+            None
+        };
+
+        #[derive(Clone)]
+        struct ArrowSignatureInput {
+            sig_id: String,
+            paper_id: PaperId,
+            raw_first: String,
+            raw_middle: String,
+            raw_last: String,
+            email: Option<String>,
+            position: i64,
+            affiliation_values: Vec<String>,
+            orcid: Option<String>,
+            name_counts: Option<NameCountsData>,
+        }
+
+        #[derive(Clone)]
+        struct ArrowPaperInput {
+            paper_id: PaperId,
+            raw_title: String,
+            raw_venue: String,
+            raw_journal: String,
+            raw_authors: Vec<(i64, String)>,
+            year: Option<i64>,
+            has_abstract: bool,
+            predicted_language: Option<String>,
+            is_reliable: bool,
+        }
+
+        #[derive(Clone)]
+        struct ArrowPaperPreprocessed {
+            authors: Vec<(i64, String)>,
+            year: Option<i64>,
+            has_abstract: bool,
+            predicted_language: Option<String>,
+            is_reliable: bool,
+            title_words: Option<CounterData>,
+            title_chars: Option<CounterData>,
+            venue_ngrams: Option<CounterData>,
+            journal_ngrams: Option<CounterData>,
+        }
+
+        let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
+        let mut defaulted_signature_author_position_count = 0usize;
+        let mut signature_inputs = Vec::<ArrowSignatureInput>::with_capacity(signature_ids.len());
+        for signature_id in signature_ids.iter() {
+            let raw_signature = raw_signatures.get(signature_id).ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "Arrow signatures input is missing signature_id '{signature_id}'"
+                ))
+            })?;
+            if preprocess {
+                ensure_unidecode_for_text(
+                    &unidecode,
+                    &raw_signature.author_first,
+                    &mut unidecode_char_map,
+                )?;
+                ensure_unidecode_for_text(
+                    &unidecode,
+                    &raw_signature.author_middle,
+                    &mut unidecode_char_map,
+                )?;
+                ensure_unidecode_for_text(
+                    &unidecode,
+                    &raw_signature.author_last,
+                    &mut unidecode_char_map,
+                )?;
+                ensure_unidecode_for_text(
+                    &unidecode,
+                    &raw_signature.author_suffix,
+                    &mut unidecode_char_map,
+                )?;
+                for affiliation in raw_signature.affiliations.iter() {
+                    ensure_unidecode_for_text(&unidecode, affiliation, &mut unidecode_char_map)?;
+                }
+            }
+            let position = raw_signature.position.unwrap_or_else(|| {
+                defaulted_signature_author_position_count += 1;
+                0
+            });
+            signature_inputs.push(ArrowSignatureInput {
+                sig_id: signature_id.clone(),
+                paper_id: raw_signature.paper_id.clone(),
+                raw_first: raw_signature.author_first.clone(),
+                raw_middle: raw_signature.author_middle.clone(),
+                raw_last: raw_signature.author_last.clone(),
+                email: raw_signature.email.clone(),
+                position,
+                affiliation_values: raw_signature.affiliations.clone(),
+                orcid: raw_signature.orcid.clone(),
+                name_counts: raw_signature.name_counts.clone(),
+            });
+        }
+        if preprocess {
+            for paper_id in needed_paper_ids.iter() {
+                if let Some(paper) = raw_papers.get(paper_id) {
+                    ensure_unidecode_for_text(&unidecode, &paper.title, &mut unidecode_char_map)?;
+                    ensure_unidecode_for_text(&unidecode, &paper.venue, &mut unidecode_char_map)?;
+                    ensure_unidecode_for_text(
+                        &unidecode,
+                        &paper.journal_name,
+                        &mut unidecode_char_map,
+                    )?;
+                }
+                if let Some(authors) = raw_authors_by_paper.get(paper_id) {
+                    for (_position, author_name) in authors.iter() {
+                        ensure_unidecode_for_text(
+                            &unidecode,
+                            author_name,
+                            &mut unidecode_char_map,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let mut paper_inputs = Vec::<ArrowPaperInput>::with_capacity(needed_paper_ids.len());
+        for paper_id in needed_paper_ids.iter() {
+            let Some(raw_paper) = raw_papers.get(paper_id) else {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Arrow signatures reference missing paper_id '{paper_id}'"
+                )));
+            };
+            let raw_authors = raw_authors_by_paper.remove(paper_id).unwrap_or_default();
+            let (is_reliable, predicted_language) = if raw_paper.predicted_language.is_some() {
+                (
+                    raw_paper.is_reliable.unwrap_or(false),
+                    raw_paper.predicted_language.clone(),
+                )
+            } else if preprocess {
+                let detector = language_detector.as_ref().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err("missing language detector")
+                })?;
+                let (reliable, _is_english, language) = detector.detect(&raw_paper.title);
+                (reliable, Some(language))
+            } else {
+                (false, None)
+            };
+            paper_inputs.push(ArrowPaperInput {
+                paper_id: paper_id.clone(),
+                raw_title: raw_paper.title.clone(),
+                raw_venue: raw_paper.venue.clone(),
+                raw_journal: raw_paper.journal_name.clone(),
+                raw_authors,
+                year: raw_paper.year.filter(|year| *year > 0),
+                has_abstract: !raw_paper.abstract_text.is_empty(),
+                predicted_language,
+                is_reliable,
+            });
+        }
+
+        let paper_preprocess_start = Instant::now();
+        let computed_papers = py.allow_threads(|| {
+            let compute = || {
+                paper_inputs
+                    .par_iter()
+                    .map(|paper_input| {
+                        let title = if preprocess {
+                            normalize_text_compat_from_map(
+                                &paper_input.raw_title,
+                                false,
+                                &unidecode_char_map,
+                            )
+                        } else {
+                            paper_input.raw_title.clone()
+                        };
+                        let venue = if preprocess {
+                            normalize_text_compat_from_map(
+                                &paper_input.raw_venue,
+                                false,
+                                &unidecode_char_map,
+                            )
+                        } else {
+                            paper_input.raw_venue.clone()
+                        };
+                        let journal_name = if preprocess {
+                            normalize_text_compat_from_map(
+                                &paper_input.raw_journal,
+                                false,
+                                &unidecode_char_map,
+                            )
+                        } else {
+                            paper_input.raw_journal.clone()
+                        };
+                        let authors = if preprocess {
+                            paper_input
+                                .raw_authors
+                                .iter()
+                                .map(|(position, raw_name)| {
+                                    (
+                                        *position,
+                                        normalize_text_compat_from_map(
+                                            raw_name,
+                                            false,
+                                            &unidecode_char_map,
+                                        ),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            paper_input.raw_authors.clone()
+                        };
+                        let title_words = if preprocess {
+                            counter_data_from_usize_map(word_ngrams_counter_python_compat(
+                                &title,
+                                &stop_words,
+                            ))
+                        } else {
+                            None
+                        };
+                        let title_chars = if preprocess {
+                            counter_data_from_usize_map(char_ngrams_counter_python_compat(
+                                &title,
+                                false,
+                                true,
+                                Some(&stop_words),
+                            ))
+                        } else {
+                            None
+                        };
+                        let venue_ngrams = if preprocess {
+                            counter_data_from_usize_map(char_ngrams_counter_python_compat(
+                                &venue,
+                                false,
+                                true,
+                                Some(&venue_stop_words),
+                            ))
+                        } else {
+                            None
+                        };
+                        let journal_ngrams = if preprocess {
+                            counter_data_from_usize_map(char_ngrams_counter_python_compat(
+                                &journal_name,
+                                false,
+                                true,
+                                Some(&venue_stop_words),
+                            ))
+                        } else {
+                            None
+                        };
+                        (
+                            paper_input.paper_id.clone(),
+                            ArrowPaperPreprocessed {
+                                authors,
+                                year: paper_input.year,
+                                has_abstract: paper_input.has_abstract,
+                                predicted_language: paper_input.predicted_language.clone(),
+                                is_reliable: paper_input.is_reliable,
+                                title_words,
+                                title_chars,
+                                venue_ngrams,
+                                journal_ngrams,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            install_with_optional_rayon_pool(num_threads, compute)
+        });
+        let mut preprocessed_papers: HashMap<PaperId, ArrowPaperPreprocessed> =
+            HashMap::with_capacity(computed_papers.len());
+        for (paper_id, preprocessed) in computed_papers {
+            preprocessed_papers.insert(paper_id, preprocessed);
+        }
+        let paper_preprocess_seconds = paper_preprocess_start.elapsed().as_secs_f64();
+
+        let signature_preprocess_start = Instant::now();
+        let computed_signatures = py.allow_threads(|| {
+            let compute = || {
+                signature_inputs
+                    .par_iter()
+                    .map(|entry| {
+                        let middle_normalized = normalize_text_compat_from_map(
+                            &entry.raw_middle,
+                            false,
+                            &unidecode_char_map,
+                        );
+                        let first_normalized = normalize_text_compat_from_map(
+                            &entry.raw_first,
+                            false,
+                            &unidecode_char_map,
+                        );
+                        let mut first_middle_split: Vec<String> =
+                            format!("{} {}", first_normalized, middle_normalized)
+                                .split_whitespace()
+                                .map(|token| token.to_string())
+                                .collect();
+                        if let Some(prefix) = first_middle_split.first() {
+                            if name_prefixes.contains(prefix) {
+                                first_middle_split.remove(0);
+                            }
+                        }
+                        let first_normalized_token =
+                            first_middle_split.get(0).cloned().unwrap_or_default();
+                        let (first_without_apostrophe, middle_without_apostrophe) =
+                            split_first_middle_hyphen_aware_compat(
+                                &entry.raw_first,
+                                &entry.raw_middle,
+                                &name_prefixes,
+                                &unidecode_char_map,
+                            );
+                        let last_normalized = normalize_text_compat_from_map(
+                            &entry.raw_last,
+                            false,
+                            &unidecode_char_map,
+                        );
+                        let mut coauthor_list: Vec<String> = Vec::new();
+                        if let Some(preprocessed_paper) = preprocessed_papers.get(&entry.paper_id) {
+                            for (author_position, author_name) in preprocessed_paper.authors.iter()
+                            {
+                                if *author_position != entry.position {
+                                    coauthor_list.push(author_name.clone());
+                                }
+                            }
+                        }
+                        let coauthors = if coauthor_list.is_empty() {
+                            None
+                        } else {
+                            Some(coauthor_list.iter().cloned().collect::<HashSet<String>>())
+                        };
+                        let mut coauthor_blocks_set: HashSet<String> = HashSet::new();
+                        for coauthor in coauthor_list.iter() {
+                            coauthor_blocks_set.insert(compute_block_compat(coauthor));
+                        }
+                        let coauthor_blocks = if coauthor_blocks_set.is_empty() {
+                            None
+                        } else {
+                            Some(coauthor_blocks_set)
+                        };
+
+                        let normalized_affiliations: Vec<String> = if preprocess {
+                            entry
+                                .affiliation_values
+                                .iter()
+                                .map(|affiliation| {
+                                    normalize_text_compat_from_map(
+                                        affiliation,
+                                        false,
+                                        &unidecode_char_map,
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            entry.affiliation_values.clone()
+                        };
+                        let affiliation_text = if preprocess {
+                            prefilter_affiliation_text(
+                                &normalized_affiliations,
+                                &affiliation_stopwords,
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let coauthor_text = if preprocess {
+                            coauthor_list.join(" ")
+                        } else {
+                            String::new()
+                        };
+                        let affiliations = if preprocess && !affiliation_text.is_empty() {
+                            counter_data_from_usize_map(word_ngrams_counter(&affiliation_text))
+                        } else {
+                            None
+                        };
+                        let coauthor_ngrams = if preprocess && !coauthor_text.is_empty() {
+                            counter_data_from_usize_map(char_ngrams_counter(&coauthor_text))
+                        } else {
+                            None
+                        };
+                        let normalized_orcid = entry.orcid.as_ref().and_then(|value| {
+                            let upper_value = value.to_ascii_uppercase();
+                            extract_orcid_from_source_id(value)
+                                .or_else(|| extract_orcid_from_source_id(&upper_value))
+                                .or_else(|| Some(value.clone()))
+                        });
+                        let name_counts = entry.name_counts.clone().or_else(|| {
+                            build_name_counts_data_from_artifact(
+                                &raw_name_counts,
+                                &entry.raw_first,
+                                &first_normalized_token,
+                                &first_without_apostrophe,
+                                &entry.raw_last,
+                                &last_normalized,
+                            )
+                            .data
+                        });
+                        (
+                            entry.sig_id.clone(),
+                            SignatureData {
+                                first: Some(first_without_apostrophe.clone()),
+                                middle: Some(middle_without_apostrophe),
+                                last_normalized: Some(last_normalized),
+                                orcid: normalized_orcid,
+                                email: entry.email.clone(),
+                                affiliations,
+                                coauthor_blocks,
+                                coauthor_ngrams,
+                                coauthors,
+                                position: entry.position,
+                                paper_id: entry.paper_id.clone(),
+                                name_counts: name_counts.or_else(|| {
+                                    Some(NameCountsData {
+                                        first: f64::NAN,
+                                        first_last: f64::NAN,
+                                        last: f64::NAN,
+                                        last_first_initial: f64::NAN,
+                                    })
+                                }),
+                                adv_name: Some(first_without_apostrophe),
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            install_with_optional_rayon_pool(num_threads, compute)
+        });
+        let mut signatures: HashMap<String, SignatureData> =
+            HashMap::with_capacity(computed_signatures.len());
+        for (sig_id, signature) in computed_signatures {
+            signatures.insert(sig_id, signature);
+        }
+        let signature_preprocess_seconds = signature_preprocess_start.elapsed().as_secs_f64();
+
+        let reference_counter_start = Instant::now();
+        let mut missing_specter_paper_count = 0usize;
+        let mut papers: HashMap<PaperId, PaperData> =
+            HashMap::with_capacity(preprocessed_papers.len());
+        for (paper_id, paper) in preprocessed_papers.into_iter() {
+            let specter = specter_by_paper.get(&paper_id).cloned();
+            if specter.is_none() {
+                missing_specter_paper_count += 1;
+            }
+            let specter_norm = specter.as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        let value_f64 = *value as f64;
+                        value_f64 * value_f64
+                    })
+                    .sum::<f64>()
+                    .sqrt()
+            });
+            papers.insert(
+                paper_id,
+                PaperData {
+                    venue_ngrams: paper.venue_ngrams,
+                    title_words: paper.title_words,
+                    title_chars: paper.title_chars,
+                    ref_authors: None,
+                    ref_titles: None,
+                    ref_venues: None,
+                    ref_blocks: None,
+                    ref_details_present: false,
+                    references: HashSet::new(),
+                    year: paper.year,
+                    has_abstract: paper.has_abstract,
+                    predicted_language: paper.predicted_language,
+                    is_reliable: paper.is_reliable,
+                    journal_ngrams: paper.journal_ngrams,
+                    specter,
+                    specter_norm,
+                },
+            );
+        }
+        let reference_counter_seconds = reference_counter_start.elapsed().as_secs_f64();
+
+        let name_tuples = match name_tuples_arrow_path.as_ref() {
+            Some(path) => read_raw_arrow_name_tuples(path)?,
+            None => extract_feature_block_name_tuples(py, name_tuples)?,
+        };
+        let cluster_seeds_disallow = HashSet::new();
+        let json_ingest_telemetry = JsonIngestTelemetry {
+            json_parse_seconds: parse_seconds,
+            paper_preprocess_seconds,
+            reference_counter_seconds,
+            signature_preprocess_seconds,
+            cluster_seed_seconds: 0.0,
+            missing_specter_paper_count,
+            defaulted_name_count_signature_count: 0,
+            defaulted_name_count_first_count: 0,
+            defaulted_name_count_first_last_count: 0,
+            defaulted_name_count_last_count: 0,
+            defaulted_name_count_last_first_initial_count: 0,
+            defaulted_signature_author_position_count,
+            defaulted_paper_author_position_count: 0,
+        };
+
+        Ok(RustFeaturizer {
+            signatures,
+            signature_ids,
+            papers,
+            name_tuples,
+            cluster_seeds_disallow,
+            cluster_seeds_require,
+            compute_reference_features,
+            cluster_seed_require_value,
+            cluster_seed_disallow_value,
+            json_ingest_telemetry: Some(json_ingest_telemetry),
+            cached_signature_id_order: OnceLock::new(),
+            cluster_seeds_disallow_index: OnceLock::new(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(
+        signature = (
+            feature_block,
+            name_tuples = None,
+            name_counts_path = None,
+            preprocess = true,
+            compute_reference_features = false,
+            cluster_seed_require_value = 0.0,
+            cluster_seed_disallow_value = 10000.0,
+            num_threads = None
+        )
+    )]
+    fn from_feature_block(
+        py: Python<'_>,
+        feature_block: &Bound<'_, PyAny>,
+        name_tuples: Option<&Bound<'_, PyAny>>,
+        name_counts_path: Option<&str>,
+        preprocess: bool,
+        compute_reference_features: bool,
+        cluster_seed_require_value: f64,
+        cluster_seed_disallow_value: f64,
+        num_threads: Option<usize>,
+    ) -> PyResult<Self> {
+        if compute_reference_features {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "RustFeaturizer.from_feature_block does not support reference features",
+            ));
+        }
+
+        let text_module = py.import("s2and.text")?;
+        let unidecode = text_module.getattr("unidecode")?;
+        let stop_words = extract_required_string_set(&text_module.getattr("STOPWORDS")?)?;
+        let venue_stop_words =
+            extract_required_string_set(&text_module.getattr("VENUE_STOP_WORDS")?)?;
+        let name_prefixes = extract_required_string_set(&text_module.getattr("NAME_PREFIXES")?)?;
+        let affiliation_stopwords = extract_affiliation_stopwords(py)?;
+        let raw_name_counts = load_raw_name_counts_from_json_path(name_counts_path, None, false)?;
+        let language_detector = if preprocess {
+            Some(LanguageDetectorCompat::new(py))
+        } else {
+            None
+        };
+
+        #[derive(Clone)]
+        struct FeatureBlockSignatureInput {
+            sig_id: String,
+            paper_id: PaperId,
+            raw_first: String,
+            raw_middle: String,
+            raw_last: String,
+            email: Option<String>,
+            position: i64,
+            affiliation_values: Vec<String>,
+            orcid: Option<String>,
+            name_counts: Option<NameCountsData>,
+        }
+
+        #[derive(Clone)]
+        struct FeatureBlockPaperInput {
+            paper_id: PaperId,
+            raw_title: String,
+            raw_venue: String,
+            raw_journal: String,
+            raw_authors: Vec<(i64, String)>,
+            year: Option<i64>,
+            has_abstract: bool,
+            predicted_language: Option<String>,
+            is_reliable: bool,
+        }
+
+        #[derive(Clone)]
+        struct FeatureBlockPaperPreprocessed {
+            authors: Vec<(i64, String)>,
+            year: Option<i64>,
+            has_abstract: bool,
+            predicted_language: Option<String>,
+            is_reliable: bool,
+            title_words: Option<CounterData>,
+            title_chars: Option<CounterData>,
+            venue_ngrams: Option<CounterData>,
+            journal_ngrams: Option<CounterData>,
+        }
+
+        let parse_start = Instant::now();
+        let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
+        let signatures_obj = feature_block.getattr("signatures")?;
+        let mut signature_inputs: Vec<FeatureBlockSignatureInput> = Vec::new();
+        let mut needed_paper_ids: HashSet<PaperId> = HashSet::new();
+        let mut defaulted_signature_author_position_count = 0usize;
+        for item in PyIterator::from_object(&signatures_obj)? {
+            let signature = item?;
+            let sig_id: String = signature.getattr("signature_id")?.extract()?;
+            let paper_id = extract_id_string(&signature.getattr("paper_id")?)?;
+            needed_paper_ids.insert(paper_id.clone());
+            let raw_first: String = signature
+                .getattr("author_first")?
+                .extract::<Option<String>>()?
+                .unwrap_or_default();
+            let raw_middle: String = signature
+                .getattr("author_middle")?
+                .extract::<Option<String>>()?
+                .unwrap_or_default();
+            let raw_last: String = signature
+                .getattr("author_last")?
+                .extract::<Option<String>>()?
+                .unwrap_or_default();
+            let email: Option<String> = signature.getattr("author_email")?.extract()?;
+            let position = match signature
+                .getattr("author_position")?
+                .extract::<Option<i64>>()?
+            {
+                Some(value) => value,
+                None => {
+                    defaulted_signature_author_position_count += 1;
+                    0
+                }
+            };
+            let affiliation_values =
+                extract_string_list(&signature.getattr("author_affiliations")?)?;
+            let orcid: Option<String> = signature.getattr("author_orcid")?.extract()?;
+            let name_counts = extract_feature_block_name_counts_data(&signature)?;
+
+            ensure_unidecode_for_text(&unidecode, &raw_first, &mut unidecode_char_map)?;
+            ensure_unidecode_for_text(&unidecode, &raw_middle, &mut unidecode_char_map)?;
+            ensure_unidecode_for_text(&unidecode, &raw_last, &mut unidecode_char_map)?;
+            for affiliation in affiliation_values.iter() {
+                ensure_unidecode_for_text(&unidecode, affiliation, &mut unidecode_char_map)?;
+            }
+            signature_inputs.push(FeatureBlockSignatureInput {
+                sig_id,
+                paper_id,
+                raw_first,
+                raw_middle,
+                raw_last,
+                email,
+                position,
+                affiliation_values,
+                orcid,
+                name_counts,
+            });
+        }
+
+        let mut raw_authors_by_paper: HashMap<PaperId, Vec<(i64, String)>> = HashMap::new();
+        let paper_authors_obj = feature_block.getattr("paper_authors")?;
+        let mut defaulted_paper_author_position_count = 0usize;
+        for item in PyIterator::from_object(&paper_authors_obj)? {
+            let author = item?;
+            let paper_id = extract_id_string(&author.getattr("paper_id")?)?;
+            let position = author
+                .getattr("position")?
+                .extract::<i64>()
+                .unwrap_or_else(|_| {
+                    defaulted_paper_author_position_count += 1;
+                    0
+                });
+            let author_name: String = author.getattr("author_name")?.extract()?;
+            if preprocess {
+                ensure_unidecode_for_text(&unidecode, &author_name, &mut unidecode_char_map)?;
+            }
+            raw_authors_by_paper
+                .entry(paper_id)
+                .or_insert_with(Vec::new)
+                .push((position, author_name));
+        }
+        for authors in raw_authors_by_paper.values_mut() {
+            authors.sort_by_key(|(position, _name)| *position);
+        }
+
+        let papers_obj = feature_block.getattr("papers")?;
+        let mut paper_inputs: Vec<FeatureBlockPaperInput> = Vec::new();
+        for item in PyIterator::from_object(&papers_obj)? {
+            let paper = item?;
+            let paper_id = extract_id_string(&paper.getattr("paper_id")?)?;
+            if !needed_paper_ids.contains(&paper_id) {
+                continue;
+            }
+            let raw_title: String = paper
+                .getattr("title")?
+                .extract::<Option<String>>()?
+                .unwrap_or_default();
+            let raw_venue: String = paper
+                .getattr("venue")?
+                .extract::<Option<String>>()?
+                .unwrap_or_default();
+            let raw_journal: String = paper
+                .getattr("journal_name")?
+                .extract::<Option<String>>()?
+                .unwrap_or_default();
+            if preprocess {
+                ensure_unidecode_for_text(&unidecode, &raw_title, &mut unidecode_char_map)?;
+                ensure_unidecode_for_text(&unidecode, &raw_venue, &mut unidecode_char_map)?;
+                ensure_unidecode_for_text(&unidecode, &raw_journal, &mut unidecode_char_map)?;
+            }
+            let raw_authors = raw_authors_by_paper.remove(&paper_id).unwrap_or_default();
+            let year: Option<i64> = match paper.getattr("year")?.extract::<Option<i64>>()? {
+                Some(value) if value > 0 => Some(value),
+                _ => None,
+            };
+            let abstract_text: Option<String> = paper.getattr("abstract")?.extract()?;
+            let has_abstract = abstract_text
+                .as_ref()
+                .map_or(false, |value| !value.is_empty());
+            let supplied_predicted_language: Option<String> =
+                paper.getattr("predicted_language")?.extract()?;
+            let supplied_is_reliable: Option<bool> = paper.getattr("is_reliable")?.extract()?;
+            let (is_reliable, predicted_language) = if supplied_predicted_language.is_some() {
+                (
+                    supplied_is_reliable.unwrap_or(false),
+                    supplied_predicted_language,
+                )
+            } else if preprocess {
+                let detector = language_detector.as_ref().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err("missing language detector")
+                })?;
+                let (reliable, _is_english, language) = detector.detect(&raw_title);
+                (reliable, Some(language))
+            } else {
+                (false, None)
+            };
+            paper_inputs.push(FeatureBlockPaperInput {
+                paper_id,
+                raw_title,
+                raw_venue,
+                raw_journal,
+                raw_authors,
+                year,
+                has_abstract,
+                predicted_language,
+                is_reliable,
+            });
+        }
+        let parse_seconds = parse_start.elapsed().as_secs_f64();
+
+        let paper_preprocess_start = Instant::now();
+        let computed_papers = py.allow_threads(|| {
+            let compute = || {
+                paper_inputs
+                    .par_iter()
+                    .map(|paper_input| {
+                        let title = if preprocess {
+                            normalize_text_compat_from_map(
+                                &paper_input.raw_title,
+                                false,
+                                &unidecode_char_map,
+                            )
+                        } else {
+                            paper_input.raw_title.clone()
+                        };
+                        let venue = if preprocess {
+                            normalize_text_compat_from_map(
+                                &paper_input.raw_venue,
+                                false,
+                                &unidecode_char_map,
+                            )
+                        } else {
+                            paper_input.raw_venue.clone()
+                        };
+                        let journal_name = if preprocess {
+                            normalize_text_compat_from_map(
+                                &paper_input.raw_journal,
+                                false,
+                                &unidecode_char_map,
+                            )
+                        } else {
+                            paper_input.raw_journal.clone()
+                        };
+                        let authors = if preprocess {
+                            paper_input
+                                .raw_authors
+                                .iter()
+                                .map(|(position, raw_name)| {
+                                    (
+                                        *position,
+                                        normalize_text_compat_from_map(
+                                            raw_name,
+                                            false,
+                                            &unidecode_char_map,
+                                        ),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            paper_input.raw_authors.clone()
+                        };
+                        let title_words = if preprocess {
+                            counter_data_from_usize_map(word_ngrams_counter_python_compat(
+                                &title,
+                                &stop_words,
+                            ))
+                        } else {
+                            None
+                        };
+                        let title_chars = if preprocess {
+                            counter_data_from_usize_map(char_ngrams_counter_python_compat(
+                                &title,
+                                false,
+                                true,
+                                Some(&stop_words),
+                            ))
+                        } else {
+                            None
+                        };
+                        let venue_ngrams = if preprocess {
+                            counter_data_from_usize_map(char_ngrams_counter_python_compat(
+                                &venue,
+                                false,
+                                true,
+                                Some(&venue_stop_words),
+                            ))
+                        } else {
+                            None
+                        };
+                        let journal_ngrams = if preprocess {
+                            counter_data_from_usize_map(char_ngrams_counter_python_compat(
+                                &journal_name,
+                                false,
+                                true,
+                                Some(&venue_stop_words),
+                            ))
+                        } else {
+                            None
+                        };
+                        (
+                            paper_input.paper_id.clone(),
+                            FeatureBlockPaperPreprocessed {
+                                authors,
+                                year: paper_input.year,
+                                has_abstract: paper_input.has_abstract,
+                                predicted_language: paper_input.predicted_language.clone(),
+                                is_reliable: paper_input.is_reliable,
+                                title_words,
+                                title_chars,
+                                venue_ngrams,
+                                journal_ngrams,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            install_with_optional_rayon_pool(num_threads, compute)
+        });
+        let mut preprocessed_papers: HashMap<PaperId, FeatureBlockPaperPreprocessed> =
+            HashMap::with_capacity(computed_papers.len());
+        for (paper_id, preprocessed) in computed_papers {
+            preprocessed_papers.insert(paper_id, preprocessed);
+        }
+        let paper_preprocess_seconds = paper_preprocess_start.elapsed().as_secs_f64();
+
+        let missing_paper_ids: Vec<String> = signature_inputs
+            .iter()
+            .filter(|entry| !preprocessed_papers.contains_key(&entry.paper_id))
+            .map(|entry| entry.paper_id.to_string())
+            .collect();
+        if !missing_paper_ids.is_empty() {
+            let examples = missing_paper_ids
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "FeatureBlock signatures reference {} missing papers; examples: {}",
+                missing_paper_ids.len(),
+                examples
+            )));
+        }
+
+        let signature_preprocess_start = Instant::now();
+        let computed_signatures = py.allow_threads(|| {
+            let compute = || {
+                signature_inputs
+                    .par_iter()
+                    .map(|entry| {
+                        let middle_normalized = normalize_text_compat_from_map(
+                            &entry.raw_middle,
+                            false,
+                            &unidecode_char_map,
+                        );
+                        let first_normalized = normalize_text_compat_from_map(
+                            &entry.raw_first,
+                            false,
+                            &unidecode_char_map,
+                        );
+                        let mut first_middle_split: Vec<String> =
+                            format!("{} {}", first_normalized, middle_normalized)
+                                .split_whitespace()
+                                .map(|token| token.to_string())
+                                .collect();
+                        if let Some(prefix) = first_middle_split.first() {
+                            if name_prefixes.contains(prefix) {
+                                first_middle_split.remove(0);
+                            }
+                        }
+                        let first_normalized_token =
+                            first_middle_split.get(0).cloned().unwrap_or_default();
+                        let (first_without_apostrophe, middle_without_apostrophe) =
+                            split_first_middle_hyphen_aware_compat(
+                                &entry.raw_first,
+                                &entry.raw_middle,
+                                &name_prefixes,
+                                &unidecode_char_map,
+                            );
+                        let last_normalized = normalize_text_compat_from_map(
+                            &entry.raw_last,
+                            false,
+                            &unidecode_char_map,
+                        );
+                        let mut coauthor_list: Vec<String> = Vec::new();
+                        if let Some(preprocessed_paper) = preprocessed_papers.get(&entry.paper_id) {
+                            for (author_position, author_name) in preprocessed_paper.authors.iter()
+                            {
+                                if *author_position != entry.position {
+                                    coauthor_list.push(author_name.clone());
+                                }
+                            }
+                        }
+                        let coauthors = if coauthor_list.is_empty() {
+                            None
+                        } else {
+                            Some(coauthor_list.iter().cloned().collect::<HashSet<String>>())
+                        };
+                        let mut coauthor_blocks_set: HashSet<String> = HashSet::new();
+                        for coauthor in coauthor_list.iter() {
+                            coauthor_blocks_set.insert(compute_block_compat(coauthor));
+                        }
+                        let coauthor_blocks = if coauthor_blocks_set.is_empty() {
+                            None
+                        } else {
+                            Some(coauthor_blocks_set)
+                        };
+
+                        let normalized_affiliations: Vec<String> = if preprocess {
+                            entry
+                                .affiliation_values
+                                .iter()
+                                .map(|affiliation| {
+                                    normalize_text_compat_from_map(
+                                        affiliation,
+                                        false,
+                                        &unidecode_char_map,
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            entry.affiliation_values.clone()
+                        };
+                        let affiliation_text = if preprocess {
+                            prefilter_affiliation_text(
+                                &normalized_affiliations,
+                                &affiliation_stopwords,
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let coauthor_text = if preprocess {
+                            coauthor_list.join(" ")
+                        } else {
+                            String::new()
+                        };
+                        let affiliations = if preprocess && !affiliation_text.is_empty() {
+                            counter_data_from_usize_map(word_ngrams_counter(&affiliation_text))
+                        } else {
+                            None
+                        };
+                        let coauthor_ngrams = if preprocess && !coauthor_text.is_empty() {
+                            counter_data_from_usize_map(char_ngrams_counter(&coauthor_text))
+                        } else {
+                            None
+                        };
+                        let normalized_orcid = entry.orcid.as_ref().and_then(|value| {
+                            let upper_value = value.to_ascii_uppercase();
+                            extract_orcid_from_source_id(value)
+                                .or_else(|| extract_orcid_from_source_id(&upper_value))
+                                .or_else(|| Some(value.clone()))
+                        });
+                        let name_counts = entry.name_counts.clone().or_else(|| {
+                            build_name_counts_data_from_artifact(
+                                &raw_name_counts,
+                                &entry.raw_first,
+                                &first_normalized_token,
+                                &first_without_apostrophe,
+                                &entry.raw_last,
+                                &last_normalized,
+                            )
+                            .data
+                        });
+                        (
+                            entry.sig_id.clone(),
+                            SignatureData {
+                                first: Some(first_without_apostrophe.clone()),
+                                middle: Some(middle_without_apostrophe),
+                                last_normalized: Some(last_normalized),
+                                orcid: normalized_orcid,
+                                email: entry.email.clone(),
+                                affiliations,
+                                coauthor_blocks,
+                                coauthor_ngrams,
+                                coauthors,
+                                position: entry.position,
+                                paper_id: entry.paper_id.clone(),
+                                name_counts: name_counts.or_else(|| {
+                                    Some(NameCountsData {
+                                        first: f64::NAN,
+                                        first_last: f64::NAN,
+                                        last: f64::NAN,
+                                        last_first_initial: f64::NAN,
+                                    })
+                                }),
+                                adv_name: Some(first_without_apostrophe),
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            install_with_optional_rayon_pool(num_threads, compute)
+        });
+        let mut signatures: HashMap<String, SignatureData> =
+            HashMap::with_capacity(computed_signatures.len());
+        for (sig_id, signature) in computed_signatures {
+            signatures.insert(sig_id, signature);
+        }
+        let signature_preprocess_seconds = signature_preprocess_start.elapsed().as_secs_f64();
+
+        let specter_by_paper = extract_feature_block_specter_by_paper(feature_block)?;
+        let reference_counter_start = Instant::now();
+        let mut missing_specter_paper_count = 0usize;
+        let mut papers: HashMap<PaperId, PaperData> =
+            HashMap::with_capacity(preprocessed_papers.len());
+        for (paper_id, paper) in preprocessed_papers.into_iter() {
+            let specter = specter_by_paper.get(&paper_id).cloned();
+            if specter.is_none() {
+                missing_specter_paper_count += 1;
+            }
+            let specter_norm = specter.as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        let value_f64 = *value as f64;
+                        value_f64 * value_f64
+                    })
+                    .sum::<f64>()
+                    .sqrt()
+            });
+            papers.insert(
+                paper_id,
+                PaperData {
+                    venue_ngrams: paper.venue_ngrams,
+                    title_words: paper.title_words,
+                    title_chars: paper.title_chars,
+                    ref_authors: None,
+                    ref_titles: None,
+                    ref_venues: None,
+                    ref_blocks: None,
+                    ref_details_present: false,
+                    references: HashSet::new(),
+                    year: paper.year,
+                    has_abstract: paper.has_abstract,
+                    predicted_language: paper.predicted_language,
+                    is_reliable: paper.is_reliable,
+                    journal_ngrams: paper.journal_ngrams,
+                    specter,
+                    specter_norm,
+                },
+            );
+        }
+        let reference_counter_seconds = reference_counter_start.elapsed().as_secs_f64();
+
+        let mut signature_ids: Vec<String> =
+            PyIterator::from_object(&feature_block.getattr("signature_ids")?)?
+                .map(|item| item.and_then(|value| value.extract::<String>()))
+                .collect::<PyResult<Vec<_>>>()?;
+        if signature_ids.is_empty() {
+            signature_ids = signatures.keys().cloned().collect();
+            signature_ids.sort_unstable();
+        }
+        let name_tuples = extract_feature_block_name_tuples(py, name_tuples)?;
+        let cluster_seed_start = Instant::now();
+        let cluster_seeds_require = extract_feature_block_cluster_seeds_require(feature_block)?;
+        let cluster_seeds_disallow = extract_feature_block_cluster_seeds_disallow(feature_block)?;
+        let cluster_seed_seconds = cluster_seed_start.elapsed().as_secs_f64();
+
+        let json_ingest_telemetry = JsonIngestTelemetry {
+            json_parse_seconds: parse_seconds,
+            paper_preprocess_seconds,
+            reference_counter_seconds,
+            signature_preprocess_seconds,
+            cluster_seed_seconds,
+            missing_specter_paper_count,
+            defaulted_name_count_signature_count: 0,
+            defaulted_name_count_first_count: 0,
+            defaulted_name_count_first_last_count: 0,
+            defaulted_name_count_last_count: 0,
+            defaulted_name_count_last_first_initial_count: 0,
+            defaulted_signature_author_position_count,
+            defaulted_paper_author_position_count,
+        };
+
+        Ok(RustFeaturizer {
+            signatures,
+            signature_ids,
+            papers,
+            name_tuples,
+            cluster_seeds_disallow,
+            cluster_seeds_require,
+            compute_reference_features,
+            cluster_seed_require_value,
+            cluster_seed_disallow_value,
+            json_ingest_telemetry: Some(json_ingest_telemetry),
             cached_signature_id_order: OnceLock::new(),
             cluster_seeds_disallow_index: OnceLock::new(),
         })
@@ -6629,6 +9869,18 @@ impl RustFeaturizer {
 
     fn signature_ids(&self) -> Vec<String> {
         self.signature_id_order().to_vec()
+    }
+
+    fn cluster_seeds_require(&self) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = self
+            .cluster_seeds_require
+            .iter()
+            .map(|(signature_id, cluster_id)| {
+                (signature_id.clone(), cluster_id_to_string(cluster_id))
+            })
+            .collect();
+        pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        pairs
     }
 
     fn update_signature_name_counts(&mut self, signatures: &Bound<'_, PyAny>) -> PyResult<usize> {
@@ -9130,6 +12382,703 @@ fn get_build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(build_info.unbind())
 }
 
+fn required_path_from_py_dict(paths: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
+    match paths.get_item(key)? {
+        Some(value) => value.extract(),
+        None => Err(pyo3::exceptions::PyKeyError::new_err(format!(
+            "paths must include '{key}'"
+        ))),
+    }
+}
+
+fn optional_path_from_py_dict(paths: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
+    paths
+        .get_item(key)?
+        .map(|value| value.extract())
+        .transpose()
+}
+
+fn optional_name_counts_index_path_from_py_dict(
+    paths: &Bound<'_, PyDict>,
+) -> PyResult<Option<String>> {
+    match optional_path_from_py_dict(paths, "name_counts_index")? {
+        Some(path) => Ok(Some(path)),
+        None => optional_path_from_py_dict(paths, "name_counts_index_dir"),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (paths, query_signature_ids, top_k = 25, query_view = "auto", orcid_enabled = true, num_threads = None, max_exemplars = 4, include_seed_assignments = false))]
+fn raw_block_query_candidate_plan_arrow<'py>(
+    py: Python<'py>,
+    paths: &Bound<'py, PyDict>,
+    query_signature_ids: Vec<String>,
+    top_k: usize,
+    query_view: &str,
+    orcid_enabled: bool,
+    num_threads: Option<usize>,
+    max_exemplars: usize,
+    include_seed_assignments: bool,
+) -> PyResult<Py<PyDict>> {
+    if top_k == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "top_k must be positive",
+        ));
+    }
+    if query_signature_ids.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "query_signature_ids must be non-empty",
+        ));
+    }
+
+    let total_start = Instant::now();
+    let signatures_path = required_path_from_py_dict(paths, "signatures")?;
+    let papers_path = required_path_from_py_dict(paths, "papers")?;
+    let paper_authors_path = required_path_from_py_dict(paths, "paper_authors")?;
+    let cluster_seeds_path = required_path_from_py_dict(paths, "cluster_seeds")?;
+    let specter_path = optional_path_from_py_dict(paths, "specter")?;
+    let name_counts_arrow_path = optional_path_from_py_dict(paths, "name_counts")?;
+    let name_counts_index_path = optional_name_counts_index_path_from_py_dict(paths)?;
+
+    let read_signatures_start = Instant::now();
+    let signatures = read_raw_arrow_signatures(&signatures_path)?;
+    let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
+
+    let read_papers_start = Instant::now();
+    let papers = read_raw_arrow_papers(&papers_path)?;
+    let read_papers_secs = read_papers_start.elapsed().as_secs_f64();
+
+    let read_paper_authors_start = Instant::now();
+    let paper_authors = read_raw_arrow_paper_authors(&paper_authors_path)?;
+    let read_paper_authors_secs = read_paper_authors_start.elapsed().as_secs_f64();
+
+    let read_cluster_seeds_start = Instant::now();
+    let (raw_component_order, raw_members_by_component) =
+        read_raw_arrow_cluster_seeds(&cluster_seeds_path)?;
+    let read_cluster_seeds_secs = read_cluster_seeds_start.elapsed().as_secs_f64();
+
+    let query_signature_id_set: HashSet<String> = query_signature_ids.iter().cloned().collect();
+    let mut component_order = Vec::with_capacity(raw_component_order.len());
+    let mut members_by_component = HashMap::<String, Vec<String>>::new();
+    let mut excluded_query_seed_count = 0usize;
+    for component_key in raw_component_order {
+        let members = raw_members_by_component
+            .get(&component_key)
+            .cloned()
+            .unwrap_or_default();
+        let mut filtered_members = Vec::with_capacity(members.len());
+        for signature_id in members {
+            if query_signature_id_set.contains(&signature_id) {
+                excluded_query_seed_count += 1;
+            } else {
+                filtered_members.push(signature_id);
+            }
+        }
+        if !filtered_members.is_empty() {
+            component_order.push(component_key.clone());
+            members_by_component.insert(component_key, filtered_members);
+        }
+    }
+
+    let read_specter_start = Instant::now();
+    let specter_by_paper_id = specter_path
+        .as_ref()
+        .map(|path| read_raw_arrow_specter(path))
+        .transpose()?;
+    let read_specter_secs = read_specter_start.elapsed().as_secs_f64();
+
+    let read_name_counts_start = Instant::now();
+    let raw_name_counts = if signatures
+        .values()
+        .any(|signature| signature.name_counts.is_none())
+    {
+        match name_counts_index_path.as_ref() {
+            Some(path) => read_raw_name_counts_index(path)?,
+            None => match name_counts_arrow_path.as_ref() {
+                Some(path) => read_raw_arrow_name_counts(path)?,
+                None => RawNameCountMaps::default(),
+            },
+        }
+    } else {
+        RawNameCountMaps::default()
+    };
+    let read_name_counts_secs = read_name_counts_start.elapsed().as_secs_f64();
+
+    let text_context_start = Instant::now();
+    let text_module = py.import("s2and.text")?;
+    let unidecode = text_module.getattr("unidecode")?;
+    let name_prefixes = extract_required_string_set(&text_module.getattr("NAME_PREFIXES")?)?;
+    let affiliation_stopwords = extract_affiliation_stopwords(py)?;
+    let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
+    ensure_unidecode_for_raw_arrow_inputs(
+        &unidecode,
+        &signatures,
+        &papers,
+        &paper_authors,
+        &mut unidecode_char_map,
+    )?;
+    let text_context_secs = text_context_start.elapsed().as_secs_f64();
+
+    let mut required_signature_ids = Vec::<String>::new();
+    let mut required_seen = HashSet::<String>::new();
+    for signature_id in query_signature_ids.iter() {
+        if required_seen.insert(signature_id.clone()) {
+            required_signature_ids.push(signature_id.clone());
+        }
+    }
+    for component_key in component_order.iter() {
+        if let Some(members) = members_by_component.get(component_key) {
+            for signature_id in members {
+                if required_seen.insert(signature_id.clone()) {
+                    required_signature_ids.push(signature_id.clone());
+                }
+            }
+        }
+    }
+
+    for signature_id in required_signature_ids.iter() {
+        if !signatures.contains_key(signature_id) {
+            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                "signature_id '{}' is required by queries or cluster seeds but is missing from signatures Arrow input",
+                signature_id
+            )));
+        }
+    }
+
+    let feature_start = Instant::now();
+    let raw_feature_results: Vec<Result<(String, RawArrowFeature), String>> =
+        py.allow_threads(|| {
+            let compute = || {
+                required_signature_ids
+                    .par_iter()
+                    .map(|signature_id| {
+                        let signature = signatures.get(signature_id).ok_or_else(|| {
+                            format!("signature_id '{}' is missing from signatures", signature_id)
+                        })?;
+                        let paper = papers.get(&signature.paper_id);
+                        let authors = paper_authors.get(&signature.paper_id);
+                        Ok((
+                            signature_id.clone(),
+                            build_raw_arrow_feature(
+                                signature,
+                                paper,
+                                authors,
+                                specter_by_paper_id.as_ref(),
+                                &raw_name_counts,
+                                &name_prefixes,
+                                &affiliation_stopwords,
+                                &unidecode_char_map,
+                                orcid_enabled,
+                            ),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            install_with_optional_rayon_pool(num_threads, compute)
+        });
+    let mut features_by_signature_id = HashMap::with_capacity(raw_feature_results.len());
+    for result in raw_feature_results {
+        let (signature_id, feature) = result.map_err(pyo3::exceptions::PyKeyError::new_err)?;
+        features_by_signature_id.insert(signature_id, feature);
+    }
+    let feature_secs = feature_start.elapsed().as_secs_f64();
+
+    let query_start = Instant::now();
+    let mut queries = Vec::<RetrievalQueryData>::with_capacity(query_signature_ids.len());
+    let mut query_views = Vec::<String>::with_capacity(query_signature_ids.len());
+    let mut query_authors = Vec::<String>::with_capacity(query_signature_ids.len());
+    for signature_id in query_signature_ids.iter() {
+        let base_feature = &features_by_signature_id[signature_id];
+        let base = &base_feature.query;
+        let (masked, resolved_view) = mask_raw_arrow_query(base, query_view)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        queries.push(masked);
+        query_views.push(resolved_view);
+        query_authors.push(base_feature.query_author.clone());
+    }
+    let query_secs = query_start.elapsed().as_secs_f64();
+
+    let summary_start = Instant::now();
+    let mut summaries = Vec::<RetrievalSummaryData>::with_capacity(component_order.len());
+    for component_key in component_order.iter() {
+        let members = members_by_component.get(component_key).ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!(
+                "component_key '{}' disappeared while building summaries",
+                component_key
+            ))
+        })?;
+        let summary = build_raw_arrow_summary(
+            component_key,
+            members,
+            &features_by_signature_id,
+            max_exemplars,
+        )
+        .map_err(pyo3::exceptions::PyKeyError::new_err)?;
+        summaries.push(summary);
+    }
+    let mut component_index_by_key = HashMap::with_capacity(summaries.len());
+    let mut coauthor_cluster_df = HashMap::new();
+    let mut non_mega_coauthor_cluster_df = HashMap::new();
+    let mut affiliation_cluster_df = HashMap::new();
+    for (index, summary) in summaries.iter().enumerate() {
+        component_index_by_key.insert(summary.component_key.clone(), index);
+        increment_df_from_counter(&summary.coauthor_counts, &mut coauthor_cluster_df);
+        increment_df_from_counter(
+            &summary.non_mega_coauthor_counts,
+            &mut non_mega_coauthor_cluster_df,
+        );
+        increment_df_from_counter(&summary.affiliation_counts, &mut affiliation_cluster_df);
+    }
+    let max_block_component_size = summaries
+        .iter()
+        .map(|summary| summary.size)
+        .max()
+        .unwrap_or(0);
+    let retriever = RustHybridCentroidRetriever {
+        summaries,
+        max_block_component_size,
+        component_index_by_key,
+        coauthor_cluster_df,
+        non_mega_coauthor_cluster_df,
+        affiliation_cluster_df,
+    };
+    let summary_secs = summary_start.elapsed().as_secs_f64();
+
+    let component_members_start = Instant::now();
+    let mut component_member_indices = HashMap::<String, Vec<u32>>::new();
+    let mut seed_signature_ids = Vec::<String>::new();
+    let mut seed_component_keys = Vec::<String>::new();
+    let query_count_u32 = u32::try_from(query_signature_ids.len())
+        .map_err(|_| pyo3::exceptions::PyOverflowError::new_err("query count exceeds u32"))?;
+    for component_key in component_order.iter() {
+        let mut member_indices = Vec::<u32>::new();
+        if let Some(members) = members_by_component.get(component_key) {
+            for signature_id in members.iter() {
+                let seed_offset = u32::try_from(seed_signature_ids.len()).map_err(|_| {
+                    pyo3::exceptions::PyOverflowError::new_err("seed signature count exceeds u32")
+                })?;
+                let member_index = query_count_u32.checked_add(seed_offset).ok_or_else(|| {
+                    pyo3::exceptions::PyOverflowError::new_err("signature index exceeds u32")
+                })?;
+                member_indices.push(member_index);
+                seed_signature_ids.push(signature_id.clone());
+                seed_component_keys.push(component_key.clone());
+            }
+        }
+        component_member_indices.insert(component_key.clone(), member_indices);
+    }
+    let mut index_to_signature_id = query_signature_ids.clone();
+    index_to_signature_id.extend(seed_signature_ids.iter().cloned());
+    let component_members_secs = component_members_start.elapsed().as_secs_f64();
+
+    let retrieval_start = Instant::now();
+    let query_results: Vec<Result<RetrievalPairPlanQueryResult, String>> = py.allow_threads(|| {
+        let compute = || {
+            queries
+                .par_iter()
+                .enumerate()
+                .map(|(query_offset, current_query)| {
+                    let query_index = u32::try_from(query_offset)
+                        .map_err(|_| "query index exceeds u32".to_string())?;
+                    retriever.build_pair_plan_query_result(
+                        current_query,
+                        query_index,
+                        None,
+                        Some(query_signature_ids[query_offset].as_str()),
+                        &component_member_indices,
+                        top_k,
+                        None,
+                        0,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        install_with_optional_rayon_pool(num_threads, compute)
+    });
+
+    let mut row_query_signature_indices = Vec::<u32>::new();
+    let mut row_component_keys = Vec::<String>::new();
+    let mut row_retrieval_scores = Vec::<f32>::new();
+    let mut row_retrieval_ranks = Vec::<u16>::new();
+    let mut row_component_sizes = Vec::<u32>::new();
+    let mut row_named_signature_counts = Vec::<u32>::new();
+    let mut row_dominant_first_names = Vec::<String>::new();
+    let mut row_candidate_year_min = Vec::<i32>::new();
+    let mut row_candidate_year_max = Vec::<i32>::new();
+    let mut row_candidate_year_range_missing = Vec::<u8>::new();
+    let mut row_query_first_tokens = Vec::<String>::new();
+    let mut row_query_years = Vec::<i32>::new();
+    let mut row_query_year_missing = Vec::<u8>::new();
+    let mut row_query_has_affiliations = Vec::<u8>::new();
+    let mut row_query_has_coauthors = Vec::<u8>::new();
+    let mut row_orcid_match = Vec::<u8>::new();
+    let mut row_middle_initial_compatibility = Vec::<f32>::new();
+    let mut row_affiliation_overlap = Vec::<f32>::new();
+    let mut row_coauthor_overlap = Vec::<f32>::new();
+    let mut row_venue_overlap = Vec::<f32>::new();
+    let mut row_year_compatibility = Vec::<f32>::new();
+    let mut row_title_overlap = Vec::<f32>::new();
+    let mut row_specter_centroid_similarity = Vec::<f32>::new();
+    let mut row_specter_exemplar_similarity = Vec::<f32>::new();
+    let mut row_last_name_count_min_rarity = Vec::<f32>::new();
+    let mut row_candidate_last_name_count_min_rarity = Vec::<f32>::new();
+    let mut row_candidate_last_first_name_count_min_rarity = Vec::<f32>::new();
+    let mut row_last_first_name_count_min_rarity = Vec::<f32>::new();
+    let mut row_first_prefix_x_last_first_name_count_min_rarity = Vec::<f32>::new();
+    let mut row_candidate_cluster_max_paper_author_count = Vec::<f32>::new();
+    let mut row_paper_author_list_max_jaccard = Vec::<f32>::new();
+    let mut row_paper_author_list_max_containment = Vec::<f32>::new();
+    let mut row_paper_author_list_max_overlap_count = Vec::<f32>::new();
+    let mut row_local_author_window10_jaccard_max = Vec::<f32>::new();
+    let mut row_local_author_window10_overlap_count_max = Vec::<f32>::new();
+    let mut row_best_author_count_log_absdiff = Vec::<f32>::new();
+    let mut left_signature_indices = Vec::<u32>::new();
+    let mut right_signature_indices = Vec::<u32>::new();
+    let mut pair_row_indices = Vec::<u32>::new();
+    let mut summary_signals_by_component = HashMap::<String, RawArrowSummarySignalData>::new();
+
+    for query_result in query_results {
+        let mut query_result = query_result.map_err(pyo3::exceptions::PyKeyError::new_err)?;
+        let base_row_index = u32::try_from(row_component_keys.len()).map_err(|_| {
+            pyo3::exceptions::PyOverflowError::new_err("retrieved candidate row count exceeds u32")
+        })?;
+        for (local_row_index, member_indices) in query_result
+            .right_signature_indices_by_row
+            .iter()
+            .enumerate()
+        {
+            let local_row_index_u32 = u32::try_from(local_row_index).map_err(|_| {
+                pyo3::exceptions::PyOverflowError::new_err(
+                    "retrieved candidate row count exceeds u32",
+                )
+            })?;
+            let row_index = base_row_index
+                .checked_add(local_row_index_u32)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyOverflowError::new_err(
+                        "retrieved candidate row count exceeds u32",
+                    )
+                })?;
+            let query_signature_index = query_result.row_query_signature_indices[local_row_index];
+            for member_index in member_indices.iter() {
+                left_signature_indices.push(query_signature_index);
+                right_signature_indices.push(*member_index);
+                pair_row_indices.push(row_index);
+            }
+        }
+        for (local_row_index, component_key) in query_result.row_component_keys.iter().enumerate() {
+            let query_offset = query_result.row_query_signature_indices[local_row_index] as usize;
+            let query_signature_id = query_signature_ids.get(query_offset).ok_or_else(|| {
+                pyo3::exceptions::PyIndexError::new_err(format!(
+                    "row query signature offset {} is outside query_signature_ids",
+                    query_offset
+                ))
+            })?;
+            let query_feature = features_by_signature_id
+                .get(query_signature_id)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!(
+                        "query signature_id '{}' is missing from computed raw Arrow features",
+                        query_signature_id
+                    ))
+                })?;
+            let query = queries.get(query_offset).ok_or_else(|| {
+                pyo3::exceptions::PyIndexError::new_err(format!(
+                    "row query signature offset {} is outside query feature table",
+                    query_offset
+                ))
+            })?;
+            let component_index = retriever
+                .component_index_by_key
+                .get(component_key)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!(
+                        "component_key '{}' disappeared while building row signals",
+                        component_key
+                    ))
+                })?;
+            let summary = retriever.summaries.get(*component_index).ok_or_else(|| {
+                pyo3::exceptions::PyIndexError::new_err(format!(
+                    "component index {} is outside summary table",
+                    component_index
+                ))
+            })?;
+            if !summary_signals_by_component.contains_key(component_key) {
+                let members = members_by_component.get(component_key).ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!(
+                        "component_key '{}' disappeared while building row signals",
+                        component_key
+                    ))
+                })?;
+                let summary_signals =
+                    build_raw_arrow_summary_signals(members, &features_by_signature_id)
+                        .map_err(pyo3::exceptions::PyKeyError::new_err)?;
+                summary_signals_by_component.insert(component_key.clone(), summary_signals);
+            }
+            let summary_signals =
+                summary_signals_by_component
+                    .get(component_key)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyKeyError::new_err(format!(
+                            "component_key '{}' is missing raw row signal summary",
+                            component_key
+                        ))
+                    })?;
+            let rarity = raw_arrow_name_count_rarity_row(
+                query,
+                &query_feature.name_counts,
+                summary,
+                summary_signals,
+            );
+            let evidence =
+                raw_arrow_paper_evidence_row(query_signature_id, query_feature, summary_signals);
+            row_last_name_count_min_rarity.push(rarity.last_name_count_min_rarity);
+            row_candidate_last_name_count_min_rarity
+                .push(rarity.candidate_last_name_count_min_rarity);
+            row_candidate_last_first_name_count_min_rarity
+                .push(rarity.candidate_last_first_name_count_min_rarity);
+            row_last_first_name_count_min_rarity.push(rarity.last_first_name_count_min_rarity);
+            row_first_prefix_x_last_first_name_count_min_rarity
+                .push(rarity.first_prefix_x_last_first_name_count_min_rarity);
+            row_candidate_cluster_max_paper_author_count
+                .push(summary.max_paper_author_count as f32);
+            row_paper_author_list_max_jaccard.push(evidence.paper_author_list_max_jaccard);
+            row_paper_author_list_max_containment.push(evidence.paper_author_list_max_containment);
+            row_paper_author_list_max_overlap_count
+                .push(evidence.paper_author_list_max_overlap_count);
+            row_local_author_window10_jaccard_max.push(evidence.local_author_window10_jaccard_max);
+            row_local_author_window10_overlap_count_max
+                .push(evidence.local_author_window10_overlap_count_max);
+            row_best_author_count_log_absdiff.push(evidence.best_author_count_log_absdiff);
+        }
+        row_query_signature_indices.append(&mut query_result.row_query_signature_indices);
+        row_component_keys.append(&mut query_result.row_component_keys);
+        row_retrieval_scores.append(&mut query_result.row_retrieval_scores);
+        row_retrieval_ranks.append(&mut query_result.row_retrieval_ranks);
+        row_component_sizes.append(&mut query_result.row_component_sizes);
+        row_named_signature_counts.append(&mut query_result.row_named_signature_counts);
+        row_dominant_first_names.append(&mut query_result.row_dominant_first_names);
+        row_candidate_year_min.append(&mut query_result.row_candidate_year_min);
+        row_candidate_year_max.append(&mut query_result.row_candidate_year_max);
+        row_candidate_year_range_missing.append(&mut query_result.row_candidate_year_range_missing);
+        row_query_first_tokens.append(&mut query_result.row_query_first_tokens);
+        row_query_years.append(&mut query_result.row_query_years);
+        row_query_year_missing.append(&mut query_result.row_query_year_missing);
+        row_query_has_affiliations.append(&mut query_result.row_query_has_affiliations);
+        row_query_has_coauthors.append(&mut query_result.row_query_has_coauthors);
+        row_orcid_match.append(&mut query_result.row_orcid_match);
+        row_middle_initial_compatibility.append(&mut query_result.row_middle_initial_compatibility);
+        row_affiliation_overlap.append(&mut query_result.row_affiliation_overlap);
+        row_coauthor_overlap.append(&mut query_result.row_coauthor_overlap);
+        row_venue_overlap.append(&mut query_result.row_venue_overlap);
+        row_year_compatibility.append(&mut query_result.row_year_compatibility);
+        row_title_overlap.append(&mut query_result.row_title_overlap);
+        row_specter_centroid_similarity.append(&mut query_result.row_specter_centroid_similarity);
+        row_specter_exemplar_similarity.append(&mut query_result.row_specter_exemplar_similarity);
+    }
+    let retrieval_secs = retrieval_start.elapsed().as_secs_f64();
+
+    let mut left_signature_ids = Vec::<String>::with_capacity(left_signature_indices.len());
+    let mut right_signature_ids = Vec::<String>::with_capacity(right_signature_indices.len());
+    for index in left_signature_indices.iter() {
+        let Some(signature_id) = index_to_signature_id.get(*index as usize) else {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "left signature index {} is outside signature id table",
+                index
+            )));
+        };
+        left_signature_ids.push(signature_id.clone());
+    }
+    for index in right_signature_indices.iter() {
+        let Some(signature_id) = index_to_signature_id.get(*index as usize) else {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "right signature index {} is outside signature id table",
+                index
+            )));
+        };
+        right_signature_ids.push(signature_id.clone());
+    }
+
+    let retrieved_component_keys: HashSet<String> = row_component_keys.iter().cloned().collect();
+    let component_members = PyDict::new(py);
+    for component_key in component_order.iter() {
+        if !retrieved_component_keys.contains(component_key) {
+            continue;
+        }
+        component_members.set_item(
+            component_key,
+            members_by_component
+                .get(component_key)
+                .cloned()
+                .unwrap_or_default(),
+        )?;
+    }
+
+    let timings = PyDict::new(py);
+    timings.set_item("read_signatures_secs", read_signatures_secs)?;
+    timings.set_item("read_papers_secs", read_papers_secs)?;
+    timings.set_item("read_paper_authors_secs", read_paper_authors_secs)?;
+    timings.set_item("read_cluster_seeds_secs", read_cluster_seeds_secs)?;
+    timings.set_item("read_specter_secs", read_specter_secs)?;
+    timings.set_item("read_name_counts_secs", read_name_counts_secs)?;
+    timings.set_item("text_context_secs", text_context_secs)?;
+    timings.set_item("feature_secs", feature_secs)?;
+    timings.set_item("query_secs", query_secs)?;
+    timings.set_item("summary_secs", summary_secs)?;
+    timings.set_item("component_members_secs", component_members_secs)?;
+    timings.set_item("retrieval_secs", retrieval_secs)?;
+    timings.set_item("total_secs", total_start.elapsed().as_secs_f64())?;
+
+    let telemetry = PyDict::new(py);
+    telemetry.set_item("signature_count", signatures.len())?;
+    telemetry.set_item("paper_count", papers.len())?;
+    telemetry.set_item("paper_author_paper_count", paper_authors.len())?;
+    telemetry.set_item("cluster_count", component_order.len())?;
+    telemetry.set_item("seed_signature_count", seed_signature_ids.len())?;
+    telemetry.set_item("query_signature_count", query_signature_ids.len())?;
+    telemetry.set_item("excluded_query_seed_count", excluded_query_seed_count)?;
+    telemetry.set_item(
+        "specter_count",
+        specter_by_paper_id.as_ref().map_or(0usize, HashMap::len),
+    )?;
+    telemetry.set_item("unidecode_char_count", unidecode_char_map.len())?;
+    telemetry.set_item("timings", timings)?;
+
+    let payload = PyDict::new(py);
+    payload.set_item("schema_version", "raw_arrow_candidate_plan_v1")?;
+    payload.set_item("row_count", row_component_keys.len())?;
+    payload.set_item("pair_count", left_signature_indices.len())?;
+    payload.set_item("query_signature_ids", query_signature_ids)?;
+    payload.set_item("query_views", query_views)?;
+    payload.set_item("query_authors", query_authors)?;
+    if include_seed_assignments {
+        payload.set_item("seed_signature_ids", seed_signature_ids)?;
+        payload.set_item("seed_component_keys", seed_component_keys)?;
+    }
+    payload.set_item("component_members", component_members)?;
+    payload.set_item(
+        "left_signature_indices",
+        left_signature_indices.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "right_signature_indices",
+        right_signature_indices.to_pyarray(py),
+    )?;
+    payload.set_item("left_signature_ids", left_signature_ids)?;
+    payload.set_item("right_signature_ids", right_signature_ids)?;
+    payload.set_item("pair_row_indices", pair_row_indices.to_pyarray(py))?;
+    payload.set_item(
+        "row_query_signature_indices",
+        row_query_signature_indices.to_pyarray(py),
+    )?;
+    payload.set_item("row_component_keys", row_component_keys)?;
+    payload.set_item("retrieval_scores", row_retrieval_scores.to_pyarray(py))?;
+    payload.set_item("retrieval_ranks", row_retrieval_ranks.to_pyarray(py))?;
+    payload.set_item("row_component_sizes", row_component_sizes.to_pyarray(py))?;
+    payload.set_item(
+        "row_named_signature_counts",
+        row_named_signature_counts.to_pyarray(py),
+    )?;
+    payload.set_item("row_dominant_first_names", row_dominant_first_names)?;
+    payload.set_item(
+        "row_candidate_year_min",
+        row_candidate_year_min.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_candidate_year_max",
+        row_candidate_year_max.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_candidate_year_range_missing",
+        row_candidate_year_range_missing.to_pyarray(py),
+    )?;
+    payload.set_item("row_query_first_tokens", row_query_first_tokens)?;
+    payload.set_item("row_query_years", row_query_years.to_pyarray(py))?;
+    payload.set_item(
+        "row_query_year_missing",
+        row_query_year_missing.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_query_has_affiliations",
+        row_query_has_affiliations.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_query_has_coauthors",
+        row_query_has_coauthors.to_pyarray(py),
+    )?;
+    payload.set_item("row_orcid_match", row_orcid_match.to_pyarray(py))?;
+    payload.set_item(
+        "middle_initial_compatibility",
+        row_middle_initial_compatibility.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "affiliation_overlap",
+        row_affiliation_overlap.to_pyarray(py),
+    )?;
+    payload.set_item("coauthor_overlap", row_coauthor_overlap.to_pyarray(py))?;
+    payload.set_item("venue_overlap", row_venue_overlap.to_pyarray(py))?;
+    payload.set_item("year_compatibility", row_year_compatibility.to_pyarray(py))?;
+    payload.set_item("title_overlap", row_title_overlap.to_pyarray(py))?;
+    payload.set_item(
+        "specter_centroid_similarity",
+        row_specter_centroid_similarity.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "specter_exemplar_similarity",
+        row_specter_exemplar_similarity.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_last_name_count_min_rarity",
+        row_last_name_count_min_rarity.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_candidate_last_name_count_min_rarity",
+        row_candidate_last_name_count_min_rarity.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_candidate_last_first_name_count_min_rarity",
+        row_candidate_last_first_name_count_min_rarity.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_last_first_name_count_min_rarity",
+        row_last_first_name_count_min_rarity.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_first_prefix_x_last_first_name_count_min_rarity",
+        row_first_prefix_x_last_first_name_count_min_rarity.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_candidate_cluster_max_paper_author_count",
+        row_candidate_cluster_max_paper_author_count.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_paper_author_list_max_jaccard",
+        row_paper_author_list_max_jaccard.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_paper_author_list_max_containment",
+        row_paper_author_list_max_containment.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_paper_author_list_max_overlap_count",
+        row_paper_author_list_max_overlap_count.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_local_author_window10_jaccard_max",
+        row_local_author_window10_jaccard_max.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_local_author_window10_overlap_count_max",
+        row_local_author_window10_overlap_count_max.to_pyarray(py),
+    )?;
+    payload.set_item(
+        "row_best_author_count_log_absdiff",
+        row_best_author_count_log_absdiff.to_pyarray(py),
+    )?;
+    payload.set_item("telemetry", telemetry)?;
+    Ok(payload.unbind())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9195,6 +13144,7 @@ fn _s2and_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS.to_vec(),
     )?;
     m.add_function(wrap_pyfunction!(get_build_info, m)?)?;
+    m.add_function(wrap_pyfunction!(raw_block_query_candidate_plan_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(promoted_linker_non_pairwise_features, m)?)?;
     m.add_function(wrap_pyfunction!(signature_ngrams_batch, m)?)?;
     m.add_class::<RustFeaturizer>()?;

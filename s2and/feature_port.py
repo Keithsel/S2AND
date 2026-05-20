@@ -5,6 +5,7 @@ import threading
 import time
 import weakref
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -551,6 +552,84 @@ def _build_rust_featurizer_from_json_paths(
     }
 
 
+def build_rust_featurizer_from_feature_block(
+    feature_block: Any,
+    *,
+    name_tuples: Any = "filtered",
+    load_name_counts: bool = False,
+    name_counts_path: str | None = None,
+    preprocess: bool = True,
+    compute_reference_features: bool = False,
+    cluster_seed_require_value: float = 0.0,
+    cluster_seed_disallow_value: float = 10000.0,
+    num_threads: int | None = None,
+) -> Any:
+    """Build a Rust featurizer directly from the narrow `FeatureBlock` contract."""
+
+    rust_module = _require_rust_runtime()
+    rust_featurizer_cls = getattr(rust_module, "RustFeaturizer", None)
+    method = None if rust_featurizer_cls is None else getattr(rust_featurizer_cls, "from_feature_block", None)
+    if not callable(method):
+        raise RuntimeError("RustFeaturizer.from_feature_block is required for raw FeatureBlock scoring")
+    resolved_name_counts_path = name_counts_path
+    if load_name_counts and resolved_name_counts_path is None:
+        resolved_name_counts_path = _rust_name_counts_artifact_path()
+        if resolved_name_counts_path is None:
+            from s2and.consts import _PACKAGE_DATA_DIR
+
+            resolved_name_counts_path = os.path.join(_PACKAGE_DATA_DIR, "name_counts_rust.json")
+    return method(
+        feature_block,
+        name_tuples,
+        resolved_name_counts_path,
+        bool(preprocess),
+        bool(compute_reference_features),
+        float(cluster_seed_require_value),
+        float(cluster_seed_disallow_value),
+        None if num_threads is None else resolve_n_jobs(num_threads),
+    )
+
+
+def build_rust_featurizer_from_arrow_paths(
+    paths: Mapping[str, str],
+    *,
+    signature_ids: Sequence[Any] | None = None,
+    name_tuples: Any = "filtered",
+    load_name_counts: bool = False,
+    name_counts_path: str | None = None,
+    preprocess: bool = True,
+    compute_reference_features: bool = False,
+    cluster_seed_require_value: float = 0.0,
+    cluster_seed_disallow_value: float = 10000.0,
+    num_threads: int | None = None,
+) -> Any:
+    """Build a Rust featurizer directly from Arrow IPC FeatureBlock paths."""
+
+    rust_module = _require_rust_runtime()
+    rust_featurizer_cls = getattr(rust_module, "RustFeaturizer", None)
+    method = None if rust_featurizer_cls is None else getattr(rust_featurizer_cls, "from_arrow_paths", None)
+    if not callable(method):
+        raise RuntimeError("RustFeaturizer.from_arrow_paths is required for raw Arrow scoring")
+    resolved_name_counts_path = name_counts_path
+    if load_name_counts and resolved_name_counts_path is None:
+        resolved_name_counts_path = _rust_name_counts_artifact_path()
+        if resolved_name_counts_path is None:
+            from s2and.consts import _PACKAGE_DATA_DIR
+
+            resolved_name_counts_path = os.path.join(_PACKAGE_DATA_DIR, "name_counts_rust.json")
+    return method(
+        {str(key): str(value) for key, value in paths.items()},
+        None if signature_ids is None else [str(value) for value in signature_ids],
+        name_tuples,
+        resolved_name_counts_path,
+        bool(preprocess),
+        bool(compute_reference_features),
+        float(cluster_seed_require_value),
+        float(cluster_seed_disallow_value),
+        None if num_threads is None else resolve_n_jobs(num_threads),
+    )
+
+
 def build_rust_featurizer(
     dataset: ANDData,
     *,
@@ -915,6 +994,8 @@ __all__ = [
     "build_linker_pair_features_and_aggregate_stats_arrays_rust",
     "build_linker_pair_features_and_aggregate_stats_indexed_rust",
     "build_pair_feature_matrix_rust",
+    "build_rust_featurizer_from_arrow_paths",
+    "build_rust_featurizer_from_feature_block",
     "clear_rust_featurizer_cache",
     "evict_rust_featurizer",
     "featurize_pair_rust",

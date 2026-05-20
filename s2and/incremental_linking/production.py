@@ -674,3 +674,99 @@ def predict_incremental_promoted_linker(
     payload["incremental_linker_query_view"] = _summarize_query_views(resolved_query_views)
     payload["incremental_linker_telemetry"] = merged_telemetry
     return payload
+
+
+def predict_incremental_promoted_linker_from_arrow_paths(
+    clusterer: Any,
+    block_signatures: list[str],
+    dataset: ANDData,
+    *,
+    arrow_paths: Mapping[str, Any],
+    artifact_dir: Path,
+    prevent_new_incompatibilities: bool,
+    partial_supervision: dict[tuple[str, str], int | float],
+    runtime_context: RuntimeContext,
+    total_ram_bytes: int | None,
+    batching_threshold: int | None,
+    resolve_total_ram_bytes: ResolveTotalRamBytesFn,
+    build_incremental_result: BuildIncrementalResultFn,
+) -> dict[str, Any]:
+    """Run the promoted linker from Arrow artifacts, then finish residuals through the normal path."""
+
+    artifact = artifact_module.load_incremental_linking_artifact(artifact_dir)
+    resolved_total_ram_bytes, _ = resolve_total_ram_bytes(total_ram_bytes)
+    cluster_seeds_require, recluster_map, cluster_seeds_require_inverse = clusterer._build_incremental_seed_setup(
+        dataset,
+        partial_supervision,
+        runtime_context,
+        total_ram_bytes=resolved_total_ram_bytes,
+    )
+    if len(cluster_seeds_require) == 0:
+        raise ValueError("Promoted incremental linker mode requires at least one seed cluster")
+
+    unassigned_signature_ids = [
+        str(signature_id) for signature_id in block_signatures if str(signature_id) not in cluster_seeds_require
+    ]
+    linked_signature_clusters: dict[str, int | str] = {}
+    batch_telemetries: list[Mapping[str, int | float | str]] = []
+    batch_sizes: list[int] = []
+    query_batch_size = max(1, int(batching_threshold or len(unassigned_signature_ids) or 1))
+    orcid_enabled = not bool(getattr(clusterer, "suppress_orcid", False))
+    name_tuples = getattr(dataset, "name_tuples", "filtered")
+    arrow_path_payload = {str(key): str(value) for key, value in arrow_paths.items()}
+
+    for start_index in range(0, len(unassigned_signature_ids), query_batch_size):
+        query_batch = unassigned_signature_ids[start_index : start_index + query_batch_size]
+        result = runtime_module.predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            clusterer,
+            artifact,
+            arrow_paths=arrow_path_payload,
+            query_signature_ids=query_batch,
+            top_k=int(artifact.metadata.retrieval_top_k),
+            partial_supervision=partial_supervision,
+            runtime_context=runtime_context,
+            n_jobs=clusterer.n_jobs,
+            total_ram_bytes=resolved_total_ram_bytes,
+            load_name_counts=False,
+            name_tuples=name_tuples,
+            orcid_enabled=orcid_enabled,
+        )
+        linked_signature_clusters.update(dict(result.linked_signature_clusters))
+        batch_telemetries.append(dict(result.telemetry))
+        batch_sizes.append(len(query_batch))
+
+    merged_telemetry = merge_promoted_incremental_batch_telemetry(
+        batch_telemetries,
+        batch_sizes=batch_sizes,
+        configured_batch_size=batching_threshold,
+    )
+    predicted_clusters = clusterer._finish_incremental_with_seed_links(
+        unassigned_signature_ids,
+        dataset,
+        linked_signature_clusters,
+        recluster_map,
+        cluster_seeds_require_inverse,
+        prevent_new_incompatibilities,
+        partial_supervision,
+        runtime_context,
+        total_ram_bytes=resolved_total_ram_bytes,
+    )
+    residual_count = sum(
+        1 for signature_id in unassigned_signature_ids if signature_id not in linked_signature_clusters
+    )
+    phase_b_required_bytes = residual_count * (residual_count - 1) // 2 * 8
+    payload = build_incremental_result(
+        predicted_clusters,
+        phase_b_mode="exact",
+        phase_b_budget_bytes=phase_b_required_bytes,
+        phase_b_required_bytes=phase_b_required_bytes,
+        phase_b_residual_count=residual_count,
+    )
+    payload["incremental_linker_artifact_path"] = str(artifact_dir)
+    payload["incremental_linker_query_view"] = "raw_arrow"
+    payload["incremental_linker_telemetry"] = {
+        **merged_telemetry,
+        "arrow_promoted_incremental": 1,
+        "arrow_path_count": len(arrow_path_payload),
+    }
+    return payload

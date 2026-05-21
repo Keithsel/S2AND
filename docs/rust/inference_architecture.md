@@ -51,6 +51,18 @@ updates, cross-process transactional writes, or richer offline inspection.
 | JSON Rust loaders | Avoid `ANDData`, but still read compatibility JSON and call Python text normalization helpers. | Keep for fixtures and compatibility; Arrow IPC is the table-shaped target. |
 | Training and release replay | Python owns data cleaning, feature table materialization, LightGBM training, calibration, and metrics. | Not a no-`ANDData` inference target; keep Python unless runtime profiling shows a training bottleneck worth porting. |
 
+Profiling on the `f_matsen` inference payload shows that the Arrow incremental
+path spent its material residual time in altered-profile seed pre-splitting:
+raw Arrow retrieval and scoring were small, while the altered pre-split called
+back through pairwise prediction for hundreds of seed signatures. Production
+request producers should still emit the canonical Arrow inputs, including
+`altered_cluster_signatures.arrow` when altered claimed profiles are present. A
+model-keyed `altered_cluster_splits` artifact is an optional S2AND-generated
+derived cache on top of those inputs, not a new required producer input.
+Query-scoped skipping is only safe when the candidate contract proves an
+altered profile cannot affect any incoming query; an unsplit top-k miss is not
+enough because split subprofiles can change retrieval scores.
+
 ## Current Verification Focus
 
 - Tiny Arrow fixture tests for schema and row-signal behavior.

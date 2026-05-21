@@ -518,7 +518,7 @@ def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tm
     assert "candidate_cluster_max_paper_author_count" in retrieval_batch.row_signals
 
 
-def test_raw_arrow_candidate_plan_emits_native_row_signals_from_name_counts_arrow(tmp_path: Path) -> None:
+def test_raw_arrow_candidate_plan_rejects_name_counts_arrow_without_index(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
         pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
@@ -548,61 +548,15 @@ def test_raw_arrow_candidate_plan_emits_native_row_signals_from_name_counts_arro
         ),
     )
 
-    raw_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
-        paths,
-        ["q1"],
-        top_k=2,
-        query_view="full",
-        orcid_enabled=False,
-        num_threads=1,
-    )
-    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
-        raw_plan,
-        signature_id_to_index={"q1": 0, "s1": 1, "s2": 2},
-    )
-
-    assert raw_plan["query_authors"] == ["alice wang"]
-    np.testing.assert_allclose(
-        raw_plan["row_last_name_count_min_rarity"],
-        np.asarray([1.0 / np.sqrt(20.0), 1.0 / np.sqrt(20.0)], dtype=np.float32),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    np.testing.assert_allclose(
-        raw_plan["row_last_first_name_count_min_rarity"],
-        np.asarray([1.0 / np.sqrt(5.0), 1.0 / np.sqrt(5.0)], dtype=np.float32),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    np.testing.assert_allclose(
-        raw_plan["row_candidate_last_name_count_min_rarity"],
-        np.asarray([1.0 / np.sqrt(20.0), 1.0 / np.sqrt(40.0)], dtype=np.float32),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    np.testing.assert_allclose(
-        raw_plan["row_candidate_last_first_name_count_min_rarity"],
-        np.asarray([1.0 / np.sqrt(5.0), 1.0 / np.sqrt(6.0)], dtype=np.float32),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    np.testing.assert_allclose(
-        raw_plan["row_first_prefix_x_last_first_name_count_min_rarity"],
-        np.asarray([1.0 / np.sqrt(5.0), 0.0], dtype=np.float32),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    np.testing.assert_allclose(raw_plan["row_candidate_cluster_max_paper_author_count"], [2.0, 2.0])
-    np.testing.assert_allclose(raw_plan["row_paper_author_list_max_jaccard"], [1.0, 0.0])
-    np.testing.assert_allclose(raw_plan["row_paper_author_list_max_containment"], [1.0, 0.0])
-    np.testing.assert_allclose(raw_plan["row_paper_author_list_max_overlap_count"], [2.0, 0.0])
-    np.testing.assert_allclose(raw_plan["row_local_author_window10_jaccard_max"], [1.0, 0.0])
-    np.testing.assert_allclose(raw_plan["row_local_author_window10_overlap_count_max"], [1.0, 0.0])
-    np.testing.assert_allclose(raw_plan["row_best_author_count_log_absdiff"], [0.0, 0.0])
-    np.testing.assert_allclose(
-        retrieval_batch.row_signals["last_first_name_count_min_rarity"],
-        raw_plan["row_last_first_name_count_min_rarity"],
-    )
+    with pytest.raises(ValueError, match="requires name_counts_index"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
 
 
 def test_raw_arrow_candidate_plan_emits_native_row_signals_from_name_counts_index(
@@ -737,6 +691,7 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
             }
         ),
     )
+    arrow_paths["name_counts_index"] = index_paths["name_counts_index"]
     signature_ids = ["q1", "s1", "s2"]
     pairs = [("q1", "s1"), ("q1", "s2")]
 
@@ -768,6 +723,21 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
         from_arrow.featurize_pairs_matrix(pairs, None, 1, np.nan),
         equal_nan=True,
     )
+
+    arrow_only_paths = dict(arrow_paths)
+    del arrow_only_paths["name_counts_index"]
+    with pytest.raises(ValueError, match="requires name_counts_index"):
+        s2and_rust.RustFeaturizer.from_arrow_paths(
+            arrow_only_paths,
+            signature_ids,
+            set(),
+            None,
+            True,
+            False,
+            0.0,
+            10000.0,
+            1,
+        )
 
 
 def test_rust_featurizer_from_arrow_paths_uses_arrow_name_pairs(tmp_path: Path) -> None:

@@ -1,6 +1,6 @@
 use arrow::array::{
-    Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    LargeListArray, LargeStringArray, ListArray, StringArray, UInt32Array, UInt64Array,
+    Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeListArray,
+    LargeStringArray, ListArray, StringArray, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
 use arrow::ipc::reader::FileReader as ArrowFileReader;
@@ -2020,6 +2020,14 @@ struct RawArrowPaperEvidenceRow {
     best_author_count_log_absdiff: f32,
 }
 
+fn parallel_drop_vec<T: Send>(values: Vec<T>) {
+    values.into_par_iter().for_each(drop);
+}
+
+fn parallel_drop_hashmap<K: Send, V: Send>(values: HashMap<K, V>) {
+    values.into_par_iter().for_each(drop);
+}
+
 fn io_error_to_py(context: &str, path: &str, err: impl std::fmt::Display) -> PyErr {
     pyo3::exceptions::PyIOError::new_err(format!("{context} '{}': {err}", path))
 }
@@ -2206,54 +2214,6 @@ fn arrow_optional_i64(array: &dyn Array, row: usize, context: &str) -> PyResult<
             "{context} must be an integer column, got {other:?}"
         ))),
     }
-}
-
-fn arrow_optional_f64(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<f64>> {
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    match array.data_type() {
-        DataType::Float64 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{context} is not a Float64 array"
-                    ))
-                })?;
-            Ok(Some(values.value(row)))
-        }
-        DataType::Float32 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{context} is not a Float32 array"
-                    ))
-                })?;
-            Ok(Some(values.value(row) as f64))
-        }
-        DataType::Int64
-        | DataType::Int32
-        | DataType::UInt64
-        | DataType::UInt32
-        | DataType::Utf8
-        | DataType::LargeUtf8 => {
-            arrow_optional_i64(array, row, context).map(|value| value.map(|integer| integer as f64))
-        }
-        DataType::Null => Ok(None),
-        other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "{context} must be a numeric column, got {other:?}"
-        ))),
-    }
-}
-
-fn arrow_required_f64(array: &dyn Array, row: usize, context: &str) -> PyResult<f64> {
-    arrow_optional_f64(array, row, context)?.ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err(format!("{context} is null at row {row}"))
-    })
 }
 
 fn arrow_optional_bool(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<bool>> {
@@ -2618,65 +2578,6 @@ fn read_raw_arrow_specter_filtered(
 
 fn read_raw_arrow_specter(path: &str) -> PyResult<HashMap<String, Vec<f32>>> {
     read_raw_arrow_specter_filtered(path, None)
-}
-
-fn insert_raw_arrow_name_count(
-    raw_name_counts: &mut RawNameCountMaps,
-    kind: &str,
-    name: String,
-    count: f64,
-    path: &str,
-    row: usize,
-) -> PyResult<()> {
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "first" | "first_dict" => {
-            raw_name_counts.first.insert(name, count);
-            Ok(())
-        }
-        "last" | "last_dict" => {
-            raw_name_counts.last.insert(name, count);
-            Ok(())
-        }
-        "first_last" | "first_last_dict" => {
-            raw_name_counts.first_last.insert(name, count);
-            Ok(())
-        }
-        "last_first_initial" | "last_first_initial_dict" => {
-            raw_name_counts.last_first_initial.insert(name, count);
-            Ok(())
-        }
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unknown name_counts kind '{other}' in '{path}' at row {row}"
-        ))),
-    }
-}
-
-fn read_raw_arrow_name_counts(path: &str) -> PyResult<RawNameCountMaps> {
-    let mut raw_name_counts = RawNameCountMaps::default();
-    for batch in read_arrow_batches(path)? {
-        let kind_col = batch.column(arrow_first_existing_column_index(
-            &batch,
-            path,
-            &["kind", "count_type", "name_count_type"],
-        )?);
-        let name_col = batch.column(arrow_first_existing_column_index(
-            &batch,
-            path,
-            &["name", "key"],
-        )?);
-        let count_col = batch.column(arrow_first_existing_column_index(
-            &batch,
-            path,
-            &["count", "value"],
-        )?);
-        for row in 0..batch.num_rows() {
-            let kind = arrow_required_string(kind_col.as_ref(), row, "name_counts.kind")?;
-            let name = arrow_required_string(name_col.as_ref(), row, "name_counts.name")?;
-            let count = arrow_required_f64(count_col.as_ref(), row, "name_counts.count")?;
-            insert_raw_arrow_name_count(&mut raw_name_counts, &kind, name, count, path, row)?;
-        }
-    }
-    Ok(raw_name_counts)
 }
 
 fn read_raw_name_counts_index(path: &str) -> PyResult<RawNameCountMaps> {
@@ -7302,7 +7203,11 @@ impl RustFeaturizer {
         let raw_name_counts = match name_counts_index_path.as_ref() {
             Some(path) => read_raw_name_counts_index(path)?,
             None => match name_counts_arrow_path.as_ref() {
-                Some(path) => read_raw_arrow_name_counts(path)?,
+                Some(path) => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "name_counts Arrow path '{path}' requires name_counts_index; refusing slow Arrow fallback"
+                    )));
+                }
                 None => load_raw_name_counts_from_json_path(name_counts_path, None, false)?,
             },
         };
@@ -12427,7 +12332,11 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     let raw_name_counts = match name_counts_index_path.as_ref() {
         Some(path) => read_raw_name_counts_index(path)?,
         None => match name_counts_arrow_path.as_ref() {
-            Some(path) => read_raw_arrow_name_counts(path)?,
+            Some(path) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "name_counts Arrow path '{path}' requires name_counts_index; refusing slow Arrow fallback"
+                )));
+            }
             None => RawNameCountMaps::default(),
         },
     };
@@ -12528,22 +12437,31 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     let query_secs = query_start.elapsed().as_secs_f64();
 
     let summary_start = Instant::now();
-    let mut summaries = Vec::<RetrievalSummaryData>::with_capacity(component_order.len());
-    for component_key in component_order.iter() {
-        let members = members_by_component.get(component_key).ok_or_else(|| {
-            pyo3::exceptions::PyKeyError::new_err(format!(
-                "component_key '{}' disappeared while building summaries",
-                component_key
-            ))
-        })?;
-        let summary = build_raw_arrow_summary(
-            component_key,
-            members,
-            &features_by_signature_id,
-            max_exemplars,
-        )
-        .map_err(pyo3::exceptions::PyKeyError::new_err)?;
-        summaries.push(summary);
+    let summary_results: Vec<Result<RetrievalSummaryData, String>> = py.allow_threads(|| {
+        let compute = || {
+            component_order
+                .par_iter()
+                .map(|component_key| {
+                    let members = members_by_component.get(component_key).ok_or_else(|| {
+                        format!(
+                            "component_key '{}' disappeared while building summaries",
+                            component_key
+                        )
+                    })?;
+                    build_raw_arrow_summary(
+                        component_key,
+                        members,
+                        &features_by_signature_id,
+                        max_exemplars,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        install_with_optional_rayon_pool(num_threads, compute)
+    });
+    let mut summaries = Vec::<RetrievalSummaryData>::with_capacity(summary_results.len());
+    for result in summary_results {
+        summaries.push(result.map_err(pyo3::exceptions::PyKeyError::new_err)?);
     }
     let mut component_index_by_key = HashMap::with_capacity(summaries.len());
     let mut coauthor_cluster_df = HashMap::new();
@@ -12596,8 +12514,6 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         }
         component_member_indices.insert(component_key.clone(), member_indices);
     }
-    let mut index_to_signature_id = query_signature_ids.clone();
-    index_to_signature_id.extend(seed_signature_ids.iter().cloned());
     let component_members_secs = component_members_start.elapsed().as_secs_f64();
 
     let retrieval_start = Instant::now();
@@ -12809,20 +12725,29 @@ fn raw_block_query_candidate_plan_arrow<'py>(
 
     let mut left_signature_ids = Vec::<String>::with_capacity(left_signature_indices.len());
     let mut right_signature_ids = Vec::<String>::with_capacity(right_signature_indices.len());
+    let signature_index_count = query_signature_ids.len() + seed_signature_ids.len();
+    let signature_id_for_index = |index: u32| -> Option<&String> {
+        let offset = index as usize;
+        if offset < query_signature_ids.len() {
+            query_signature_ids.get(offset)
+        } else {
+            seed_signature_ids.get(offset - query_signature_ids.len())
+        }
+    };
     for index in left_signature_indices.iter() {
-        let Some(signature_id) = index_to_signature_id.get(*index as usize) else {
+        let Some(signature_id) = signature_id_for_index(*index) else {
             return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "left signature index {} is outside signature id table",
-                index
+                "left signature index {} is outside signature id table of length {}",
+                index, signature_index_count
             )));
         };
         left_signature_ids.push(signature_id.clone());
     }
     for index in right_signature_indices.iter() {
-        let Some(signature_id) = index_to_signature_id.get(*index as usize) else {
+        let Some(signature_id) = signature_id_for_index(*index) else {
             return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "right signature index {} is outside signature id table",
-                index
+                "right signature index {} is outside signature id table of length {}",
+                index, signature_index_count
             )));
         };
         right_signature_ids.push(signature_id.clone());
@@ -12873,6 +12798,8 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     telemetry.set_item("unidecode_char_count", unidecode_char_map.len())?;
     telemetry.set_item("timings", timings)?;
 
+    let mut seed_signature_ids_for_payload = Some(seed_signature_ids);
+    let mut seed_component_keys_for_payload = Some(seed_component_keys);
     let payload = PyDict::new(py);
     payload.set_item("schema_version", "raw_arrow_candidate_plan_v1")?;
     payload.set_item("row_count", row_component_keys.len())?;
@@ -12881,8 +12808,18 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     payload.set_item("query_views", query_views)?;
     payload.set_item("query_authors", query_authors)?;
     if include_seed_assignments {
-        payload.set_item("seed_signature_ids", seed_signature_ids)?;
-        payload.set_item("seed_component_keys", seed_component_keys)?;
+        payload.set_item(
+            "seed_signature_ids",
+            seed_signature_ids_for_payload.take().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("missing seed_signature_ids payload")
+            })?,
+        )?;
+        payload.set_item(
+            "seed_component_keys",
+            seed_component_keys_for_payload.take().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("missing seed_component_keys payload")
+            })?,
+        )?;
     }
     payload.set_item("component_members", component_members)?;
     payload.set_item(
@@ -13005,7 +12942,44 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         row_best_author_count_log_absdiff.to_pyarray(py),
     )?;
     payload.set_item("telemetry", telemetry)?;
-    Ok(payload.unbind())
+    let output = payload.unbind();
+    py.allow_threads(|| {
+        let compute = || {
+            let RustHybridCentroidRetriever {
+                summaries,
+                max_block_component_size: _,
+                component_index_by_key,
+                coauthor_cluster_df,
+                non_mega_coauthor_cluster_df,
+                affiliation_cluster_df,
+            } = retriever;
+            parallel_drop_hashmap(features_by_signature_id);
+            if let Some(specter) = specter_by_paper_id {
+                parallel_drop_hashmap(specter);
+            }
+            parallel_drop_hashmap(signatures);
+            parallel_drop_hashmap(papers);
+            parallel_drop_hashmap(paper_authors);
+            parallel_drop_hashmap(raw_members_by_component);
+            parallel_drop_hashmap(members_by_component);
+            parallel_drop_hashmap(component_member_indices);
+            parallel_drop_hashmap(summary_signals_by_component);
+            parallel_drop_vec(summaries);
+            parallel_drop_vec(component_order);
+            if let Some(seed_signature_ids) = seed_signature_ids_for_payload {
+                parallel_drop_vec(seed_signature_ids);
+            }
+            if let Some(seed_component_keys) = seed_component_keys_for_payload {
+                parallel_drop_vec(seed_component_keys);
+            }
+            drop(component_index_by_key);
+            drop(coauthor_cluster_df);
+            drop(non_mega_coauthor_cluster_df);
+            drop(affiliation_cluster_df);
+        };
+        install_with_optional_rayon_pool(num_threads, compute)
+    });
+    Ok(output)
 }
 
 #[cfg(test)]

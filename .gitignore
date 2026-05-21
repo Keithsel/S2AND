@@ -19,7 +19,8 @@ s2and/data/medline/
 s2and/data/pubmed/
 s2and/data/qian/
 s2and/data/temp/
-s2and/data/s2and_mini/
+s2and/data/s2and_mini*/
+s2and/data/name_counts_index/
 s2and/data/augmented/
 s2and/data/orcid/
 s2and/data/test/

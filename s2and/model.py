@@ -3,10 +3,11 @@ from __future__ import annotations
 import copy
 import logging
 import math
+import tempfile
 import time
 import warnings
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -217,6 +218,61 @@ def _resolve_dataset_arrow_paths(
             if resolved is not None:
                 return resolved
     return None
+
+
+def _write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, Any]) -> None:
+    import pyarrow as pa
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    items = [(str(signature_id), str(cluster_id)) for signature_id, cluster_id in cluster_seeds_require.items()]
+    table = pa.table(
+        {
+            "signature_id": pa.array([signature_id for signature_id, _cluster_id in items], type=pa.string()),
+            "cluster_id": pa.array([cluster_id for _signature_id, cluster_id in items], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+
+
+def _arrow_paths_with_current_cluster_seeds(dataset: Any, arrow_paths: Mapping[str, Any]) -> dict[str, str]:
+    """Return Arrow paths whose cluster seed table mirrors current dataset seeds."""
+
+    paths = {str(key): str(value) for key, value in arrow_paths.items()}
+    current_seed_version = _cluster_seeds_version(dataset)
+
+    tmpdir = getattr(dataset, "_s2and_arrow_cluster_seeds_tmpdir", None)
+    if tmpdir is None:
+        tmpdir = tempfile.TemporaryDirectory(prefix="s2and_arrow_cluster_seeds_")
+        dataset._s2and_arrow_cluster_seeds_tmpdir = tmpdir
+    cached_version = getattr(dataset, "_s2and_arrow_cluster_seeds_version", None)
+    cached_path = getattr(dataset, "_s2and_arrow_cluster_seeds_path", None)
+    if cached_version == current_seed_version and cached_path is not None and Path(str(cached_path)).exists():
+        paths["cluster_seeds"] = str(cached_path)
+        return paths
+
+    output_path = Path(tmpdir.name) / f"cluster_seeds_v{current_seed_version}.arrow"
+    _write_cluster_seeds_arrow(output_path, getattr(dataset, "cluster_seeds_require", {}) or {})
+    dataset._s2and_arrow_cluster_seeds_version = current_seed_version
+    dataset._s2and_arrow_cluster_seeds_path = str(output_path)
+    paths["cluster_seeds"] = str(output_path)
+    return paths
+
+
+def _partial_supervision_with_cluster_seed_disallows(
+    signatures: Sequence[str],
+    dataset: Any,
+    partial_supervision: Mapping[tuple[str, str], int | float],
+) -> dict[tuple[str, str], int | float]:
+    merged: dict[tuple[str, str], int | float] = dict(partial_supervision)
+    signature_set = {str(signature_id) for signature_id in signatures}
+    for left, right in getattr(dataset, "cluster_seeds_disallow", set()) or set():
+        left_id = str(left)
+        right_id = str(right)
+        if left_id in signature_set and right_id in signature_set:
+            merged.setdefault((left_id, right_id), LARGE_INTEGER)
+    return merged
 
 
 def _selected_feature_indices(featurizer_info: FeaturizationInfo) -> list[int]:
@@ -2311,6 +2367,11 @@ class Clusterer:
         fastcluster_dtype = np.float64 if isinstance(self.cluster_model, FastCluster) else np.float16
         pairwise_probas: dict[str, np.ndarray] = {}
         model_predict_seconds = 0.0
+        constraint_seconds = 0.0
+        feature_matrix_seconds = 0.0
+        nameless_feature_matrix_seconds = 0.0
+        matrix_write_seconds = 0.0
+        total_start = time.perf_counter()
         for block_key, signatures in block_dict.items():
             block_size = int(len(signatures))
             block_pair_count = int(block_size * (block_size - 1) // 2)
@@ -2331,6 +2392,7 @@ class Clusterer:
             while offset < block_pair_count:
                 chunk_pair_count = int(min(resolved_pair_chunk_size, block_pair_count - offset))
                 if self.use_default_constraints_as_supervision:
+                    stage_start = time.perf_counter()
                     local_i, local_j, constraint_values = get_constraints_block_upper_triangle_indexed_rust(
                         None,
                         block_signature_indices,
@@ -2343,6 +2405,7 @@ class Clusterer:
                         runtime_context=runtime_context,
                         suppress_orcid=getattr(self, "suppress_orcid", False),
                     )
+                    constraint_seconds += time.perf_counter() - stage_start
                     local_i_array = np.asarray(local_i, dtype=np.intp)
                     local_j_array = np.asarray(local_j, dtype=np.intp)
                 else:
@@ -2364,6 +2427,7 @@ class Clusterer:
                     elif value is not None:
                         labels[row_offset] = float(value - LARGE_INTEGER)
 
+                stage_start = time.perf_counter()
                 batch_features = build_block_upper_triangle_feature_matrix_indexed_rust(
                     None,
                     block_signature_indices,
@@ -2375,8 +2439,10 @@ class Clusterer:
                     runtime_context=runtime_context,
                     featurizer=rust_featurizer,
                 )
+                feature_matrix_seconds += time.perf_counter() - stage_start
                 batch_nameless_features: np.ndarray | None = None
                 if nameless_selected_indices is not None:
+                    stage_start = time.perf_counter()
                     batch_nameless_features = build_block_upper_triangle_feature_matrix_indexed_rust(
                         None,
                         block_signature_indices,
@@ -2388,6 +2454,7 @@ class Clusterer:
                         runtime_context=runtime_context,
                         featurizer=rust_featurizer,
                     )
+                    nameless_feature_matrix_seconds += time.perf_counter() - stage_start
                 batch_predictions, batch_seconds = _predict_and_combine(
                     self.classifier,
                     self.nameless_classifier,
@@ -2399,6 +2466,7 @@ class Clusterer:
                     runtime_context=runtime_context,
                 )
                 model_predict_seconds += float(batch_seconds)
+                stage_start = time.perf_counter()
                 if isinstance(self.cluster_model, FastCluster):
                     end = offset + int(len(batch_predictions))
                     pairwise_proba[offset:end] = np.asarray(batch_predictions, dtype=pairwise_proba.dtype)
@@ -2407,6 +2475,7 @@ class Clusterer:
                         batch_predictions,
                         dtype=pairwise_proba.dtype,
                     )
+                matrix_write_seconds += time.perf_counter() - stage_start
                 offset += chunk_pair_count
 
             if not isinstance(self.cluster_model, FastCluster):
@@ -2417,6 +2486,31 @@ class Clusterer:
             "Telemetry stage: stage=model_predict_rust_featurizer_total seconds=%.3f blocks=%d",
             model_predict_seconds,
             len(block_dict),
+        )
+        telemetry = {
+            "total_seconds": float(time.perf_counter() - total_start),
+            "constraint_seconds": float(constraint_seconds),
+            "feature_matrix_seconds": float(feature_matrix_seconds),
+            "nameless_feature_matrix_seconds": float(nameless_feature_matrix_seconds),
+            "model_predict_seconds": float(model_predict_seconds),
+            "matrix_write_seconds": float(matrix_write_seconds),
+            "block_count": int(len(block_dict)),
+            "pair_count": int(total_pairs),
+        }
+        self._last_rust_featurizer_make_dists_telemetry = telemetry
+        logger.info(
+            "Telemetry stage: stage=rust_featurizer_make_dists total_seconds=%.3f "
+            "constraint_seconds=%.3f feature_matrix_seconds=%.3f "
+            "nameless_feature_matrix_seconds=%.3f model_predict_seconds=%.3f "
+            "matrix_write_seconds=%.3f blocks=%d pairs=%d",
+            telemetry["total_seconds"],
+            telemetry["constraint_seconds"],
+            telemetry["feature_matrix_seconds"],
+            telemetry["nameless_feature_matrix_seconds"],
+            telemetry["model_predict_seconds"],
+            telemetry["matrix_write_seconds"],
+            telemetry["block_count"],
+            telemetry["pair_count"],
         )
         return pairwise_probas
 
@@ -2450,7 +2544,9 @@ class Clusterer:
             cluster_seeds_require=resolved_cluster_seeds_require,
             cluster_seeds_disallow=set(cluster_seeds_disallow or ()),
         )
-        if dists is None:
+        built_dists = dists is None
+        if built_dists:
+            make_dists_start = time.perf_counter()
             dists = self.make_distance_matrices_from_rust_featurizer(
                 block_dict,
                 rust_featurizer,
@@ -2459,6 +2555,10 @@ class Clusterer:
                 runtime_context=runtime_context,
                 total_ram_bytes=total_ram_bytes,
             )
+            make_dists_seconds = time.perf_counter() - make_dists_start
+        else:
+            make_dists_seconds = 0.0
+        cluster_start = time.perf_counter()
         pred_clusters, out_dists = self.predict_helper(
             block_dict,
             cast(Any, proxy_dataset),
@@ -2469,6 +2569,26 @@ class Clusterer:
             incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
             runtime_context=runtime_context,
             total_ram_bytes=total_ram_bytes,
+        )
+        cluster_seconds = time.perf_counter() - cluster_start
+        make_dists_telemetry = (
+            dict(getattr(self, "_last_rust_featurizer_make_dists_telemetry", {}) or {}) if built_dists else {}
+        )
+        telemetry = {
+            "make_dists_seconds": float(make_dists_seconds),
+            "cluster_from_dists_seconds": float(cluster_seconds),
+            "block_count": int(len(block_dict)),
+            "pair_count": int(sum(len(signatures) * (len(signatures) - 1) // 2 for signatures in block_dict.values())),
+            **{f"make_dists_{key}": value for key, value in make_dists_telemetry.items()},
+        }
+        self._last_rust_featurizer_predict_telemetry = telemetry
+        logger.info(
+            "Telemetry stage: stage=rust_featurizer_predict make_dists_seconds=%.3f "
+            "cluster_from_dists_seconds=%.3f blocks=%d pairs=%d",
+            telemetry["make_dists_seconds"],
+            telemetry["cluster_from_dists_seconds"],
+            telemetry["block_count"],
+            telemetry["pair_count"],
         )
         return dict(pred_clusters), out_dists
 
@@ -2497,6 +2617,7 @@ class Clusterer:
         signature_ids = list(
             dict.fromkeys(str(signature_id) for signatures in block_dict.values() for signature_id in signatures)
         )
+        featurizer_start = time.perf_counter()
         rust_featurizer = build_rust_featurizer_from_arrow_paths(
             {str(key): str(value) for key, value in arrow_paths.items()},
             signature_ids=signature_ids,
@@ -2507,7 +2628,9 @@ class Clusterer:
             compute_reference_features=False,
             num_threads=self.n_jobs,
         )
-        return self.predict_from_rust_featurizer(
+        arrow_featurizer_seconds = time.perf_counter() - featurizer_start
+        predict_start = time.perf_counter()
+        result = self.predict_from_rust_featurizer(
             block_dict,
             rust_featurizer,
             dists=dists,
@@ -2517,6 +2640,30 @@ class Clusterer:
             runtime_context=runtime_context,
             total_ram_bytes=total_ram_bytes,
         )
+        predict_seconds = time.perf_counter() - predict_start
+        nested_telemetry = dict(getattr(self, "_last_rust_featurizer_predict_telemetry", {}) or {})
+        telemetry = {
+            "arrow_featurizer_seconds": float(arrow_featurizer_seconds),
+            "rust_featurizer_predict_seconds": float(predict_seconds),
+            "total_seconds": float(arrow_featurizer_seconds + predict_seconds),
+            "signature_count": int(len(signature_ids)),
+            "block_count": int(len(block_dict)),
+            "pair_count": int(sum(len(signatures) * (len(signatures) - 1) // 2 for signatures in block_dict.values())),
+            **{f"rust_{key}": value for key, value in nested_telemetry.items()},
+        }
+        self._last_arrow_predict_telemetry = telemetry
+        logger.info(
+            "Telemetry stage: stage=arrow_predict_total total_seconds=%.3f "
+            "arrow_featurizer_seconds=%.3f rust_featurizer_predict_seconds=%.3f "
+            "signatures=%d blocks=%d pairs=%d",
+            telemetry["total_seconds"],
+            telemetry["arrow_featurizer_seconds"],
+            telemetry["rust_featurizer_predict_seconds"],
+            telemetry["signature_count"],
+            telemetry["block_count"],
+            telemetry["pair_count"],
+        )
+        return result
 
     def fit(
         self,
@@ -2721,6 +2868,7 @@ class Clusterer:
         incremental_dont_use_cluster_seeds: bool,
         runtime_context: RuntimeContext,
         total_ram_bytes: int | None,
+        rust_featurizer: object | None = None,
     ) -> dict[str, list[str]]:
         pred_clusters: dict[str, list[str]] = {}
         if len(block_dict_multiple_letter) == 0:
@@ -2737,17 +2885,29 @@ class Clusterer:
             block_signatures = block_dict_multiple_letter[block_key]
             logger.info(f"Working on subblock {block_key}")
             start = time.time()
-            pred_clusters_intermediate, _ = self.predict_helper(
-                {block_key: block_signatures},
-                dataset,
-                dists=None,
-                cluster_model_params=cluster_model_params,
-                partial_supervision=partial_supervision,
-                use_s2_clusters=use_s2_clusters,
-                incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
-                runtime_context=runtime_context,
-                total_ram_bytes=total_ram_bytes,
-            )
+            if rust_featurizer is None:
+                pred_clusters_intermediate, _ = self.predict_helper(
+                    {block_key: block_signatures},
+                    dataset,
+                    dists=None,
+                    cluster_model_params=cluster_model_params,
+                    partial_supervision=partial_supervision,
+                    use_s2_clusters=use_s2_clusters,
+                    incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
+                    runtime_context=runtime_context,
+                    total_ram_bytes=total_ram_bytes,
+                )
+            else:
+                pred_clusters_intermediate, _ = self.predict_from_rust_featurizer(
+                    {block_key: block_signatures},
+                    rust_featurizer,
+                    dists=None,
+                    cluster_model_params=cluster_model_params,
+                    partial_supervision=partial_supervision,
+                    incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
+                    runtime_context=runtime_context,
+                    total_ram_bytes=total_ram_bytes,
+                )
             end = time.time()
             predict_times[block_key] = end - start
             pred_clusters.update(pred_clusters_intermediate)
@@ -2859,6 +3019,7 @@ class Clusterer:
         dists: dict[str, np.ndarray] | None,
         total_ram_bytes: int | None,
         restore_rust_cluster_seeds_on_exit: bool,
+        arrow_paths: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, list[str]], None]:
         assert batching_threshold > 0, "Batching threshold must be positive"
         assert dists is None, "If batching_threshold is not None, then can't use precomputed dists"
@@ -2877,6 +3038,37 @@ class Clusterer:
             alert_flag,
         ) = self._partition_subblocked_first_name_groups(block_dict_subblocked, dataset)
 
+        rust_featurizer: object | None = None
+        if arrow_paths is not None and len(block_dict_multiple_letter_first_names) > 0 and not use_s2_clusters:
+            signature_ids = list(
+                dict.fromkeys(
+                    str(signature_id)
+                    for signatures in block_dict_multiple_letter_first_names.values()
+                    for signature_id in signatures
+                )
+            )
+            logger.info(
+                "Building Arrow/Rust featurizer for subblocked predict: subblocks=%d signatures=%d",
+                len(block_dict_multiple_letter_first_names),
+                len(signature_ids),
+            )
+            stage_start = time.perf_counter()
+            rust_featurizer = build_rust_featurizer_from_arrow_paths(
+                {str(key): str(value) for key, value in arrow_paths.items()},
+                signature_ids=signature_ids,
+                name_tuples="filtered",
+                load_name_counts=False,
+                preprocess=True,
+                compute_reference_features=False,
+                num_threads=self.n_jobs,
+            )
+            logger.info(
+                "Telemetry stage: stage=arrow_subblocked_featurizer seconds=%.3f subblocks=%d signatures=%d",
+                time.perf_counter() - stage_start,
+                len(block_dict_multiple_letter_first_names),
+                len(signature_ids),
+            )
+
         pred_clusters = self._predict_subblocked_multiple_letter_groups(
             block_dict_multiple_letter_first_names,
             alert_flag=alert_flag,
@@ -2887,6 +3079,7 @@ class Clusterer:
             incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
             runtime_context=runtime_context,
             total_ram_bytes=total_ram_bytes,
+            rust_featurizer=rust_featurizer,
         )
         pred_clusters = self._predict_subblocked_single_letter_incremental_groups(
             block_dict_single_letter_first_names,
@@ -2970,8 +3163,7 @@ class Clusterer:
 
         arrow_paths = None
         if (
-            batching_threshold is None
-            and dists is None
+            dists is None
             and not use_s2_clusters
             and stage_uses_rust(runtime_context)
             and not _uses_reference_features(self.featurizer_info)
@@ -2983,7 +3175,7 @@ class Clusterer:
                 require_cluster_seeds=False,
             )
 
-        if arrow_paths is not None:
+        if arrow_paths is not None and batching_threshold is None:
             logger.info("Running predict through Arrow/Rust paths - no subblocking")
             start = time.time()
             pred_clusters, dists = self.predict_from_arrow_paths(
@@ -3016,6 +3208,7 @@ class Clusterer:
                 dists=dists,
                 total_ram_bytes=total_ram_bytes,
                 restore_rust_cluster_seeds_on_exit=restore_rust_cluster_seeds_on_exit,
+                arrow_paths=arrow_paths,
             )
 
         else:
@@ -3408,6 +3601,7 @@ class Clusterer:
         partial_supervision: dict[tuple[str, str], int | float],
         runtime_context: RuntimeContext,
         total_ram_bytes: int | None = None,
+        arrow_paths: Mapping[str, Any] | None = None,
     ) -> tuple[
         dict[str, int | str],
         dict[int | str, int | str],
@@ -3431,29 +3625,91 @@ class Clusterer:
             )
             # It's possible an altered signature is not in cluster_seeds_require when
             # a custom seed map is passed; skip those safely here.
-            for altered_cluster_num in altered_cluster_nums:
-                signature_ids_for_cluster_num = cluster_seeds_require_inverse.get(altered_cluster_num, [])
-                if len(signature_ids_for_cluster_num) == 0:
-                    continue
+            sorted_altered_cluster_nums = sorted(altered_cluster_nums, key=str)
+            if arrow_paths is not None:
+                presplit_arrow_paths = {
+                    str(key): str(value) for key, value in arrow_paths.items() if str(key) != "cluster_seeds"
+                }
+                presplit_block_dict: dict[str, list[str]] = {}
+                block_key_to_cluster_num: dict[str, int | str] = {}
+                signature_to_cluster_num: dict[str, int | str] = {}
+                for altered_index, altered_cluster_num in enumerate(sorted_altered_cluster_nums):
+                    signature_ids_for_cluster_num = cluster_seeds_require_inverse.get(altered_cluster_num, [])
+                    if len(signature_ids_for_cluster_num) <= 1:
+                        continue
+                    block_key = f"altered_profile_{altered_index}"
+                    presplit_block_dict[block_key] = signature_ids_for_cluster_num
+                    block_key_to_cluster_num[block_key] = altered_cluster_num
+                    for signature_id in signature_ids_for_cluster_num:
+                        signature_to_cluster_num[str(signature_id)] = altered_cluster_num
 
-                # During this pre-split, do not apply incoming cluster seeds as constraints.
-                # At this stage we are splitting claimed profiles to match S2AND predictions,
-                # so claimed-profile seeds should not bias the split.
-                reclustered_output, _ = self.predict_helper(
-                    {"block": signature_ids_for_cluster_num},
-                    dataset,
-                    incremental_dont_use_cluster_seeds=True,
-                    partial_supervision=partial_supervision,
-                    runtime_context=runtime_context,
-                    total_ram_bytes=total_ram_bytes,
-                )
-                if len(reclustered_output) <= 1:
-                    continue
-                for i, new_cluster_of_signatures in enumerate(reclustered_output.values()):
-                    new_cluster_num = str(altered_cluster_num) + f"_{i}"
-                    recluster_map[new_cluster_num] = altered_cluster_num
-                    for reclustered_signature_id in new_cluster_of_signatures:
-                        cluster_seeds_require[reclustered_signature_id] = new_cluster_num
+                if presplit_block_dict:
+                    presplit_signatures = [
+                        signature_id for signatures in presplit_block_dict.values() for signature_id in signatures
+                    ]
+                    presplit_partial_supervision = _partial_supervision_with_cluster_seed_disallows(
+                        presplit_signatures,
+                        dataset,
+                        partial_supervision,
+                    )
+                    reclustered_output, _ = self.predict_from_arrow_paths(
+                        presplit_block_dict,
+                        presplit_arrow_paths,
+                        incremental_dont_use_cluster_seeds=True,
+                        partial_supervision=presplit_partial_supervision,
+                        runtime_context=runtime_context,
+                        total_ram_bytes=total_ram_bytes,
+                        load_name_counts=False,
+                        name_tuples=getattr(dataset, "name_tuples", "filtered"),
+                    )
+                    reclustered_by_cluster_num: dict[int | str, list[list[str]]] = defaultdict(list)
+                    for new_cluster_of_signatures in reclustered_output.values():
+                        if len(new_cluster_of_signatures) == 0:
+                            continue
+                        output_cluster_nums = {
+                            signature_to_cluster_num[str(signature_id)] for signature_id in new_cluster_of_signatures
+                        }
+                        if len(output_cluster_nums) != 1:
+                            raise ValueError(
+                                "Altered profile pre-split produced a cluster spanning claimed profiles: "
+                                f"{sorted(str(cluster_num) for cluster_num in output_cluster_nums)}"
+                            )
+                        altered_cluster_num = next(iter(output_cluster_nums))
+                        reclustered_by_cluster_num[altered_cluster_num].append(new_cluster_of_signatures)
+
+                    for altered_cluster_num in block_key_to_cluster_num.values():
+                        new_clusters = reclustered_by_cluster_num.get(altered_cluster_num, [])
+                        if len(new_clusters) <= 1:
+                            continue
+                        for i, new_cluster_of_signatures in enumerate(new_clusters):
+                            new_cluster_num = str(altered_cluster_num) + f"_{i}"
+                            recluster_map[new_cluster_num] = altered_cluster_num
+                            for reclustered_signature_id in new_cluster_of_signatures:
+                                cluster_seeds_require[reclustered_signature_id] = new_cluster_num
+            else:
+                for altered_cluster_num in sorted_altered_cluster_nums:
+                    signature_ids_for_cluster_num = cluster_seeds_require_inverse.get(altered_cluster_num, [])
+                    if len(signature_ids_for_cluster_num) <= 1:
+                        continue
+
+                    # During this pre-split, do not apply incoming cluster seeds as constraints.
+                    # At this stage we are splitting claimed profiles to match S2AND predictions,
+                    # so claimed-profile seeds should not bias the split.
+                    reclustered_output, _ = self.predict_helper(
+                        {"block": signature_ids_for_cluster_num},
+                        dataset,
+                        incremental_dont_use_cluster_seeds=True,
+                        partial_supervision=partial_supervision,
+                        runtime_context=runtime_context,
+                        total_ram_bytes=total_ram_bytes,
+                    )
+                    if len(reclustered_output) <= 1:
+                        continue
+                    for i, new_cluster_of_signatures in enumerate(reclustered_output.values()):
+                        new_cluster_num = str(altered_cluster_num) + f"_{i}"
+                        recluster_map[new_cluster_num] = altered_cluster_num
+                        for reclustered_signature_id in new_cluster_of_signatures:
+                            cluster_seeds_require[reclustered_signature_id] = new_cluster_num
 
         return cluster_seeds_require, recluster_map, cluster_seeds_require_inverse
 
@@ -3486,6 +3742,7 @@ class Clusterer:
         partial_supervision: dict[tuple[str, str], int | float],
         runtime_context: RuntimeContext,
         total_ram_bytes: int | None = None,
+        arrow_paths: Mapping[str, Any] | None = None,
     ) -> dict[str, list[str]]:
         """Apply supplied seed-link decisions, then recluster abstained signatures."""
 
@@ -3544,13 +3801,33 @@ class Clusterer:
         # all remaining singletons are reclustered together
         if len(singleton_signatures) > 0:
             logger.info("Clustering together the still unassigned signatures")
-            reclustered_output, _ = self.predict_helper(
-                {"block": singleton_signatures},
-                dataset,
-                partial_supervision=partial_supervision,
-                runtime_context=runtime_context,
-                total_ram_bytes=total_ram_bytes,
-            )
+            if arrow_paths is None:
+                reclustered_output, _ = self.predict_helper(
+                    {"block": singleton_signatures},
+                    dataset,
+                    partial_supervision=partial_supervision,
+                    runtime_context=runtime_context,
+                    total_ram_bytes=total_ram_bytes,
+                )
+            else:
+                residual_partial_supervision = _partial_supervision_with_cluster_seed_disallows(
+                    singleton_signatures,
+                    dataset,
+                    partial_supervision,
+                )
+                logger.info(
+                    "Running incremental residual Phase B through Arrow/Rust paths: residual_signatures=%d",
+                    len(singleton_signatures),
+                )
+                reclustered_output, _ = self.predict_from_arrow_paths(
+                    {"block": singleton_signatures},
+                    arrow_paths,
+                    partial_supervision=residual_partial_supervision,
+                    runtime_context=runtime_context,
+                    total_ram_bytes=total_ram_bytes,
+                    load_name_counts=False,
+                    name_tuples=getattr(dataset, "name_tuples", "filtered"),
+                )
             new_cluster_id = _next_unused_cluster_id(pred_clusters, int(dataset.max_seed_cluster_id or 0))
             for new_cluster in reclustered_output.values():
                 new_cluster_id = _next_unused_cluster_id(pred_clusters, new_cluster_id)
@@ -3675,13 +3952,17 @@ class Clusterer:
             getattr(self, "incremental_linker_artifact_dir", None) or DEFAULT_INCREMENTAL_LINKER_ARTIFACT_DIR
         )
         arrow_paths = None
-        if not getattr(dataset, "altered_cluster_signatures", None):
+        if (
+            not _uses_reference_features(self.featurizer_info)
+            and not _uses_reference_features(self.nameless_featurizer_info)
+        ):
             arrow_paths = _resolve_dataset_arrow_paths(
                 dataset,
                 require_specter=_uses_embedding_features(self),
-                require_cluster_seeds=True,
+                require_cluster_seeds=False,
             )
         if arrow_paths is not None:
+            arrow_paths = _arrow_paths_with_current_cluster_seeds(dataset, arrow_paths)
             logger.info("Running promoted incremental linker through Arrow/Rust paths")
             return predict_incremental_promoted_linker_from_arrow_paths(
                 self,

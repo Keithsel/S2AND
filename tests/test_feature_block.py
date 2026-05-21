@@ -241,7 +241,6 @@ def test_feature_block_from_anddata_builds_requested_mini_contract() -> None:
         ("p1", 1, "charles babbage"),
     ]
     assert feature_block.signatures[0].author_orcid == "0000-0000-0000-0001"
-    assert feature_block.signatures[0].name_count_first == 10.0
     assert feature_block.specter_paper_ids == ("p_q", "p1")
     np.testing.assert_allclose(feature_block.specter_embeddings, [[1.0, 0.0], [1.0, 0.1]])
 
@@ -267,13 +266,8 @@ def test_feature_block_to_arrow_tables_matches_raw_schema() -> None:
         "author_block",
         "author_email",
         "source_author_ids",
-        "name_count_first",
-        "name_count_last",
-        "name_count_first_last",
-        "name_count_last_first_initial",
     ]
     assert tables["signatures"].schema.field("author_suffix").type == pa.string()
-    assert tables["signatures"].schema.field("name_count_last").type == pa.float64()
     assert tables["papers"].schema.field("abstract").type == pa.string()
     assert tables["papers"].schema.field("predicted_language").type == pa.string()
     assert tables["papers"].schema.field("is_reliable").type == pa.bool_()
@@ -305,7 +299,6 @@ def test_feature_block_to_arrow_tables_keeps_all_null_optional_columns_typed() -
 
     assert tables["signatures"].schema.field("author_suffix").type == pa.string()
     assert tables["signatures"].schema.field("author_email").type == pa.string()
-    assert tables["signatures"].schema.field("name_count_first").type == pa.float64()
     assert tables["papers"].schema.field("predicted_language").type == pa.string()
     assert tables["papers"].schema.field("is_reliable").type == pa.bool_()
     assert tables["cluster_seeds"].schema.field("signature_id").type == pa.string()
@@ -320,7 +313,6 @@ def test_write_feature_block_arrow_from_anddata_skips_empty_seed_table(tmp_path:
         signature_ids=["q"],
         query_signature_ids=["q"],
         include_specter=False,
-        drop_embedded_name_counts=True,
     )
 
     assert set(paths) == {"signatures", "papers", "paper_authors"}
@@ -394,12 +386,6 @@ def test_feature_block_to_mini_anddata_materializes_only_requested_rows() -> Non
     assert mini.cluster_seeds_require == {"s1": "c_ada"}
     assert mini.cluster_seeds_disallow == set()
     assert mini.signatures["q"].author_info_orcid == "0000000000000001"
-    assert mini.signatures["q"].author_info_name_counts == NameCounts(
-        first=10.0,
-        last=20.0,
-        first_last=5.0,
-        last_first_initial=8.0,
-    )
     np.testing.assert_allclose(mini.specter_embeddings["p1"], [1.0, 0.1])
 
 

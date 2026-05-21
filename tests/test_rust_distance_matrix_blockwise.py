@@ -471,6 +471,12 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch):
     assert captured["signature_ids"] == ("0", "1", "2")
     assert captured["load_name_counts"] is True
     assert captured["total_ram_bytes"] == 123
+    telemetry = clusterer._last_arrow_predict_telemetry
+    assert telemetry["signature_count"] == 3
+    assert telemetry["block_count"] == 1
+    assert telemetry["pair_count"] == 3
+    assert telemetry["arrow_featurizer_seconds"] >= 0
+    assert telemetry["rust_featurizer_predict_seconds"] >= 0
 
 
 def test_predict_from_arrow_paths_rejects_reference_features(monkeypatch):
@@ -541,6 +547,63 @@ def test_predict_auto_routes_to_arrow_paths_when_dataset_advertises_them(tmp_pat
     assert captured["block_dict"] == {"block": ["0", "1"]}
     assert captured["paths"] == arrow_paths
     assert captured["runtime_context"] is runtime_context
+
+
+def test_predict_subblocked_uses_arrow_featurizer_for_multiple_letter_groups(tmp_path, monkeypatch):
+    captured = {"predict_calls": []}
+    dataset = _dummy_dataset("dummy_predict_subblocked_arrow")
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
+    dataset.arrow_paths = arrow_paths
+    runtime_context = type(
+        "RuntimeContext",
+        (),
+        {
+            "operation": "cluster_predict",
+            "requested_backend": "rust",
+            "resolved_backend": "rust",
+            "use_rust": True,
+            "run_id": "test-subblocked-arrow-predict",
+            "source": "test",
+        },
+    )()
+
+    class _FakeFeaturizer:
+        pass
+
+    def fake_build_from_arrow_paths(paths, **kwargs):
+        captured["build_paths"] = dict(paths)
+        captured["build_signature_ids"] = tuple(kwargs["signature_ids"])
+        return _FakeFeaturizer()
+
+    def fail_predict_helper(*_args, **_kwargs):
+        raise AssertionError("subblocked Arrow predict should not call legacy predict_helper")
+
+    def fake_predict_from_rust_featurizer(self, block_dict, rust_featurizer, **kwargs):
+        del self, rust_featurizer, kwargs
+        captured["predict_calls"].append(dict(block_dict))
+        return {f"{next(iter(block_dict))}_0": list(next(iter(block_dict.values())))}, None
+
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", fake_build_from_arrow_paths)
+    monkeypatch.setattr(Clusterer, "predict_helper", fail_predict_helper)
+    monkeypatch.setattr(Clusterer, "predict_from_rust_featurizer", fake_predict_from_rust_featurizer)
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+    result, dists = clusterer.predict({"block": ["0", "1"]}, dataset, batching_threshold=10)
+
+    assert result == {"block_0": ["0", "1"]}
+    assert dists is None
+    assert captured["build_paths"] == arrow_paths
+    assert captured["build_signature_ids"] == ("0", "1")
+    assert captured["predict_calls"] == [{"block": ["0", "1"]}]
 
 
 def test_arrow_path_discovery_uses_original_signature_path_after_filtering(tmp_path):

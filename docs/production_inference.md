@@ -430,11 +430,9 @@ caps the number of unassigned query signatures per promoted linker batch, while
 cap. The first meaningful promoted batch recalibrates rows/pairs per query for
 remaining batches, and telemetry records predicted/observed RSS deltas.
 
-The release evidence in [predict_incremental_fast_design.md](predict_incremental_fast_design.md)
-includes a current promoted-53 4k real-block run: 3,000,000 broad seed/query
-pairs reduced to 150,000 promoted scored pairs, 354 exact residual queries,
-499,848 residual-tail bytes, 8.202s `predict_incremental` time, 9.288s
-setup-inclusive runtime, and 0.621 GiB process-tree peak RSS.
+The current Rust inference boundary, direct Arrow path, and remaining
+Python-heavy paths are summarized in
+[rust/inference_architecture.md](rust/inference_architecture.md).
 
 If seed-bearing FeatureBlock Arrow artifacts are available, promoted
 `predict_incremental(...)` uses the raw Arrow/Rust retrieval and scoring bridge

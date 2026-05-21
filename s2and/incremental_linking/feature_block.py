@@ -61,10 +61,6 @@ class FeatureBlockSignature:
     author_block: str | None = None
     author_email: str | None = None
     source_author_ids: tuple[str, ...] = ()
-    name_count_first: float | None = None
-    name_count_last: float | None = None
-    name_count_first_last: float | None = None
-    name_count_last_first_initial: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "signature_id", str(self.signature_id))
@@ -258,19 +254,6 @@ class FeatureBlock:
                         [list(row.source_author_ids) for row in self.signatures],
                         type=pa.list_(pa.string()),
                     ),
-                    "name_count_first": pa.array(
-                        [row.name_count_first for row in self.signatures],
-                        type=pa.float64(),
-                    ),
-                    "name_count_last": pa.array([row.name_count_last for row in self.signatures], type=pa.float64()),
-                    "name_count_first_last": pa.array(
-                        [row.name_count_first_last for row in self.signatures],
-                        type=pa.float64(),
-                    ),
-                    "name_count_last_first_initial": pa.array(
-                        [row.name_count_last_first_initial for row in self.signatures],
-                        type=pa.float64(),
-                    ),
                 }
             ),
             "papers": pa.table(
@@ -332,31 +315,17 @@ def write_arrow_ipc_table(table: Any, path: str | Path) -> str:
     return str(output_path)
 
 
-def _drop_embedded_signature_name_counts(table: Any) -> Any:
-    name_count_columns = [
-        "name_count_first",
-        "name_count_last",
-        "name_count_first_last",
-        "name_count_last_first_initial",
-    ]
-    drop_columns = [column for column in name_count_columns if column in table.column_names]
-    return table if not drop_columns else table.drop(drop_columns)
-
-
 def write_feature_block_arrow_tables(
     feature_block: FeatureBlock,
     output_dir: str | Path,
     *,
     include_empty_cluster_seeds: bool = False,
-    drop_embedded_name_counts: bool = False,
     overwrite: bool = True,
 ) -> dict[str, str]:
     """Write `FeatureBlock` Arrow IPC tables and return paths keyed by table name."""
 
     output_path = Path(output_dir)
     tables = feature_block.to_arrow_tables()
-    if drop_embedded_name_counts:
-        tables["signatures"] = _drop_embedded_signature_name_counts(tables["signatures"])
     paths: dict[str, str] = {}
     for name, table in tables.items():
         if name == "cluster_seeds" and table.num_rows == 0 and not include_empty_cluster_seeds:
@@ -377,7 +346,6 @@ def write_feature_block_arrow_from_anddata(
     cluster_seeds_require: Mapping[Any, Any] | None = None,
     include_specter: bool = True,
     include_empty_cluster_seeds: bool = False,
-    drop_embedded_name_counts: bool = False,
     overwrite: bool = True,
 ) -> dict[str, str]:
     """Build a `FeatureBlock` from `ANDData` and write complete Arrow IPC tables."""
@@ -393,7 +361,6 @@ def write_feature_block_arrow_from_anddata(
         feature_block,
         output_dir,
         include_empty_cluster_seeds=include_empty_cluster_seeds,
-        drop_embedded_name_counts=drop_embedded_name_counts,
         overwrite=overwrite,
     )
 
@@ -867,7 +834,7 @@ def feature_block_to_mini_anddata(
     not for full-block Arrow-to-Python materialization.
     """
 
-    from s2and.data import ANDData, NameCounts
+    from s2and.data import ANDData
 
     dataset = ANDData(
         signatures=_feature_block_signatures_payload(feature_block),
@@ -885,19 +852,6 @@ def feature_block_to_mini_anddata(
     dataset.cluster_seeds_require = dict(feature_block.cluster_seeds_require)
     dataset.cluster_seeds_disallow = set(feature_block.cluster_seeds_disallow)
 
-    for row in feature_block.signatures:
-        if row.signature_id not in dataset.signatures:
-            continue
-        if not _signature_row_has_name_counts(row):
-            continue
-        dataset.signatures[row.signature_id] = dataset.signatures[row.signature_id]._replace(
-            author_info_name_counts=NameCounts(
-                first=row.name_count_first,
-                last=row.name_count_last,
-                first_last=row.name_count_first_last,
-                last_first_initial=row.name_count_last_first_initial,
-            )
-        )
     return dataset
 
 
@@ -914,19 +868,6 @@ def _filter_arrow_table_by_values(pa: Any, pc: Any, table: Any, column: str, val
     return table.filter(mask)
 
 
-def _arrow_name_count(row: Mapping[str, Any], key: str) -> float | None:
-    value = row.get(key)
-    if value is None:
-        return None
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(numeric):
-        return None
-    return numeric
-
-
 def _feature_block_signature_from_arrow_row(signature_id: str, row: Mapping[str, Any]) -> FeatureBlockSignature:
     return FeatureBlockSignature(
         signature_id=str(row.get("signature_id", signature_id)),
@@ -941,10 +882,6 @@ def _feature_block_signature_from_arrow_row(signature_id: str, row: Mapping[str,
         author_block=_optional_str(row.get("author_block")),
         author_email=_optional_str(row.get("author_email")),
         source_author_ids=tuple(str(value) for value in (row.get("source_author_ids") or ()) if value is not None),
-        name_count_first=_arrow_name_count(row, "name_count_first"),
-        name_count_last=_arrow_name_count(row, "name_count_last"),
-        name_count_first_last=_arrow_name_count(row, "name_count_first_last"),
-        name_count_last_first_initial=_arrow_name_count(row, "name_count_last_first_initial"),
     )
 
 
@@ -1018,31 +955,11 @@ def _raw_orcid(author_info: Mapping[str, Any]) -> str | None:
     return _optional_str(author_info.get("orcid"))
 
 
-def _raw_name_counts(author_info: Mapping[str, Any]) -> Mapping[str, Any]:
-    value = author_info.get("name_counts") or author_info.get("author_info_name_counts") or {}
-    return value if isinstance(value, Mapping) else {}
-
-
-def _name_count_mapping_attr(counts: Mapping[str, Any], *names: str) -> float | None:
-    for name in names:
-        value = counts.get(name)
-        if value is None:
-            continue
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(numeric):
-            return numeric
-    return None
-
-
 def _feature_block_signature_from_raw_payload(
     signature_id: str,
     raw_signature: Mapping[str, Any],
 ) -> FeatureBlockSignature:
     author_info = _raw_author_info(raw_signature)
-    counts = _raw_name_counts(author_info)
     return FeatureBlockSignature(
         signature_id=str(raw_signature.get("signature_id", signature_id)),
         paper_id=str(raw_signature["paper_id"]),
@@ -1056,14 +973,6 @@ def _feature_block_signature_from_raw_payload(
         author_block=_optional_str(author_info.get("block")),
         author_email=_optional_str(author_info.get("email")),
         source_author_ids=tuple(str(value) for value in (raw_signature.get("sourced_author_ids") or ())),
-        name_count_first=_name_count_mapping_attr(counts, "first", "name_count_first"),
-        name_count_last=_name_count_mapping_attr(counts, "last", "name_count_last"),
-        name_count_first_last=_name_count_mapping_attr(counts, "first_last", "name_count_first_last"),
-        name_count_last_first_initial=_name_count_mapping_attr(
-            counts,
-            "last_first_initial",
-            "name_count_last_first_initial",
-        ),
     )
 
 
@@ -1163,18 +1072,6 @@ def _feature_block_specter_payload(feature_block: FeatureBlock) -> dict[str, np.
     }
 
 
-def _signature_row_has_name_counts(row: FeatureBlockSignature) -> bool:
-    return any(
-        value is not None
-        for value in (
-            row.name_count_first,
-            row.name_count_last,
-            row.name_count_first_last,
-            row.name_count_last_first_initial,
-        )
-    )
-
-
 def _feature_block_specter_from_mapping(
     paper_ids: Sequence[str],
     specter_embeddings: Mapping[Any, Any] | tuple[Any, Any] | None,
@@ -1224,20 +1121,6 @@ def _feature_block_specter_from_mapping(
     return tuple(selected_paper_ids), np.ascontiguousarray(np.vstack(vectors), dtype=np.float32)
 
 
-def _name_count_attr(signature: Any, name: str) -> float | None:
-    counts = getattr(signature, "author_info_name_counts", None)
-    value = getattr(counts, name, None)
-    if value is None:
-        return None
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(numeric):
-        return None
-    return numeric
-
-
 def _feature_block_signature_from_anddata(dataset: Any, signature_id: str) -> FeatureBlockSignature:
     signature = dataset.signatures[str(signature_id)]
     return FeatureBlockSignature(
@@ -1253,10 +1136,6 @@ def _feature_block_signature_from_anddata(dataset: Any, signature_id: str) -> Fe
         author_block=_optional_str(getattr(signature, "author_info_block", None)),
         author_email=_optional_str(getattr(signature, "author_info_email", None)),
         source_author_ids=tuple(str(value) for value in (getattr(signature, "sourced_author_ids", None) or ())),
-        name_count_first=_name_count_attr(signature, "first"),
-        name_count_last=_name_count_attr(signature, "last"),
-        name_count_first_last=_name_count_attr(signature, "first_last"),
-        name_count_last_first_initial=_name_count_attr(signature, "last_first_initial"),
     )
 
 

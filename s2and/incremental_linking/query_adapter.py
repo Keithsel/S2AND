@@ -6,7 +6,6 @@ import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -287,15 +286,6 @@ def _feature_block_affiliation_terms(signature: Any) -> frozenset[str]:
     return frozenset(get_text_ngrams_words(" ".join(tokens), stopwords=set()).keys())
 
 
-def _feature_block_name_counts(signature: Any) -> Any | None:
-    return SimpleNamespace(
-        first=signature.name_count_first,
-        last=signature.name_count_last,
-        first_last=signature.name_count_first_last,
-        last_first_initial=signature.name_count_last_first_initial,
-    )
-
-
 def _feature_block_author_records(
     author_records_by_paper: Mapping[str, tuple[tuple[int, str], ...]],
     paper_id: str,
@@ -390,7 +380,7 @@ def extract_query_features_from_feature_block(
             has_full_first=len(first) > 1,
             has_middle=bool(middle_tokens),
             title_terms=title_terms,
-            name_counts=_feature_block_name_counts(signature),
+            name_counts=None,
             paper_author_count=len(author_records),
             paper_author_names=paper_author_names,
             author_position=author_position,

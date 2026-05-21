@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import tempfile
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -46,6 +47,54 @@ BuildIncrementalResultFn = Callable[..., dict[str, Any]]
 BuildIncrementalConstraintBackendFn = Callable[..., Any]
 GetRustFeaturizerFn = Callable[..., Any]
 ResolveTotalRamBytesFn = Callable[[int | None], tuple[int, str]]
+
+
+def _write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, Any]) -> None:
+    import pyarrow as pa
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    items = [(str(signature_id), str(cluster_id)) for signature_id, cluster_id in cluster_seeds_require.items()]
+    table = pa.table(
+        {
+            "signature_id": pa.array([signature_id for signature_id, _cluster_id in items], type=pa.string()),
+            "cluster_id": pa.array([cluster_id for _signature_id, cluster_id in items], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+
+
+def _arrow_paths_with_seed_assignments(
+    dataset: ANDData,
+    arrow_paths: Mapping[str, Any],
+    cluster_seeds_require: Mapping[str, int | str],
+) -> dict[str, str]:
+    """Return Arrow paths with a request-local cluster seed table."""
+
+    paths = {str(key): str(value) for key, value in arrow_paths.items()}
+    seed_fingerprint = tuple(
+        sorted((str(signature_id), str(cluster_id)) for signature_id, cluster_id in cluster_seeds_require.items())
+    )
+    tmpdir = getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_tmpdir", None)
+    if tmpdir is None:
+        tmpdir = tempfile.TemporaryDirectory(prefix="s2and_arrow_incremental_cluster_seeds_")
+        dataset._s2and_arrow_incremental_cluster_seeds_tmpdir = tmpdir
+
+    cached_fingerprint = getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_fingerprint", None)
+    cached_path = getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_path", None)
+    if cached_fingerprint == seed_fingerprint and cached_path is not None and Path(str(cached_path)).exists():
+        paths["cluster_seeds"] = str(cached_path)
+        return paths
+
+    write_index = int(getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_write_index", 0)) + 1
+    output_path = Path(tmpdir.name) / f"cluster_seeds_incremental_v{write_index}.arrow"
+    _write_cluster_seeds_arrow(output_path, cluster_seeds_require)
+    dataset._s2and_arrow_incremental_cluster_seeds_write_index = write_index
+    dataset._s2and_arrow_incremental_cluster_seeds_fingerprint = seed_fingerprint
+    dataset._s2and_arrow_incremental_cluster_seeds_path = str(output_path)
+    paths["cluster_seeds"] = str(output_path)
+    return paths
 
 
 def promoted_incremental_component_sizes(cluster_seeds_require: Mapping[str, int | str]) -> dict[str, int]:
@@ -695,11 +744,13 @@ def predict_incremental_promoted_linker_from_arrow_paths(
 
     artifact = artifact_module.load_incremental_linking_artifact(artifact_dir)
     resolved_total_ram_bytes, _ = resolve_total_ram_bytes(total_ram_bytes)
+    base_arrow_path_payload = {str(key): str(value) for key, value in arrow_paths.items()}
     cluster_seeds_require, recluster_map, cluster_seeds_require_inverse = clusterer._build_incremental_seed_setup(
         dataset,
         partial_supervision,
         runtime_context,
         total_ram_bytes=resolved_total_ram_bytes,
+        arrow_paths=base_arrow_path_payload,
     )
     if len(cluster_seeds_require) == 0:
         raise ValueError("Promoted incremental linker mode requires at least one seed cluster")
@@ -713,7 +764,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
     query_batch_size = max(1, int(batching_threshold or len(unassigned_signature_ids) or 1))
     orcid_enabled = not bool(getattr(clusterer, "suppress_orcid", False))
     name_tuples = getattr(dataset, "name_tuples", "filtered")
-    arrow_path_payload = {str(key): str(value) for key, value in arrow_paths.items()}
+    arrow_path_payload = _arrow_paths_with_seed_assignments(dataset, base_arrow_path_payload, cluster_seeds_require)
 
     for start_index in range(0, len(unassigned_signature_ids), query_batch_size):
         query_batch = unassigned_signature_ids[start_index : start_index + query_batch_size]
@@ -750,6 +801,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
         partial_supervision,
         runtime_context,
         total_ram_bytes=resolved_total_ram_bytes,
+        arrow_paths=arrow_path_payload,
     )
     residual_count = sum(
         1 for signature_id in unassigned_signature_ids if signature_id not in linked_signature_clusters

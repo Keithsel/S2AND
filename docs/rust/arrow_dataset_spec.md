@@ -82,7 +82,7 @@ the path mapping should use these keys:
 | `specter` | Path to the embedding table selected for the current model, even if the file is physically named `specter2.arrow` |
 | `cluster_seeds` | Path to `cluster_seeds.arrow` for incremental/seeded prediction |
 | `clusters` | Path to eval-only ground-truth clusters JSON |
-| `name_counts_index` | Optional shared/global name-count index directory |
+| `name_counts_index` | Optional shared/global name-count index directory, normally `s2and/data/name_counts_index` |
 | `name_counts` | Optional long-form Arrow name-count table for generation/inspection/parity, not preferred on the hot path |
 
 ---
@@ -95,7 +95,7 @@ Rows must match the values that S2AND would expose after normal preprocessing:
 - `use_sinonym_overwrite=False`
 - `use_orcid_id=True`
 - `name_tuples="filtered"`
-- `load_name_counts=True` when embedding per-signature name counts
+- `name_counts_index/` available when the selected model uses name-count features
 
 Use the existing `FeatureBlock` writer as the reference implementation:
 `s2and.incremental_linking.feature_block.write_feature_block_arrow_from_anddata`.
@@ -112,8 +112,8 @@ Important parity details:
   current `FeatureBlock` encoding writes `"Has Abstract"` when the preprocessed
   paper has an abstract and `""` otherwise.
 - Include all paper-author rows needed for coauthor features.
-- Include embedded name-count columns in `signatures.arrow` whenever the model
-  uses the `name_counts` feature.
+- Do not include embedded name-count columns in `signatures.arrow`; use the
+  shared `name_counts_index/` sidecar.
 
 ---
 
@@ -137,14 +137,8 @@ One row per signature. Required columns:
 | `author_block` | `string` | yes | S2 block key, needed for block reconstruction/eval |
 | `author_email` | `string` | yes | Author email |
 | `source_author_ids` | `list<string>` | yes | Upstream author ids |
-| `name_count_first` | `float64` | yes | Embedded first-name count |
-| `name_count_last` | `float64` | yes | Embedded last-name count |
-| `name_count_first_last` | `float64` | yes | Embedded first+last count |
-| `name_count_last_first_initial` | `float64` | yes | Embedded last+first-initial count |
 
-The four `name_count_*` columns are optional only when the selected model does
-not use `name_counts` or when a shared `name_counts_index` fallback is
-explicitly supplied. For production hot-path datasets, embed them.
+Name-count values are intentionally not part of the signature table.
 
 ### `papers.arrow`
 
@@ -222,16 +216,15 @@ Production prediction does not need this file.
 
 Preferred production layout:
 
-1. Embed the four per-signature name-count values in `signatures.arrow`.
-2. If embedded counts cannot be generated, provide a shared/global
-   `name_counts_index/` sidecar.
-3. Keep `name_counts.arrow` only for generation, inspection, and parity
+1. Provide a shared/global `s2and/data/name_counts_index/` sidecar when the
+   selected model uses name-count features.
+2. Keep `name_counts.arrow` only for generation, inspection, and parity
    debugging.
 
 The shared binary index layout is:
 
 ```text
-name_counts_index/
+s2and/data/name_counts_index/
   manifest.json
   first.bin
   last.bin
@@ -290,8 +283,7 @@ Recommended additional fields:
 - `generator_version` or git commit.
 - `specter` metadata with `row_count`, `dimension`, and source artifact id for
   each embedding file.
-- `name_counts` metadata, either `"embedded": true` or the shared index path and
-  schema version.
+- `name_counts` metadata with the shared index path and schema version.
 - `validation` summary with row counts, duplicate counts, missing reference
   counts, and parity-check command/output location.
 
@@ -317,8 +309,8 @@ Required checks:
 - When embeddings are required, every referenced paper has an embedding in the
   selected SPECTER file.
 - `cluster_seeds.signature_id` is a subset of `signatures.signature_id`.
-- Embedded `name_count_*` fields are present and non-null when the selected model
-  uses `name_counts`.
+- `name_counts_index/manifest.json` exists when the selected model uses
+  `name_counts`.
 - `author_block` is present when the dataset will be used for block
   reconstruction or offline eval.
 - Signature row order matches the source `ANDData` order or the documented

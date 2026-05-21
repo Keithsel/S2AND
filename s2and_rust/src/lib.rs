@@ -1972,7 +1972,6 @@ struct RawArrowSignature {
     email: Option<String>,
     orcid: Option<String>,
     position: Option<i64>,
-    name_counts: Option<NameCountsData>,
 }
 
 #[derive(Clone)]
@@ -2396,40 +2395,6 @@ fn arrow_optional_f32_vector(
     }
 }
 
-fn raw_arrow_optional_name_counts(
-    first_col: Option<&dyn Array>,
-    first_last_col: Option<&dyn Array>,
-    last_col: Option<&dyn Array>,
-    last_first_initial_col: Option<&dyn Array>,
-    row: usize,
-) -> PyResult<Option<NameCountsData>> {
-    let first = match first_col {
-        Some(col) => arrow_optional_f64(col, row, "name_count_first")?,
-        None => None,
-    };
-    let first_last = match first_last_col {
-        Some(col) => arrow_optional_f64(col, row, "name_count_first_last")?,
-        None => None,
-    };
-    let last = match last_col {
-        Some(col) => arrow_optional_f64(col, row, "name_count_last")?,
-        None => None,
-    };
-    let last_first_initial = match last_first_initial_col {
-        Some(col) => arrow_optional_f64(col, row, "name_count_last_first_initial")?,
-        None => None,
-    };
-    if first.is_none() && first_last.is_none() && last.is_none() && last_first_initial.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(NameCountsData {
-        first: first.unwrap_or(f64::NAN),
-        first_last: first_last.unwrap_or(f64::NAN),
-        last: last.unwrap_or(f64::NAN),
-        last_first_initial: last_first_initial.unwrap_or(f64::NAN),
-    }))
-}
-
 fn read_raw_arrow_signatures_filtered(
     path: &str,
     keep_signature_ids: Option<&HashSet<String>>,
@@ -2448,16 +2413,6 @@ fn read_raw_arrow_signatures_filtered(
         let position_col = batch.column(arrow_column_index(&batch, "author_position", path)?);
         let email_col = arrow_optional_column_index(&batch, "author_email")
             .map(|index| batch.column(index).as_ref());
-        let name_count_first_col = arrow_optional_column_index(&batch, "name_count_first")
-            .map(|index| batch.column(index).as_ref());
-        let name_count_first_last_col =
-            arrow_optional_column_index(&batch, "name_count_first_last")
-                .map(|index| batch.column(index).as_ref());
-        let name_count_last_col = arrow_optional_column_index(&batch, "name_count_last")
-            .map(|index| batch.column(index).as_ref());
-        let name_count_last_first_initial_col =
-            arrow_optional_column_index(&batch, "name_count_last_first_initial")
-                .map(|index| batch.column(index).as_ref());
         for row in 0..batch.num_rows() {
             let signature_id =
                 arrow_required_string(signature_id_col.as_ref(), row, "signature_id")?;
@@ -2497,13 +2452,6 @@ fn read_raw_arrow_signatures_filtered(
                     orcid: arrow_optional_string(orcid_col.as_ref(), row, "author_orcid")?
                         .and_then(|value| normalize_orcid_owned(&value)),
                     position: arrow_optional_i64(position_col.as_ref(), row, "author_position")?,
-                    name_counts: raw_arrow_optional_name_counts(
-                        name_count_first_col,
-                        name_count_first_last_col,
-                        name_count_last_col,
-                        name_count_last_first_initial_col,
-                        row,
-                    )?,
                 },
             );
         }
@@ -2815,17 +2763,15 @@ fn build_raw_arrow_feature(
     );
     let last_normalized =
         normalize_text_compat_from_map(&signature.author_last, false, unidecode_char_map);
-    let name_counts = signature.name_counts.clone().or_else(|| {
-        build_name_counts_data_from_artifact(
-            raw_name_counts,
-            &signature.author_first,
-            &first,
-            &first,
-            &signature.author_last,
-            &last_normalized,
-        )
-        .data
-    });
+    let name_counts = build_name_counts_data_from_artifact(
+        raw_name_counts,
+        &signature.author_first,
+        &first,
+        &first,
+        &signature.author_last,
+        &last_normalized,
+    )
+    .data;
     let middle_initials: HashSet<String> = middle
         .split_whitespace()
         .filter_map(|token| token.chars().next().map(|ch| ch.to_string()))
@@ -3462,25 +3408,6 @@ fn extract_name_counts_data(obj: &Bound<'_, PyAny>) -> PyResult<Option<NameCount
     let first_last: Option<f64> = obj.getattr("first_last")?.extract()?;
     let last: Option<f64> = obj.getattr("last")?.extract()?;
     let last_first_initial: Option<f64> = obj.getattr("last_first_initial")?.extract()?;
-    Ok(Some(NameCountsData {
-        first: first.unwrap_or(f64::NAN),
-        first_last: first_last.unwrap_or(f64::NAN),
-        last: last.unwrap_or(f64::NAN),
-        last_first_initial: last_first_initial.unwrap_or(f64::NAN),
-    }))
-}
-
-fn extract_feature_block_name_counts_data(
-    obj: &Bound<'_, PyAny>,
-) -> PyResult<Option<NameCountsData>> {
-    let first: Option<f64> = obj.getattr("name_count_first")?.extract()?;
-    let first_last: Option<f64> = obj.getattr("name_count_first_last")?.extract()?;
-    let last: Option<f64> = obj.getattr("name_count_last")?.extract()?;
-    let last_first_initial: Option<f64> =
-        obj.getattr("name_count_last_first_initial")?.extract()?;
-    if first.is_none() && first_last.is_none() && last.is_none() && last_first_initial.is_none() {
-        return Ok(None);
-    }
     Ok(Some(NameCountsData {
         first: first.unwrap_or(f64::NAN),
         first_last: first_last.unwrap_or(f64::NAN),
@@ -7346,19 +7273,12 @@ impl RustFeaturizer {
             extract_required_string_set(&text_module.getattr("VENUE_STOP_WORDS")?)?;
         let name_prefixes = extract_required_string_set(&text_module.getattr("NAME_PREFIXES")?)?;
         let affiliation_stopwords = extract_affiliation_stopwords(py)?;
-        let needs_name_counts_artifact = raw_signatures
-            .values()
-            .any(|signature| signature.name_counts.is_none());
-        let raw_name_counts = if needs_name_counts_artifact {
-            match name_counts_index_path.as_ref() {
-                Some(path) => read_raw_name_counts_index(path)?,
-                None => match name_counts_arrow_path.as_ref() {
-                    Some(path) => read_raw_arrow_name_counts(path)?,
-                    None => load_raw_name_counts_from_json_path(name_counts_path, None, false)?,
-                },
-            }
-        } else {
-            RawNameCountMaps::default()
+        let raw_name_counts = match name_counts_index_path.as_ref() {
+            Some(path) => read_raw_name_counts_index(path)?,
+            None => match name_counts_arrow_path.as_ref() {
+                Some(path) => read_raw_arrow_name_counts(path)?,
+                None => load_raw_name_counts_from_json_path(name_counts_path, None, false)?,
+            },
         };
         let language_detector = if preprocess {
             Some(LanguageDetectorCompat::new(py))
@@ -7377,7 +7297,6 @@ impl RustFeaturizer {
             position: i64,
             affiliation_values: Vec<String>,
             orcid: Option<String>,
-            name_counts: Option<NameCountsData>,
         }
 
         #[derive(Clone)]
@@ -7454,7 +7373,6 @@ impl RustFeaturizer {
                 position,
                 affiliation_values: raw_signature.affiliations.clone(),
                 orcid: raw_signature.orcid.clone(),
-                name_counts: raw_signature.name_counts.clone(),
             });
         }
         if preprocess {
@@ -7738,17 +7656,15 @@ impl RustFeaturizer {
                                 .or_else(|| extract_orcid_from_source_id(&upper_value))
                                 .or_else(|| Some(value.clone()))
                         });
-                        let name_counts = entry.name_counts.clone().or_else(|| {
-                            build_name_counts_data_from_artifact(
-                                &raw_name_counts,
-                                &entry.raw_first,
-                                &first_normalized_token,
-                                &first_without_apostrophe,
-                                &entry.raw_last,
-                                &last_normalized,
-                            )
-                            .data
-                        });
+                        let name_counts = build_name_counts_data_from_artifact(
+                            &raw_name_counts,
+                            &entry.raw_first,
+                            &first_normalized_token,
+                            &first_without_apostrophe,
+                            &entry.raw_last,
+                            &last_normalized,
+                        )
+                        .data;
                         (
                             entry.sig_id.clone(),
                             SignatureData {
@@ -7921,7 +7837,6 @@ impl RustFeaturizer {
             position: i64,
             affiliation_values: Vec<String>,
             orcid: Option<String>,
-            name_counts: Option<NameCountsData>,
         }
 
         #[derive(Clone)]
@@ -7987,7 +7902,6 @@ impl RustFeaturizer {
             let affiliation_values =
                 extract_string_list(&signature.getattr("author_affiliations")?)?;
             let orcid: Option<String> = signature.getattr("author_orcid")?.extract()?;
-            let name_counts = extract_feature_block_name_counts_data(&signature)?;
 
             ensure_unidecode_for_text(&unidecode, &raw_first, &mut unidecode_char_map)?;
             ensure_unidecode_for_text(&unidecode, &raw_middle, &mut unidecode_char_map)?;
@@ -8005,7 +7919,6 @@ impl RustFeaturizer {
                 position,
                 affiliation_values,
                 orcid,
-                name_counts,
             });
         }
 
@@ -8342,17 +8255,15 @@ impl RustFeaturizer {
                                 .or_else(|| extract_orcid_from_source_id(&upper_value))
                                 .or_else(|| Some(value.clone()))
                         });
-                        let name_counts = entry.name_counts.clone().or_else(|| {
-                            build_name_counts_data_from_artifact(
-                                &raw_name_counts,
-                                &entry.raw_first,
-                                &first_normalized_token,
-                                &first_without_apostrophe,
-                                &entry.raw_last,
-                                &last_normalized,
-                            )
-                            .data
-                        });
+                        let name_counts = build_name_counts_data_from_artifact(
+                            &raw_name_counts,
+                            &entry.raw_first,
+                            &first_normalized_token,
+                            &first_without_apostrophe,
+                            &entry.raw_last,
+                            &last_normalized,
+                        )
+                        .data;
                         (
                             entry.sig_id.clone(),
                             SignatureData {
@@ -12488,19 +12399,12 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     let read_specter_secs = read_specter_start.elapsed().as_secs_f64();
 
     let read_name_counts_start = Instant::now();
-    let raw_name_counts = if signatures
-        .values()
-        .any(|signature| signature.name_counts.is_none())
-    {
-        match name_counts_index_path.as_ref() {
-            Some(path) => read_raw_name_counts_index(path)?,
-            None => match name_counts_arrow_path.as_ref() {
-                Some(path) => read_raw_arrow_name_counts(path)?,
-                None => RawNameCountMaps::default(),
-            },
-        }
-    } else {
-        RawNameCountMaps::default()
+    let raw_name_counts = match name_counts_index_path.as_ref() {
+        Some(path) => read_raw_name_counts_index(path)?,
+        None => match name_counts_arrow_path.as_ref() {
+            Some(path) => read_raw_arrow_name_counts(path)?,
+            None => RawNameCountMaps::default(),
+        },
     };
     let read_name_counts_secs = read_name_counts_start.elapsed().as_secs_f64();
 

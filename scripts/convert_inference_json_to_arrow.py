@@ -62,8 +62,11 @@ def convert_inference_json_to_arrow(
 
     from s2and.data import ANDData
     from s2and.incremental_linking.feature_block import (
+        raw_planner_arrow_physical_layout,
+        write_arrow_ipc_table,
         write_feature_block_arrow_from_anddata,
         write_name_counts_index,
+        write_raw_arrow_batch_lookup_indexes,
     )
 
     output_dir = output_root / dataset_name
@@ -124,9 +127,7 @@ def convert_inference_json_to_arrow(
     altered_arrow_path = output_dir / "altered_cluster_signatures.arrow"
     if overwrite or not altered_arrow_path.exists():
         table = pa.table({"signature_id": pa.array(altered, type=pa.string())})
-        with pa.OSFile(str(altered_arrow_path), "wb") as sink:
-            with pa.ipc.new_file(sink, table.schema) as writer:
-                writer.write_table(table)
+        write_arrow_ipc_table(table, altered_arrow_path)
     paths["altered_cluster_signatures"] = str(altered_arrow_path)
 
     source_paths = {
@@ -141,6 +142,15 @@ def convert_inference_json_to_arrow(
     if overwrite or not source_paths["cluster_seeds_json"].exists():
         _write_json(source_paths["cluster_seeds_json"], payload.get("cluster_seeds") or {})
     paths.update({key: str(path) for key, path in source_paths.items()})
+
+    start = time.perf_counter()
+    paths, raw_planner_index_metrics = write_raw_arrow_batch_lookup_indexes(
+        paths,
+        output_dir,
+        overwrite=overwrite,
+    )
+    write_raw_planner_indexes_seconds = time.perf_counter() - start
+    physical_layout = raw_planner_arrow_physical_layout(paths)
 
     name_counts_index_metrics: dict[str, Any] = {"skipped": True}
     write_name_counts_index_seconds = 0.0
@@ -165,12 +175,15 @@ def convert_inference_json_to_arrow(
         "altered_cluster_signature_count": len(altered),
         "altered_cluster_signatures": altered,
         "paths": paths,
+        "physical_layout": physical_layout,
+        "raw_planner_batch_indexes": raw_planner_index_metrics,
         "name_counts_index": name_counts_index_metrics,
         "name_tuples": "default packaged filtered aliases",
         "timings_seconds": {
             "load_json_seconds": load_seconds,
             "anddata_seconds": anddata_seconds,
             "write_arrow_seconds": write_arrow_seconds,
+            "write_raw_planner_indexes_seconds": write_raw_planner_indexes_seconds,
             "write_name_counts_index_seconds": write_name_counts_index_seconds,
         },
     }

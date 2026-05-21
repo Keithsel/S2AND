@@ -639,9 +639,18 @@ def feature_values_from_runtime(
         for key, value in row_signals.items():
             values[str(key)] = value
     if feature_matrix.pairwise_stats is not None:
-        pairwise_values = np.asarray(feature_matrix.pairwise_stats.feature_matrix(), dtype=np.float64)
-        for index, column in enumerate(feature_matrix.pairwise_stats.aggregate_feature_columns):
-            values[str(column)] = pairwise_values[:, index]
+        missing_pairwise_columns = [
+            str(column)
+            for column in feature_matrix.pairwise_stats.aggregate_feature_columns
+            if str(column) not in values
+        ]
+        if missing_pairwise_columns:
+            missing_pairwise_column_set = set(missing_pairwise_columns)
+            pairwise_values = np.asarray(feature_matrix.pairwise_stats.feature_matrix(), dtype=np.float64)
+            for index, column in enumerate(feature_matrix.pairwise_stats.aggregate_feature_columns):
+                column = str(column)
+                if column in missing_pairwise_column_set:
+                    values[column] = pairwise_values[:, index]
     return values
 
 

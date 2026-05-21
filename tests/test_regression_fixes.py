@@ -351,9 +351,7 @@ def test_clusterer_predict_optionally_skips_final_rust_seed_restore(
     monkeypatch.setattr(
         model_module,
         "_sync_rust_cluster_seeds",
-        lambda dataset_arg, runtime_context=None: sync_snapshots.append(
-            dict(dataset_arg.cluster_seeds_require)
-        ),
+        lambda dataset_arg, runtime_context=None: sync_snapshots.append(dict(dataset_arg.cluster_seeds_require)),
     )
     monkeypatch.setattr(
         model_module,
@@ -574,6 +572,94 @@ def test_clusterer_predict_subblocked_single_letter_suppresses_altered_arrow_pat
 
     assert observed_model_altered == [[]]
     assert dataset.altered_cluster_signatures is None
+    assert getattr(dataset, "_s2and_disable_altered_cluster_signatures", False) is False
+    assert getattr(dataset, "_s2and_disable_arrow_cluster_seeds", False) is False
+
+
+def test_clusterer_predict_subblocked_single_letter_skips_sync_for_arrow_promoted_incremental(
+    monkeypatch,
+    tmp_path,
+):
+    arrow_paths = {}
+    for key in ("signatures", "papers", "paper_authors", "cluster_seeds"):
+        path = tmp_path / f"{key}.arrow"
+        path.touch()
+        arrow_paths[key] = str(path)
+
+    original_cluster_seeds = {"orig_seed": "orig_cluster"}
+    dataset = _as_anddata(
+        SimpleNamespace(
+            signatures={
+                "m1": _subblocking_signature("alex"),
+                "m2": _subblocking_signature("alex"),
+                "s1": _subblocking_signature("a"),
+                "s2": _subblocking_signature("a"),
+            },
+            cluster_seeds_require=dict(original_cluster_seeds),
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=None,
+            arrow_paths=arrow_paths,
+        )
+    )
+
+    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
+    clusterer = Clusterer(featurizer_info=featurizer_info, classifier=None, n_jobs=1, use_cache=False)
+
+    sync_snapshots: list[dict[str, str]] = []
+    evict_snapshots: list[dict[str, str]] = []
+    observed_seed_maps: list[dict[str, str]] = []
+
+    monkeypatch.setattr(
+        model_module,
+        "_sync_rust_cluster_seeds",
+        lambda dataset_arg, runtime_context=None: sync_snapshots.append(dict(dataset_arg.cluster_seeds_require)),
+    )
+    monkeypatch.setattr(
+        model_module,
+        "evict_rust_featurizer",
+        lambda dataset_arg: evict_snapshots.append(dict(dataset_arg.cluster_seeds_require)) or True,
+    )
+
+    def fake_predict_incremental(self, block_signatures, dataset_arg, *args, **kwargs):
+        del self, args
+        assert kwargs["runtime_context"].use_rust is True
+        assert getattr(dataset_arg, "_s2and_disable_arrow_cluster_seeds", False) is True
+        observed_seed_maps.append(dict(dataset_arg.cluster_seeds_require))
+        return {
+            "clusters": {"merged": list(dataset_arg.cluster_seeds_require.keys()) + list(block_signatures)},
+            "phase_b_mode": "exact",
+            "phase_b_budget_bytes": 0,
+            "phase_b_required_bytes": 0,
+        }
+
+    monkeypatch.setattr(Clusterer, "predict_incremental", fake_predict_incremental)
+
+    runtime_context = RuntimeContext(
+        operation="cluster_predict",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="test-subblocked-single-letter-arrow-sync-skip",
+        source="default",
+    )
+    result = clusterer._predict_subblocked_single_letter_incremental_groups(
+        {"single_a": ["s1"], "single_b": ["s2"]},
+        pred_clusters={"cluster_multi": ["m1", "m2"]},
+        desired_memory_use=1_000_000,
+        dataset=dataset,
+        partial_supervision={},
+        runtime_context=runtime_context,
+        restore_rust_cluster_seeds_on_exit=False,
+    )
+
+    assert result == {"merged": ["m1", "m2", "s1", "s2"]}
+    assert observed_seed_maps == [
+        {"m1": "cluster_multi", "m2": "cluster_multi"},
+        {"m1": "merged", "m2": "merged", "s1": "merged"},
+    ]
+    assert sync_snapshots == []
+    assert evict_snapshots == [original_cluster_seeds]
+    assert dict(dataset.cluster_seeds_require) == original_cluster_seeds
     assert getattr(dataset, "_s2and_disable_altered_cluster_signatures", False) is False
     assert getattr(dataset, "_s2and_disable_arrow_cluster_seeds", False) is False
 

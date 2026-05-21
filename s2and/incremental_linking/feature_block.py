@@ -37,12 +37,36 @@ FEATURE_BLOCK_EXCLUDED_ANDDATA_RESPONSIBILITIES: tuple[str, ...] = (
 )
 
 NAME_COUNTS_INDEX_SCHEMA_VERSION = "name_counts_index_v1"
+ARROW_PHYSICAL_LAYOUT_SCHEMA_VERSION = "s2and_arrow_physical_v1"
+ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION = "arrow_batch_lookup_index_v1"
 _NAME_COUNTS_INDEX_MAGIC = b"S2NCI001"
+_ARROW_BATCH_LOOKUP_INDEX_MAGIC = b"S2ABI001"
 _NAME_COUNTS_INDEX_HASH_DOMAIN = b"s2and-name-counts-index-v1\x00"
 _NAME_COUNTS_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQ")
 _NAME_COUNTS_INDEX_RECORD_STRUCT = struct.Struct("<QQQIId")
+_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQ")
+_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT = struct.Struct("<QII")
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
+
+RAW_PLANNER_ARROW_KEY_COLUMNS: dict[str, str] = {
+    "signatures": "signature_id",
+    "papers": "paper_id",
+    "paper_authors": "paper_id",
+    "specter": "paper_id",
+}
+RAW_PLANNER_ARROW_BATCH_INDEX_KEYS: dict[str, str] = {
+    "signatures": "signatures_batch_index",
+    "papers": "papers_batch_index",
+    "paper_authors": "paper_authors_batch_index",
+    "specter": "specter_batch_index",
+}
+RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS: dict[str, int] = {
+    "signatures": 16_384,
+    "papers": 16_384,
+    "paper_authors": 16_384,
+    "specter": 2_048,
+}
 
 
 @dataclass(frozen=True)
@@ -314,17 +338,237 @@ class FeatureBlock:
         return tables
 
 
-def write_arrow_ipc_table(table: Any, path: str | Path) -> str:
-    """Write one Arrow IPC file and return its path."""
+def _record_batch_limit_for_table(
+    table_name: str,
+    max_record_batch_rows: Mapping[str, int] | int | None,
+) -> int | None:
+    if max_record_batch_rows is None:
+        return None
+    if isinstance(max_record_batch_rows, Mapping):
+        raw_limit = max_record_batch_rows.get(table_name)
+        if raw_limit is None:
+            return None
+    else:
+        raw_limit = max_record_batch_rows
+    limit = int(raw_limit)
+    if limit <= 0:
+        raise ValueError(f"max_record_batch_rows must be positive for {table_name!r}: {limit}")
+    return limit
+
+
+def write_arrow_ipc_table(
+    table: Any,
+    path: str | Path,
+    *,
+    max_record_batch_rows: int | None = None,
+) -> str:
+    """Write one Arrow IPC file-format table and return its path."""
 
     import pyarrow as pa
 
+    batch_limit = None if max_record_batch_rows is None else int(max_record_batch_rows)
+    if batch_limit is not None and batch_limit <= 0:
+        raise ValueError(f"max_record_batch_rows must be positive: {max_record_batch_rows}")
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with pa.OSFile(str(output_path), "wb") as sink:
         with pa.ipc.new_file(sink, table.schema) as writer:
-            writer.write_table(table)
+            writer.write_table(table, max_chunksize=batch_limit)
     return str(output_path)
+
+
+def arrow_ipc_physical_layout(path: str | Path) -> dict[str, int]:
+    """Return row and record-batch layout metrics for one Arrow IPC file."""
+
+    import pyarrow as pa
+
+    row_count = 0
+    max_batch_rows = 0
+    with pa.memory_map(str(path), "r") as source:
+        reader = pa.ipc.open_file(source)
+        record_batch_count = int(reader.num_record_batches)
+        for batch_index in range(record_batch_count):
+            batch_rows = int(reader.get_batch(batch_index).num_rows)
+            row_count += batch_rows
+            max_batch_rows = max(max_batch_rows, batch_rows)
+    return {
+        "row_count": row_count,
+        "record_batch_count": record_batch_count,
+        "actual_max_batch_rows": max_batch_rows,
+    }
+
+
+def _raise_if_record_batch_limit_exceeded(
+    *,
+    arrow_path: str | Path,
+    table_name: str,
+    batch_index: int,
+    batch_rows: int,
+    max_record_batch_rows: int | None,
+) -> None:
+    if max_record_batch_rows is None or batch_rows <= max_record_batch_rows:
+        return
+    batch_label = f"record batch {batch_index}" if batch_index >= 0 else "at least one record batch"
+    raise ValueError(
+        f"{table_name}.arrow has {batch_label} with {batch_rows} rows, "
+        f"exceeding the raw-planner limit of {max_record_batch_rows}: {arrow_path!s}. "
+        "Rewrite the Arrow IPC file with bounded record batches before building lookup indexes."
+    )
+
+
+def write_arrow_batch_lookup_index(
+    arrow_path: str | Path,
+    index_path: str | Path,
+    *,
+    key_column: str,
+    table_name: str = "arrow",
+    max_record_batch_rows: int | None = None,
+    overwrite: bool = True,
+) -> tuple[str, dict[str, int | str | bool]]:
+    """Write a Rust-readable key-hash to Arrow record-batch lookup index."""
+
+    import pyarrow as pa
+
+    output_path = Path(index_path)
+    if output_path.exists() and not overwrite:
+        layout = arrow_ipc_physical_layout(arrow_path)
+        _raise_if_record_batch_limit_exceeded(
+            arrow_path=arrow_path,
+            table_name=table_name,
+            batch_index=-1,
+            batch_rows=layout["actual_max_batch_rows"],
+            max_record_batch_rows=max_record_batch_rows,
+        )
+        return str(output_path), {
+            "reused": True,
+            "schema_version": ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION,
+            **layout,
+            "max_record_batch_rows": int(max_record_batch_rows or 0),
+        }
+
+    records: list[tuple[int, int]] = []
+    row_count = 0
+    max_batch_rows = 0
+    arrow_path_obj = Path(arrow_path)
+    with pa.memory_map(str(arrow_path), "r") as source:
+        reader = pa.ipc.open_file(source)
+        record_batch_count = int(reader.num_record_batches)
+        key_column_index = reader.schema.get_field_index(key_column)
+        if key_column_index < 0:
+            raise KeyError(f"Arrow IPC file {arrow_path!s} is missing key column {key_column!r}")
+        for batch_index in range(record_batch_count):
+            batch = reader.get_batch(batch_index)
+            batch_rows = int(batch.num_rows)
+            max_batch_rows = max(max_batch_rows, batch_rows)
+            _raise_if_record_batch_limit_exceeded(
+                arrow_path=arrow_path,
+                table_name=table_name,
+                batch_index=batch_index,
+                batch_rows=batch_rows,
+                max_record_batch_rows=max_record_batch_rows,
+            )
+            keys = batch.column(key_column_index).to_pylist()
+            row_count += len(keys)
+            records.extend((_fnv64_bytes(str(key).encode("utf-8")), batch_index) for key in keys if key is not None)
+
+    records.sort()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    source_stat = arrow_path_obj.stat()
+    with output_path.open("wb") as outfile:
+        outfile.write(
+            _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.pack(
+                _ARROW_BATCH_LOOKUP_INDEX_MAGIC,
+                len(records),
+                source_stat.st_size,
+                source_stat.st_mtime_ns,
+            )
+        )
+        for key_hash, batch_index in records:
+            outfile.write(_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.pack(key_hash, batch_index, 0))
+    return str(output_path), {
+        "reused": False,
+        "schema_version": ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION,
+        "magic": _ARROW_BATCH_LOOKUP_INDEX_MAGIC.decode("ascii"),
+        "row_count": row_count,
+        "record_count": len(records),
+        "record_batch_count": record_batch_count,
+        "actual_max_batch_rows": max_batch_rows,
+        "max_record_batch_rows": int(max_record_batch_rows or 0),
+    }
+
+
+def write_raw_arrow_batch_lookup_indexes(
+    paths: Mapping[str, Any],
+    output_dir: str | Path | None = None,
+    *,
+    max_record_batch_rows: Mapping[str, int] | int | None = RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS,
+    overwrite: bool = True,
+) -> tuple[dict[str, str], dict[str, dict[str, int | str | bool]]]:
+    """Write optional batch lookup indexes for raw Arrow planner inputs."""
+
+    output_path = Path(output_dir) if output_dir is not None else None
+    indexed_paths = {str(key): str(value) for key, value in paths.items()}
+    metrics: dict[str, dict[str, int | str | bool]] = {}
+    for arrow_key, key_column in RAW_PLANNER_ARROW_KEY_COLUMNS.items():
+        arrow_value = paths.get(arrow_key)
+        if arrow_value is None:
+            continue
+        index_key = RAW_PLANNER_ARROW_BATCH_INDEX_KEYS[arrow_key]
+        batch_limit = _record_batch_limit_for_table(arrow_key, max_record_batch_rows)
+        arrow_file_path = Path(str(arrow_value))
+        index_file_path = (
+            output_path / f"{arrow_file_path.stem}.{index_key}.bin"
+            if output_path is not None
+            else arrow_file_path.with_name(f"{arrow_file_path.stem}.{index_key}.bin")
+        )
+        index_file, index_metrics = write_arrow_batch_lookup_index(
+            arrow_file_path,
+            index_file_path,
+            key_column=key_column,
+            table_name=arrow_key,
+            max_record_batch_rows=batch_limit,
+            overwrite=overwrite,
+        )
+        indexed_paths[index_key] = index_file
+        metrics[index_key] = index_metrics
+    return indexed_paths, metrics
+
+
+def raw_planner_arrow_physical_layout(
+    paths: Mapping[str, Any],
+    *,
+    max_record_batch_rows: Mapping[str, int] | int | None = RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS,
+) -> dict[str, Any]:
+    """Build manifest-ready physical-layout metadata for raw-planner Arrow inputs."""
+
+    tables: dict[str, dict[str, int | str | bool]] = {}
+    for table_name in RAW_PLANNER_ARROW_KEY_COLUMNS:
+        path_value = paths.get(table_name)
+        if path_value is None:
+            continue
+        batch_limit = _record_batch_limit_for_table(table_name, max_record_batch_rows)
+        layout = arrow_ipc_physical_layout(path_value)
+        _raise_if_record_batch_limit_exceeded(
+            arrow_path=path_value,
+            table_name=table_name,
+            batch_index=-1,
+            batch_rows=layout["actual_max_batch_rows"],
+            max_record_batch_rows=batch_limit,
+        )
+        index_key = RAW_PLANNER_ARROW_BATCH_INDEX_KEYS[table_name]
+        index_path = paths.get(index_key)
+        tables[table_name] = {
+            "key": RAW_PLANNER_ARROW_KEY_COLUMNS[table_name],
+            "max_record_batch_rows": int(batch_limit or 0),
+            "batch_index_path_key": index_key,
+            "batch_index_present": bool(index_path),
+            **layout,
+        }
+    return {
+        "schema": ARROW_PHYSICAL_LAYOUT_SCHEMA_VERSION,
+        "optimized_for": "incremental_raw_candidate_planning",
+        "tables": tables,
+    }
 
 
 def write_feature_block_arrow_tables(
@@ -332,6 +576,7 @@ def write_feature_block_arrow_tables(
     output_dir: str | Path,
     *,
     include_empty_cluster_seeds: bool = False,
+    max_record_batch_rows: Mapping[str, int] | int | None = RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS,
     overwrite: bool = True,
 ) -> dict[str, str]:
     """Write `FeatureBlock` Arrow IPC tables and return paths keyed by table name."""
@@ -348,7 +593,11 @@ def write_feature_block_arrow_tables(
             continue
         path = output_path / f"{name}.arrow"
         if overwrite or not path.exists():
-            write_arrow_ipc_table(table, path)
+            write_arrow_ipc_table(
+                table,
+                path,
+                max_record_batch_rows=_record_batch_limit_for_table(name, max_record_batch_rows),
+            )
         paths[name] = str(path)
     return paths
 
@@ -362,6 +611,7 @@ def write_feature_block_arrow_from_anddata(
     cluster_seeds_require: Mapping[Any, Any] | None = None,
     include_specter: bool = True,
     include_empty_cluster_seeds: bool = False,
+    max_record_batch_rows: Mapping[str, int] | int | None = RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS,
     overwrite: bool = True,
 ) -> dict[str, str]:
     """Build a `FeatureBlock` from `ANDData` and write complete Arrow IPC tables."""
@@ -377,6 +627,7 @@ def write_feature_block_arrow_from_anddata(
         feature_block,
         output_dir,
         include_empty_cluster_seeds=include_empty_cluster_seeds,
+        max_record_batch_rows=max_record_batch_rows,
         overwrite=overwrite,
     )
 

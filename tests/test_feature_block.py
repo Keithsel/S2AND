@@ -10,18 +10,23 @@ import pytest
 from s2and.data import ANDData, NameCounts
 from s2and.incremental_linking.feature_block import (
     FEATURE_BLOCK_EXCLUDED_ANDDATA_RESPONSIBILITIES,
+    RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS,
     FeatureBlockSignatureOrder,
+    arrow_ipc_physical_layout,
     feature_block_for_signature_order,
     feature_block_from_anddata,
     feature_block_from_arrow_paths,
     feature_block_from_raw_payloads,
     feature_block_signature_order_from_raw_candidate_plan,
     feature_block_to_mini_anddata,
+    raw_planner_arrow_physical_layout,
+    write_arrow_ipc_table,
     write_feature_block_arrow_from_anddata,
     write_feature_block_arrow_tables,
     write_name_counts_arrow,
     write_name_counts_index,
     write_name_pairs_arrow,
+    write_raw_arrow_batch_lookup_indexes,
 )
 from s2and.incremental_linking.features import LinkerFeatureMatrix
 from s2and.incremental_linking.query_adapter import (
@@ -339,6 +344,54 @@ def test_feature_block_from_arrow_paths_reads_cluster_seed_disallows(tmp_path: P
     feature_block = feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
     assert feature_block.cluster_seeds_disallow == (("q", "s2"),)
+
+
+def test_write_arrow_ipc_table_writes_bounded_record_batches(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    table = pa.table({"signature_id": pa.array([str(index) for index in range(5)], type=pa.string())})
+    path = write_arrow_ipc_table(table, tmp_path / "signatures.arrow", max_record_batch_rows=2)
+
+    assert arrow_ipc_physical_layout(path) == {
+        "row_count": 5,
+        "record_batch_count": 3,
+        "actual_max_batch_rows": 2,
+    }
+
+
+def test_raw_planner_index_rejects_unbounded_large_batch(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    table = pa.table({"signature_id": pa.array([str(index) for index in range(5)], type=pa.string())})
+    path = write_arrow_ipc_table(table, tmp_path / "signatures.arrow")
+
+    with pytest.raises(ValueError, match="exceeding the raw-planner limit of 2"):
+        write_raw_arrow_batch_lookup_indexes(
+            {"signatures": path},
+            tmp_path,
+            max_record_batch_rows={"signatures": 2},
+        )
+
+
+def test_raw_planner_index_metadata_uses_stem_qualified_sidecar(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    table = pa.table({"signature_id": pa.array([str(index) for index in range(5)], type=pa.string())})
+    path = write_arrow_ipc_table(table, tmp_path / "signatures.arrow", max_record_batch_rows=2)
+    indexed_paths, index_metrics = write_raw_arrow_batch_lookup_indexes(
+        {"signatures": path},
+        tmp_path,
+        max_record_batch_rows={"signatures": 2},
+    )
+    layout = raw_planner_arrow_physical_layout(indexed_paths, max_record_batch_rows={"signatures": 2})
+
+    assert Path(indexed_paths["signatures_batch_index"]).name == "signatures.signatures_batch_index.bin"
+    assert index_metrics["signatures_batch_index"]["record_batch_count"] == 3
+    assert index_metrics["signatures_batch_index"]["actual_max_batch_rows"] == 2
+    assert layout["schema"] == "s2and_arrow_physical_v1"
+    assert layout["tables"]["signatures"]["batch_index_present"] is True
+    assert layout["tables"]["signatures"]["max_record_batch_rows"] == 2
+    assert RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS["signatures"] == 16_384
 
 
 def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -708,6 +761,7 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
         retrieval_batch = kwargs["retrieval_batch"]
         captured["retrieval_left_indices"] = retrieval_batch.candidate_batch.left_signature_indices.tolist()
         captured["retrieval_right_indices"] = retrieval_batch.candidate_batch.right_signature_indices.tolist()
+        captured["retrieval_query_author"] = retrieval_batch.row_signals["query_author"].tolist()
         captured["extra_row_signal_builder"] = kwargs["extra_row_signal_builder"]
         captured["seed_setup"] = kwargs["seed_setup"]
         captured["queries"] = kwargs["queries"]
@@ -757,6 +811,7 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     assert captured["featurizer_signature_ids"] == ("q", "s1", "s2", "s3")
     assert captured["retrieval_left_indices"] == [0, 0, 0]
     assert captured["retrieval_right_indices"] == [1, 2, 3]
+    assert captured["retrieval_query_author"] == ["ada lovelace", "ada lovelace"]
     assert captured["extra_row_signal_builder"] is None
     queries = captured["queries"]
     assert isinstance(queries, tuple)
@@ -767,6 +822,73 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     assert result.telemetry["raw_arrow_seed_signature_count"] == 3
     assert "raw_arrow_retrieval_seconds" in result.telemetry
     assert captured["retrieval_paths"] == captured["featurizer_paths"]
+
+
+def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeFeaturizer:
+        def signature_ids(self) -> list[str]:
+            return ["q", "s1", "s2", "s3"]
+
+    def fail_build_rust_featurizer_from_arrow_paths(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("prebuilt raw Arrow featurizer should be reused")
+
+    def fake_from_retrieval(**kwargs: object) -> LinkOrAbstainProductionResult:
+        retrieval_batch = kwargs["retrieval_batch"]
+        captured["featurizer"] = kwargs["featurizer"]
+        captured["retrieval_left_indices"] = retrieval_batch.candidate_batch.left_signature_indices.tolist()
+        captured["retrieval_right_indices"] = retrieval_batch.candidate_batch.right_signature_indices.tolist()
+        return LinkOrAbstainProductionResult(
+            feature_matrix=LinkerFeatureMatrix(
+                matrix=np.empty((2, 0), dtype=np.float32),
+                feature_columns=(),
+                candidate_batch=retrieval_batch.candidate_batch,
+            ),
+            compact_result=LinkOrAbstainCompactResult(
+                probabilities=np.asarray([0.8, 0.2], dtype=np.float32),
+                decisions=(),
+            ),
+            telemetry={"pairwise_feature_seconds": 0.5, "constraint_api_mode": "rust_index_arrays"},
+            retrieval_batch=retrieval_batch,
+            pairwise_model_result=CandidateBatchPairwiseModelResult(
+                row_signals={},
+                pairwise_stats=None,
+                telemetry={},
+            ),
+            linked_signature_clusters={"q": "c_ada"},
+        )
+
+    fake_featurizer = FakeFeaturizer()
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port.build_rust_featurizer_from_arrow_paths",
+        fail_build_rust_featurizer_from_arrow_paths,
+    )
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime._predict_incremental_link_or_abstain_production_from_retrieval_private",
+        lambda *args, **kwargs: fake_from_retrieval(**kwargs),
+    )
+
+    result = predict_incremental_link_or_abstain_from_raw_arrow_paths(
+        type("Clusterer", (), {"n_jobs": 1})(),
+        type("Artifact", (), {"metadata": type("Metadata", (), {"retrieval_top_k": 25})()})(),
+        arrow_paths={},
+        query_signature_ids=["q"],
+        raw_candidate_plan=_raw_plan(),
+        rust_featurizer=fake_featurizer,
+        top_k=2,
+        n_jobs=1,
+        load_name_counts=False,
+        name_tuples=set(),
+    )
+
+    assert captured["featurizer"] is fake_featurizer
+    assert captured["retrieval_left_indices"] == [0, 0, 0]
+    assert captured["retrieval_right_indices"] == [1, 2, 3]
+    assert result.telemetry["raw_arrow_featurizer_reused"] == 1
+    assert result.telemetry["raw_arrow_featurizer_seconds"] >= 0.0
 
 
 def test_rust_featurizer_from_feature_block_matches_mini_anddata() -> None:

@@ -203,13 +203,21 @@ def build_linker_retrieval_batch_from_raw_candidate_plan(
             "raw candidate plan query_views length must match query_signature_ids: "
             f"{len(raw_query_views)} != {len(query_signature_ids)}"
         )
+    raw_query_authors = [str(value or "") for value in _required_raw_plan_value(plan, "query_authors")]
+    if len(raw_query_authors) != len(query_signature_ids):
+        raise ValueError(
+            "raw candidate plan query_authors length must match query_signature_ids: "
+            f"{len(raw_query_authors)} != {len(query_signature_ids)}"
+        )
     query_views = np.asarray([raw_query_views[int(offset)] for offset in row_query_offsets], dtype=object)
+    query_authors = np.asarray([raw_query_authors[int(offset)] for offset in row_query_offsets], dtype=object)
     query_first_tokens = _raw_plan_array(plan, "row_query_first_tokens", object, row_count)
     row_signals: dict[str, Any] = {
         "retrieval_score": retrieval_scores,
         "retrieval_rank": retrieval_ranks,
         "candidate_component_key": np.asarray(row_component_keys, dtype=object),
         "query_view": query_views,
+        "query_author": query_authors,
         "first_name_bucket": first_name_bucket_array(query_first_tokens, query_views),
     }
     for raw_key, signal_key, dtype in _RAW_PLAN_ROW_SIGNAL_KEYS:

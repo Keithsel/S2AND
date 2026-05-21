@@ -6,8 +6,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from s2and.incremental_linking.feature_block import feature_block_from_arrow_paths, write_name_counts_index
+from s2and.incremental_linking.feature_block import (
+    feature_block_from_arrow_paths,
+    write_name_counts_index,
+    write_raw_arrow_batch_lookup_indexes,
+)
 from s2and.incremental_linking.retrieval import build_linker_retrieval_batch_from_raw_candidate_plan
+from s2and.incremental_linking.runtime import subset_raw_candidate_plan_for_query_ids
 from tests.helpers import build_cluster_summary, build_query_features
 
 pa = pytest.importorskip("pyarrow")
@@ -20,6 +25,31 @@ def _write_ipc(path: Path, table: pa.Table) -> str:
         with pa.ipc.new_file(sink, table.schema) as writer:
             writer.write_table(table)
     return str(path)
+
+
+def _write_ipc_batches(path: Path, table: pa.Table, *, batch_size: int) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            for batch in table.to_batches(max_chunksize=batch_size):
+                writer.write_batch(batch)
+    return str(path)
+
+
+def _assert_raw_candidate_plans_equal(left: dict[str, object], right: dict[str, object]) -> None:
+    assert set(left) == set(right)
+    for key in sorted(set(left).difference({"telemetry"})):
+        left_value = left[key]
+        right_value = right[key]
+        if isinstance(left_value, np.ndarray) or isinstance(right_value, np.ndarray):
+            left_array = np.asarray(left_value)
+            right_array = np.asarray(right_value)
+            if left_array.dtype.kind == "f" or right_array.dtype.kind == "f":
+                np.testing.assert_allclose(left_array, right_array, rtol=1e-6, atol=1e-6, err_msg=key)
+            else:
+                np.testing.assert_array_equal(left_array, right_array, err_msg=key)
+        else:
+            assert left_value == right_value, key
 
 
 def _write_tiny_name_counts_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
@@ -181,6 +211,127 @@ def test_raw_arrow_candidate_plan_matches_existing_rust_retriever(tmp_path: Path
     assert raw_plan["right_signature_ids"] == ["s1", "s2"]
     assert raw_plan["query_views"] == ["full"]
     assert raw_plan["telemetry"]["signature_count"] == 3
+
+
+def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    irrelevant_count = 24
+    signature_ids = ["q1", "s1", "s2"] + [f"junk_sig_{index}" for index in range(irrelevant_count)]
+    paper_ids = ["p_q", "p1", "p2"] + [f"junk_paper_{index}" for index in range(irrelevant_count)]
+    signatures = pa.table(
+        {
+            "signature_id": pa.array(signature_ids, type=pa.string()),
+            "paper_id": pa.array(paper_ids, type=pa.string()),
+            "author_first": pa.array(["Alice", "Alice", "Bob"] + ["Noise"] * irrelevant_count, type=pa.string()),
+            "author_middle": pa.array(["", "", ""] + [""] * irrelevant_count, type=pa.string()),
+            "author_last": pa.array(["Wang", "Wang", "Jones"] + ["Ignored"] * irrelevant_count, type=pa.string()),
+            "author_suffix": pa.array(["", "", ""] + [""] * irrelevant_count, type=pa.string()),
+            "author_affiliations": pa.array(
+                [["AI Lab"], ["AI Lab"], ["Other Lab"]] + [[] for _ in range(irrelevant_count)],
+                type=pa.list_(pa.string()),
+            ),
+            "author_orcid": pa.array([None] * len(signature_ids), type=pa.string()),
+            "author_position": pa.array([0] * len(signature_ids), type=pa.int64()),
+        }
+    )
+    papers = pa.table(
+        {
+            "paper_id": pa.array(paper_ids, type=pa.string()),
+            "title": pa.array(["Graph Models", "Graph Models", "Different Topic"] + ["Noise"] * irrelevant_count),
+            "venue": pa.array(["NeurIPS", "NeurIPS", "ICML"] + [""] * irrelevant_count),
+            "journal_name": pa.array(["", "", ""] + [""] * irrelevant_count),
+            "year": pa.array([2020, 2020, 2010] + [1990] * irrelevant_count, type=pa.int64()),
+        }
+    )
+    paper_authors = pa.table(
+        {
+            "paper_id": pa.array(paper_ids, type=pa.string()),
+            "position": pa.array([0] * len(paper_ids), type=pa.int64()),
+            "author_name": pa.array(["Alice Wang", "Alice Wang", "Bob Jones"] + ["Noise"] * irrelevant_count),
+        }
+    )
+    cluster_seeds = pa.table(
+        {
+            "signature_id": pa.array(["s1", "s2"], type=pa.string()),
+            "cluster_id": pa.array(["c_match", "c_other"], type=pa.string()),
+        }
+    )
+    specter = pa.table(
+        {
+            "paper_id": pa.array(paper_ids, type=pa.string()),
+            "embedding": pa.FixedSizeListArray.from_arrays(
+                pa.array(
+                    [1.0, 0.0, 1.0, 0.0, 0.0, 1.0] + [0.0, 0.0] * irrelevant_count,
+                    type=pa.float32(),
+                ),
+                2,
+            ),
+        }
+    )
+    batch_size = 1
+    paths = {
+        "signatures": _write_ipc_batches(tmp_path / "signatures.arrow", signatures, batch_size=batch_size),
+        "papers": _write_ipc_batches(tmp_path / "papers.arrow", papers, batch_size=batch_size),
+        "paper_authors": _write_ipc_batches(
+            tmp_path / "paper_authors.arrow",
+            paper_authors,
+            batch_size=batch_size,
+        ),
+        "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
+        "specter": _write_ipc_batches(tmp_path / "specter.arrow", specter, batch_size=batch_size),
+    }
+    indexed_paths, index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
+
+    full_scan_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+    indexed_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        indexed_paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+
+    _assert_raw_candidate_plans_equal(indexed_plan, full_scan_plan)
+    telemetry = indexed_plan["telemetry"]
+    assert telemetry["indexed_arrow_candidate_plan"] is True
+    assert full_scan_plan["telemetry"]["signature_count"] == 3 + irrelevant_count
+    assert telemetry["signature_count"] == 3
+    assert telemetry["paper_count"] == 3
+    assert telemetry["paper_author_paper_count"] == 3
+    assert telemetry["specter_count"] == 3
+    assert telemetry["signature_rows_scanned"] == 3
+    assert telemetry["paper_rows_scanned"] == 3
+    assert telemetry["paper_author_rows_scanned"] == 3
+    assert telemetry["specter_rows_scanned"] == 3
+    assert index_metrics["signatures_batch_index"]["record_count"] == len(signature_ids)
+
+
+def test_raw_arrow_candidate_plan_rejects_stale_batch_index(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
+    with Path(paths["signatures"]).open("ab") as outfile:
+        outfile.write(b"\0")
+
+    with pytest.raises(ValueError, match="stale"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            indexed_paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
 
 
 def test_raw_arrow_candidate_plan_orcid_override_returns_all_matches(tmp_path: Path) -> None:
@@ -424,6 +575,43 @@ def test_raw_arrow_candidate_plan_matches_multi_query_auto_views_and_specter(tmp
     assert raw_plan["query_views"] == ["full", "initial_only"]
     assert raw_plan["left_signature_ids"] == ["q_full", "q_full", "q_initial", "q_initial"]
     assert raw_plan["right_signature_ids"] == ["s_full", "s_other", "s_initial", "s_other"]
+
+    subset_plan = subset_raw_candidate_plan_for_query_ids(raw_plan, ["q_initial"], zero_plan_timings=True)
+    single_query_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q_initial"],
+        top_k=2,
+        query_view="auto",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+    for key in (
+        "query_signature_ids",
+        "query_views",
+        "query_authors",
+        "row_component_keys",
+        "left_signature_ids",
+        "right_signature_ids",
+    ):
+        assert subset_plan[key] == single_query_plan[key]
+    for key in (
+        "row_query_signature_indices",
+        "retrieval_scores",
+        "retrieval_ranks",
+        "left_signature_indices",
+        "right_signature_indices",
+        "pair_row_indices",
+        "row_orcid_match",
+        "specter_centroid_similarity",
+    ):
+        np.testing.assert_array_equal(subset_plan[key], single_query_plan[key])
+    assert subset_plan["telemetry"]["query_signature_count"] == 1
+    assert subset_plan["telemetry"]["signature_count"] == 0
+    assert subset_plan["telemetry"]["seed_signature_count"] == raw_plan["telemetry"]["seed_signature_count"]
+    assert subset_plan["telemetry"]["cluster_count"] == raw_plan["telemetry"]["cluster_count"]
+    assert subset_plan["telemetry"]["timings"]["total_secs"] == 0.0
+    assert subset_plan["telemetry"]["window_plan_reused"] == 1
+    assert "window_query_signature_count" not in subset_plan["telemetry"]
 
 
 def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metadata(tmp_path: Path) -> None:

@@ -12,6 +12,7 @@ from s2and.incremental_linking.linker_pairwise import (
     LinkerCandidateBatch,
     promoted_pairwise_aggregate_columns,
 )
+from s2and.incremental_linking.logistic_gate import feature_values_from_runtime
 
 
 class StaticPairwiseStats:
@@ -22,8 +23,10 @@ class StaticPairwiseStats:
     ) -> None:
         self._matrix = np.asarray(matrix, dtype=np.float32)
         self.aggregate_feature_columns = columns
+        self.feature_matrix_call_count = 0
 
     def feature_matrix(self) -> np.ndarray:
+        self.feature_matrix_call_count += 1
         return self._matrix
 
 
@@ -156,3 +159,34 @@ def test_assemble_linker_feature_matrix_matches_tracked_target_order() -> None:
     expected = pd.concat([frame, pairwise_frame], axis=1).loc[:, list(target_columns)].to_numpy(np.float32)
 
     np.testing.assert_array_equal(assembled.matrix, expected)
+
+
+def test_feature_values_from_runtime_reuses_assembled_pairwise_columns() -> None:
+    row_count = 3
+    candidate_batch = LinkerCandidateBatch(
+        row_count=row_count,
+        left_signature_indices=np.zeros(0, dtype=np.uint32),
+        right_signature_indices=np.zeros(0, dtype=np.uint32),
+        pair_row_indices=np.zeros(0, dtype=np.uint32),
+        retrieval_scores=np.asarray([0.3, 0.2, 0.1], dtype=np.float32),
+        retrieval_ranks=np.asarray([1, 2, 3], dtype=np.uint16),
+    )
+    pairwise_columns = promoted_pairwise_aggregate_columns()
+    pairwise_matrix = np.arange(row_count * len(pairwise_columns), dtype=np.float32).reshape(
+        row_count, len(pairwise_columns)
+    )
+    pairwise_stats = StaticPairwiseStats(pairwise_matrix, pairwise_columns)
+    assembled = features.assemble_linker_feature_matrix(
+        candidate_batch,
+        _row_feature_fixture(row_count),
+        pairwise_stats=pairwise_stats,
+    )
+
+    assert pairwise_stats.feature_matrix_call_count == 1
+    values = feature_values_from_runtime(assembled, None)
+
+    assert pairwise_stats.feature_matrix_call_count == 1
+    np.testing.assert_array_equal(
+        values["pw_mean_first_names_equal"],
+        assembled.matrix[:, assembled.feature_columns.index("pw_mean_first_names_equal")],
+    )

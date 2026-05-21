@@ -151,6 +151,8 @@ def resolve_dataset_file(data_root: str, dataset_name: str, preferred_name: str,
 
 
 def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suffix: str) -> dict[str, str]:
+    from s2and.incremental_linking.feature_block import RAW_PLANNER_ARROW_BATCH_INDEX_KEYS
+
     dataset_root = os.path.join(arrow_root, dataset_name)
     specter_name = "specter2.arrow" if specter_suffix == "_specter2.pkl" else "specter.arrow"
     paths = {
@@ -164,6 +166,18 @@ def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suff
     if missing:
         formatted = ", ".join(f"{key}={path}" for key, path in missing.items())
         raise FileNotFoundError(f"Missing Arrow dataset files for {dataset_name}: {formatted}")
+    for arrow_key, index_key in RAW_PLANNER_ARROW_BATCH_INDEX_KEYS.items():
+        arrow_path = paths.get(arrow_key)
+        if arrow_path is None:
+            continue
+        arrow_stem = os.path.splitext(os.path.basename(arrow_path))[0]
+        for candidate in (
+            os.path.join(os.path.dirname(arrow_path), f"{arrow_stem}.{index_key}.bin"),
+            os.path.join(dataset_root, f"{index_key}.bin"),
+        ):
+            if os.path.exists(candidate):
+                paths[index_key] = candidate
+                break
     return paths
 
 
@@ -207,9 +221,11 @@ def split_blocks_like_anddata(
     for block_id, signatures in blocks_dict.items():
         block_ids.append(block_id)
         block_sizes.append(len(signatures))
-    y_group = KMeans(n_clusters=num_clusters_for_block_size, random_state=random_seed, n_init=10).fit(
-        np.array(block_sizes).reshape(-1, 1)
-    ).labels_
+    y_group = (
+        KMeans(n_clusters=num_clusters_for_block_size, random_state=random_seed, n_init=10)
+        .fit(np.array(block_sizes).reshape(-1, 1))
+        .labels_
+    )
     train_blocks, val_test_blocks, _, val_test_length = train_test_split(
         block_ids,
         y_group,
@@ -375,10 +391,14 @@ def main() -> None:
             raise ValueError(f"Unknown dataset(s) for --dataset {args.dataset}: {unknown_datasets}")
         datasets = requested_datasets
     active_specter_suffixes = [str(suffix) for suffix in (args.specter_suffixes or specter_suffixes)]
-    arrow_available = args.dataset == "mini" and not train_flag and arrow_datasets_available(
-        arrow_data_root,
-        datasets,
-        active_specter_suffixes,
+    arrow_available = (
+        args.dataset == "mini"
+        and not train_flag
+        and arrow_datasets_available(
+            arrow_data_root,
+            datasets,
+            active_specter_suffixes,
+        )
     )
     if args.use_arrow and not arrow_available:
         # Raise the precise missing-file error for the first requested combination.

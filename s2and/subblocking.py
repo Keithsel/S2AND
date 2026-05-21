@@ -227,6 +227,69 @@ def _specter_labeled_subblock_stats(subblocks: dict[str, list[str]]) -> tuple[in
     return len(specter_keys), specter_signature_count
 
 
+def _subblock_merge_candidate_metadata(key: str, size: int) -> tuple[int, str, str | None, str | None, str | None]:
+    key_parts = key.split("|")
+    first_name = key_parts[0]
+    middle_name = key_parts[1].split("=")[1] if len(key_parts) > 1 else None
+    if len(first_name) > 1:
+        name_for_splits = first_name
+    elif len(first_name) == 1 and middle_name is not None:
+        name_for_splits = middle_name
+    else:
+        name_for_splits = None
+    lookup = None if name_for_splits is None else name_for_splits.split(" ")[0]
+    return size, first_name, middle_name, name_for_splits, lookup
+
+
+def _sorted_subblock_merge_candidates(
+    output: dict[str, list[str]],
+    maximum_size: int,
+    first_k_letter_counts_sorted: dict,
+) -> list[tuple[tuple[str, str], float]]:
+    """Return legacy subblock merge candidates with key metadata parsed once."""
+
+    small_enough_keys = [key for key, value in output.items() if len(value) < maximum_size]
+    metadata = {key: _subblock_merge_candidate_metadata(key, len(output[key])) for key in small_enough_keys}
+    candidates: list[tuple[tuple[str, str], float]] = []
+    for pair in combinations(small_enough_keys, 2):
+        size_1, first_name_1, middle_name_1, name_for_splits_1, lookup_1 = metadata[pair[0]]
+        size_2, first_name_2, middle_name_2, name_for_splits_2, lookup_2 = metadata[pair[1]]
+        if size_1 + size_2 >= maximum_size:
+            continue
+        if name_for_splits_1 is None or name_for_splits_2 is None:
+            continue
+        both_multi_letter = len(first_name_1) > 1 and len(first_name_2) > 1
+        both_single_letter_with_middle = (
+            len(first_name_1) == 1
+            and len(first_name_2) == 1
+            and middle_name_1 is not None
+            and middle_name_2 is not None
+        )
+        if not both_multi_letter and not both_single_letter_with_middle:
+            continue
+
+        if name_for_splits_1 == name_for_splits_2:
+            if middle_name_1 is not None and middle_name_2 is not None:
+                score = 0
+                for i in range(1, len(middle_name_1)):
+                    if middle_name_1[:i] == middle_name_2[:i]:
+                        score = i
+            else:
+                score = 0
+            candidates.append((pair, 1e10 + score))
+        elif same_prefix_tokens(name_for_splits_1, name_for_splits_2):
+            score = min(len(name_for_splits_1), len(name_for_splits_2))
+            candidates.append((pair, 1e5 + score))
+        elif (
+            lookup_1 is not None
+            and lookup_2 is not None
+            and lookup_1 in first_k_letter_counts_sorted
+            and lookup_2 in first_k_letter_counts_sorted[lookup_1]
+        ):
+            candidates.append((pair, first_k_letter_counts_sorted[lookup_1][lookup_2]))
+    return sorted(candidates, key=lambda x: (x[1], x[0][0], x[0][1]), reverse=True)
+
+
 def make_subblocks_with_telemetry(
     signature_ids,
     anddata,
@@ -399,82 +462,11 @@ def make_subblocks_with_telemetry(
     First step is to find candidates for merging.
     """
     logger.info("Starting to merge subblocks. First step is to find candidates for merging.")
-    small_enough_keys = [k for k, v in output.items() if len(v) < maximum_size]
-    # for each pair of keys in small_enough, look up the count in first_k_letter_counts_sorted
-    # and keep only pairs where their sum is less than maximum subblock size
-    # then sort descending by the count
-    small_enough_pairs_counts = []
-    for pair in list(combinations(small_enough_keys, 2)):
-        # the addition of this pair can't be greater than the maximum size
-        if len(output[pair[0]]) + len(output[pair[1]]) < maximum_size:
-            pair_0_split = pair[0].split("|")
-            pair_1_split = pair[1].split("|")
-
-            first_name_1 = pair_0_split[0]
-            first_name_2 = pair_1_split[0]
-
-            if len(pair_0_split) > 1:
-                middle_name_1 = pair_0_split[1].split("=")[1]
-            else:
-                middle_name_1 = None
-
-            if len(pair_1_split) > 1:
-                middle_name_2 = pair_1_split[1].split("=")[1]
-            else:
-                middle_name_2 = None
-
-            # for more than single-letter first names
-            # we consider merging the subblocks if they overlapping first k letters
-            # however this may be not necessary as the constraints disallow
-            # situations where not (a.startswith(b) or b.startswith(a))
-            if len(first_name_1) > 1 and len(first_name_2) > 1:
-                name_for_splits_1 = first_name_1
-                name_for_splits_2 = first_name_2
-            # then we have the situation where we have single letter first names and available middle name
-            # here we'll use the middle names for the proposed merges
-            elif (
-                len(first_name_1) == 1
-                and len(first_name_2) == 1
-                and middle_name_1 is not None
-                and middle_name_2 is not None
-            ):
-                name_for_splits_1 = middle_name_1
-                name_for_splits_2 = middle_name_2
-            # we don't really want to mix cases where one has 2 or more first name letters and the other doesn't
-            # also it's weird when one has a middle name and the other doesn't (and they're both single letter)
-            # so just skipping them all
-            else:
-                continue
-
-            # if names are the same, then we give this a very high artificial count
-            # and the count for this will be very high
-            if name_for_splits_1 == name_for_splits_2:
-                # we also have to add overlap between the middle names if they exist
-                # to prioritize James W.E. to be joined with James W over being joined with James E
-                if middle_name_1 is not None and middle_name_2 is not None:
-                    score = 0
-                    for i in range(1, len(middle_name_1)):
-                        if middle_name_1[:i] == middle_name_2[:i]:
-                            score = i
-                else:
-                    score = 0
-                small_enough_pairs_counts.append((pair, 1e10 + score))
-            # the name tuples allow the situation where prefixes match in either direction
-            elif same_prefix_tokens(name_for_splits_1, name_for_splits_2):
-                score = min(len(name_for_splits_1), len(name_for_splits_2))
-                small_enough_pairs_counts.append((pair, 1e5 + score))
-            # the other option is that the names are different but we have counts
-            else:
-                # TODO(s2and): Temporary compatibility tweak for hyphen-preserving first names.
-                # The ORCID-derived first_k_letter_counts were generated with legacy normalization.
-                # To preserve utility without regenerating, probe counts using token before first space.
-                # Consider removing this once counts are regenerated with new logic.
-                lookup_1 = name_for_splits_1.split(" ")[0]
-                lookup_2 = name_for_splits_2.split(" ")[0]
-                if lookup_1 in first_k_letter_counts_sorted and lookup_2 in first_k_letter_counts_sorted[lookup_1]:
-                    small_enough_pairs_counts.append((pair, first_k_letter_counts_sorted[lookup_1][lookup_2]))
-
-    small_enough_pairs_sorted = sorted(small_enough_pairs_counts, key=lambda x: (x[1], x[0][0], x[0][1]), reverse=True)
+    small_enough_pairs_sorted = _sorted_subblock_merge_candidates(
+        output,
+        maximum_size,
+        first_k_letter_counts_sorted,
+    )
     # now we go down the list and merge until we reach merged subblocks not above maximum size
     # it's possible that when we merge subblock A and B, the resulting subblock is still below thresh
     # and then it's legal to merge A/B with C, so we have to keep track of all that

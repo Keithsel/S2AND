@@ -1524,6 +1524,23 @@ def test_private_production_slice_supplies_query_author_to_logistic_gate(
     assert result.compact_result.decisions[0].action == "link"
 
 
+def test_production_query_author_row_signals_reuses_retrieval_signal() -> None:
+    retrieval_batch = _production_retrieval_batch(
+        row_query_signature_indices=np.asarray([0, 0], dtype=np.uint32),
+        row_component_keys=("c1", "c2"),
+    )
+    retrieval_batch.row_signals["query_author"] = np.asarray(["Ada Lovelace", "Ada Lovelace"], dtype=object)
+
+    assert (
+        runtime_module._production_query_author_row_signals(
+            retrieval_batch,
+            query_signature_id_by_index={0: "q1"},
+            query_by_signature_id={"q1": SimpleNamespace(query_author="ignored")},
+        )
+        == {}
+    )
+
+
 def test_query_author_for_gate_fallback_includes_full_signature_name() -> None:
     query = SimpleNamespace(
         query_author="",

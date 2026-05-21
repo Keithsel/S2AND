@@ -34,6 +34,7 @@ from s2and.feature_port import (
     evict_rust_featurizer,
 )
 from s2and.featurizer import FeaturizationInfo, many_pairs_featurize, resolve_cache_policy
+from s2and.incremental_linking.feature_block import RAW_PLANNER_ARROW_BATCH_INDEX_KEYS
 from s2and.incremental_linking.production import (
     predict_incremental_promoted_linker,
     predict_incremental_promoted_linker_from_arrow_paths,
@@ -315,6 +316,22 @@ def _coerce_existing_arrow_paths(
     return paths
 
 
+def _add_raw_planner_batch_index_paths(paths: dict[str, str], arrow_dataset_dir: Path) -> None:
+    for arrow_key, index_key in RAW_PLANNER_ARROW_BATCH_INDEX_KEYS.items():
+        if index_key in paths:
+            continue
+        arrow_path_value = paths.get(arrow_key)
+        candidates = []
+        if arrow_path_value is not None:
+            arrow_path = Path(arrow_path_value)
+            candidates.append(arrow_path.with_name(f"{arrow_path.stem}.{index_key}.bin"))
+        candidates.append(arrow_dataset_dir / f"{index_key}.bin")
+        for candidate in candidates:
+            if candidate.exists():
+                paths[index_key] = str(candidate)
+                break
+
+
 def _specter_arrow_name_for_dataset(dataset: Any) -> str:
     specter_path = getattr(dataset, "specter_embeddings_path", None)
     specter_name = "" if specter_path is None else Path(str(specter_path)).name.lower()
@@ -338,6 +355,9 @@ def _resolve_dataset_arrow_paths(
             strict=True,
         )
         if explicit is not None:
+            signatures_path = explicit.get("signatures")
+            if signatures_path is not None:
+                _add_raw_planner_batch_index_paths(explicit, Path(signatures_path).resolve().parent)
             if require_cluster_seeds:
                 cluster_seeds_path = explicit.get("cluster_seeds")
                 if cluster_seeds_path is None or not Path(cluster_seeds_path).exists():
@@ -383,6 +403,7 @@ def _resolve_dataset_arrow_paths(
             altered_path = arrow_dataset_dir / "altered_cluster_signatures.arrow"
             if altered_path.exists():
                 paths["altered_cluster_signatures"] = str(altered_path)
+            _add_raw_planner_batch_index_paths(paths, arrow_dataset_dir)
             resolved = _coerce_existing_arrow_paths(
                 paths,
                 require_specter=require_specter,
@@ -3352,11 +3373,31 @@ class Clusterer:
         vars(dataset)["_s2and_disable_arrow_cluster_seeds"] = True
         pred_clusters_intermediate: dict[str, list[str]] = pred_clusters
         try:
+            synthetic_arrow_paths_available = (
+                stage_uses_rust(runtime_context)
+                and not _uses_reference_features(self.featurizer_info)
+                and not _uses_reference_features(self.nameless_featurizer_info)
+                and _resolve_dataset_arrow_paths(
+                    dataset,
+                    require_specter=_uses_embedding_features(self),
+                    require_cluster_seeds=False,
+                )
+                is not None
+            )
+
+            def sync_synthetic_cluster_seeds_if_needed() -> None:
+                if synthetic_arrow_paths_available and getattr(dataset, "cluster_seeds_require", {}):
+                    logger.info(
+                        "Skipping synthetic Rust cluster seed sync; promoted incremental will use current Arrow seeds"
+                    )
+                    return
+                _sync_rust_cluster_seeds(dataset, runtime_context=runtime_context)
+
             for cluster_id, signatures in pred_clusters_intermediate.items():
                 for signature in signatures:
                     dataset.cluster_seeds_require[signature] = cluster_id
             _bump_cluster_seeds_version(dataset)
-            _sync_rust_cluster_seeds(dataset, runtime_context=runtime_context)
+            sync_synthetic_cluster_seeds_if_needed()
 
             predict_times: dict[str, float] = {}
             for block_key in sorted(block_dict_single_letter.keys()):
@@ -3412,7 +3453,7 @@ class Clusterer:
                     for signature in signatures:
                         dataset.cluster_seeds_require[signature] = cluster_id
                 _bump_cluster_seeds_version(dataset)
-                _sync_rust_cluster_seeds(dataset, runtime_context=runtime_context)
+                sync_synthetic_cluster_seeds_if_needed()
 
             logger.info(f"Finished subblocked predict incremental. Here's how long each subblock took: {predict_times}")
         finally:
@@ -4121,8 +4162,11 @@ class Clusterer:
         recluster_map: dict[int | str, int | str] = {}
         cluster_seeds_require: dict[str, int | str] = {}
         source_cluster_seeds_require = copy.deepcopy(getattr(dataset, "cluster_seeds_require", {}) or {})
+        source_cluster_seeds_origin = "dataset" if source_cluster_seeds_require else "empty"
         if not source_cluster_seeds_require and not _dataset_disables_arrow_cluster_seeds(dataset):
             source_cluster_seeds_require = _cluster_seeds_require_from_arrow_paths(arrow_paths)
+            if source_cluster_seeds_require:
+                source_cluster_seeds_origin = "arrow"
         for signature_id, cluster_num in source_cluster_seeds_require.items():
             cluster_num_value: int | str
             if isinstance(cluster_num, int | str):
@@ -4319,6 +4363,8 @@ class Clusterer:
             "seed_setup_altered_presplit_orcid_skip_count": int(altered_presplit_orcid_skip_count),
             "seed_setup_recluster_map_entry_count": int(len(recluster_map)),
             "seed_setup_altered_cluster_count": int(altered_cluster_count),
+            "seed_setup_cluster_seeds_source": source_cluster_seeds_origin,
+            "seed_setup_cluster_seeds_from_arrow": int(source_cluster_seeds_origin == "arrow"),
         }
         return cluster_seeds_require, recluster_map, cluster_seeds_require_inverse
 

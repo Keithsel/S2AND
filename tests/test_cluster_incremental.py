@@ -642,6 +642,37 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
     assert captured["finish_arrow_paths"] == captured["arrow_paths"]
 
 
+def test_resolve_dataset_arrow_paths_discovers_raw_planner_batch_indexes(tmp_path: Path) -> None:
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+        "cluster_seeds": "cluster_seeds.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
+    for filename in (
+        "signatures.signatures_batch_index.bin",
+        "papers.papers_batch_index.bin",
+        "paper_authors.paper_authors_batch_index.bin",
+    ):
+        (tmp_path / filename).touch()
+
+    dataset = SimpleNamespace(arrow_paths=arrow_paths)
+    resolved = model_module._resolve_dataset_arrow_paths(
+        dataset,
+        require_specter=False,
+        require_cluster_seeds=True,
+    )
+
+    assert resolved is not None
+    assert Path(resolved["signatures_batch_index"]).name == "signatures.signatures_batch_index.bin"
+    assert Path(resolved["papers_batch_index"]).name == "papers.papers_batch_index.bin"
+    assert Path(resolved["paper_authors_batch_index"]).name == "paper_authors.paper_authors_batch_index.bin"
+
+
 def test_predict_incremental_arrow_promoted_linker_uses_seed_arrow_without_python_seed_map(
     clusterer_dataset_factory,
     monkeypatch,
@@ -742,11 +773,13 @@ def test_predict_incremental_arrow_promoted_linker_uses_seed_arrow_without_pytho
     assert result["incremental_linker_query_view"] == "raw_arrow"
     assert result["incremental_linker_telemetry"]["seed_setup_seed_signature_count"] == 4
     assert result["incremental_linker_telemetry"]["seed_setup_component_count"] == 2
+    assert result["incremental_linker_telemetry"]["seed_setup_cluster_seeds_source"] == "arrow"
+    assert result["incremental_linker_telemetry"]["seed_arrow_reused_source"] == 1
     assert sync_calls == []
     assert captured["query_signature_ids"] == ("5", "8")
     assert captured["finish_unassigned"] == ["5", "8"]
     assert captured["finish_seed_inverse"] == {"0": ["6", "7"], "1": ["3", "4"]}
-    assert captured["raw_arrow_paths"]["cluster_seeds"] != str(cluster_seeds_path)
+    assert captured["raw_arrow_paths"]["cluster_seeds"] == str(cluster_seeds_path)
 
 
 def test_predict_incremental_arrow_seed_path_can_be_suppressed_for_synthetic_calls(
@@ -813,6 +846,153 @@ def test_predict_incremental_arrow_seed_path_can_be_suppressed_for_synthetic_cal
 
     assert result["clusters"] == {"fallback": ["5", "8"]}
     assert captured["fallback_dataset"] is dataset
+
+
+def test_predict_incremental_arrow_promoted_linker_reuses_window_featurizer(
+    clusterer_dataset_factory,
+    monkeypatch,
+    tmp_path,
+):
+    import pyarrow as pa
+
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_auto_incremental_arrow_window_featurizer")
+    block = ["3", "4", "5", "6", "7", "8"]
+    dataset.cluster_seeds_require = {}
+    dataset.altered_cluster_signatures = None
+    runtime_context = SimpleNamespace(
+        operation="cluster_predict_incremental",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="test-rust-promoted-incremental-arrow-window-featurizer",
+        source="S2AND_BACKEND",
+    )
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
+    cluster_seeds_path = tmp_path / "cluster_seeds.arrow"
+    seed_table = pa.table(
+        {
+            "signature_id": pa.array(["6", "7", "3", "4"], type=pa.string()),
+            "cluster_id": pa.array(["0", "0", "1", "1"], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(cluster_seeds_path), "wb") as sink:
+        with pa.ipc.new_file(sink, seed_table.schema) as writer:
+            writer.write_table(seed_table)
+    arrow_paths["cluster_seeds"] = str(cluster_seeds_path)
+    dataset.arrow_paths = arrow_paths
+    captured: dict[str, Any] = {"runtime_featurizers": [], "runtime_batches": []}
+
+    class FakeArtifact:
+        metadata = SimpleNamespace(retrieval_top_k=25)
+
+    class FakeFeaturizer:
+        def __init__(self, signature_ids):
+            self._signature_ids = list(signature_ids)
+
+        def signature_ids(self):
+            return list(self._signature_ids)
+
+    class FakeRustModule:
+        @staticmethod
+        def raw_block_query_candidate_plan_arrow(paths_arg, query_signature_ids, **kwargs):
+            captured["raw_plan_paths"] = dict(paths_arg)
+            captured["raw_plan_query_signature_ids"] = tuple(query_signature_ids)
+            captured["raw_plan_kwargs"] = dict(kwargs)
+            query_count = len(query_signature_ids)
+            return {
+                "query_signature_ids": list(query_signature_ids),
+                "query_views": ["full"] * query_count,
+                "query_authors": ["author"] * query_count,
+                "row_count": 0,
+                "pair_count": 0,
+                "row_query_signature_indices": np.asarray([], dtype=np.uint32),
+                "pair_row_indices": np.asarray([], dtype=np.uint32),
+                "left_signature_indices": np.asarray([], dtype=np.uint32),
+                "right_signature_indices": np.asarray([], dtype=np.uint32),
+                "left_signature_ids": [],
+                "right_signature_ids": [],
+                "row_component_keys": [],
+                "component_members": {},
+                "telemetry": {
+                    "query_signature_count": query_count,
+                    "signature_count": query_count,
+                    "seed_signature_count": 4,
+                    "cluster_count": 2,
+                    "timings": {"total_secs": 0.25},
+                },
+            }
+
+    def fake_build_rust_featurizer_from_arrow_paths(paths_arg, **kwargs):
+        captured["featurizer_paths"] = dict(paths_arg)
+        captured["featurizer_signature_ids"] = tuple(kwargs["signature_ids"])
+        return FakeFeaturizer(kwargs["signature_ids"])
+
+    def fake_raw_arrow_linker(clusterer_arg, artifact_arg, **kwargs):
+        del clusterer_arg, artifact_arg
+        query_batch = tuple(kwargs["query_signature_ids"])
+        captured["runtime_batches"].append(query_batch)
+        captured["runtime_featurizers"].append(kwargs["rust_featurizer"])
+        return SimpleNamespace(
+            linked_signature_clusters={str(signature_id): "0" for signature_id in query_batch},
+            telemetry={
+                "candidate_row_count": 0,
+                "pair_count": 0,
+                "query_count": len(query_batch),
+                "raw_arrow_featurizer_reused": int(kwargs["rust_featurizer"] is not None),
+                "raw_arrow_seed_signature_count": 4,
+                "raw_arrow_seed_component_count": 2,
+                "raw_arrow_plan_seed_signature_count": 0,
+                "raw_arrow_plan_cluster_count": 0,
+            },
+        )
+
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        production_module.artifact_module,
+        "load_incremental_linking_artifact",
+        lambda _path: FakeArtifact(),
+    )
+    monkeypatch.setattr(production_module.feature_port, "_require_rust_runtime", lambda: FakeRustModule)
+    monkeypatch.setattr(
+        production_module.feature_port,
+        "build_rust_featurizer_from_arrow_paths",
+        fake_build_rust_featurizer_from_arrow_paths,
+    )
+    monkeypatch.setattr(
+        production_module.runtime_module,
+        "predict_incremental_link_or_abstain_from_raw_arrow_paths",
+        fake_raw_arrow_linker,
+    )
+
+    result = clusterer.predict_incremental(block, dataset, batching_threshold=1)
+
+    assert result["clusters"] == {"0": ["6", "7", "5", "8"], "1": ["3", "4"]}
+    assert captured["raw_plan_query_signature_ids"] == ("5", "8")
+    assert captured["featurizer_signature_ids"] == ("5", "8")
+    assert captured["runtime_batches"] == [("5",), ("8",)]
+    assert len({id(featurizer) for featurizer in captured["runtime_featurizers"]}) == 1
+    assert captured["runtime_featurizers"][0] is not None
+    telemetry = result["incremental_linker_telemetry"]
+    assert telemetry["raw_arrow_window_plan_count"] == 1
+    assert telemetry["raw_arrow_window_featurizer_count"] == 1
+    assert telemetry["raw_arrow_window_featurizer_signature_count"] == 2
+    assert "raw_arrow_window_subset_seconds" in telemetry
+    assert telemetry["raw_arrow_featurizer_reused"] == 2
+    assert telemetry["seed_signature_count"] == 4
+    assert telemetry["seed_component_count"] == 2
+    assert telemetry["raw_arrow_seed_signature_count"] == 4
+    assert telemetry["raw_arrow_seed_component_count"] == 2
+    assert telemetry["raw_arrow_plan_seed_signature_count"] == 0
+    assert telemetry["raw_arrow_plan_cluster_count"] == 0
 
 
 def test_predict_incremental_arrow_promoted_linker_transforms_altered_seed_arrow(
@@ -902,6 +1082,7 @@ def test_predict_incremental_arrow_promoted_linker_transforms_altered_seed_arrow
     assert result["incremental_linker_telemetry"]["seed_setup_altered_signature_count"] == 1
     assert result["incremental_linker_telemetry"]["seed_setup_altered_presplit_block_count"] == 1
     assert result["incremental_linker_telemetry"]["seed_setup_altered_presplit_signature_count"] == 2
+    assert result["incremental_linker_telemetry"]["seed_arrow_reused_source"] == 0
     assert sync_calls == []
     assert result["clusters"] == {"0": ["6", "7", "5", "8"], "1": ["3", "4"]}
     assert captured["presplit_block_dict"] == {"altered_profile_0": ["6", "7"]}

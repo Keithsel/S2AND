@@ -130,3 +130,8 @@ def test_convert_inference_json_to_arrow_preserves_seed_and_altered_tables(
     assert _read_table(manifest["paths"]["papers"]).num_rows == 3
     assert _read_table(manifest["paths"]["paper_authors"]).num_rows == 3
     assert _read_table(manifest["paths"]["specter"]).num_rows == 3
+    assert Path(manifest["paths"]["signatures_batch_index"]).name == "signatures.signatures_batch_index.bin"
+    assert Path(manifest["paths"]["papers_batch_index"]).exists()
+    assert manifest["physical_layout"]["schema"] == "s2and_arrow_physical_v1"
+    assert manifest["physical_layout"]["tables"]["signatures"]["batch_index_present"] is True
+    assert manifest["raw_planner_batch_indexes"]["signatures_batch_index"]["record_count"] == 3

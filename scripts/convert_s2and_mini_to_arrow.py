@@ -31,16 +31,6 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _write_arrow_ipc_table(table: Any, path: Path) -> str:
-    import pyarrow as pa
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with pa.OSFile(str(path), "wb") as sink:
-        with pa.ipc.new_file(sink, table.schema) as writer:
-            writer.write_table(table)
-    return str(path)
-
-
 def _specter_mapping(payload: Any) -> dict[str, np.ndarray]:
     if isinstance(payload, dict):
         return {str(key): np.asarray(value, dtype=np.float32) for key, value in payload.items()}
@@ -90,7 +80,13 @@ def _write_specter_arrow(
             "embedding": pa.FixedSizeListArray.from_arrays(flat, dimension),
         }
     )
-    _write_arrow_ipc_table(table, output_path)
+    from s2and.incremental_linking.feature_block import RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS, write_arrow_ipc_table
+
+    write_arrow_ipc_table(
+        table,
+        output_path,
+        max_record_batch_rows=RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS["specter"],
+    )
     return {
         "path": str(output_path),
         "reused": False,
@@ -119,8 +115,13 @@ def convert_dataset(
 ) -> dict[str, Any]:
     from s2and.data import ANDData
     from s2and.incremental_linking.feature_block import (
+        RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS,
+        arrow_ipc_physical_layout,
+        raw_planner_arrow_physical_layout,
+        write_arrow_batch_lookup_index,
         write_feature_block_arrow_from_anddata,
         write_name_counts_index,
+        write_raw_arrow_batch_lookup_indexes,
     )
 
     source_dir = source_root / dataset
@@ -188,6 +189,29 @@ def convert_dataset(
     }
     paths["specter"] = str(output_dir / "specter.arrow")
     paths["specter2"] = str(output_dir / "specter2.arrow")
+    paths, raw_planner_index_metrics = write_raw_arrow_batch_lookup_indexes(
+        paths,
+        output_dir,
+        overwrite=overwrite,
+    )
+    specter2_index_path, specter2_index_metrics = write_arrow_batch_lookup_index(
+        paths["specter2"],
+        output_dir / "specter2.specter_batch_index.bin",
+        key_column="paper_id",
+        table_name="specter2",
+        max_record_batch_rows=RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS["specter"],
+        overwrite=overwrite,
+    )
+    paths["specter2_batch_index"] = specter2_index_path
+    raw_planner_index_metrics["specter2_batch_index"] = specter2_index_metrics
+    physical_layout = raw_planner_arrow_physical_layout(paths)
+    physical_layout["tables"]["specter2"] = {
+        "key": "paper_id",
+        "max_record_batch_rows": RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS["specter"],
+        "batch_index_path": specter2_index_path,
+        "batch_index_present": True,
+        **arrow_ipc_physical_layout(paths["specter2"]),
+    }
 
     start = time.perf_counter()
     name_counts_index_path, name_counts_index_metrics = write_name_counts_index(
@@ -206,6 +230,8 @@ def convert_dataset(
         "cluster_count": len(dataset_obj.clusters or {}),
         "paths": paths,
         "specter": specter_reports,
+        "physical_layout": physical_layout,
+        "raw_planner_batch_indexes": raw_planner_index_metrics,
         "name_counts_index": name_counts_index_metrics,
         "name_tuples": "default packaged filtered aliases",
         "timings_seconds": {

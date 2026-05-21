@@ -24,7 +24,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 fn py_len(s: &str) -> usize {
     // Python len() semantics for str: count of Unicode scalar values
@@ -40,6 +40,9 @@ const DROPPED_AFFIXES: [&str; 48] = [
 
 const FNV_OFFSET: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
+const ARROW_BATCH_LOOKUP_INDEX_MAGIC: &[u8; 8] = b"S2ABI001";
+const ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN: usize = 32;
+const ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN: usize = 16;
 
 fn is_dropped_affix(token: &str) -> bool {
     DROPPED_AFFIXES.contains(&token)
@@ -2050,6 +2053,191 @@ fn read_arrow_batches(path: &str) -> PyResult<Vec<RecordBatch>> {
         .collect()
 }
 
+struct ArrowBatchLookupIndex {
+    mmap: Mmap,
+    record_count: usize,
+}
+
+impl ArrowBatchLookupIndex {
+    fn open(path: &str, source_arrow_path: &str) -> PyResult<Self> {
+        let file = File::open(path)
+            .map_err(|err| io_error_to_py("failed to open Arrow batch lookup index", path, err))?;
+        let mmap = unsafe {
+            Mmap::map(&file).map_err(|err| {
+                io_error_to_py("failed to memory-map Arrow batch lookup index", path, err)
+            })?
+        };
+        if mmap.len() < ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Arrow batch lookup index '{path}' is shorter than its header"
+            )));
+        }
+        if &mmap[0..8] != ARROW_BATCH_LOOKUP_INDEX_MAGIC {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Arrow batch lookup index '{path}' has invalid magic bytes"
+            )));
+        }
+        let source_metadata = fs::metadata(source_arrow_path).map_err(|err| {
+            io_error_to_py(
+                "failed to stat Arrow IPC file for batch lookup index validation",
+                source_arrow_path,
+                err,
+            )
+        })?;
+        let source_size = source_metadata.len();
+        let source_mtime_ns = source_metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        let indexed_source_size = u64::from_le_bytes(
+            mmap[16..24]
+                .try_into()
+                .expect("indexed source-size slice has fixed length"),
+        );
+        let indexed_source_mtime_ns = u64::from_le_bytes(
+            mmap[24..32]
+                .try_into()
+                .expect("indexed source-mtime slice has fixed length"),
+        );
+        if indexed_source_size != source_size || indexed_source_mtime_ns != source_mtime_ns {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Arrow batch lookup index '{path}' is stale for '{source_arrow_path}': \
+                 indexed size/mtime=({indexed_source_size}, {indexed_source_mtime_ns}) \
+                 current size/mtime=({source_size}, {source_mtime_ns})"
+            )));
+        }
+        let record_count = u64::from_le_bytes(
+            mmap[8..16]
+                .try_into()
+                .expect("slice length is checked by fixed header length"),
+        ) as usize;
+        let expected_len = ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN
+            .checked_add(
+                record_count
+                    .checked_mul(ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyOverflowError::new_err(
+                            "Arrow batch lookup index record count overflows usize",
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                pyo3::exceptions::PyOverflowError::new_err(
+                    "Arrow batch lookup index length overflows usize",
+                )
+            })?;
+        if mmap.len() != expected_len {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Arrow batch lookup index '{path}' length {} does not match expected length {expected_len}",
+                mmap.len()
+            )));
+        }
+        Ok(Self { mmap, record_count })
+    }
+
+    fn record_offset(index: usize) -> usize {
+        ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN + index * ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN
+    }
+
+    fn record_hash(&self, index: usize) -> u64 {
+        let offset = Self::record_offset(index);
+        u64::from_le_bytes(
+            self.mmap[offset..offset + 8]
+                .try_into()
+                .expect("record hash slice has fixed length"),
+        )
+    }
+
+    fn record_batch_index(&self, index: usize) -> u32 {
+        let offset = Self::record_offset(index) + 8;
+        u32::from_le_bytes(
+            self.mmap[offset..offset + 4]
+                .try_into()
+                .expect("record batch-index slice has fixed length"),
+        )
+    }
+
+    fn lower_bound(&self, hash: u64) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.record_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.record_hash(mid) < hash {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    fn batch_indices_for_keys(&self, keys: &HashSet<String>) -> HashSet<usize> {
+        let mut out = HashSet::new();
+        for key in keys {
+            let hash = fnv64(key.as_bytes());
+            let mut index = self.lower_bound(hash);
+            while index < self.record_count && self.record_hash(index) == hash {
+                out.insert(self.record_batch_index(index) as usize);
+                index += 1;
+            }
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct IndexedArrowReadStats {
+    batches_read: usize,
+    rows_scanned: usize,
+}
+
+fn read_indexed_arrow_batches(
+    path: &str,
+    index_path: &str,
+    keep_ids: &HashSet<String>,
+) -> PyResult<(Vec<RecordBatch>, IndexedArrowReadStats)> {
+    if keep_ids.is_empty() {
+        return Ok((Vec::new(), IndexedArrowReadStats::default()));
+    }
+    let index = ArrowBatchLookupIndex::open(index_path, path)?;
+    let mut batch_indices: Vec<usize> =
+        index.batch_indices_for_keys(keep_ids).into_iter().collect();
+    batch_indices.sort_unstable();
+    let file = File::open(path)
+        .map_err(|err| io_error_to_py("failed to open Arrow IPC file", path, err))?;
+    let mut reader = ArrowFileReader::try_new(file, None)
+        .map_err(|err| arrow_error_to_py("failed to read Arrow IPC schema from", path, err))?;
+    let mut batches = Vec::with_capacity(batch_indices.len());
+    let mut rows_scanned = 0usize;
+    for batch_index in batch_indices {
+        reader.set_index(batch_index).map_err(|err| {
+            arrow_error_to_py("failed to seek Arrow IPC record batch in", path, err)
+        })?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Arrow IPC file '{path}' is missing indexed record batch {batch_index}"
+                ))
+            })?
+            .map_err(|err| {
+                arrow_error_to_py("failed to read Arrow IPC record batch from", path, err)
+            })?;
+        rows_scanned += batch.num_rows();
+        batches.push(batch);
+    }
+    let batches_read = batches.len();
+    Ok((
+        batches,
+        IndexedArrowReadStats {
+            batches_read,
+            rows_scanned,
+        },
+    ))
+}
+
 fn arrow_column_index(batch: &RecordBatch, name: &str, path: &str) -> PyResult<usize> {
     batch.schema().index_of(name).map_err(|err| {
         pyo3::exceptions::PyKeyError::new_err(format!(
@@ -2359,8 +2547,28 @@ fn read_raw_arrow_signatures_filtered(
     path: &str,
     keep_signature_ids: Option<&HashSet<String>>,
 ) -> PyResult<HashMap<String, RawArrowSignature>> {
+    read_raw_arrow_signatures_from_batches(path, read_arrow_batches(path)?, keep_signature_ids)
+}
+
+fn read_raw_arrow_signatures_indexed(
+    path: &str,
+    index_path: &str,
+    keep_signature_ids: &HashSet<String>,
+) -> PyResult<(HashMap<String, RawArrowSignature>, IndexedArrowReadStats)> {
+    let (batches, stats) = read_indexed_arrow_batches(path, index_path, keep_signature_ids)?;
+    Ok((
+        read_raw_arrow_signatures_from_batches(path, batches, Some(keep_signature_ids))?,
+        stats,
+    ))
+}
+
+fn read_raw_arrow_signatures_from_batches(
+    path: &str,
+    batches: Vec<RecordBatch>,
+    keep_signature_ids: Option<&HashSet<String>>,
+) -> PyResult<HashMap<String, RawArrowSignature>> {
     let mut out = HashMap::new();
-    for batch in read_arrow_batches(path)? {
+    for batch in batches {
         let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
         let first_col = batch.column(arrow_column_index(&batch, "author_first", path)?);
@@ -2427,8 +2635,28 @@ fn read_raw_arrow_papers_filtered(
     path: &str,
     keep_paper_ids: Option<&HashSet<String>>,
 ) -> PyResult<HashMap<String, RawArrowPaper>> {
+    read_raw_arrow_papers_from_batches(path, read_arrow_batches(path)?, keep_paper_ids)
+}
+
+fn read_raw_arrow_papers_indexed(
+    path: &str,
+    index_path: &str,
+    keep_paper_ids: &HashSet<String>,
+) -> PyResult<(HashMap<String, RawArrowPaper>, IndexedArrowReadStats)> {
+    let (batches, stats) = read_indexed_arrow_batches(path, index_path, keep_paper_ids)?;
+    Ok((
+        read_raw_arrow_papers_from_batches(path, batches, Some(keep_paper_ids))?,
+        stats,
+    ))
+}
+
+fn read_raw_arrow_papers_from_batches(
+    path: &str,
+    batches: Vec<RecordBatch>,
+    keep_paper_ids: Option<&HashSet<String>>,
+) -> PyResult<HashMap<String, RawArrowPaper>> {
     let mut out = HashMap::new();
-    for batch in read_arrow_batches(path)? {
+    for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
         let title_col = batch.column(arrow_column_index(&batch, "title", path)?);
         let abstract_col = arrow_optional_column_index(&batch, "abstract")
@@ -2484,8 +2712,28 @@ fn read_raw_arrow_paper_authors_filtered(
     path: &str,
     keep_paper_ids: Option<&HashSet<String>>,
 ) -> PyResult<HashMap<String, Vec<(i64, String)>>> {
+    read_raw_arrow_paper_authors_from_batches(path, read_arrow_batches(path)?, keep_paper_ids)
+}
+
+fn read_raw_arrow_paper_authors_indexed(
+    path: &str,
+    index_path: &str,
+    keep_paper_ids: &HashSet<String>,
+) -> PyResult<(HashMap<String, Vec<(i64, String)>>, IndexedArrowReadStats)> {
+    let (batches, stats) = read_indexed_arrow_batches(path, index_path, keep_paper_ids)?;
+    Ok((
+        read_raw_arrow_paper_authors_from_batches(path, batches, Some(keep_paper_ids))?,
+        stats,
+    ))
+}
+
+fn read_raw_arrow_paper_authors_from_batches(
+    path: &str,
+    batches: Vec<RecordBatch>,
+    keep_paper_ids: Option<&HashSet<String>>,
+) -> PyResult<HashMap<String, Vec<(i64, String)>>> {
     let mut out: HashMap<String, Vec<(i64, String)>> = HashMap::new();
-    for batch in read_arrow_batches(path)? {
+    for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
         let position_col = batch.column(arrow_column_index(&batch, "position", path)?);
         let author_name_col = batch.column(arrow_column_index(&batch, "author_name", path)?);
@@ -2555,8 +2803,28 @@ fn read_raw_arrow_specter_filtered(
     path: &str,
     keep_paper_ids: Option<&HashSet<String>>,
 ) -> PyResult<HashMap<String, Vec<f32>>> {
+    read_raw_arrow_specter_from_batches(path, read_arrow_batches(path)?, keep_paper_ids)
+}
+
+fn read_raw_arrow_specter_indexed(
+    path: &str,
+    index_path: &str,
+    keep_paper_ids: &HashSet<String>,
+) -> PyResult<(HashMap<String, Vec<f32>>, IndexedArrowReadStats)> {
+    let (batches, stats) = read_indexed_arrow_batches(path, index_path, keep_paper_ids)?;
+    Ok((
+        read_raw_arrow_specter_from_batches(path, batches, Some(keep_paper_ids))?,
+        stats,
+    ))
+}
+
+fn read_raw_arrow_specter_from_batches(
+    path: &str,
+    batches: Vec<RecordBatch>,
+    keep_paper_ids: Option<&HashSet<String>>,
+) -> PyResult<HashMap<String, Vec<f32>>> {
     let mut out = HashMap::new();
-    for batch in read_arrow_batches(path)? {
+    for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
         let embedding_col = batch.column(arrow_column_index(&batch, "embedding", path)?);
         for row in 0..batch.num_rows() {
@@ -12280,18 +12548,11 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     let specter_path = optional_path_from_py_dict(paths, "specter")?;
     let name_counts_arrow_path = optional_path_from_py_dict(paths, "name_counts")?;
     let name_counts_index_path = optional_name_counts_index_path_from_py_dict(paths)?;
-
-    let read_signatures_start = Instant::now();
-    let signatures = read_raw_arrow_signatures(&signatures_path)?;
-    let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
-
-    let read_papers_start = Instant::now();
-    let papers = read_raw_arrow_papers(&papers_path)?;
-    let read_papers_secs = read_papers_start.elapsed().as_secs_f64();
-
-    let read_paper_authors_start = Instant::now();
-    let paper_authors = read_raw_arrow_paper_authors(&paper_authors_path)?;
-    let read_paper_authors_secs = read_paper_authors_start.elapsed().as_secs_f64();
+    let signatures_batch_index_path = optional_path_from_py_dict(paths, "signatures_batch_index")?;
+    let papers_batch_index_path = optional_path_from_py_dict(paths, "papers_batch_index")?;
+    let paper_authors_batch_index_path =
+        optional_path_from_py_dict(paths, "paper_authors_batch_index")?;
+    let specter_batch_index_path = optional_path_from_py_dict(paths, "specter_batch_index")?;
 
     let read_cluster_seeds_start = Instant::now();
     let (raw_component_order, raw_members_by_component) =
@@ -12321,11 +12582,99 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         }
     }
 
+    let mut required_signature_ids = Vec::<String>::new();
+    let mut required_seen = HashSet::<String>::new();
+    for signature_id in query_signature_ids.iter() {
+        if required_seen.insert(signature_id.clone()) {
+            required_signature_ids.push(signature_id.clone());
+        }
+    }
+    for component_key in component_order.iter() {
+        if let Some(members) = members_by_component.get(component_key) {
+            for signature_id in members {
+                if required_seen.insert(signature_id.clone()) {
+                    required_signature_ids.push(signature_id.clone());
+                }
+            }
+        }
+    }
+    let required_signature_id_set: HashSet<String> =
+        required_signature_ids.iter().cloned().collect();
+
+    let read_signatures_start = Instant::now();
+    let mut signature_index_stats = IndexedArrowReadStats::default();
+    let signatures = match signatures_batch_index_path.as_ref() {
+        Some(index_path) => {
+            let (loaded, stats) = read_raw_arrow_signatures_indexed(
+                &signatures_path,
+                index_path,
+                &required_signature_id_set,
+            )?;
+            signature_index_stats = stats;
+            loaded
+        }
+        None => read_raw_arrow_signatures(&signatures_path)?,
+    };
+    let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
+
+    for signature_id in required_signature_ids.iter() {
+        if !signatures.contains_key(signature_id) {
+            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                "signature_id '{}' is required by queries or cluster seeds but is missing from signatures Arrow input",
+                signature_id
+            )));
+        }
+    }
+
+    let needed_paper_ids: HashSet<String> = required_signature_ids
+        .iter()
+        .filter_map(|signature_id| signatures.get(signature_id))
+        .map(|signature| signature.paper_id.clone())
+        .collect();
+
+    let read_papers_start = Instant::now();
+    let mut paper_index_stats = IndexedArrowReadStats::default();
+    let papers = match papers_batch_index_path.as_ref() {
+        Some(index_path) => {
+            let (loaded, stats) =
+                read_raw_arrow_papers_indexed(&papers_path, index_path, &needed_paper_ids)?;
+            paper_index_stats = stats;
+            loaded
+        }
+        None => read_raw_arrow_papers(&papers_path)?,
+    };
+    let read_papers_secs = read_papers_start.elapsed().as_secs_f64();
+
+    let read_paper_authors_start = Instant::now();
+    let mut paper_author_index_stats = IndexedArrowReadStats::default();
+    let paper_authors = match paper_authors_batch_index_path.as_ref() {
+        Some(index_path) => {
+            let (loaded, stats) = read_raw_arrow_paper_authors_indexed(
+                &paper_authors_path,
+                index_path,
+                &needed_paper_ids,
+            )?;
+            paper_author_index_stats = stats;
+            loaded
+        }
+        None => read_raw_arrow_paper_authors(&paper_authors_path)?,
+    };
+    let read_paper_authors_secs = read_paper_authors_start.elapsed().as_secs_f64();
+
     let read_specter_start = Instant::now();
-    let specter_by_paper_id = specter_path
-        .as_ref()
-        .map(|path| read_raw_arrow_specter(path))
-        .transpose()?;
+    let mut specter_index_stats = IndexedArrowReadStats::default();
+    let specter_by_paper_id = match specter_path.as_ref() {
+        Some(path) => match specter_batch_index_path.as_ref() {
+            Some(index_path) => {
+                let (loaded, stats) =
+                    read_raw_arrow_specter_indexed(path, index_path, &needed_paper_ids)?;
+                specter_index_stats = stats;
+                Some(loaded)
+            }
+            None => Some(read_raw_arrow_specter(path)?),
+        },
+        None => None,
+    };
     let read_specter_secs = read_specter_start.elapsed().as_secs_f64();
 
     let read_name_counts_start = Instant::now();
@@ -12356,32 +12705,6 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         &mut unidecode_char_map,
     )?;
     let text_context_secs = text_context_start.elapsed().as_secs_f64();
-
-    let mut required_signature_ids = Vec::<String>::new();
-    let mut required_seen = HashSet::<String>::new();
-    for signature_id in query_signature_ids.iter() {
-        if required_seen.insert(signature_id.clone()) {
-            required_signature_ids.push(signature_id.clone());
-        }
-    }
-    for component_key in component_order.iter() {
-        if let Some(members) = members_by_component.get(component_key) {
-            for signature_id in members {
-                if required_seen.insert(signature_id.clone()) {
-                    required_signature_ids.push(signature_id.clone());
-                }
-            }
-        }
-    }
-
-    for signature_id in required_signature_ids.iter() {
-        if !signatures.contains_key(signature_id) {
-            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                "signature_id '{}' is required by queries or cluster seeds but is missing from signatures Arrow input",
-                signature_id
-            )));
-        }
-    }
 
     let feature_start = Instant::now();
     let raw_feature_results: Vec<Result<(String, RawArrowFeature), String>> =
@@ -12795,6 +13118,27 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         "specter_count",
         specter_by_paper_id.as_ref().map_or(0usize, HashMap::len),
     )?;
+    telemetry.set_item(
+        "indexed_arrow_candidate_plan",
+        signatures_batch_index_path.is_some()
+            || papers_batch_index_path.is_some()
+            || paper_authors_batch_index_path.is_some()
+            || specter_batch_index_path.is_some(),
+    )?;
+    telemetry.set_item("signature_batches_read", signature_index_stats.batches_read)?;
+    telemetry.set_item("signature_rows_scanned", signature_index_stats.rows_scanned)?;
+    telemetry.set_item("paper_batches_read", paper_index_stats.batches_read)?;
+    telemetry.set_item("paper_rows_scanned", paper_index_stats.rows_scanned)?;
+    telemetry.set_item(
+        "paper_author_batches_read",
+        paper_author_index_stats.batches_read,
+    )?;
+    telemetry.set_item(
+        "paper_author_rows_scanned",
+        paper_author_index_stats.rows_scanned,
+    )?;
+    telemetry.set_item("specter_batches_read", specter_index_stats.batches_read)?;
+    telemetry.set_item("specter_rows_scanned", specter_index_stats.rows_scanned)?;
     telemetry.set_item("unidecode_char_count", unidecode_char_map.len())?;
     telemetry.set_item("timings", timings)?;
 

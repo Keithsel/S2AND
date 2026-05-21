@@ -1,6 +1,6 @@
 # Arrow Dataset Specification
 
-Status date: 2026-05-20
+Status date: 2026-05-21
 
 This document defines the Arrow artifact contract for engineers assembling
 datasets for the direct Rust S2AND inference path. These artifacts are used by
@@ -59,6 +59,11 @@ Preferred on-disk layout:
     paper_authors.arrow
     specter.arrow
     specter2.arrow
+    signatures.signatures_batch_index.bin
+    papers.papers_batch_index.bin
+    paper_authors.paper_authors_batch_index.bin
+    specter.specter_batch_index.bin
+    specter2.specter_batch_index.bin
     cluster_seeds.arrow
     cluster_seed_disallows.arrow
     altered_cluster_signatures.arrow
@@ -100,6 +105,84 @@ the path mapping should use these keys:
 | `clusters` | Path to eval-only ground-truth clusters JSON |
 | `name_counts_index` | Optional shared/global name-count index directory, normally `s2and/data/name_counts_index` |
 | `name_counts` | Optional long-form Arrow name-count table for generation/inspection/parity, not preferred on the hot path |
+| `signatures_batch_index` | Optional S2AND-generated lookup index for `signatures.arrow`, used by indexed raw candidate planning |
+| `papers_batch_index` | Optional S2AND-generated lookup index for `papers.arrow`, used by indexed raw candidate planning |
+| `paper_authors_batch_index` | Optional S2AND-generated lookup index for `paper_authors.arrow`, used by indexed raw candidate planning |
+| `specter_batch_index` | Optional S2AND-generated lookup index for the selected embedding path passed as `specter`, used by indexed raw candidate planning |
+
+---
+
+## Large-Block Physical Layout
+
+The schema above is the semantic artifact contract. Large-block incremental
+serving also needs a physical layout that makes indexed raw candidate planning
+cheap. This layout is not required for correctness, but it is required for the
+scalable performance path on large blocks such as common family-name blocks.
+
+For large block artifacts, producers should write the lookup tables below as
+Arrow IPC file-format files with bounded record batches. Do not write these
+tables as one giant record batch when the row count exceeds the limit.
+
+| Table | Lookup key | Maximum rows per IPC record batch |
+|---|---|---:|
+| `signatures.arrow` | `signature_id` | 16,384 |
+| `papers.arrow` | `paper_id` | 16,384 |
+| `paper_authors.arrow` | `paper_id` | 16,384 |
+| `specter.arrow` / `specter2.arrow` | `paper_id` | 2,048 |
+
+The smaller request-scoped tables do not need a random-access physical layout:
+
+| Table | Layout guidance |
+|---|---|
+| `cluster_seeds.arrow` | Read fully by the raw planner; no bounded-batch requirement. |
+| `cluster_seed_disallows.arrow` | Read fully when present; no bounded-batch requirement. |
+| `altered_cluster_signatures.arrow` | Read as request metadata; bounded batches do not address altered-profile pre-splitting cost. |
+
+Implementation notes for producers:
+
+- Use Arrow IPC file format, not stream format.
+- In PyArrow, call `pyarrow.ipc.new_file(...)` and write tables with
+  `writer.write_table(table, max_chunksize=<limit>)`.
+- Preserve `signatures.arrow` row order. Record-batch boundaries must not
+  change row contents or row order.
+- Keep `paper_authors.arrow` grouped by `paper_id`, then ordered by `position`
+  where practical. This improves locality when all authors for a paper are read.
+- One record batch is acceptable only when
+  `row_count <= maximum rows per IPC record batch`.
+- For embedding files, the 2,048-row limit is intentionally lower because each
+  row contains a dense vector. If the embedding dimension changes enough that a
+  batch becomes much larger than roughly 8-16 MiB, lower this limit rather than
+  raising it.
+
+S2AND binary batch indexes are derived artifacts over the final Arrow files.
+The preferred handoff is for producers to supply bounded Arrow IPC files and
+for an S2AND prep step to generate these indexes. Producers may include indexes
+only when they are generated with S2AND tooling, such as
+`s2and.incremental_linking.feature_block.write_raw_arrow_batch_lookup_indexes`.
+Do not hand-write the binary format in an independent pipeline. Do not generate
+these indexes before a later rewrite or deployment copy that changes the source
+Arrow file metadata; regenerate the indexes from the final files in their
+serving location.
+
+Recommended sidecar filenames are stem-qualified:
+
+```text
+signatures.signatures_batch_index.bin
+papers.papers_batch_index.bin
+paper_authors.paper_authors_batch_index.bin
+specter.specter_batch_index.bin
+specter2.specter_batch_index.bin
+```
+
+When both `specter.arrow` and `specter2.arrow` are present, write one embedding
+index per file. At runtime, the selected embedding file is passed under the
+`specter` path key, and S2AND uses the adjacent
+`<embedding-stem>.specter_batch_index.bin` sidecar when present.
+
+The batch-index format is S2AND-owned and versioned by
+`arrow_batch_lookup_index_v1`. Each record maps a 64-bit FNV-1a hash of the
+lookup key to an IPC record-batch index; the Rust reader verifies exact ids
+after loading the selected batches, so hash collisions do not change results.
 
 ---
 
@@ -307,7 +390,7 @@ runtime artifact, not something duplicated into every dataset directory.
 Each dataset directory must contain `manifest.json`. The manifest is not the hot
 path source of truth, but it is required for auditability and validation.
 
-Required fields:
+Required fields for semantic Arrow artifacts:
 
 ```json
 {
@@ -326,6 +409,34 @@ Required fields:
 }
 ```
 
+Large-block optimized artifacts should also include:
+
+```json
+{
+  "paths": {
+    "signatures_batch_index": "signatures.signatures_batch_index.bin",
+    "papers_batch_index": "papers.papers_batch_index.bin",
+    "paper_authors_batch_index": "paper_authors.paper_authors_batch_index.bin",
+    "specter_batch_index": "specter.specter_batch_index.bin"
+  },
+  "physical_layout": {
+    "schema": "s2and_arrow_physical_v1",
+    "optimized_for": "incremental_raw_candidate_planning",
+    "tables": {
+      "signatures": {
+        "key": "signature_id",
+        "max_record_batch_rows": 16384,
+        "row_count": 0,
+        "record_batch_count": 0,
+        "actual_max_batch_rows": 0,
+        "batch_index_path_key": "signatures_batch_index",
+        "batch_index_present": true
+      }
+    }
+  }
+}
+```
+
 Recommended additional fields:
 
 - `cluster_count` for eval datasets.
@@ -335,8 +446,12 @@ Recommended additional fields:
 - `specter` metadata with `row_count`, `dimension`, and source artifact id for
   each embedding file.
 - `name_counts` metadata with the shared index path and schema version.
+- `physical_layout.tables.<table>` entries for every large lookup table:
+  `row_count`, `record_batch_count`, `actual_max_batch_rows`,
+  `max_record_batch_rows`, lookup `key`, and batch-index presence.
+- `raw_planner_batch_indexes` metrics when S2AND-generated sidecars are present.
 - `validation` summary with row counts, duplicate counts, missing reference
-  counts, and parity-check command/output location.
+  counts, physical-layout checks, and parity-check command/output location.
 
 Root-level `manifest.json` should list dataset directories and their manifest
 paths when an artifact bundle contains multiple datasets.
@@ -371,6 +486,20 @@ Required checks:
   source order for that dataset.
 - Eval-only clusters JSON references only signatures present in
   `signatures.arrow`.
+
+Required physical-layout checks for large-block optimized artifacts:
+
+- `signatures.arrow`, `papers.arrow`, `paper_authors.arrow`, and the selected
+  embedding file are bounded as specified in
+  [Large-Block Physical Layout](#large-block-physical-layout).
+- `physical_layout.schema` is `s2and_arrow_physical_v1`.
+- `physical_layout.tables.<table>.actual_max_batch_rows` is less than or equal
+  to `physical_layout.tables.<table>.max_record_batch_rows`.
+- One-batch lookup tables have
+  `row_count <= max_record_batch_rows`; otherwise they should be rejected as
+  unoptimized for indexed raw planning.
+- If batch-index sidecars are present, they were generated from the final Arrow
+  files and the manifest path keys point to those sidecars.
 
 Recommended smoke checks:
 

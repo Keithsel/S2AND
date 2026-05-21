@@ -72,12 +72,6 @@ Notes:
   accepted only as a legacy compatibility fallback.
 - `<dataset>_clusters.json` is ground truth for offline evaluation only. It is
   not part of production inference scoring.
-- `altered_cluster_splits.arrow` and `altered_cluster_splits_manifest.json` are
-  optional derived caches produced by S2AND tooling, not required producer
-  inputs. They cache the model-specific split of altered claimed seed profiles,
-  keyed by production-model fingerprint and seed/disallow fingerprint. If the
-  fingerprint does not match, runtime ignores the cache and falls back to online
-  pre-splitting.
 - `specter.arrow` is the SPECTER v1 embedding table. `specter2.arrow` is the
   SPECTER v2 embedding table. Include whichever model family will be used; eval
   bundles usually include both.
@@ -97,8 +91,6 @@ the path mapping should use these keys:
 | `specter` | Path to the embedding table selected for the current model, even if the file is physically named `specter2.arrow` |
 | `cluster_seeds` | Path to `cluster_seeds.arrow` for incremental/seeded prediction |
 | `altered_cluster_signatures` | Path to `altered_cluster_signatures.arrow` when altered claimed profiles are present; text fallback is accepted for legacy callers |
-| `altered_cluster_splits` | Optional path to precomputed altered-profile split rows |
-| `altered_cluster_splits_manifest` | Optional path to the split sidecar manifest used for fingerprint validation |
 | `clusters` | Path to eval-only ground-truth clusters JSON |
 | `name_counts_index` | Optional shared/global name-count index directory, normally `s2and/data/name_counts_index` |
 | `name_counts` | Optional long-form Arrow name-count table for generation/inspection/parity, not preferred on the hot path |
@@ -322,9 +314,6 @@ Recommended additional fields:
 - `specter` metadata with `row_count`, `dimension`, and source artifact id for
   each embedding file.
 - `name_counts` metadata with the shared index path and schema version.
-- `altered_cluster_splits` metadata with row count, split cluster count, model
-  fingerprint, and seed fingerprint when precomputed altered-profile splits are
-  present.
 - `validation` summary with row counts, duplicate counts, missing reference
   counts, and parity-check command/output location.
 

@@ -56,12 +56,12 @@ path spent its material residual time in altered-profile seed pre-splitting:
 raw Arrow retrieval and scoring were small, while the altered pre-split called
 back through pairwise prediction for hundreds of seed signatures. Production
 request producers should still emit the canonical Arrow inputs, including
-`altered_cluster_signatures.arrow` when altered claimed profiles are present. A
-model-keyed `altered_cluster_splits` artifact is an optional S2AND-generated
-derived cache on top of those inputs, not a new required producer input.
-Query-scoped skipping is only safe when the candidate contract proves an
-altered profile cannot affect any incoming query; an unsplit top-k miss is not
-enough because split subprofiles can change retrieval scores.
+`altered_cluster_signatures.arrow` when altered claimed profiles are present.
+The runtime pre-splits altered claimed profiles in process before promoted
+incremental linking; request producers do not provide any separate altered split
+artifact. The Arrow path first asks Rust retrieval which original seed
+components are candidate-relevant for the incoming queries, then only pre-splits
+altered claimed profiles in those components.
 
 ## Current Verification Focus
 

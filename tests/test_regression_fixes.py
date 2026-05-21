@@ -1,5 +1,6 @@
+from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -410,6 +411,352 @@ def test_clusterer_predict_optionally_skips_final_rust_seed_restore(
     version_before_mutation = int(dataset._cluster_seeds_version)
     dataset.cluster_seeds_require["new_seed"] = "new_cluster"
     assert int(dataset._cluster_seeds_version) == version_before_mutation + 1
+
+
+def test_clusterer_predict_subblocked_single_letter_ignores_original_altered_profiles(monkeypatch):
+    class Signature:
+        def __init__(self, first_name):
+            self.author_info_first_normalized_without_apostrophe = first_name
+
+    original_altered = ["m1"]
+    dataset = _as_anddata(
+        SimpleNamespace(
+            signatures={
+                "m1": Signature("alex"),
+                "m2": Signature("alex"),
+                "s1": Signature("a"),
+                "s2": Signature("a"),
+            },
+            cluster_seeds_require={},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=list(original_altered),
+        )
+    )
+
+    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
+    clusterer = Clusterer(featurizer_info=featurizer_info, classifier=None, n_jobs=1, use_cache=False)
+
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda _dataset, runtime_context=None: None)
+    monkeypatch.setattr(
+        model_module,
+        "make_subblocks",
+        lambda block_signatures, _dataset, maximum_size: {
+            "multi": ["m1", "m2"],
+            "single": ["s1", "s2"],
+        },
+    )
+
+    def fake_predict_helper(self, block_dict, _dataset, *args, **kwargs):
+        del self, _dataset, args, kwargs
+        block_key = next(iter(block_dict))
+        return {"cluster_multi": list(block_dict[block_key])}, None
+
+    observed_altered: list[list[str]] = []
+
+    def fake_predict_incremental(self, block_signatures, dataset_arg, *args, **kwargs):
+        del self, args, kwargs
+        assert getattr(dataset_arg, "_s2and_disable_arrow_cluster_seeds", False) is True
+        observed_altered.append(list(dataset_arg.altered_cluster_signatures or []))
+        return {
+            "clusters": {"merged": list(dataset_arg.cluster_seeds_require.keys()) + list(block_signatures)},
+            "phase_b_mode": "exact",
+            "phase_b_budget_bytes": 0,
+            "phase_b_required_bytes": 0,
+        }
+
+    monkeypatch.setattr(Clusterer, "predict_helper", fake_predict_helper)
+    monkeypatch.setattr(Clusterer, "predict_incremental", fake_predict_incremental)
+
+    runtime_context = RuntimeContext(
+        operation="cluster_predict",
+        requested_backend="python",
+        resolved_backend="python",
+        use_rust=False,
+        run_id="test-no-altered-arrow-leak",
+        source="default",
+    )
+    clusterer.predict(
+        {"block": ["m1", "m2", "s1", "s2"]},
+        dataset,
+        batching_threshold=2,
+        runtime_context=runtime_context,
+    )
+
+    assert observed_altered == [[]]
+    assert dataset.altered_cluster_signatures == original_altered
+    assert getattr(dataset, "_s2and_disable_altered_cluster_signatures", False) is False
+    assert getattr(dataset, "_s2and_disable_arrow_cluster_seeds", False) is False
+
+
+def test_clusterer_predict_subblocked_single_letter_suppresses_altered_arrow_path(monkeypatch, tmp_path):
+    import pyarrow as pa
+
+    class Signature:
+        def __init__(self, first_name):
+            self.author_info_first_normalized_without_apostrophe = first_name
+
+    altered_path = tmp_path / "altered_cluster_signatures.arrow"
+    table = pa.table({"signature_id": pa.array(["m1"], type=pa.string())})
+    with pa.OSFile(str(altered_path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+    arrow_paths = {"altered_cluster_signatures": str(altered_path)}
+    for key in ("signatures", "papers", "paper_authors", "cluster_seeds"):
+        path = tmp_path / f"{key}.arrow"
+        path.touch()
+        arrow_paths[key] = str(path)
+
+    dataset = _as_anddata(
+        SimpleNamespace(
+            signatures={
+                "m1": Signature("alex"),
+                "m2": Signature("alex"),
+                "s1": Signature("a"),
+                "s2": Signature("a"),
+            },
+            cluster_seeds_require={},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=None,
+            arrow_paths=arrow_paths,
+        )
+    )
+
+    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
+    clusterer = Clusterer(featurizer_info=featurizer_info, classifier=None, n_jobs=1, use_cache=False)
+
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda _dataset, runtime_context=None: None)
+    monkeypatch.setattr(
+        model_module,
+        "make_subblocks",
+        lambda block_signatures, _dataset, maximum_size: {
+            "multi": ["m1", "m2"],
+            "single": ["s1", "s2"],
+        },
+    )
+
+    def fake_predict_helper(self, block_dict, _dataset, *args, **kwargs):
+        del self, _dataset, args, kwargs
+        block_key = next(iter(block_dict))
+        return {"cluster_multi": list(block_dict[block_key])}, None
+
+    observed_model_altered: list[list[str]] = []
+
+    def fake_predict_incremental(self, block_signatures, dataset_arg, *args, **kwargs):
+        del self, args, kwargs
+        assert getattr(dataset_arg, "_s2and_disable_arrow_cluster_seeds", False) is True
+        observed_model_altered.append(
+            model_module._dataset_altered_cluster_signatures(dataset_arg, dataset_arg.arrow_paths)
+        )
+        return {
+            "clusters": {"merged": list(dataset_arg.cluster_seeds_require.keys()) + list(block_signatures)},
+            "phase_b_mode": "exact",
+            "phase_b_budget_bytes": 0,
+            "phase_b_required_bytes": 0,
+        }
+
+    monkeypatch.setattr(Clusterer, "predict_helper", fake_predict_helper)
+    monkeypatch.setattr(Clusterer, "predict_incremental", fake_predict_incremental)
+
+    runtime_context = RuntimeContext(
+        operation="cluster_predict",
+        requested_backend="python",
+        resolved_backend="python",
+        use_rust=False,
+        run_id="test-no-altered-arrow-leak",
+        source="default",
+    )
+    clusterer.predict(
+        {"block": ["m1", "m2", "s1", "s2"]},
+        dataset,
+        batching_threshold=2,
+        runtime_context=runtime_context,
+    )
+
+    assert observed_model_altered == [[]]
+    assert dataset.altered_cluster_signatures is None
+    assert getattr(dataset, "_s2and_disable_altered_cluster_signatures", False) is False
+    assert getattr(dataset, "_s2and_disable_arrow_cluster_seeds", False) is False
+
+
+def test_clusterer_predict_subblocked_single_letter_restores_state_after_incremental_failure(monkeypatch):
+    class Signature:
+        def __init__(self, first_name):
+            self.author_info_first_normalized_without_apostrophe = first_name
+
+    original_cluster_seeds = {"orig_seed": "orig_cluster"}
+    original_altered = ["orig_seed"]
+    dataset = _as_anddata(
+        SimpleNamespace(
+            signatures={
+                "m1": Signature("alex"),
+                "m2": Signature("alex"),
+                "s1": Signature("a"),
+                "s2": Signature("a"),
+            },
+            cluster_seeds_require=dict(original_cluster_seeds),
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=list(original_altered),
+        )
+    )
+
+    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
+    clusterer = Clusterer(featurizer_info=featurizer_info, classifier=None, n_jobs=1, use_cache=False)
+
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda _dataset, runtime_context=None: None)
+    monkeypatch.setattr(
+        model_module,
+        "make_subblocks",
+        lambda block_signatures, _dataset, maximum_size: {
+            "multi": ["m1", "m2"],
+            "single": ["s1", "s2"],
+        },
+    )
+
+    def fake_predict_helper(self, block_dict, _dataset, *args, **kwargs):
+        del self, _dataset, args, kwargs
+        block_key = next(iter(block_dict))
+        return {"cluster_multi": list(block_dict[block_key])}, None
+
+    def fake_predict_incremental(self, block_signatures, dataset_arg, *args, **kwargs):
+        del self, block_signatures, dataset_arg, args, kwargs
+        raise RuntimeError("synthetic incremental failed")
+
+    monkeypatch.setattr(Clusterer, "predict_helper", fake_predict_helper)
+    monkeypatch.setattr(Clusterer, "predict_incremental", fake_predict_incremental)
+
+    with pytest.raises(RuntimeError, match="synthetic incremental failed"):
+        clusterer.predict({"block": ["m1", "m2", "s1", "s2"]}, dataset, batching_threshold=2)
+
+    assert dict(dataset.cluster_seeds_require) == original_cluster_seeds
+    assert dataset.altered_cluster_signatures == original_altered
+    assert getattr(dataset, "_s2and_disable_altered_cluster_signatures", False) is False
+    assert getattr(dataset, "_s2and_disable_arrow_cluster_seeds", False) is False
+
+
+def test_clusterer_predict_subblocked_arrow_presplits_altered_profile_seeds(
+    monkeypatch,
+    tmp_path,
+):
+    import pyarrow as pa
+
+    dataset = _as_anddata(
+        SimpleNamespace(
+            signatures={
+                "seed0": _subblocking_signature("alex"),
+                "seed1": _subblocking_signature("alex"),
+                "seed2": _subblocking_signature("alex"),
+            },
+            cluster_seeds_require={"seed0": "7", "seed1": "7", "seed2": "8"},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=["seed0"],
+            name_tuples="filtered",
+        )
+    )
+    original_seeds = dict(dataset.cluster_seeds_require)
+    arrow_paths = {
+        "signatures": str(tmp_path / "signatures.arrow"),
+        "papers": str(tmp_path / "papers.arrow"),
+        "paper_authors": str(tmp_path / "paper_authors.arrow"),
+        "cluster_seeds": str(tmp_path / "cluster_seeds.arrow"),
+    }
+    for path in arrow_paths.values():
+        Path(path).touch()
+
+    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
+    clusterer = Clusterer(featurizer_info=featurizer_info, classifier=None, n_jobs=1, use_cache=False)
+
+    def fake_predict_from_arrow_paths(block_dict, arrow_paths_arg, **kwargs):
+        assert dict(block_dict) == {"altered_profile_0": ["seed0", "seed1"]}
+        assert "cluster_seeds" not in arrow_paths_arg
+        assert kwargs["incremental_dont_use_cluster_seeds"] is True
+        return {"split0": ["seed0"], "split1": ["seed1"]}, None
+
+    clusterer.predict_from_arrow_paths = cast(Any, fake_predict_from_arrow_paths)
+    rust_sentinel = object()
+    captured: dict[str, Any] = {}
+
+    def fake_build_rust_featurizer_from_arrow_paths(paths, **kwargs):
+        del kwargs
+        seed_path = Path(paths["cluster_seeds"])
+        assert seed_path != Path(arrow_paths["cluster_seeds"])
+        with pa.memory_map(str(seed_path), "r") as source:
+            table = pa.ipc.open_file(source).read_all()
+        captured["cluster_seeds_arrow"] = {
+            str(signature_id): str(cluster_id)
+            for signature_id, cluster_id in zip(
+                table["signature_id"].to_pylist(),
+                table["cluster_id"].to_pylist(),
+                strict=True,
+            )
+        }
+        return rust_sentinel
+
+    def fake_predict_multiple(self, block_dict_multiple_letter, **kwargs):
+        del self
+        assert dict(block_dict_multiple_letter) == {"block": ["seed0", "seed1", "seed2"]}
+        assert kwargs["rust_featurizer"] is rust_sentinel
+        assert dict(kwargs["dataset"].cluster_seeds_require) == {
+            "seed0": "7_0",
+            "seed1": "7_1",
+            "seed2": "8",
+        }
+        return {
+            "cluster0": ["seed0"],
+            "cluster1": ["seed1"],
+            "cluster2": ["seed2"],
+        }
+
+    def fake_predict_single(self, block_dict_single_letter, *, pred_clusters, dataset, **kwargs):
+        del self, kwargs
+        assert block_dict_single_letter == {}
+        assert dict(dataset.cluster_seeds_require) == {"seed0": "7_0", "seed1": "7_1", "seed2": "8"}
+        return pred_clusters
+
+    sync_snapshots: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        model_module,
+        "build_rust_featurizer_from_arrow_paths",
+        fake_build_rust_featurizer_from_arrow_paths,
+    )
+    monkeypatch.setattr(Clusterer, "_predict_subblocked_multiple_letter_groups", fake_predict_multiple)
+    monkeypatch.setattr(Clusterer, "_predict_subblocked_single_letter_incremental_groups", fake_predict_single)
+    monkeypatch.setattr(
+        model_module,
+        "_sync_rust_cluster_seeds",
+        lambda dataset_arg, runtime_context=None: sync_snapshots.append(dict(dataset_arg.cluster_seeds_require)),
+    )
+
+    runtime_context = RuntimeContext(
+        operation="cluster_predict",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="test-bulk-altered-presplit",
+        source="default",
+    )
+    clusters, dists = clusterer._predict_subblocked(
+        {"block": ["seed0", "seed1", "seed2"]},
+        dataset,
+        cluster_model_params=None,
+        partial_supervision={},
+        use_s2_clusters=False,
+        incremental_dont_use_cluster_seeds=False,
+        batching_threshold=3,
+        desired_memory_use=None,
+        runtime_context=runtime_context,
+        dists=None,
+        total_ram_bytes=None,
+        restore_rust_cluster_seeds_on_exit=True,
+        arrow_paths=arrow_paths,
+    )
+
+    assert clusters == {"cluster0": ["seed0"], "cluster1": ["seed1"], "cluster2": ["seed2"]}
+    assert dists is None
+    assert captured["cluster_seeds_arrow"] == {"seed0": "7_0", "seed1": "7_1", "seed2": "8"}
+    assert dict(dataset.cluster_seeds_require) == original_seeds
+    assert sync_snapshots[-1] == original_seeds
+    assert clusterer._last_subblocked_altered_presplit_telemetry["bulk_altered_presplit_applied"] == 1
+    assert clusterer._last_subblocked_altered_presplit_telemetry["bulk_altered_presplit_cache_miss_count"] == 1
 
 
 def test_sync_rust_cluster_seeds_skips_when_unchanged(monkeypatch):

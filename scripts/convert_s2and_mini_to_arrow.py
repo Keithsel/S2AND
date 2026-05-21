@@ -110,14 +110,17 @@ def _source_file(source_dir: Path, dataset: str, suffix: str) -> Path:
 def convert_dataset(
     source_root: Path,
     output_root: Path,
+    name_counts_index_root: Path,
     dataset: str,
     *,
     n_jobs: int,
     overwrite: bool,
+    overwrite_name_counts_index: bool,
 ) -> dict[str, Any]:
     from s2and.data import ANDData
     from s2and.incremental_linking.feature_block import (
         write_feature_block_arrow_from_anddata,
+        write_name_counts_index,
     )
 
     source_dir = source_root / dataset
@@ -158,7 +161,6 @@ def convert_dataset(
         signature_ids=list(dataset_obj.signatures),
         include_specter=False,
         include_empty_cluster_seeds=False,
-        drop_embedded_name_counts=False,
         overwrite=overwrite,
     )
     write_common_seconds = time.perf_counter() - start
@@ -187,19 +189,29 @@ def convert_dataset(
     paths["specter"] = str(output_dir / "specter.arrow")
     paths["specter2"] = str(output_dir / "specter2.arrow")
 
+    start = time.perf_counter()
+    name_counts_index_path, name_counts_index_metrics = write_name_counts_index(
+        name_counts_index_root,
+        overwrite=overwrite_name_counts_index,
+    )
+    paths["name_counts_index"] = name_counts_index_path
+    write_name_counts_index_seconds = time.perf_counter() - start
+
     manifest = {
         "dataset": dataset,
         "source_dir": str(source_dir),
-        "schema": "feature_block_arrow_v1",
+        "schema": "feature_block_arrow_v2",
         "signature_count": len(dataset_obj.signatures),
         "paper_count": len(dataset_obj.papers),
         "cluster_count": len(dataset_obj.clusters or {}),
         "paths": paths,
         "specter": specter_reports,
+        "name_counts_index": name_counts_index_metrics,
         "name_tuples": "default packaged filtered aliases",
         "timings_seconds": {
             "anddata_seconds": anddata_seconds,
             "write_common_seconds": write_common_seconds,
+            "write_name_counts_index_seconds": write_name_counts_index_seconds,
         },
     }
     _write_json(output_dir / "manifest.json", manifest)
@@ -210,6 +222,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, default=Path("s2and/data/s2and_mini"))
     parser.add_argument("--output-root", type=Path, default=Path("s2and/data/s2and_mini_arrow"))
+    parser.add_argument("--name-counts-index-root", type=Path, default=Path("s2and/data"))
     parser.add_argument("--datasets", nargs="*", default=list(DATASETS))
     parser.add_argument("--n-jobs", type=int, default=20)
     parser.add_argument("--overwrite", action="store_true")
@@ -223,9 +236,11 @@ def main() -> None:
         report = convert_dataset(
             args.source_root,
             output_root,
+            args.name_counts_index_root,
             str(dataset),
             n_jobs=int(args.n_jobs),
             overwrite=bool(args.overwrite),
+            overwrite_name_counts_index=bool(args.overwrite) and not reports,
         )
         report["total_seconds"] = time.perf_counter() - start
         reports.append(report)
@@ -234,6 +249,7 @@ def main() -> None:
     root_manifest = {
         "source_root": str(args.source_root),
         "output_root": str(output_root),
+        "name_counts_index_root": str(args.name_counts_index_root),
         "datasets": [report["dataset"] for report in reports],
         "reports": reports,
     }

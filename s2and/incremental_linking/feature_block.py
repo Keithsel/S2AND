@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-FEATURE_BLOCK_SCHEMA_VERSION = "feature_block_v1"
+FEATURE_BLOCK_SCHEMA_VERSION = "feature_block_v2"
 
 FEATURE_BLOCK_INCLUDED_RESPONSIBILITIES: tuple[str, ...] = (
     "signature_identity_and_author_fields",
@@ -290,6 +290,18 @@ class FeatureBlock:
                     ),
                 }
             ),
+            "cluster_seed_disallows": pa.table(
+                {
+                    "signature_id_1": pa.array(
+                        [left for left, _right in self.cluster_seeds_disallow],
+                        type=pa.string(),
+                    ),
+                    "signature_id_2": pa.array(
+                        [right for _left, right in self.cluster_seeds_disallow],
+                        type=pa.string(),
+                    ),
+                }
+            ),
         }
         if self.specter_embeddings is not None:
             flat = pa.array(np.ravel(self.specter_embeddings), type=pa.float32())
@@ -328,7 +340,11 @@ def write_feature_block_arrow_tables(
     tables = feature_block.to_arrow_tables()
     paths: dict[str, str] = {}
     for name, table in tables.items():
-        if name == "cluster_seeds" and table.num_rows == 0 and not include_empty_cluster_seeds:
+        if (
+            name in {"cluster_seeds", "cluster_seed_disallows"}
+            and table.num_rows == 0
+            and not include_empty_cluster_seeds
+        ):
             continue
         path = output_path / f"{name}.arrow"
         if overwrite or not path.exists():
@@ -756,12 +772,32 @@ def feature_block_from_arrow_paths(
             for signature_id in members
             if str(signature_id) in selected_signature_id_set
         )
+    disallow_pairs: tuple[tuple[str, str], ...] = ()
+    disallow_path = paths.get("cluster_seed_disallows")
+    if disallow_path is not None:
+        disallow_table = _read_arrow_ipc_table(pa, disallow_path)
+        missing_disallow_columns = sorted({"signature_id_1", "signature_id_2"}.difference(disallow_table.column_names))
+        if missing_disallow_columns:
+            raise ValueError(f"cluster seed disallows Arrow is missing required columns: {missing_disallow_columns}")
+        disallow_rows: list[tuple[str, str]] = []
+        for left, right in zip(
+            disallow_table["signature_id_1"].to_pylist(),
+            disallow_table["signature_id_2"].to_pylist(),
+            strict=True,
+        ):
+            if left is None or right is None:
+                raise ValueError("cluster seed disallows Arrow cannot contain null signature ids")
+            left_id = str(left)
+            right_id = str(right)
+            if left_id in selected_signature_id_set and right_id in selected_signature_id_set:
+                disallow_rows.append((left_id, right_id))
+        disallow_pairs = tuple(disallow_rows)
     return FeatureBlock(
         signatures=signature_rows,
         papers=paper_rows,
         paper_authors=paper_author_rows,
         cluster_seeds_require=require_pairs,
-        cluster_seeds_disallow=(),
+        cluster_seeds_disallow=disallow_pairs,
         query_signature_ids=signature_order.query_signature_ids,
         specter_paper_ids=(),
         specter_embeddings=None,

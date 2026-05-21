@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -79,7 +80,7 @@ def _arrow_paths_with_seed_assignments(
     tmpdir = getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_tmpdir", None)
     if tmpdir is None:
         tmpdir = tempfile.TemporaryDirectory(prefix="s2and_arrow_incremental_cluster_seeds_")
-        dataset._s2and_arrow_incremental_cluster_seeds_tmpdir = tmpdir
+        vars(dataset)["_s2and_arrow_incremental_cluster_seeds_tmpdir"] = tmpdir
 
     cached_fingerprint = getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_fingerprint", None)
     cached_path = getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_path", None)
@@ -90,9 +91,9 @@ def _arrow_paths_with_seed_assignments(
     write_index = int(getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_write_index", 0)) + 1
     output_path = Path(tmpdir.name) / f"cluster_seeds_incremental_v{write_index}.arrow"
     _write_cluster_seeds_arrow(output_path, cluster_seeds_require)
-    dataset._s2and_arrow_incremental_cluster_seeds_write_index = write_index
-    dataset._s2and_arrow_incremental_cluster_seeds_fingerprint = seed_fingerprint
-    dataset._s2and_arrow_incremental_cluster_seeds_path = str(output_path)
+    vars(dataset)["_s2and_arrow_incremental_cluster_seeds_write_index"] = write_index
+    vars(dataset)["_s2and_arrow_incremental_cluster_seeds_fingerprint"] = seed_fingerprint
+    vars(dataset)["_s2and_arrow_incremental_cluster_seeds_path"] = str(output_path)
     paths["cluster_seeds"] = str(output_path)
     return paths
 
@@ -396,6 +397,7 @@ def predict_incremental_promoted_linker(
         runtime_context,
         total_ram_bytes=resolved_total_ram_bytes,
     )
+    seed_setup_telemetry = dict(getattr(clusterer, "_last_incremental_seed_setup_telemetry", {}) or {})
     if len(cluster_seeds_require) == 0:
         raise ValueError("Promoted incremental linker mode requires at least one seed cluster")
 
@@ -697,6 +699,7 @@ def predict_incremental_promoted_linker(
         int(merged_telemetry.get("memory_underpredicted_batch_count", 0)),
         runtime_context.run_id,
     )
+    finish_start = time.perf_counter()
     predicted_clusters = clusterer._finish_incremental_with_seed_links(
         unassigned_signature_ids,
         dataset,
@@ -708,6 +711,12 @@ def predict_incremental_promoted_linker(
         runtime_context,
         total_ram_bytes=resolved_total_ram_bytes,
     )
+    finish_seconds = time.perf_counter() - finish_start
+    merged_telemetry = {
+        **seed_setup_telemetry,
+        **merged_telemetry,
+        "incremental_finish_seconds": float(finish_seconds),
+    }
     residual_count = sum(
         1 for signature_id in unassigned_signature_ids if signature_id not in linked_signature_clusters
     )
@@ -752,6 +761,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
         total_ram_bytes=resolved_total_ram_bytes,
         arrow_paths=base_arrow_path_payload,
     )
+    seed_setup_telemetry = dict(getattr(clusterer, "_last_incremental_seed_setup_telemetry", {}) or {})
     if len(cluster_seeds_require) == 0:
         raise ValueError("Promoted incremental linker mode requires at least one seed cluster")
 
@@ -791,6 +801,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
         batch_sizes=batch_sizes,
         configured_batch_size=batching_threshold,
     )
+    finish_start = time.perf_counter()
     predicted_clusters = clusterer._finish_incremental_with_seed_links(
         unassigned_signature_ids,
         dataset,
@@ -803,6 +814,8 @@ def predict_incremental_promoted_linker_from_arrow_paths(
         total_ram_bytes=resolved_total_ram_bytes,
         arrow_paths=arrow_path_payload,
     )
+    finish_seconds = time.perf_counter() - finish_start
+    residual_phase_b_telemetry = dict(getattr(clusterer, "_last_incremental_residual_phase_b_telemetry", {}) or {})
     residual_count = sum(
         1 for signature_id in unassigned_signature_ids if signature_id not in linked_signature_clusters
     )
@@ -817,7 +830,10 @@ def predict_incremental_promoted_linker_from_arrow_paths(
     payload["incremental_linker_artifact_path"] = str(artifact_dir)
     payload["incremental_linker_query_view"] = "raw_arrow"
     payload["incremental_linker_telemetry"] = {
+        **seed_setup_telemetry,
         **merged_telemetry,
+        **residual_phase_b_telemetry,
+        "incremental_finish_seconds": float(finish_seconds),
         "arrow_promoted_incremental": 1,
         "arrow_path_count": len(arrow_path_payload),
     }

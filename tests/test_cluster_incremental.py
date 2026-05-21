@@ -1,4 +1,5 @@
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 
@@ -269,8 +270,8 @@ def test_predict_incremental_rust_promoted_linker_uses_seed_link_seam(clusterer_
     assert captured_runtime["artifact"] is artifact
     assert captured_runtime["total_ram_bytes"] == 1_000_000_000
     assert captured_runtime["seed_setup"][0] == captured_inputs["cluster_seeds_require"]
-    assert residual_blocks == [["8"]]
-    assert residual_total_ram_bytes == [1_000_000_000]
+    assert residual_blocks == []
+    assert residual_total_ram_bytes == []
     assert any(set(signatures) == {"3", "4", "5"} for signatures in result["clusters"].values())
     assert any(set(signatures) == {"8"} for signatures in result["clusters"].values())
     assert result["incremental_linker_query_view"] == "full"
@@ -457,7 +458,7 @@ def test_promoted_incremental_orcid_fanout_skips_seed_scan_without_query_orcids(
     monkeypatch.setattr(production_module, "_signature_orcid", fake_signature_orcid)
 
     fanout = production_module.promoted_incremental_orcid_fanout_by_query(
-        SimpleNamespace(),
+        cast(ANDData, SimpleNamespace()),
         ["query-1", "query-2"],
         {"seed-1": "component-1"},
         orcid_enabled=True,
@@ -569,6 +570,7 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
         arrow_paths[key] = str(path)
     dataset.arrow_paths = arrow_paths
     captured: dict[str, Any] = {}
+    sync_calls: list[object] = []
 
     class FakeArtifact:
         metadata = SimpleNamespace(retrieval_top_k=25)
@@ -608,7 +610,7 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
         return {"finished": list(unassigned_signature_ids)}
 
     monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
-    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: sync_calls.append(args))
     monkeypatch.setattr(
         production_module.artifact_module,
         "load_incremental_linking_artifact",
@@ -626,6 +628,9 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
     assert result["clusters"] == {"finished": captured["finish_unassigned"]}
     assert result["incremental_linker_query_view"] == "raw_arrow"
     assert result["incremental_linker_telemetry"]["arrow_promoted_incremental"] == 1
+    assert result["incremental_linker_telemetry"]["seed_setup_altered_signature_count"] == 0
+    assert result["incremental_linker_telemetry"]["incremental_finish_seconds"] >= 0.0
+    assert sync_calls == []
     assert {key: value for key, value in captured["arrow_paths"].items() if key != "cluster_seeds"} == {
         key: value for key, value in arrow_paths.items() if key != "cluster_seeds"
     }
@@ -635,6 +640,179 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
     assert captured["finish_runtime_context"] is runtime_context
     assert captured["finish_linked"]
     assert captured["finish_arrow_paths"] == captured["arrow_paths"]
+
+
+def test_predict_incremental_arrow_promoted_linker_uses_seed_arrow_without_python_seed_map(
+    clusterer_dataset_factory,
+    monkeypatch,
+    tmp_path,
+):
+    import pyarrow as pa
+
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_auto_incremental_arrow_seed_only")
+    block = ["3", "4", "5", "6", "7", "8"]
+    dataset.cluster_seeds_require = {}
+    dataset.altered_cluster_signatures = None
+    runtime_context = SimpleNamespace(
+        operation="cluster_predict_incremental",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="test-rust-promoted-incremental-arrow-seed-only",
+        source="S2AND_BACKEND",
+    )
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
+    cluster_seeds_path = tmp_path / "cluster_seeds.arrow"
+    seed_table = pa.table(
+        {
+            "signature_id": pa.array(["6", "7", "3", "4"], type=pa.string()),
+            "cluster_id": pa.array(["0", "0", "1", "1"], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(cluster_seeds_path), "wb") as sink:
+        with pa.ipc.new_file(sink, seed_table.schema) as writer:
+            writer.write_table(seed_table)
+    arrow_paths["cluster_seeds"] = str(cluster_seeds_path)
+    dataset.arrow_paths = arrow_paths
+    captured: dict[str, Any] = {}
+    sync_calls: list[object] = []
+
+    class FakeArtifact:
+        metadata = SimpleNamespace(retrieval_top_k=25)
+
+    def fail_python_incremental(*_args, **_kwargs):
+        raise AssertionError("cluster_seeds.arrow should keep promoted Arrow incremental active")
+
+    def fake_raw_arrow_linker(clusterer_arg, artifact_arg, **kwargs):
+        del clusterer_arg, artifact_arg
+        captured["raw_arrow_paths"] = dict(kwargs["arrow_paths"])
+        captured["query_signature_ids"] = tuple(kwargs["query_signature_ids"])
+        return SimpleNamespace(
+            linked_signature_clusters={},
+            telemetry={"candidate_row_count": 0, "pair_count": 0, "query_count": len(kwargs["query_signature_ids"])},
+        )
+
+    def fake_finish_incremental(
+        self,
+        unassigned_signature_ids,
+        dataset_arg,
+        linked_signature_clusters,
+        recluster_map,
+        cluster_seeds_require_inverse,
+        prevent_new_incompatibilities,
+        partial_supervision,
+        runtime_context_arg,
+        total_ram_bytes=None,
+        arrow_paths=None,
+    ):
+        del self, dataset_arg, linked_signature_clusters, recluster_map, prevent_new_incompatibilities
+        del partial_supervision, runtime_context_arg, total_ram_bytes, arrow_paths
+        captured["finish_unassigned"] = list(unassigned_signature_ids)
+        captured["finish_seed_inverse"] = {
+            str(cluster_id): list(signature_ids) for cluster_id, signature_ids in cluster_seeds_require_inverse.items()
+        }
+        return {"finished": list(unassigned_signature_ids)}
+
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: sync_calls.append(args))
+    monkeypatch.setattr(Clusterer, "_predict_incremental_helper", fail_python_incremental)
+    monkeypatch.setattr(
+        production_module.artifact_module,
+        "load_incremental_linking_artifact",
+        lambda _path: FakeArtifact(),
+    )
+    monkeypatch.setattr(
+        production_module.runtime_module,
+        "predict_incremental_link_or_abstain_from_raw_arrow_paths",
+        fake_raw_arrow_linker,
+    )
+    monkeypatch.setattr(Clusterer, "_finish_incremental_with_seed_links", fake_finish_incremental)
+
+    result = clusterer.predict_incremental(block, dataset, batching_threshold=None)
+
+    assert result["clusters"] == {"finished": ["5", "8"]}
+    assert result["incremental_linker_query_view"] == "raw_arrow"
+    assert result["incremental_linker_telemetry"]["seed_setup_seed_signature_count"] == 4
+    assert result["incremental_linker_telemetry"]["seed_setup_component_count"] == 2
+    assert sync_calls == []
+    assert captured["query_signature_ids"] == ("5", "8")
+    assert captured["finish_unassigned"] == ["5", "8"]
+    assert captured["finish_seed_inverse"] == {"0": ["6", "7"], "1": ["3", "4"]}
+    assert captured["raw_arrow_paths"]["cluster_seeds"] != str(cluster_seeds_path)
+
+
+def test_predict_incremental_arrow_seed_path_can_be_suppressed_for_synthetic_calls(
+    clusterer_dataset_factory,
+    monkeypatch,
+    tmp_path,
+):
+    import pyarrow as pa
+
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_auto_incremental_arrow_seed_suppressed")
+    dataset.cluster_seeds_require = {}
+    vars(dataset)["_s2and_disable_arrow_cluster_seeds"] = True
+    runtime_context = SimpleNamespace(
+        operation="cluster_predict_incremental",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="test-rust-promoted-incremental-arrow-seed-suppressed",
+        source="S2AND_BACKEND",
+    )
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
+    cluster_seeds_path = tmp_path / "cluster_seeds.arrow"
+    seed_table = pa.table(
+        {
+            "signature_id": pa.array(["6", "7"], type=pa.string()),
+            "cluster_id": pa.array(["0", "0"], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(cluster_seeds_path), "wb") as sink:
+        with pa.ipc.new_file(sink, seed_table.schema) as writer:
+            writer.write_table(seed_table)
+    arrow_paths["cluster_seeds"] = str(cluster_seeds_path)
+    dataset.arrow_paths = arrow_paths
+    captured: dict[str, Any] = {}
+
+    def fake_python_incremental(self, block_signatures, dataset_arg, **kwargs):
+        del self, kwargs
+        captured["fallback_block"] = list(block_signatures)
+        captured["fallback_dataset"] = dataset_arg
+        return {
+            "clusters": {"fallback": list(block_signatures)},
+            "phase_b_mode": "exact",
+            "phase_b_budget_bytes": 0,
+            "phase_b_required_bytes": 0,
+        }
+
+    def fail_arrow_promoted(*_args, **_kwargs):
+        raise AssertionError("suppressed Arrow cluster seeds should not enter promoted Arrow incremental")
+
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Clusterer, "_predict_incremental_helper", fake_python_incremental)
+    monkeypatch.setattr(Clusterer, "_predict_incremental_promoted_linker", fail_arrow_promoted)
+
+    result = clusterer.predict_incremental(["5", "8"], dataset, batching_threshold=None)
+
+    assert result["clusters"] == {"fallback": ["5", "8"]}
+    assert captured["fallback_dataset"] is dataset
 
 
 def test_predict_incremental_arrow_promoted_linker_transforms_altered_seed_arrow(
@@ -665,6 +843,7 @@ def test_predict_incremental_arrow_promoted_linker_transforms_altered_seed_arrow
         arrow_paths[key] = str(path)
     dataset.arrow_paths = arrow_paths
     captured: dict[str, Any] = {}
+    sync_calls: list[object] = []
 
     class FakeArtifact:
         metadata = SimpleNamespace(retrieval_top_k=25)
@@ -686,7 +865,7 @@ def test_predict_incremental_arrow_promoted_linker_transforms_altered_seed_arrow
         )
 
     monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
-    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: sync_calls.append(args))
     monkeypatch.setattr(
         model_module,
         "_resolve_total_ram_bytes_for_incremental",
@@ -720,6 +899,10 @@ def test_predict_incremental_arrow_promoted_linker_transforms_altered_seed_arrow
 
     assert result["incremental_linker_query_view"] == "raw_arrow"
     assert result["incremental_linker_telemetry"]["arrow_promoted_incremental"] == 1
+    assert result["incremental_linker_telemetry"]["seed_setup_altered_signature_count"] == 1
+    assert result["incremental_linker_telemetry"]["seed_setup_altered_presplit_block_count"] == 1
+    assert result["incremental_linker_telemetry"]["seed_setup_altered_presplit_signature_count"] == 2
+    assert sync_calls == []
     assert result["clusters"] == {"0": ["6", "7", "5", "8"], "1": ["3", "4"]}
     assert captured["presplit_block_dict"] == {"altered_profile_0": ["6", "7"]}
     assert "cluster_seeds" not in captured["presplit_arrow_paths"]
@@ -887,7 +1070,7 @@ def test_predict_incremental_promoted_linker_batches_queries(
     assert captured_inputs["query_view"] is None
     assert captured_inputs["orcid_enabled"] is True
     assert runtime_batches == [["5"], ["8"]]
-    assert residual_blocks == [["8"]]
+    assert residual_blocks == []
     assert any(set(signatures) == {"3", "4", "5"} for signatures in result["clusters"].values())
     telemetry = result["incremental_linker_telemetry"]
     assert telemetry["query_count"] == 2
@@ -1431,8 +1614,34 @@ def test_finish_incremental_with_seed_links_reclusters_only_abstains():
     )
 
     assert result == {"7": ["seed0", "u1"], "8": ["seed1"], "9": ["u2"]}
-    assert residual_blocks == [["u2"]]
-    assert residual_total_ram_bytes == [123_456]
+    assert residual_blocks == []
+    assert residual_total_ram_bytes == []
+
+
+def test_finish_incremental_with_seed_links_uses_seed_setup_when_dataset_seed_map_is_empty():
+    clusterer = _build_minimal_incremental_clusterer()
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={},
+            signatures={},
+            max_seed_cluster_id=0,
+            name_tuples="filtered",
+        ),
+    )
+
+    result = clusterer._finish_incremental_with_seed_links(
+        ["q1"],
+        dataset,
+        {"q1": "c1"},
+        {},
+        {"c1": ["s1", "s2"]},
+        prevent_new_incompatibilities=False,
+        partial_supervision={},
+        runtime_context=cast(Any, object()),
+    )
+
+    assert result == {"c1": ["s1", "s2", "q1"]}
 
 
 def test_finish_incremental_with_seed_links_reclusters_abstains_from_arrow_paths():
@@ -1484,6 +1693,122 @@ def test_finish_incremental_with_seed_links_reclusters_abstains_from_arrow_paths
     assert captured["partial_supervision"] == {("u2", "u3"): LARGE_INTEGER}
     assert captured["runtime_context"] is runtime_context
     assert captured["total_ram_bytes"] == 123_456
+
+
+def test_finish_incremental_with_seed_links_splits_residual_phase_b_by_first_initial():
+    clusterer = _build_minimal_incremental_clusterer()
+    residual_blocks: list[list[str]] = []
+
+    def fake_predict_from_arrow_paths(block_dict, arrow_paths, **kwargs):
+        del arrow_paths, kwargs
+        residual_block = list(block_dict["block"])
+        residual_blocks.append(residual_block)
+        return {"residual_cluster": residual_block}, None
+
+    clusterer.predict_from_arrow_paths = cast(Any, fake_predict_from_arrow_paths)
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed": "7"},
+            cluster_seeds_disallow=set(),
+            max_seed_cluster_id=7,
+            signatures={
+                "u_a1": SimpleNamespace(
+                    author_info_first_normalized_without_apostrophe="alice",
+                    author_info_first="Alice",
+                    author_info_orcid=None,
+                ),
+                "u_b1": SimpleNamespace(
+                    author_info_first_normalized_without_apostrophe="bob",
+                    author_info_first="Bob",
+                    author_info_orcid=None,
+                ),
+                "u_a2": SimpleNamespace(
+                    author_info_first_normalized_without_apostrophe="alan",
+                    author_info_first="Alan",
+                    author_info_orcid=None,
+                ),
+                "u_b2": SimpleNamespace(
+                    author_info_first_normalized_without_apostrophe="bea",
+                    author_info_first="Bea",
+                    author_info_orcid=None,
+                ),
+            },
+            name_tuples=set(),
+        ),
+    )
+
+    result = clusterer._finish_incremental_with_seed_links(
+        ["u_a1", "u_b1", "u_a2", "u_b2"],
+        dataset,
+        {},
+        {},
+        {"7": ["seed"]},
+        False,
+        {},
+        runtime_context=cast(Any, object()),
+        arrow_paths={"signatures": "signatures.arrow"},
+    )
+
+    assert result == {"7": ["seed"], "8": ["u_a1", "u_a2"], "9": ["u_b1", "u_b2"]}
+    assert residual_blocks == [["u_a1", "u_a2"], ["u_b1", "u_b2"]]
+    assert clusterer._last_incremental_residual_phase_b_telemetry == {
+        "residual_phase_b_signature_count": 4,
+        "residual_phase_b_group_count": 2,
+        "residual_phase_b_pair_count_before": 6,
+        "residual_phase_b_pair_count_after": 2,
+        "residual_phase_b_pair_count_saved": 4,
+    }
+
+
+def test_finish_incremental_with_seed_links_residual_phase_b_preserves_same_orcid_group():
+    clusterer = _build_minimal_incremental_clusterer()
+    residual_blocks: list[list[str]] = []
+
+    def fake_predict_helper(block_dict, dataset, partial_supervision, runtime_context, total_ram_bytes=None):
+        del dataset, partial_supervision, runtime_context, total_ram_bytes
+        residual_block = list(block_dict["block"])
+        residual_blocks.append(residual_block)
+        return {"residual_cluster": residual_block}, None
+
+    clusterer.predict_helper = cast(Any, fake_predict_helper)
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed": "7"},
+            cluster_seeds_disallow=set(),
+            max_seed_cluster_id=7,
+            signatures={
+                "u_a": SimpleNamespace(
+                    author_info_first_normalized_without_apostrophe="alice",
+                    author_info_first="Alice",
+                    author_info_orcid="0000-0001",
+                ),
+                "u_b": SimpleNamespace(
+                    author_info_first_normalized_without_apostrophe="bob",
+                    author_info_first="Bob",
+                    author_info_orcid="0000-0001",
+                ),
+            },
+            name_tuples=set(),
+        ),
+    )
+
+    result = clusterer._finish_incremental_with_seed_links(
+        ["u_a", "u_b"],
+        dataset,
+        {},
+        {},
+        {"7": ["seed"]},
+        False,
+        {},
+        runtime_context=cast(Any, object()),
+    )
+
+    assert result == {"7": ["seed"], "8": ["u_a", "u_b"]}
+    assert residual_blocks == [["u_a", "u_b"]]
+    assert clusterer._last_incremental_residual_phase_b_telemetry["residual_phase_b_group_count"] == 1
+    assert clusterer._last_incremental_residual_phase_b_telemetry["residual_phase_b_pair_count_saved"] == 0
 
 
 def test_finish_incremental_with_seed_links_accepts_legacy_name_tuple_forms():
@@ -1663,6 +1988,359 @@ def test_build_incremental_seed_setup_uses_arrow_paths_for_altered_profile_reclu
     }
     assert recluster_map == {"7_0": "7", "7_1": "7", "8_0": "8", "8_1": "8"}
     assert cluster_seeds_require_inverse == {"7": ["seed0", "seed1"], "8": ["seed2", "seed3"], "9": ["seed4"]}
+
+
+def test_build_incremental_seed_setup_caches_arrow_altered_profile_reclustering():
+    clusterer = _build_minimal_incremental_clusterer()
+    call_count = 0
+
+    def fake_predict_from_arrow_paths(block_dict, arrow_paths, **kwargs):
+        nonlocal call_count
+        del arrow_paths, kwargs
+        call_count += 1
+        return {f"{block_key}_0": [signatures[0]] for block_key, signatures in block_dict.items()} | {
+            f"{block_key}_1": list(signatures[1:]) for block_key, signatures in block_dict.items()
+        }, None
+
+    clusterer.predict_from_arrow_paths = cast(Any, fake_predict_from_arrow_paths)
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed0": "7", "seed1": "7", "seed2": "8", "seed3": "8"},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=["seed0", "seed2"],
+            name_tuples="filtered",
+        ),
+    )
+    arrow_paths = {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+        "cluster_seeds": "cluster_seeds.arrow",
+    }
+
+    first_require, first_recluster_map, _ = clusterer._build_incremental_seed_setup(
+        dataset,
+        {},
+        runtime_context=cast(Any, object()),
+        arrow_paths=arrow_paths,
+    )
+    first_telemetry = dict(clusterer._last_incremental_seed_setup_telemetry)
+    second_require, second_recluster_map, _ = clusterer._build_incremental_seed_setup(
+        dataset,
+        {},
+        runtime_context=cast(Any, object()),
+        arrow_paths=arrow_paths,
+    )
+    second_telemetry = dict(clusterer._last_incremental_seed_setup_telemetry)
+
+    assert call_count == 1
+    assert second_require == first_require
+    assert second_recluster_map == first_recluster_map
+    assert first_telemetry["seed_setup_altered_presplit_cache_hit_count"] == 0
+    assert first_telemetry["seed_setup_altered_presplit_cache_miss_count"] == 2
+    assert second_telemetry["seed_setup_altered_presplit_cache_hit_count"] == 2
+    assert second_telemetry["seed_setup_altered_presplit_cache_miss_count"] == 0
+    assert second_telemetry["seed_setup_altered_presplit_predict_seconds"] == 0.0
+
+
+def test_build_incremental_seed_setup_cache_includes_partial_supervision():
+    clusterer = _build_minimal_incremental_clusterer()
+    call_count = 0
+
+    def fake_predict_from_arrow_paths(block_dict, arrow_paths, **kwargs):
+        nonlocal call_count
+        del block_dict, arrow_paths, kwargs
+        call_count += 1
+        return {"split0": ["seed0"], "split1": ["seed1"]}, None
+
+    clusterer.predict_from_arrow_paths = cast(Any, fake_predict_from_arrow_paths)
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed0": "7", "seed1": "7"},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=["seed0"],
+            name_tuples="filtered",
+        ),
+    )
+    arrow_paths = {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }
+
+    clusterer._build_incremental_seed_setup(
+        dataset,
+        {},
+        runtime_context=cast(Any, object()),
+        arrow_paths=arrow_paths,
+    )
+    clusterer._build_incremental_seed_setup(
+        dataset,
+        {("seed0", "seed1"): LARGE_INTEGER},
+        runtime_context=cast(Any, object()),
+        arrow_paths=arrow_paths,
+    )
+
+    assert call_count == 2
+    assert clusterer._last_incremental_seed_setup_telemetry["seed_setup_altered_presplit_cache_miss_count"] == 1
+
+
+def test_build_incremental_seed_setup_skips_same_orcid_altered_profile_reclustering():
+    clusterer = _build_minimal_incremental_clusterer()
+    clusterer.predict_from_arrow_paths = cast(
+        Any,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("same-ORCID altered profile should not need exact reclustering")
+        ),
+    )
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed0": "7", "seed1": "7", "seed2": "7"},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=["seed0"],
+            signatures={
+                "seed0": SimpleNamespace(author_info_orcid="0000-0001"),
+                "seed1": SimpleNamespace(author_info_orcid="00000001"),
+                "seed2": SimpleNamespace(author_info_orcid="0000-0001"),
+            },
+            name_tuples="filtered",
+        ),
+    )
+
+    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = clusterer._build_incremental_seed_setup(
+        dataset,
+        {},
+        runtime_context=cast(Any, object()),
+        arrow_paths={
+            "signatures": "signatures.arrow",
+            "papers": "papers.arrow",
+            "paper_authors": "paper_authors.arrow",
+        },
+    )
+
+    assert cluster_seeds_require == {"seed0": "7", "seed1": "7", "seed2": "7"}
+    assert recluster_map == {}
+    assert clusterer._last_incremental_seed_setup_telemetry["seed_setup_altered_presplit_orcid_skip_count"] == 1
+    assert clusterer._last_incremental_seed_setup_telemetry["seed_setup_altered_presplit_cache_miss_count"] == 0
+
+
+def test_build_incremental_seed_setup_same_orcid_skip_respects_explicit_disallow():
+    clusterer = _build_minimal_incremental_clusterer()
+    call_count = 0
+
+    def fake_predict_from_arrow_paths(block_dict, arrow_paths, **kwargs):
+        nonlocal call_count
+        del block_dict, arrow_paths, kwargs
+        call_count += 1
+        return {"split0": ["seed0"], "split1": ["seed1"]}, None
+
+    clusterer.predict_from_arrow_paths = cast(Any, fake_predict_from_arrow_paths)
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed0": "7", "seed1": "7"},
+            cluster_seeds_disallow={("seed0", "seed1")},
+            altered_cluster_signatures=["seed0"],
+            signatures={
+                "seed0": SimpleNamespace(author_info_orcid="0000-0001"),
+                "seed1": SimpleNamespace(author_info_orcid="0000-0001"),
+            },
+            name_tuples="filtered",
+        ),
+    )
+
+    clusterer._build_incremental_seed_setup(
+        dataset,
+        {},
+        runtime_context=cast(Any, object()),
+        arrow_paths={
+            "signatures": "signatures.arrow",
+            "papers": "papers.arrow",
+            "paper_authors": "paper_authors.arrow",
+        },
+    )
+
+    assert call_count == 1
+    assert clusterer._last_incremental_seed_setup_telemetry["seed_setup_altered_presplit_orcid_skip_count"] == 0
+
+
+def test_build_incremental_seed_setup_loads_altered_signatures_from_arrow_path(tmp_path: Path):
+    import pyarrow as pa
+
+    clusterer = _build_minimal_incremental_clusterer()
+    captured: dict[str, Any] = {}
+
+    def fake_predict_from_arrow_paths(block_dict, arrow_paths, **kwargs):
+        del arrow_paths
+        captured["block_dict"] = dict(block_dict)
+        captured["partial_supervision"] = dict(kwargs.get("partial_supervision", {}))
+        return {"split0": ["seed0"], "split1": ["seed1"]}, None
+
+    clusterer.predict_from_arrow_paths = cast(Any, fake_predict_from_arrow_paths)
+    altered_path = tmp_path / "altered_cluster_signatures.arrow"
+    table = pa.table({"signature_id": pa.array(["seed0"], type=pa.string())})
+    with pa.OSFile(str(altered_path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed0": "7", "seed1": "7", "seed2": "8"},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=None,
+            name_tuples="filtered",
+        ),
+    )
+
+    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = clusterer._build_incremental_seed_setup(
+        dataset,
+        {},
+        runtime_context=cast(Any, object()),
+        arrow_paths={"altered_cluster_signatures": str(altered_path)},
+    )
+
+    assert captured["block_dict"] == {"altered_profile_0": ["seed0", "seed1"]}
+    assert cluster_seeds_require == {"seed0": "7_0", "seed1": "7_1", "seed2": "8"}
+    assert recluster_map == {"7_0": "7", "7_1": "7"}
+    assert clusterer._last_incremental_seed_setup_telemetry["seed_setup_altered_signature_count"] == 1
+
+
+def test_build_incremental_seed_setup_loads_seed_and_altered_signatures_from_arrow_paths(tmp_path: Path):
+    import pyarrow as pa
+
+    clusterer = _build_minimal_incremental_clusterer()
+    captured: dict[str, Any] = {}
+
+    def fake_predict_from_arrow_paths(block_dict, arrow_paths, **kwargs):
+        del arrow_paths
+        captured["block_dict"] = dict(block_dict)
+        captured["partial_supervision"] = dict(kwargs.get("partial_supervision", {}))
+        return {"split0": ["seed0"], "split1": ["seed1"]}, None
+
+    clusterer.predict_from_arrow_paths = cast(Any, fake_predict_from_arrow_paths)
+    cluster_seeds_path = tmp_path / "cluster_seeds.arrow"
+    seed_table = pa.table(
+        {
+            "signature_id": pa.array(["seed0", "seed1", "seed2"], type=pa.string()),
+            "cluster_id": pa.array(["7", "7", "8"], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(cluster_seeds_path), "wb") as sink:
+        with pa.ipc.new_file(sink, seed_table.schema) as writer:
+            writer.write_table(seed_table)
+    altered_path = tmp_path / "altered_cluster_signatures.arrow"
+    altered_table = pa.table({"signature_id": pa.array(["seed0"], type=pa.string())})
+    with pa.OSFile(str(altered_path), "wb") as sink:
+        with pa.ipc.new_file(sink, altered_table.schema) as writer:
+            writer.write_table(altered_table)
+    disallow_path = tmp_path / "cluster_seed_disallows.arrow"
+    disallow_table = pa.table(
+        {
+            "signature_id_1": pa.array(["seed0"], type=pa.string()),
+            "signature_id_2": pa.array(["seed1"], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(disallow_path), "wb") as sink:
+        with pa.ipc.new_file(sink, disallow_table.schema) as writer:
+            writer.write_table(disallow_table)
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=None,
+            name_tuples="filtered",
+        ),
+    )
+
+    cluster_seeds_require, recluster_map, cluster_seeds_require_inverse = clusterer._build_incremental_seed_setup(
+        dataset,
+        {},
+        runtime_context=cast(Any, object()),
+        arrow_paths={
+            "cluster_seeds": str(cluster_seeds_path),
+            "cluster_seed_disallows": str(disallow_path),
+            "altered_cluster_signatures": str(altered_path),
+        },
+    )
+
+    assert captured["block_dict"] == {"altered_profile_0": ["seed0", "seed1"]}
+    assert captured["partial_supervision"] == {("seed0", "seed1"): LARGE_INTEGER}
+    assert cluster_seeds_require == {"seed0": "7_0", "seed1": "7_1", "seed2": "8"}
+    assert recluster_map == {"7_0": "7", "7_1": "7"}
+    assert cluster_seeds_require_inverse == {"7": ["seed0", "seed1"], "8": ["seed2"]}
+
+
+def test_cluster_seeds_arrow_read_cache_reuses_parse_and_returns_copy(monkeypatch, tmp_path: Path):
+    import pyarrow as pa
+
+    model_module._CLUSTER_SEEDS_ARROW_CACHE.clear()
+    cluster_seeds_path = tmp_path / "cluster_seeds.arrow"
+    model_module._write_cluster_seeds_arrow(cluster_seeds_path, {"seed0": "7", "seed1": "7"})
+
+    open_file_call_count = 0
+    original_open_file = pa.ipc.open_file
+
+    def counting_open_file(*args, **kwargs):
+        nonlocal open_file_call_count
+        open_file_call_count += 1
+        return original_open_file(*args, **kwargs)
+
+    monkeypatch.setattr(pa.ipc, "open_file", counting_open_file)
+
+    first = model_module._cluster_seeds_require_from_arrow_paths({"cluster_seeds": str(cluster_seeds_path)})
+    first["seed0"] = "mutated"
+    second = model_module._cluster_seeds_require_from_arrow_paths({"cluster_seeds": str(cluster_seeds_path)})
+
+    assert second == {"seed0": "7", "seed1": "7"}
+    assert open_file_call_count == 1
+
+    model_module._write_cluster_seeds_arrow(
+        cluster_seeds_path,
+        {"seed0": "8", "seed1": "7", "seed2": "9"},
+    )
+    third = model_module._cluster_seeds_require_from_arrow_paths({"cluster_seeds": str(cluster_seeds_path)})
+
+    assert third == {"seed0": "8", "seed1": "7", "seed2": "9"}
+    assert open_file_call_count == 2
+
+
+def test_build_incremental_seed_setup_empty_altered_list_overrides_arrow_path(tmp_path: Path):
+    import pyarrow as pa
+
+    clusterer = _build_minimal_incremental_clusterer()
+    clusterer.predict_from_arrow_paths = cast(
+        Any,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("empty Python altered list is authoritative")),
+    )
+    altered_path = tmp_path / "altered_cluster_signatures.arrow"
+    table = pa.table({"signature_id": pa.array(["seed0"], type=pa.string())})
+    with pa.OSFile(str(altered_path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed0": "7", "seed1": "7", "seed2": "8"},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=[],
+            name_tuples="filtered",
+        ),
+    )
+
+    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = clusterer._build_incremental_seed_setup(
+        dataset,
+        {},
+        runtime_context=cast(Any, object()),
+        arrow_paths={"altered_cluster_signatures": str(altered_path)},
+    )
+
+    assert cluster_seeds_require == {"seed0": "7", "seed1": "7", "seed2": "8"}
+    assert recluster_map == {}
+    assert clusterer._last_incremental_seed_setup_telemetry["seed_setup_altered_signature_count"] == 0
 
 
 def test_top1_consensus_broadcast_only_applies_when_cluster_members_agree():

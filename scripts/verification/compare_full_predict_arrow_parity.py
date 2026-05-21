@@ -345,7 +345,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.output_dir,
         signature_ids=selected_signature_ids,
         include_specter=not args.no_specter,
-        drop_embedded_name_counts=not args.keep_embedded_name_counts,
     )
     timings["write_complete_arrow_seconds"] = time.perf_counter() - start
 
@@ -355,12 +354,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     arrow_paths["name_counts"] = name_counts_arrow_path
     timings["write_name_counts_arrow_seconds"] = time.perf_counter() - start
 
-    name_counts_index_metrics: dict[str, Any] | None = None
-    if args.use_name_counts_index:
-        start = time.perf_counter()
-        name_counts_index_path, name_counts_index_metrics = write_name_counts_index(name_counts_artifact_dir)
-        arrow_paths["name_counts_index"] = name_counts_index_path
-        timings["write_name_counts_index_seconds"] = time.perf_counter() - start
+    start = time.perf_counter()
+    name_counts_index_path, name_counts_index_metrics = write_name_counts_index(name_counts_artifact_dir)
+    arrow_paths["name_counts_index"] = name_counts_index_path
+    timings["write_name_counts_index_seconds"] = time.perf_counter() - start
 
     start = time.perf_counter()
     name_pairs_artifact_dir = args.name_pairs_artifact_dir or args.name_artifact_dir or args.output_dir
@@ -491,9 +488,7 @@ def main() -> None:
     parser.add_argument("--total-ram-bytes", type=int, default=1_000_000_000_000)
     parser.add_argument("--compare-features", action="store_true")
     parser.add_argument("--use-cluster-seeds", action="store_true")
-    parser.add_argument("--use-name-counts-index", action="store_true")
     parser.add_argument("--no-specter", action="store_true")
-    parser.add_argument("--keep-embedded-name-counts", action="store_true")
     parser.add_argument("--allow-mismatch", action="store_true")
     args = parser.parse_args()
 

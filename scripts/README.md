@@ -44,7 +44,7 @@
 | `make_inventors_split_and_histograms.py` | Split inventors data and generate histograms (defaults to a local ignored output path) |
 | `make_inventors_hf_specter_embeddings.py` | Generate SPECTER embeddings for inventors dataset (defaults to a local ignored output path) |
 | `extract_big_block_dataset.py` | Convert a monolithic big-block export into `ANDData`-friendly `signatures.json`, `papers.json`, and `specter.pickle` files; supports both pretty-printed and minified JSON exports |
-| `convert_inference_json_to_arrow.py` | Convert service-shaped inference JSON into direct Rust Arrow inputs, preserving seed constraints and `altered_cluster_signatures.arrow` |
+| `convert_inference_json_to_arrow.py` | Convert service-shaped inference JSON into direct Rust Arrow inputs, preserving required seed assignments, seed disallows, and `altered_cluster_signatures.arrow` |
 | `analyze_giant_block_subblocking.py` | Sweep subblocking thresholds on an extracted giant block and write preservation metrics, plots, and tables |
 | `bench_preprocess_phases.py` | Benchmark preprocessing phases (papers, signatures) across serial / threads / processes |
 

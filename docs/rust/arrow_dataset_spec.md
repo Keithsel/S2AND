@@ -26,9 +26,11 @@ Required for full-block prediction:
 - `specter.arrow` or `specter2.arrow` when the model uses
   `embedding_similarity`
 
-Required in addition for incremental prediction promoted through Arrow:
+Required in addition for seeded prediction or incremental prediction promoted
+through Arrow:
 
 - `cluster_seeds.arrow`
+- `cluster_seed_disallows.arrow`
 
 Required when incremental input contains altered claimed profiles:
 
@@ -58,6 +60,7 @@ Preferred on-disk layout:
     specter.arrow
     specter2.arrow
     cluster_seeds.arrow
+    cluster_seed_disallows.arrow
     altered_cluster_signatures.arrow
     <dataset>_clusters.json
 ```
@@ -66,6 +69,8 @@ Notes:
 
 - `cluster_seeds.arrow` is required only for seeded/incremental datasets. It can
   be omitted for unseeded full prediction and offline eval.
+- `cluster_seed_disallows.arrow` preserves pairwise seed disallow constraints.
+  Write an empty table when the request has no seed disallows.
 - `altered_cluster_signatures.arrow` is required for incremental datasets whose
   seed clusters include altered claimed profiles. It is the producer-owned
   request artifact for this condition. `altered_cluster_signatures.txt` is
@@ -90,6 +95,7 @@ the path mapping should use these keys:
 | `paper_authors` | Path to `paper_authors.arrow` |
 | `specter` | Path to the embedding table selected for the current model, even if the file is physically named `specter2.arrow` |
 | `cluster_seeds` | Path to `cluster_seeds.arrow` for incremental/seeded prediction |
+| `cluster_seed_disallows` | Path to `cluster_seed_disallows.arrow` for pairwise seed disallow constraints |
 | `altered_cluster_signatures` | Path to `altered_cluster_signatures.arrow` when altered claimed profiles are present; text fallback is accepted for legacy callers |
 | `clusters` | Path to eval-only ground-truth clusters JSON |
 | `name_counts_index` | Optional shared/global name-count index directory, normally `s2and/data/name_counts_index` |
@@ -203,8 +209,21 @@ Optional for unseeded full prediction.
 | `signature_id` | `string` | no | Seed signature id |
 | `cluster_id` | `string` | no | Required seed component/cluster id |
 
-Only required seed assignments are persisted here. Disallow constraints are not
-currently a dataset-level Arrow artifact; they remain request/runtime inputs.
+Only required seed assignments are persisted here. Pairwise seed disallow
+constraints are persisted separately in `cluster_seed_disallows.arrow`.
+
+### `cluster_seed_disallows.arrow`
+
+Required for incremental/seeded prediction through the Arrow promoted path.
+Write an empty table when no seed disallows are present.
+
+| Column | Arrow type | Nulls | Meaning |
+|---|---:|---:|---|
+| `signature_id_1` | `string` | no | First signature id in the disallow pair |
+| `signature_id_2` | `string` | no | Second signature id in the disallow pair |
+
+Each id must exist in `signatures.arrow`. Runtime treats the pair as
+undirected, matching existing `cluster_seeds_disallow` semantics.
 
 ### `altered_cluster_signatures.arrow`
 
@@ -292,14 +311,16 @@ Required fields:
 
 ```json
 {
-  "schema": "feature_block_arrow_v1",
+  "schema": "feature_block_arrow_v2",
   "dataset": "dataset_name",
   "signature_count": 0,
   "paper_count": 0,
   "paths": {
     "signatures": "signatures.arrow",
     "papers": "papers.arrow",
-    "paper_authors": "paper_authors.arrow"
+    "paper_authors": "paper_authors.arrow",
+    "cluster_seeds": "cluster_seeds.arrow",
+    "cluster_seed_disallows": "cluster_seed_disallows.arrow"
   },
   "name_tuples": "default packaged filtered aliases"
 }
@@ -339,6 +360,9 @@ Required checks:
 - When embeddings are required, every referenced paper has an embedding in the
   selected SPECTER file.
 - `cluster_seeds.signature_id` is a subset of `signatures.signature_id`.
+- `cluster_seed_disallows.signature_id_1` and
+  `cluster_seed_disallows.signature_id_2` are subsets of
+  `signatures.signature_id`.
 - `name_counts_index/manifest.json` exists when the selected model uses
   `name_counts`.
 - `author_block` is present when the dataset will be used for block

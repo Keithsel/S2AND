@@ -2577,6 +2577,20 @@ fn read_raw_arrow_cluster_seeds(
     Ok((component_order, members_by_component))
 }
 
+fn read_raw_arrow_cluster_seed_disallows(path: &str) -> PyResult<HashSet<(String, String)>> {
+    let mut out = HashSet::new();
+    for batch in read_arrow_batches(path)? {
+        let left_col = batch.column(arrow_column_index(&batch, "signature_id_1", path)?);
+        let right_col = batch.column(arrow_column_index(&batch, "signature_id_2", path)?);
+        for row in 0..batch.num_rows() {
+            let left = arrow_required_string(left_col.as_ref(), row, "signature_id_1")?;
+            let right = arrow_required_string(right_col.as_ref(), row, "signature_id_2")?;
+            out.insert(canonical_signature_pair_owned(left, right));
+        }
+    }
+    Ok(out)
+}
+
 fn read_raw_arrow_specter_filtered(
     path: &str,
     keep_paper_ids: Option<&HashSet<String>>,
@@ -7195,6 +7209,8 @@ impl RustFeaturizer {
                 pyo3::exceptions::PyKeyError::new_err("missing paper_authors Arrow path")
             })?;
         let cluster_seeds_path = extract_path_mapping_string(paths, "cluster_seeds", false)?;
+        let cluster_seed_disallows_path =
+            extract_path_mapping_string(paths, "cluster_seed_disallows", false)?;
         let specter_path = extract_path_mapping_string(paths, "specter", false)?;
         let name_counts_arrow_path = extract_path_mapping_string(paths, "name_counts", false)?;
         let name_counts_index_path = extract_name_counts_index_path(paths)?;
@@ -7261,6 +7277,16 @@ impl RustFeaturizer {
                         cluster_seeds_require
                             .insert(signature_id, ClusterId::Str(component_key.clone()));
                     }
+                }
+            }
+        }
+        let mut cluster_seeds_disallow = HashSet::<(String, String)>::new();
+        if let Some(path) = cluster_seed_disallows_path.as_ref() {
+            for (left, right) in read_raw_arrow_cluster_seed_disallows(path)? {
+                if selected_signature_id_set.contains(&left)
+                    && selected_signature_id_set.contains(&right)
+                {
+                    cluster_seeds_disallow.insert((left, right));
                 }
             }
         }
@@ -7749,7 +7775,6 @@ impl RustFeaturizer {
             Some(path) => read_raw_arrow_name_tuples(path)?,
             None => extract_feature_block_name_tuples(py, name_tuples)?,
         };
-        let cluster_seeds_disallow = HashSet::new();
         let json_ingest_telemetry = JsonIngestTelemetry {
             json_parse_seconds: parse_seconds,
             paper_preprocess_seconds,

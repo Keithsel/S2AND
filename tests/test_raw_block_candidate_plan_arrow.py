@@ -81,11 +81,18 @@ def _base_arrow_paths(tmp_path: Path) -> dict[str, str]:
             "cluster_id": pa.array(["c_match", "c_other"], type=pa.string()),
         }
     )
+    cluster_seed_disallows = pa.table(
+        {
+            "signature_id_1": pa.array(["q1"], type=pa.string()),
+            "signature_id_2": pa.array(["s2"], type=pa.string()),
+        }
+    )
     return {
         "signatures": _write_ipc(tmp_path / "signatures.arrow", signatures),
         "papers": _write_ipc(tmp_path / "papers.arrow", papers),
         "paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors),
         "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
+        "cluster_seed_disallows": _write_ipc(tmp_path / "cluster_seed_disallows.arrow", cluster_seed_disallows),
     }
 
 
@@ -686,12 +693,14 @@ def test_rust_featurizer_from_arrow_paths_matches_feature_block(tmp_path: Path) 
     pairs = [("q1", "s1"), ("q1", "s2")]
 
     assert tuple(direct.signature_ids()) == feature_block.signature_ids
+    assert feature_block.cluster_seeds_disallow == (("q1", "s2"),)
     np.testing.assert_allclose(
         direct.featurize_pairs_matrix(pairs, None, 1, np.nan),
         incumbent.featurize_pairs_matrix(pairs, None, 1, np.nan),
         equal_nan=True,
     )
     assert direct.get_constraint("s1", "s2") == incumbent.get_constraint("s1", "s2")
+    assert direct.get_constraint("q1", "s2") == incumbent.get_constraint("q1", "s2") == 10000.0
 
 
 def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(

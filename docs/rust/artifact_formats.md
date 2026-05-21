@@ -13,6 +13,7 @@ It replaces the older artifact-divergence migration log.
 | Papers | `papers.arrow` Arrow IPC table | Required direct-Rust input. Contains title, abstract-presence signal, venue, journal, year, language, and reliability fields. |
 | Paper authors | `paper_authors.arrow` Arrow IPC table | Required for coauthor and paper-author row signals. |
 | Cluster seeds | `cluster_seeds.arrow` Arrow IPC table | Required for seeded/incremental Arrow prediction. Omit for unseeded full prediction. |
+| Cluster seed disallows | `cluster_seed_disallows.arrow` Arrow IPC table | Required for seeded/incremental Arrow prediction to preserve pairwise seed disallow constraints. Write an empty table when none are present. |
 | SPECTER | Arrow fixed-size-list `float32` table | Preferred direct-path embedding input. Include the embedding version required by the model. |
 | Name counts | `s2and/data/name_counts_index/` sorted binary sidecar | Preferred Rust hot-path lookup artifact for models that use name-count features. |
 | Name-count Arrow table | `name_counts.arrow` long-form Arrow table | Generation, inspection, and parity fallback only. Do not cold-read it per request when the index is available. |

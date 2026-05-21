@@ -13,6 +13,7 @@ from s2and.incremental_linking.feature_block import (
     FeatureBlockSignatureOrder,
     feature_block_for_signature_order,
     feature_block_from_anddata,
+    feature_block_from_arrow_paths,
     feature_block_from_raw_payloads,
     feature_block_signature_order_from_raw_candidate_plan,
     feature_block_to_mini_anddata,
@@ -210,6 +211,7 @@ def _write_feature_block_arrow_paths(tmp_path: Path) -> dict[str, str]:
         papers=papers,
         raw_candidate_plan=_raw_plan(),
         cluster_seeds_require=cluster_seeds_require,
+        cluster_seeds_disallow=[("q", "s2"), ("q", "unused")],
     )
     return write_feature_block_arrow_tables(feature_block, tmp_path, include_empty_cluster_seeds=True)
 
@@ -252,7 +254,14 @@ def test_feature_block_to_arrow_tables_matches_raw_schema() -> None:
         _tiny_anddata(), signature_ids=["q", "s1"], query_signature_ids=["q"]
     ).to_arrow_tables()
 
-    assert set(tables) == {"signatures", "papers", "paper_authors", "cluster_seeds", "specter"}
+    assert set(tables) == {
+        "signatures",
+        "papers",
+        "paper_authors",
+        "cluster_seeds",
+        "cluster_seed_disallows",
+        "specter",
+    }
     assert tables["signatures"].column_names == [
         "signature_id",
         "paper_id",
@@ -272,6 +281,7 @@ def test_feature_block_to_arrow_tables_matches_raw_schema() -> None:
     assert tables["papers"].schema.field("predicted_language").type == pa.string()
     assert tables["papers"].schema.field("is_reliable").type == pa.bool_()
     assert tables["cluster_seeds"].to_pydict() == {"signature_id": ["s1"], "cluster_id": ["c_ada"]}
+    assert tables["cluster_seed_disallows"].to_pydict() == {"signature_id_1": [], "signature_id_2": []}
 
 
 def test_feature_block_to_arrow_tables_keeps_all_null_optional_columns_typed() -> None:
@@ -302,6 +312,7 @@ def test_feature_block_to_arrow_tables_keeps_all_null_optional_columns_typed() -
     assert tables["papers"].schema.field("predicted_language").type == pa.string()
     assert tables["papers"].schema.field("is_reliable").type == pa.bool_()
     assert tables["cluster_seeds"].schema.field("signature_id").type == pa.string()
+    assert tables["cluster_seed_disallows"].schema.field("signature_id_1").type == pa.string()
 
 
 def test_write_feature_block_arrow_from_anddata_skips_empty_seed_table(tmp_path: Path) -> None:
@@ -320,6 +331,14 @@ def test_write_feature_block_arrow_from_anddata_skips_empty_seed_table(tmp_path:
         signatures = pa.ipc.open_file(source).read_all()
     assert "name_count_first" not in signatures.column_names
     assert signatures.to_pydict()["signature_id"] == ["q"]
+
+
+def test_feature_block_from_arrow_paths_reads_cluster_seed_disallows(tmp_path: Path) -> None:
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+
+    feature_block = feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+    assert feature_block.cluster_seeds_disallow == (("q", "s2"),)
 
 
 def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

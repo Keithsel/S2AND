@@ -438,8 +438,9 @@ If seed-bearing FeatureBlock Arrow artifacts are available, promoted
 `predict_incremental(...)` uses the raw Arrow/Rust retrieval and scoring bridge
 by default for Phase A, then finishes residual abstains through the normal
 incremental completion path. Incremental Arrow routing requires
-`cluster_seeds.arrow`; artifacts without seed assignments fall back to the
-existing promoted `ANDData` path.
+`cluster_seeds.arrow` and `cluster_seed_disallows.arrow`; artifacts without seed
+assignments fall back to the existing promoted `ANDData` path. Write an empty
+`cluster_seed_disallows.arrow` when the request has no disallow constraints.
 
 Supporting docs:
 

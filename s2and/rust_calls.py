@@ -18,6 +18,18 @@ def _get_rust_featurizer(*args: Any, **kwargs: Any) -> Any:
     return feature_port._get_rust_featurizer(*args, **kwargs)  # noqa: SLF001
 
 
+def _resolve_featurizer(
+    dataset: ANDData | None,
+    featurizer: Any | None,
+    runtime_context: Any | None,
+) -> Any:
+    if featurizer is not None:
+        return featurizer
+    if dataset is None:
+        raise ValueError("dataset is required when featurizer is not provided")
+    return _get_rust_featurizer(dataset, runtime_context=runtime_context)
+
+
 def update_rust_cluster_seeds(
     dataset: ANDData,
     runtime_context: Any | None = None,
@@ -135,10 +147,7 @@ def get_constraint_labels_index_arrays_rust(
     ``NaN`` means unconstrained, otherwise ``constraint_distance - LARGE_INTEGER``.
     """
 
-    if featurizer is None:
-        if dataset is None:
-            raise ValueError("dataset is required when featurizer is not provided")
-        featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
+    featurizer = _resolve_featurizer(dataset, featurizer, runtime_context)
     resolved_num_threads = None if num_threads is None else resolve_n_jobs(num_threads)
 
     method = getattr(featurizer, "linker_pair_index_arrays_constraint_labels", None)
@@ -177,10 +186,7 @@ def build_linker_pair_distance_accumulators_rust(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     """Aggregate candidate pair distances into row-level accumulators in Rust."""
 
-    if featurizer is None:
-        if dataset is None:
-            raise ValueError("dataset is required when featurizer is not provided")
-        featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
+    featurizer = _resolve_featurizer(dataset, featurizer, runtime_context)
 
     method = getattr(featurizer, "linker_pair_distance_accumulators", None)
     if not callable(method):
@@ -222,10 +228,7 @@ def get_constraints_block_upper_triangle_indexed_rust(
     runtime_context: Any | None = None,
     suppress_orcid: bool = False,
 ) -> tuple[list[int], list[int], list[float | None]]:
-    if featurizer is None:
-        if dataset is None:
-            raise ValueError("dataset is required when featurizer is not provided")
-        featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
+    featurizer = _resolve_featurizer(dataset, featurizer, runtime_context)
 
     method = getattr(featurizer, "get_constraints_block_upper_triangle_indexed", None)
     if not callable(method):
@@ -346,10 +349,7 @@ def build_linker_pair_features_and_aggregate_stats_arrays_rust(
     policies for the pairwise model matrix and promoted ``pw_*`` aggregates.
     """
 
-    if featurizer is None:
-        if dataset is None:
-            raise ValueError("dataset is required when featurizer is not provided")
-        featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
+    featurizer = _resolve_featurizer(dataset, featurizer, runtime_context)
     method = getattr(featurizer, "linker_pair_index_arrays_and_aggregate_stats", None)
     if not callable(method):
         raise RuntimeError(
@@ -406,10 +406,7 @@ def build_linker_pair_aggregate_stats_arrays_rust(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Build row-level aggregate stats from numeric pair index arrays without returning pair features."""
 
-    if featurizer is None:
-        if dataset is None:
-            raise ValueError("dataset is required when featurizer is not provided")
-        featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
+    featurizer = _resolve_featurizer(dataset, featurizer, runtime_context)
     method = getattr(featurizer, "linker_pair_index_arrays_aggregate_stats", None)
     if not callable(method):
         raise RuntimeError(
@@ -445,10 +442,7 @@ def build_block_upper_triangle_feature_matrix_indexed_rust(
     runtime_context: Any | None = None,
     featurizer: Any | None = None,
 ) -> np.ndarray:
-    if featurizer is None:
-        if dataset is None:
-            raise ValueError("dataset is required when featurizer is not provided")
-        featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
+    featurizer = _resolve_featurizer(dataset, featurizer, runtime_context)
     method = getattr(featurizer, "featurize_block_upper_triangle_matrix_indexed", None)
     if not callable(method):
         raise RuntimeError(

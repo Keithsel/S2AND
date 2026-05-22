@@ -3,15 +3,6 @@ from __future__ import annotations
 import logging
 
 from scripts import rust_suite
-from scripts.production.model import train_pairwise
-
-
-def test_pairwise_training_search_space_records_eps_under_eps_label() -> None:
-    eps_node = train_pairwise._search_space()["eps"]
-    hyperopt_param = eps_node.pos_args[0]
-
-    assert hyperopt_param.name == "hyperopt_param"
-    assert hyperopt_param.pos_args[0].obj == "eps"
 
 
 def test_rust_suite_file_logging_preserves_existing_logger_level(tmp_path) -> None:

@@ -40,10 +40,7 @@ from s2and.incremental_linking.logistic_gate import (
     load_logistic_gate_config,
 )
 from s2and.incremental_linking.policy import (
-    clusterer_uses_name_count_features as _policy_clusterer_uses_name_count_features,
-)
-from s2and.incremental_linking.policy import (
-    require_arrow_name_counts_index_for_clusterer as _require_arrow_name_counts_index_for_clusterer,
+    require_arrow_name_counts_index_for_clusterer,
 )
 from s2and.incremental_linking.policy import (
     resolve_load_name_counts_policy as _resolve_load_name_counts_policy,
@@ -60,19 +57,24 @@ from s2and.runtime import build_runtime_context
 from s2and.thread_config import resolve_n_jobs
 
 LinkAction = Literal["link", "abstain"]
+SeedSetup = (
+    tuple[
+        Mapping[str, int | str],
+        Mapping[int | str, int | str],
+        Mapping[int | str, Sequence[str]],
+    ]
+    | tuple[
+        Mapping[str, int | str],
+        Mapping[int | str, int | str],
+        Mapping[int | str, Sequence[str]],
+        Mapping[int | str, Sequence[str]],
+    ]
+)
 
 # Production 1.2 dense output semantics. The pairwise distance model preserves
 # NaNs internally; only the exported pw_* aggregate features are zero-filled.
 _PAIRWISE_MODEL_NAN_VALUE: float = float("nan")
 _PAIRWISE_AGGREGATE_NAN_VALUE: float = 0.0
-
-
-def _clusterer_uses_name_count_features(clusterer: Any) -> bool:
-    return _policy_clusterer_uses_name_count_features(clusterer)
-
-
-def _require_arrow_name_counts_index(clusterer: Any, arrow_paths: Mapping[str, Any]) -> None:
-    _require_arrow_name_counts_index_for_clusterer(clusterer, arrow_paths, context="Raw Arrow scoring")
 
 
 @dataclass(frozen=True)
@@ -456,10 +458,16 @@ def _predict_incremental_link_or_abstain_compact(
 
 
 def _pairwise_model_feature_indices(featurizer_info: FeaturizationInfo) -> tuple[int, ...]:
-    selected: set[int] = set()
+    selected: list[int] = []
+    seen: set[int] = set()
     for feature_group in featurizer_info.features_to_use:
-        selected.update(featurizer_info.feature_group_to_index[str(feature_group)])
-    return tuple(sorted(selected))
+        for index in featurizer_info.feature_group_to_index[str(feature_group)]:
+            normalized_index = int(index)
+            if normalized_index in seen:
+                continue
+            seen.add(normalized_index)
+            selected.append(normalized_index)
+    return tuple(selected)
 
 
 def _matrix_positions(matrix_indices: Sequence[int], selected_indices: Sequence[int]) -> tuple[int, ...]:
@@ -470,11 +478,9 @@ def _matrix_positions(matrix_indices: Sequence[int], selected_indices: Sequence[
     return tuple(position_by_index[int(index)] for index in selected_indices)
 
 
-def _predict_pairwise_class0(classifier: Any, features: np.ndarray, *, num_threads: int) -> np.ndarray:
+def _predict_pairwise_class0(classifier: Any, features: np.ndarray) -> np.ndarray:
     # Estimator threading is configured through propagated n_jobs; predict_proba(num_threads=...)
     # is LightGBM-specific and breaks sklearn-compatible wrappers.
-    del num_threads
-
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="X does not have valid feature names", category=UserWarning)
         probabilities = classifier.predict_proba(features)
@@ -490,15 +496,18 @@ def _predict_pairwise_model_distances(
     nameless_classifier: Any | None = None,
     nameless_features: np.ndarray | None = None,
 ) -> np.ndarray:
+    # Estimator threading is configured through propagated n_jobs; predict_proba(num_threads=...)
+    # is LightGBM-specific and breaks sklearn-compatible wrappers.
+    del num_threads
+
     predictions = np.zeros(len(labels), dtype=np.float64)
     predict = np.isnan(labels)
     if np.any(predict):
-        predicted = _predict_pairwise_class0(classifier, features[predict], num_threads=num_threads)
+        predicted = _predict_pairwise_class0(classifier, features[predict])
         if nameless_classifier is not None and nameless_features is not None:
             nameless_predicted = _predict_pairwise_class0(
                 nameless_classifier,
                 nameless_features[predict],
-                num_threads=num_threads,
             )
             predicted = (predicted + nameless_predicted) / 2.0
         predictions[predict] = predicted
@@ -1229,12 +1238,7 @@ def _predict_incremental_link_or_abstain_production_private(
     constraint_backend: Any | None = None,
     extra_row_signals: Mapping[str, Any] | None = None,
     extra_row_signal_builder: Callable[[LinkerRetrievalBatch, Mapping[int, str]], Mapping[str, Any]] | None = None,
-    seed_setup: tuple[
-        Mapping[str, int | str],
-        Mapping[int | str, int | str],
-        Mapping[int | str, Sequence[str]],
-    ]
-    | None = None,
+    seed_setup: SeedSetup | None = None,
     runtime_context: Any | None = None,
     n_jobs: int | None = None,
     total_ram_bytes: int | None = None,
@@ -1265,13 +1269,14 @@ def _predict_incremental_link_or_abstain_production_private(
         build_seed_setup = getattr(clusterer, "_build_incremental_seed_setup", None)
         if not callable(build_seed_setup):
             raise TypeError("clusterer must expose _build_incremental_seed_setup for the private M3a slice")
-        cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = build_seed_setup(
+        resolved_seed_setup = build_seed_setup(
             dataset,
             partial_supervision_dict,
             resolved_runtime_context,
         )
     else:
-        cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = seed_setup
+        resolved_seed_setup = seed_setup
+    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = resolved_seed_setup[:3]
     cluster_seeds_require = dict(cluster_seeds_require)
     recluster_map = dict(recluster_map)
 
@@ -1330,12 +1335,8 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
     constraint_backend: Any | None = None,
     extra_row_signals: Mapping[str, Any] | None = None,
     extra_row_signal_builder: Callable[[LinkerRetrievalBatch, Mapping[int, str]], Mapping[str, Any]] | None = None,
-    seed_setup: tuple[
-        Mapping[str, int | str],
-        Mapping[int | str, int | str],
-        Mapping[int | str, Sequence[str]],
-    ]
-    | None = None,
+    seed_setup: SeedSetup | None = None,
+    partial_supervision_seed_signature_to_component: Mapping[str, Any] | None = None,
     runtime_context: Any | None = None,
     n_jobs: int | None = None,
     total_ram_bytes: int | None = None,
@@ -1358,13 +1359,14 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
         build_seed_setup = getattr(clusterer, "_build_incremental_seed_setup", None)
         if not callable(build_seed_setup):
             raise TypeError("clusterer must expose _build_incremental_seed_setup for the private M3a slice")
-        cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = build_seed_setup(
+        resolved_seed_setup = build_seed_setup(
             dataset,
             partial_supervision_dict,
             resolved_runtime_context,
         )
     else:
-        cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = seed_setup
+        resolved_seed_setup = seed_setup
+    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = resolved_seed_setup[:3]
     cluster_seeds_require = dict(cluster_seeds_require)
     recluster_map = dict(recluster_map)
 
@@ -1399,12 +1401,18 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
     )
     if partial_supervision_dict:
         pair_ids = _candidate_pair_ids(signature_ids_by_index, candidate_batch)
+        validation_seed_signature_to_component = (
+            {
+                str(signature_id): component
+                for signature_id, component in partial_supervision_seed_signature_to_component.items()
+            }
+            if partial_supervision_seed_signature_to_component is not None
+            else {str(signature_id): component for signature_id, component in cluster_seeds_require.items()}
+        )
         partial_telemetry = _validate_partial_supervision_window(
             partial_supervision=partial_supervision_dict,
             query_signature_ids=set(query_signature_id_strings),
-            seed_signature_to_component={
-                str(signature_id): component for signature_id, component in cluster_seeds_require.items()
-            },
+            seed_signature_to_component=validation_seed_signature_to_component,
             candidate_pair_ids=pair_ids,
         )
     else:
@@ -1514,14 +1522,28 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
     )
 
 
-def _raw_plan_query_views(raw_candidate_plan: Mapping[str, Any], query_count: int) -> tuple[str, ...]:
+def _raw_plan_query_view_values(raw_candidate_plan: Mapping[str, Any]) -> Any:
     raw_views = raw_candidate_plan.get("query_views", raw_candidate_plan.get("query_views_resolved"))
     if raw_views is None:
         raise KeyError("raw candidate plan is missing query_views")
+    return raw_views
+
+
+def _raw_plan_query_views(raw_candidate_plan: Mapping[str, Any], query_count: int) -> tuple[str, ...]:
+    raw_views = _raw_plan_query_view_values(raw_candidate_plan)
     views = tuple(str(value) for value in raw_views)
     if len(views) != int(query_count):
         raise ValueError(f"raw candidate plan query_views length must match query count: {len(views)} != {query_count}")
     return views
+
+
+def _validate_raw_plan_query_view_lengths(raw_candidate_plan: Mapping[str, Any], query_count: int) -> None:
+    """Validate raw-plan query view cardinality without returning the view tuple."""
+
+    raw_views = _raw_plan_query_view_values(raw_candidate_plan)
+    view_count = len(tuple(raw_views))
+    if view_count != int(query_count):
+        raise ValueError(f"raw candidate plan query_views length must match query count: {view_count} != {query_count}")
 
 
 def _validate_raw_plan_query_signature_ids(
@@ -1706,6 +1728,14 @@ def subset_raw_candidate_plan_for_query_ids(
             remapped = np.empty(len(raw_values), dtype=np.uint32)
             query_mask = raw_values < old_query_count
             if np.any(query_mask):
+                query_values = raw_values[query_mask]
+                outside_selected_queries = (query_values < old_query_start) | (query_values >= old_query_stop)
+                if np.any(outside_selected_queries):
+                    invalid_index = int(query_values[outside_selected_queries][0])
+                    raise ValueError(
+                        "raw candidate plan fast-path contains a query signature index outside the selected "
+                        f"contiguous query range: {invalid_index}"
+                    )
                 remapped[query_mask] = raw_values[query_mask] - old_query_start
             if np.any(~query_mask):
                 remapped[~query_mask] = new_query_count + (raw_values[~query_mask] - old_query_count)
@@ -1769,21 +1799,29 @@ def subset_raw_candidate_plan_for_query_ids(
 
     old_query_count = len(plan_query_ids)
     new_query_count = len(requested_query_ids)
+    old_to_new_query_lookup = np.full(old_query_count, -1, dtype=np.int64)
+    for old_offset, new_offset in old_to_new_query_offset.items():
+        old_to_new_query_lookup[int(old_offset)] = int(new_offset)
 
     def remap_signature_indices(values: Any) -> np.ndarray:
         raw_values = np.asarray(values, dtype=np.uint32)[pair_mask]
         remapped = np.empty(len(raw_values), dtype=np.uint32)
-        for offset, raw_value in enumerate(raw_values):
-            index = int(raw_value)
-            if index < old_query_count:
-                if index not in old_to_new_query_offset:
-                    raise ValueError(
-                        "raw candidate plan contains a query signature index outside the requested query subset: "
-                        f"{index}"
-                    )
-                remapped[offset] = old_to_new_query_offset[index]
-            else:
-                remapped[offset] = new_query_count + (index - old_query_count)
+        query_mask = raw_values < old_query_count
+        if np.any(query_mask):
+            raw_query_values = raw_values[query_mask]
+            query_remapped = old_to_new_query_lookup[raw_query_values]
+            if np.any(query_remapped < 0):
+                bad_index = int(raw_query_values[np.flatnonzero(query_remapped < 0)[0]])
+                raise ValueError(
+                    "raw candidate plan contains a query signature index outside the requested query subset: "
+                    f"{bad_index}"
+                )
+            remapped[query_mask] = query_remapped.astype(np.uint32, copy=False)
+        if np.any(~query_mask):
+            remapped[~query_mask] = (new_query_count + (raw_values[~query_mask] - old_query_count)).astype(
+                np.uint32,
+                copy=False,
+            )
         return remapped
 
     for key in RAW_CANDIDATE_PLAN_PAIR_KEYS:
@@ -1820,11 +1858,19 @@ def _raw_candidate_plan_seed_setup(
     component_members = raw_candidate_plan.get("component_members")
     if not isinstance(component_members, Mapping):
         raise ValueError("raw candidate plan must include component_members for scoring")
-    cluster_seeds_require = {
-        str(signature_id): str(component_key)
-        for component_key, members in component_members.items()
-        for signature_id in members
-    }
+    cluster_seeds_require: dict[str, str] = {}
+    for component_key, members in component_members.items():
+        for signature_id in members:
+            normalized_signature_id = str(signature_id)
+            normalized_component_key = str(component_key)
+            existing_component_key = cluster_seeds_require.get(normalized_signature_id)
+            if existing_component_key is not None and existing_component_key != normalized_component_key:
+                raise ValueError(
+                    "raw candidate plan component_members assigns signature_id "
+                    f"{normalized_signature_id!r} to multiple components: "
+                    f"{existing_component_key!r} and {normalized_component_key!r}"
+                )
+            cluster_seeds_require[normalized_signature_id] = normalized_component_key
     return _identity_seed_setup(cluster_seeds_require)
 
 
@@ -2009,14 +2055,15 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     orcid_enabled: bool = True,
     raw_candidate_plan: Mapping[str, Any] | None = None,
     rust_featurizer: Any | None = None,
+    partial_supervision_seed_signature_to_component: Mapping[str, Any] | None = None,
 ) -> LinkOrAbstainProductionResult:
     """Retrieve and score raw Arrow IPC inputs through Rust without `ANDData`."""
 
     resolved_runtime_context = runtime_context or build_runtime_context("incremental_link_or_abstain_raw_arrow")
     n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
     top_k_resolved = int(artifact.metadata.retrieval_top_k if top_k is None else top_k)
-    arrow_path_payload = {str(key): str(value) for key, value in arrow_paths.items()}
-    _require_arrow_name_counts_index(clusterer, arrow_path_payload)
+    arrow_path_payload = feature_port.normalize_arrow_paths(arrow_paths)
+    require_arrow_name_counts_index_for_clusterer(clusterer, arrow_path_payload, context="Raw Arrow scoring")
     query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
 
     if raw_candidate_plan is None:
@@ -2060,12 +2107,13 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
         raw_arrow_featurizer_reused = 1
     raw_arrow_featurizer_seconds = time.perf_counter() - stage_start
     featurizer_signature_id_to_index = signature_id_to_index_map(featurizer)
+    raw_arrow_signature_count = len(featurizer_signature_id_to_index)
 
     retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
         raw_candidate_plan,
         signature_id_to_index=featurizer_signature_id_to_index,
     )
-    _raw_plan_query_views(raw_candidate_plan, len(query_signature_id_strings))
+    _validate_raw_plan_query_view_lengths(raw_candidate_plan, len(query_signature_id_strings))
     stage_start = time.perf_counter()
     query_placeholders = _raw_candidate_plan_query_placeholders(raw_candidate_plan, query_signature_id_strings)
     seed_setup = _raw_candidate_plan_seed_setup(raw_candidate_plan)
@@ -2090,6 +2138,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
         constraint_backend=None,
         extra_row_signal_builder=None,
         seed_setup=seed_setup,
+        partial_supervision_seed_signature_to_component=partial_supervision_seed_signature_to_component,
         runtime_context=resolved_runtime_context,
         n_jobs=n_jobs_resolved,
         total_ram_bytes=total_ram_bytes,
@@ -2105,7 +2154,8 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
         "raw_arrow_featurizer_seconds": float(raw_arrow_featurizer_seconds),
         "raw_arrow_featurizer_reused": int(raw_arrow_featurizer_reused),
         "raw_arrow_signal_seconds": float(raw_arrow_signal_seconds),
-        "raw_arrow_signature_count": int(len(signature_order.signature_ids)),
+        "raw_arrow_signature_count": int(raw_arrow_signature_count),
+        "raw_arrow_plan_signature_count": int(len(signature_order.signature_ids)),
         "raw_arrow_seed_signature_count": int(seed_signature_count),
         "raw_arrow_seed_component_count": int(seed_component_count),
     }

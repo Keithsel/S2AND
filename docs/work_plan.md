@@ -36,8 +36,11 @@ artifact decisions live in:
 
 - Regenerate durable Arrow bundles from the complete schema in
   [rust/arrow_dataset_spec.md](rust/arrow_dataset_spec.md).
-- Include `s2and/data/name_counts_index/` as the shared name-count artifact for
-  runtime bundles that use name-count features.
+- Regenerate `s2and/data/name_counts_index/` into the manifest-backed
+  `generations/<generation-id>/` layout before publishing runtime bundles; the
+  current direct-file layout is a legacy source artifact.
+- Include the regenerated `s2and/data/name_counts_index/` as the shared
+  name-count artifact for runtime bundles that use name-count features.
 - Keep `name_counts.arrow` available for generation, inspection, and parity
   debugging, not as the default request-time read.
 
@@ -56,6 +59,11 @@ s2and-release-arrow/
   manifest.json
   LICENSE.txt
   lid.176.bin
+  production_model_v1.21/
+    manifest.json
+    clusterer.json
+    pairwise/
+    incremental_linker/
   production_model_v1.0.pickle
   production_model_v1.1.pickle
   production_model_v1.2.pickle
@@ -79,9 +87,14 @@ s2and-release-arrow/
     papers.arrow
     paper_authors.arrow
     specter.arrow
-    *.batch_index.bin
+    signatures.signatures_batch_index.bin
+    papers.papers_batch_index.bin
+    paper_authors.paper_authors_batch_index.bin
+    specter.specter_batch_index.bin
     <dataset>_clusters.json
     splits/
+  # ^ Every benchmark dataset directory (aminer ... zbmath) has the same
+  # internal layout shown under zbmath/ above.
   linker_replay_20260513/
     manifest.json
     bundle.json
@@ -91,7 +104,10 @@ s2and-release-arrow/
       papers.arrow
       paper_authors.arrow
       specter2.arrow
-      *.batch_index.bin
+      signatures.signatures_batch_index.bin
+      papers.papers_batch_index.bin
+      paper_authors.paper_authors_batch_index.bin
+      specter2.specter_batch_index.bin
     components/
     labels/
     splits/
@@ -109,14 +125,21 @@ s2and-release-arrow/
     `paper_authors.arrow`.
   - Convert linker replay `embeddings/<dataset>/specter2.pkl` to
     `specter2.arrow`.
-  - Convert `name_counts.pickle` to `name_counts_index/`; do not publish
-    `name_counts.arrow` in this release.
-  - Generate and ship Arrow batch lookup indexes beside the Arrow files.
+  - Convert `name_counts.pickle` to a manifest-backed generation under
+    `name_counts_index/`; do not publish `name_counts.arrow` in this release.
+    The checked-in direct-file `s2and/data/name_counts_index/` layout is a
+    legacy source artifact until regenerated.
+  - Generate and ship Arrow batch lookup indexes beside the Arrow files using
+    `<table-stem>.<path-key>.bin` names, for example
+    `signatures.signatures_batch_index.bin` and
+    `specter2.specter_batch_index.bin`.
 - Keep small metadata and offline evaluation artifacts in their existing
   formats.
   - Keep `LICENSE.txt` and `lid.176.bin` unchanged.
+  - Copy `production_model_v1.21/` exactly as the current native production
+    model bundle.
   - Copy `production_model_v1.0.pickle`, `production_model_v1.1.pickle`, and
-    `production_model_v1.2.pickle` exactly as legacy model artifacts.
+    `production_model_v1.2.pickle` exactly as legacy compatibility artifacts.
   - Keep `<dataset>_clusters.json` as eval-only truth.
   - Keep train/test split keys, pair CSVs, replay split CSVs, replay
     `summary.json`, `bundle.json`, and manifests, with paths and checksums
@@ -158,8 +181,9 @@ production inference.
     mode if still needed.
   - Retire or relabel non-Arrow production-inference claims in rust-suite docs.
 - Make artifact conversion mandatory before production inference.
-  - Keep `scripts/convert_inference_json_to_arrow.py` as the supported bridge
-    from service-shaped JSON to Arrow.
+  - Keep `scripts/convert_to_arrow.py service-json` as the supported bridge
+    from service-shaped JSON to Arrow, alongside the benchmark and
+    linker-replay conversion subcommands used for release assembly.
   - Ensure the converter always emits the artifacts required by production
     models, including `name_counts_index`.
   - Add a small validation command or test that opens the produced Arrow bundle
@@ -175,7 +199,7 @@ production inference.
   - Keep raw Arrow incremental tests for candidate rows, pair rows, row
     signals, probabilities, and final decisions.
   - Add or adjust script-level smoke tests for
-    `scripts/convert_inference_json_to_arrow.py`, the Arrow prod-model tutorial
+    `scripts/convert_to_arrow.py service-json`, the Arrow prod-model tutorial
     flow, the Arrow prod eval flow, and the Arrow rust-suite production
     benchmark flow.
 - Clean up after migration.

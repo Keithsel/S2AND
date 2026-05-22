@@ -436,6 +436,70 @@ def test_make_distance_matrices_from_rust_featurizer_avoids_anddata_lookup(monke
     assert captured["feature_calls"] == 3
 
 
+def test_predict_from_rust_featurizer_builds_and_clusters_one_block_at_a_time(monkeypatch):
+    make_calls = []
+    cluster_calls = []
+
+    class _FakeFeaturizer:
+        def signature_rule_metadata(self):
+            return [(str(index), f"First{index}", None) for index in range(4)]
+
+    def fake_make_dists(
+        self,
+        block_dict,
+        _rust_featurizer,
+        **_kwargs,
+    ):
+        make_calls.append(tuple(block_dict))
+        assert len(block_dict) == 1
+        block_key, signatures = next(iter(block_dict.items()))
+        self._last_rust_featurizer_make_dists_telemetry = {
+            "total_seconds": 0.25,
+            "constraint_seconds": 0.1,
+            "feature_matrix_seconds": 0.2,
+            "nameless_feature_matrix_seconds": 0.0,
+            "model_predict_seconds": 0.3,
+            "matrix_write_seconds": 0.4,
+            "block_count": 1,
+            "pair_count": len(signatures) * (len(signatures) - 1) // 2,
+        }
+        return {block_key: np.zeros((len(signatures), len(signatures)), dtype=np.float16)}
+
+    def fake_cluster_one_block(
+        self,
+        signatures,
+        pairwise_proba,
+        effective_cluster_model_params,
+        dataset,
+        all_disallow_signature_ids,
+        *,
+        block_key,
+    ):
+        del self, pairwise_proba, effective_cluster_model_params, dataset, all_disallow_signature_ids
+        cluster_calls.append((block_key, tuple(signatures)))
+        return [0 for _signature in signatures]
+
+    monkeypatch.setattr(Clusterer, "make_distance_matrices_from_rust_featurizer", fake_make_dists)
+    monkeypatch.setattr(Clusterer, "_cluster_one_block_with_logging", fake_cluster_one_block)
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+    result, dists = clusterer.predict_from_rust_featurizer(
+        {"a": ["0", "1"], "b": ["2", "3"]},
+        _FakeFeaturizer(),
+        cluster_seeds_require={},
+    )
+
+    assert dists is None
+    assert make_calls == [("a",), ("b",)]
+    assert cluster_calls == [("a", ("0", "1")), ("b", ("2", "3"))]
+    assert result == {"a_0": ["0", "1"], "b_0": ["2", "3"]}
+    telemetry = clusterer._last_rust_featurizer_predict_telemetry
+    assert telemetry["make_dists_total_seconds"] >= 0.0
+    assert telemetry["make_dists_constraint_seconds"] == 0.2
+    assert telemetry["make_dists_block_count"] == 2
+    assert telemetry["make_dists_pair_count"] == 2
+
+
 def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, tmp_path):
     import pyarrow as pa
 
@@ -465,7 +529,8 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, 
         captured["block_dict"] = block_dict
         captured["rust_featurizer"] = rust_featurizer
         captured["total_ram_bytes"] = kwargs["total_ram_bytes"]
-        captured["cluster_seeds_disallow"] = kwargs["cluster_seeds_disallow"]
+        captured["partial_supervision"] = dict(kwargs["partial_supervision"])
+        captured["cluster_seeds_disallow"] = kwargs.get("cluster_seeds_disallow")
         return {"block_0": ["0", "1", "2"]}, None
 
     monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", fake_build_from_arrow_paths)
@@ -489,7 +554,8 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, 
     assert captured["signature_ids"] == ("0", "1", "2")
     assert captured["load_name_counts"] is True
     assert captured["total_ram_bytes"] == 123
-    assert captured["cluster_seeds_disallow"] == {("0", "2")}
+    assert captured["partial_supervision"] == {("0", "2"): LARGE_INTEGER}
+    assert captured["cluster_seeds_disallow"] is None
     telemetry = clusterer._last_arrow_predict_telemetry
     assert telemetry["signature_count"] == 3
     assert telemetry["block_count"] == 1
@@ -528,7 +594,7 @@ def test_predict_from_arrow_paths_merges_explicit_disallows(monkeypatch):
         captured["block_dict"] = block_dict
         captured["rust_featurizer"] = rust_featurizer
         captured["partial_supervision"] = dict(kwargs["partial_supervision"])
-        captured["cluster_seeds_disallow"] = set(kwargs["cluster_seeds_disallow"])
+        captured["cluster_seeds_disallow"] = kwargs.get("cluster_seeds_disallow")
         return {"block": ["0", "1", "2"]}, None
 
     monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", fake_build_from_arrow_paths)
@@ -549,7 +615,7 @@ def test_predict_from_arrow_paths_merges_explicit_disallows(monkeypatch):
         ("0", "2"): 0,
         ("1", "2"): LARGE_INTEGER,
     }
-    assert captured["cluster_seeds_disallow"] == {("0", "1"), ("1", "2")}
+    assert captured["cluster_seeds_disallow"] is None
 
 
 def test_predict_auto_routes_to_arrow_paths_when_dataset_advertises_them(tmp_path, monkeypatch):

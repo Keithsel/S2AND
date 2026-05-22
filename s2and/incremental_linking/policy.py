@@ -9,21 +9,15 @@ from typing import Any
 from s2and.incremental_linking.feature_block import normalize_cluster_seed_disallow_pairs
 
 
-def clusterer_uses_feature(clusterer: Any, feature_name: str) -> bool:
-    """Return whether either clusterer featurizer selects a named feature family."""
+def clusterer_uses_name_count_features(clusterer: Any) -> bool:
+    """Return whether the clusterer requires global name-count features."""
 
     for attr_name in ("featurizer_info", "nameless_featurizer_info"):
         featurizer_info = getattr(clusterer, attr_name, None)
         features_to_use = getattr(featurizer_info, "features_to_use", ())
-        if feature_name in features_to_use:
+        if "name_counts" in features_to_use:
             return True
     return False
-
-
-def clusterer_uses_name_count_features(clusterer: Any) -> bool:
-    """Return whether the clusterer requires global name-count features."""
-
-    return clusterer_uses_feature(clusterer, "name_counts")
 
 
 def existing_name_counts_index_path(paths: Mapping[str, Any]) -> str | None:
@@ -80,17 +74,6 @@ def dataset_cluster_seed_disallows(dataset: Any) -> set[tuple[str, str]]:
     """Return normalized disallow constraints stored on a request dataset."""
 
     return set(normalize_cluster_seed_disallow_pairs(getattr(dataset, "cluster_seeds_disallow", set()) or set()))
-
-
-def merged_cluster_seed_disallows(
-    dataset_disallows: Iterable[tuple[Any, Any]],
-    arrow_disallows: Iterable[tuple[Any, Any]],
-) -> set[tuple[str, str]]:
-    """Return the canonical union of dataset and Arrow seed disallow constraints."""
-
-    merged = set(normalize_cluster_seed_disallow_pairs(arrow_disallows))
-    merged.update(normalize_cluster_seed_disallow_pairs(dataset_disallows))
-    return merged
 
 
 def request_cluster_seed_disallow_parts(

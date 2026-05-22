@@ -18,9 +18,9 @@ inference inputs read directly by Rust.
 | Full-block prediction | `Clusterer.predict(...)` built or reused `ANDData`, then used Rust mainly for pairwise feature and clustering kernels. | `Clusterer.predict_from_arrow_paths(...)` and Arrow-routed `predict(...)` build the filtered Rust featurizer from Arrow IPC and reuse Rust blockwise feature, constraint, and clustering logic. |
 | Raw incremental requests | The raw path first materialized Python signal objects or mini compatibility objects before scoring. | `raw_block_query_candidate_plan_arrow(...)` performs retrieval and row-signal construction in Rust from Arrow IPC, then the public raw Arrow wrapper scores without full-block `ANDData`. |
 | Candidate scope | Giant blocks could lead to broad query-vs-seed-signature work before the linker saw compact candidates. | Rust retrieval builds a bounded query-to-component candidate plan before pair scoring. |
-| Pairwise feature build | Python object materialization and `ANDData` construction dominated some profiles before Rust pairwise work began. | `RustFeaturizer.from_arrow_paths(...)` constructs only the selected scoring rows from Arrow and global sidecars. |
+| Pairwise feature build | Python object materialization and `ANDData` construction dominated some profiles before Rust pairwise work began. | `RustFeaturizer.from_arrow_paths(...)` (Rust method exposed via PyO3; Python wrapper is `build_rust_featurizer_from_arrow_paths` in `s2and/feature_port.py`) constructs only the selected scoring rows from Arrow and global sidecars. |
 | Row signals | Several promoted link/abstain row signals were assembled in Python after Rust retrieval. | Rust emits the promoted native row signals needed by the raw Arrow wrapper, including name-count rarity and paper-author overlap signals. |
-| Name counts | Docs and tests previously preferred embedding four per-signature count columns in `signatures.arrow`; Rust could skip global artifacts if all selected rows had embedded counts. | Embedded Arrow name-count columns are not a supported direction. Runtime bundles should provide `s2and/data/name_counts_index/`; `name_counts.arrow` is a generation, inspection, or parity fallback. |
+| Name counts | Docs and tests previously preferred embedding four per-signature count columns in `signatures.arrow`; Rust could skip global artifacts if all selected rows had embedded counts. | Embedded Arrow name-count columns are not a supported direction. Runtime bundles should provide `s2and/data/name_counts_index/`; `name_counts.arrow` is only for generation, inspection, and parity debugging. |
 | Name alias data | Some paths could pass per-dataset Arrow `name_pairs` / `name_tuples` overrides. | Production uses the packaged filtered alias text as the default shared runtime resource. Overrides are for experiments only. |
 | SPECTER | Pickle remained common in Python paths; Rust paths handled some payloads through Python objects. | Direct Arrow uses fixed-size-list `float32` embedding tables. Safetensors is still only a future benchmark if SPECTER read time becomes material. |
 | Cluster seeds | Seed semantics were mostly Python maps on the incremental path. | Seeded/incremental Arrow uses `cluster_seeds.arrow` plus optional `cluster_seed_disallows.arrow`; unseeded full predict can omit both. |
@@ -44,7 +44,7 @@ updates, cross-process transactional writes, or richer offline inspection.
 | Path | Current Python dependency | No-`ANDData` upgrade status |
 |---|---|---|
 | `Clusterer.predict(...)` without Arrow paths | Falls back to normal `ANDData` construction and Python block orchestration. | Upgraded when callers provide complete Arrow artifacts or `dataset.arrow_paths`; otherwise keep as compatibility fallback. |
-| `Clusterer.predict_incremental(...)` without seed-bearing Arrow paths | Uses promoted Rust retrieval/scoring from `ANDData`-derived state when Arrow seed inputs are unavailable. | Upgrade by providing `signatures`, `papers`, `paper_authors`, optional `specter`, `cluster_seeds`, optional `cluster_seed_disallows`, and `s2and/data/name_counts_index/`. |
+| `Clusterer.predict_incremental(...)` without seed-bearing Arrow paths | Uses promoted Rust retrieval/scoring only when seed inputs are available from `ANDData` state; with no seed inputs it falls back to the Python incremental helper for partition coverage. | Upgrade by providing `signatures`, `papers`, `paper_authors`, optional `specter`, seed inputs via `cluster_seeds` or `dataset.cluster_seeds_require`, optional `cluster_seed_disallows`, and `s2and/data/name_counts_index/`. |
 | `RustFeaturizer.from_dataset(...)` | Traverses Python `ANDData` objects over PyO3. | Keep as incumbent/reference path; do not optimize as the production hot path. |
 | `RustFeaturizer.from_feature_block(...)` | Avoids full `ANDData`, but still traverses a Python `FeatureBlock` object and uses Python text compatibility helpers. | Useful bridge for raw payload compatibility; Arrow is the preferred no-`ANDData` runtime path. |
 | Raw payload wrappers | Build a Python `FeatureBlock` before entering Rust. | Replace with Arrow/request-table assembly when the caller can provide typed rows. |
@@ -83,4 +83,6 @@ incremental pass suppresses the original required seed memberships from
 - Raw Arrow incremental checks for candidate rows, pair rows, row signals,
   probabilities, and final link/abstain decisions.
 - Stage telemetry that separates Arrow read, name-count index load, retrieval,
-  featurizer construction, pair scoring, and final gate time.
+  featurizer construction, pair scoring, and raw row-signal construction. Final
+  logistic-gate decisions are covered by result telemetry but are not currently
+  timed as a separate stage.

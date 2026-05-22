@@ -16,14 +16,14 @@ It replaces the older artifact-divergence migration log.
 | Cluster seed disallows | `cluster_seed_disallows.arrow` Arrow IPC table | Optional for seeded/incremental Arrow prediction. Include it when pairwise seed disallow constraints are present; omitted means no disallows. |
 | SPECTER | `specter.arrow` Arrow fixed-size-list `float32` table | Preferred direct-path embedding input. Include the embedding version required by the model. |
 | Name counts | `s2and/data/name_counts_index/` sorted binary sidecar | Preferred Rust hot-path lookup artifact for models that use name-count features. |
-| Name-count Arrow table | `name_counts.arrow` long-form Arrow table | Generation, inspection, and parity fallback only. Do not cold-read it per request when the index is available. |
+| Name-count Arrow table | `name_counts.arrow` long-form Arrow table | Generation, inspection, and parity debugging only. It is not a request-time runtime fallback for `name_counts_index/`. |
 | Name aliases | Packaged filtered text file | Shared runtime default. Avoid per-dataset alias artifacts unless running an explicit experiment. |
 | Pairwise and linker models | Native LightGBM text plus JSON metadata | Current production model-bundle format. |
 | Eval clusters | Existing clusters JSON | Offline evaluation truth only; not part of production inference scoring. |
 
 ## Name Counts
 
-The preferred production layout is:
+The preferred production publication layout is:
 
 ```text
 s2and/data/name_counts_index/
@@ -38,7 +38,9 @@ s2and/data/name_counts_index/
 `manifest.json` must have `schema_version: "name_counts_index_v1"` and a
 `files` object with `first`, `last`, `first_last`, and `last_first_initial`
 entries. Each entry contains a `path`, `record_count`, and `byte_count`; new
-writers set each `path` to `generations/<generation-id>/<kind>.bin`.
+writers set each `path` to `generations/<generation-id>/<kind>.bin`. Current
+packaged artifacts may still use direct manifest-relative paths such as
+`first.bin`; readers follow the manifest and accept both shapes.
 
 Writers publish by writing every binary file into a temporary generation
 directory, renaming that directory into `generations/`, validating that every
@@ -63,10 +65,10 @@ has been removed from the runtime direction. Do not build a production request
 path that loads `name_counts.arrow` into Python dicts/lists.
 
 The legacy direct-file layout with `first.bin`, `last.bin`, `first_last.bin`,
-and `last_first_initial.bin` directly under `name_counts_index/` is no longer a
-runtime contract. Readers require `manifest.json`, and writers regenerate a
-manifest-backed generation instead of reusing direct files. Production manifests
-should use the `name_counts_index` key; do not emit the old
+and `last_first_initial.bin` directly under `name_counts_index/` is accepted
+only when referenced by `manifest.json`. New publication runs should regenerate
+a manifest-backed generation instead of reusing direct files. Production
+manifests should use the `name_counts_index` key; do not emit the old
 `name_counts_index_dir` alias.
 
 ## Deprioritized Or Rejected

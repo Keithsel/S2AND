@@ -32,6 +32,7 @@ from s2and.feature_port import (
     _get_rust_featurizer,
     build_rust_featurizer_from_arrow_paths,
     evict_rust_featurizer,
+    normalize_arrow_paths,
 )
 from s2and.featurizer import FeaturizationInfo, many_pairs_featurize, resolve_cache_policy
 from s2and.incremental_linking.feature_block import (
@@ -41,8 +42,6 @@ from s2and.incremental_linking.feature_block import (
     cluster_seed_disallows_path_from_arrow_paths,
     normalize_cluster_seed_disallow_pairs,
     read_cluster_seed_disallows_arrow,
-    write_cluster_seed_disallows_arrow,
-    write_cluster_seeds_arrow,
 )
 from s2and.incremental_linking.policy import (
     arrow_paths_have_name_counts_index as _arrow_paths_have_name_counts_index,
@@ -165,7 +164,6 @@ def _model_presplit_cache_fingerprint(clusterer: Any) -> tuple[Any, ...]:
     return (
         id(getattr(clusterer, "classifier", None)),
         id(getattr(clusterer, "nameless_classifier", None)),
-        id(cluster_model),
         _cacheable_value(cluster_model_params),
         _cacheable_value(getattr(getattr(clusterer, "featurizer_info", None), "features_to_use", ())),
         _cacheable_value(getattr(getattr(clusterer, "nameless_featurizer_info", None), "features_to_use", ())),
@@ -296,14 +294,11 @@ def _uses_reference_features(featurizer_info: FeaturizationInfo | None) -> bool:
     return featurizer_info is not None and "reference_features" in featurizer_info.features_to_use
 
 
-def _uses_feature(featurizer_info: FeaturizationInfo | None, feature_name: str) -> bool:
-    return featurizer_info is not None and feature_name in featurizer_info.features_to_use
-
-
 def _uses_embedding_features(clusterer: Any) -> bool:
-    return _uses_feature(getattr(clusterer, "featurizer_info", None), "embedding_similarity") or _uses_feature(
-        getattr(clusterer, "nameless_featurizer_info", None),
-        "embedding_similarity",
+    featurizer_info = getattr(clusterer, "featurizer_info", None)
+    nameless_featurizer_info = getattr(clusterer, "nameless_featurizer_info", None)
+    return (featurizer_info is not None and "embedding_similarity" in featurizer_info.features_to_use) or (
+        nameless_featurizer_info is not None and "embedding_similarity" in nameless_featurizer_info.features_to_use
     )
 
 
@@ -514,23 +509,6 @@ def _resolve_dataset_arrow_paths(
     return None
 
 
-def _evict_arrow_path_cache_entries(cache: OrderedDict[Any, Any], path: Path) -> None:
-    path_key = str(path)
-    for cache_key in tuple(cache):
-        if cache_key and cache_key[0] == path_key:
-            del cache[cache_key]
-
-
-def _write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, Any]) -> None:
-    write_cluster_seeds_arrow(path, cluster_seeds_require)
-    _evict_arrow_path_cache_entries(_CLUSTER_SEEDS_ARROW_CACHE, path)
-
-
-def _write_cluster_seed_disallows_arrow(path: Path, pairs: Iterable[tuple[Any, Any]]) -> None:
-    write_cluster_seed_disallows_arrow(path, pairs)
-    _evict_arrow_path_cache_entries(_CLUSTER_SEED_DISALLOWS_ARROW_CACHE, path)
-
-
 def _read_cluster_seeds_arrow(path: Path) -> dict[str, int | str]:
     cache_key = _path_cache_fingerprint(path)
     cached_items = _CLUSTER_SEEDS_ARROW_CACHE.get(cache_key)
@@ -579,6 +557,15 @@ def _cluster_seeds_require_from_arrow_paths(arrow_paths: Mapping[str, Any] | Non
     if not path.exists():
         raise FileNotFoundError(f"Arrow path cluster_seeds={path} does not exist")
     return _read_cluster_seeds_arrow(path)
+
+
+def _cluster_seeds_require_inverse(
+    cluster_seeds_require: Mapping[str, int | str],
+) -> dict[int | str, list[str]]:
+    inverse: dict[int | str, list[str]] = defaultdict(list)
+    for signature_id, cluster_num in cluster_seeds_require.items():
+        inverse[cluster_num].append(str(signature_id))
+    return inverse
 
 
 def _read_cluster_seed_disallows_arrow(path: Path) -> set[tuple[str, str]]:
@@ -1803,6 +1790,7 @@ class _RustFeaturizerPredictDataset:
 
     cluster_seeds_require: dict[str, int | str]
     cluster_seeds_disallow: set[tuple[str, str]]
+    signatures: Mapping[str, Any] = field(default_factory=dict)
     name: str = "rust_featurizer_predict"
     name_counts_last_first_initial_semantics: str | None = None
 
@@ -1810,11 +1798,41 @@ class _RustFeaturizerPredictDataset:
         self.name_counts_last_first_initial_semantics = semantics
 
 
+@dataclass(frozen=True)
+class _RustFeaturizerSignatureRuleMetadata:
+    first: str
+    author_info_orcid: str | None
+
+    @property
+    def author_info_first(self) -> str:
+        return self.first
+
+    @property
+    def author_info_first_normalized_without_apostrophe(self) -> str:
+        return self.first
+
+
 def _cluster_seeds_require_from_rust_featurizer(rust_featurizer: object) -> dict[str, int | str]:
     method = getattr(rust_featurizer, "cluster_seeds_require", None)
     if not callable(method):
         return {}
     return {str(signature_id): str(component_id) for signature_id, component_id in method()}
+
+
+def _signature_rule_metadata_from_rust_featurizer(
+    rust_featurizer: object,
+) -> dict[str, _RustFeaturizerSignatureRuleMetadata]:
+    method = getattr(rust_featurizer, "signature_rule_metadata", None)
+    if not callable(method):
+        return {}
+    metadata: dict[str, _RustFeaturizerSignatureRuleMetadata] = {}
+    for signature_id, first, orcid in method():
+        first_value = "" if first is None else str(first)
+        metadata[str(signature_id)] = _RustFeaturizerSignatureRuleMetadata(
+            first=first_value,
+            author_info_orcid=None if orcid is None else str(orcid),
+        )
+    return metadata
 
 
 def _upper_triangle_indices_for_range(
@@ -2141,6 +2159,8 @@ class Clusterer:
             the dictionary of partial supervision provided with this dataset/these blocks
         incremental_dont_use_cluster_seeds: bool
             whether to ignore dataset cluster seeds while resolving constraints in incremental flows
+        total_ram_bytes: Optional[int]
+            Optional explicit RAM budget for exact block-matrix allocation checks.
 
         Returns
         -------
@@ -2218,6 +2238,7 @@ class Clusterer:
         constraint_backend: _IncrementalConstraintBackend,
         telemetry: _ConstraintTelemetryAccumulator,
         pair_chunk_size: int | None = None,
+        start_offset: int = 0,
     ):
         block_size = len(signatures)
         if block_size <= 1:
@@ -2225,7 +2246,9 @@ class Clusterer:
         block_pair_count = int(block_size * (block_size - 1) / 2)
         pair_chunk_size = max(1, int(pair_chunk_size if pair_chunk_size is not None else self.batch_size))
         tri_i, tri_j = np.triu_indices(block_size, k=1)
-        offset = 0
+        offset = int(start_offset)
+        if offset < 0 or offset > block_pair_count:
+            raise ValueError(f"start_offset must be between 0 and {block_pair_count}, got {start_offset}")
         while offset < block_pair_count:
             end = min(offset + pair_chunk_size, block_pair_count)
             i_chunk = tri_i[offset:end]
@@ -2319,7 +2342,7 @@ class Clusterer:
                             runtime_context=runtime_context,
                             suppress_orcid=constraint_backend.suppress_orcid,
                         )
-                    except Exception as exc:
+                    except (RuntimeError, ValueError) as exc:
                         _handle_optional_rust_exception(
                             runtime_context,
                             strict_message="Rust fused block constraint evaluation failed in strict rust backend",
@@ -2398,6 +2421,7 @@ class Clusterer:
                         constraint_backend=constraint_backend,
                         telemetry=telemetry,
                         pair_chunk_size=pair_chunk_size,
+                        start_offset=offset,
                     )
             else:
                 yield from self._yield_non_fused_chunks(
@@ -2624,7 +2648,7 @@ class Clusterer:
                 batch_seconds=float(batch_seconds),
             )
 
-            if count < self.batch_size:
+            if count < effective_pair_chunk_size:
                 break
             batch_num += 1
 
@@ -2685,6 +2709,7 @@ class Clusterer:
         partial_supervision: dict[tuple[str, str], int | float] | None = None,
         disable_tqdm: bool = False,
         incremental_dont_use_cluster_seeds: bool = False,
+        total_ram_bytes: int | None = None,
     ) -> dict[str, np.ndarray]:
         """
         Creates the distance matrices for the input blocks.
@@ -2724,6 +2749,13 @@ class Clusterer:
         for block_key, signatures in block_dict.items():
             block_size = len(signatures)
             num_pairs += int(block_size * (block_size - 1) / 2)
+            _guard_predict_block_matrix_allocation(
+                block_key=block_key,
+                block_size=int(block_size),
+                uses_fastcluster=isinstance(self.cluster_model, FastCluster),
+                fastcluster_fused_dtype=fastcluster_dtype,
+                total_ram_bytes=total_ram_bytes,
+            )
             if isinstance(self.cluster_model, FastCluster):
                 # flattened pdist style
                 pairwise_proba = np.zeros(int(block_size * (block_size - 1) / 2), dtype=fastcluster_dtype)
@@ -2878,6 +2910,13 @@ class Clusterer:
         for block_key, signatures in block_dict.items():
             block_size = int(len(signatures))
             block_pair_count = int(block_size * (block_size - 1) // 2)
+            _guard_predict_block_matrix_allocation(
+                block_key=block_key,
+                block_size=block_size,
+                uses_fastcluster=isinstance(self.cluster_model, FastCluster),
+                fastcluster_fused_dtype=fastcluster_dtype,
+                total_ram_bytes=total_ram_bytes,
+            )
             if isinstance(self.cluster_model, FastCluster):
                 pairwise_proba = np.zeros(block_pair_count, dtype=fastcluster_dtype)
             else:
@@ -3043,40 +3082,84 @@ class Clusterer:
             resolved_cluster_seeds_require = {
                 str(signature_id): component_id for signature_id, component_id in cluster_seeds_require.items()
             }
+        resolved_cluster_seeds_disallow = set(normalize_cluster_seed_disallow_pairs(cluster_seeds_disallow or ()))
+        if dists is not None and resolved_cluster_seeds_disallow:
+            raise ValueError(
+                "cluster_seeds_disallow cannot be enforced when predict_from_rust_featurizer receives "
+                "externally supplied dists; apply those constraints when building dists or omit dists."
+            )
         proxy_dataset = _RustFeaturizerPredictDataset(
             cluster_seeds_require=resolved_cluster_seeds_require,
-            cluster_seeds_disallow=set(cluster_seeds_disallow or ()),
+            cluster_seeds_disallow=resolved_cluster_seeds_disallow,
+            signatures=_signature_rule_metadata_from_rust_featurizer(rust_featurizer),
         )
         built_dists = dists is None
         if built_dists:
-            make_dists_start = time.perf_counter()
-            dists = self.make_distance_matrices_from_rust_featurizer(
+            pred_clusters: defaultdict[str, list[str]] = defaultdict(list)
+            all_disallow_signature_ids: set[str] = set()
+            if self.use_default_constraints_as_supervision:
+                for sig_id_a, sig_id_b in proxy_dataset.cluster_seeds_disallow:
+                    all_disallow_signature_ids.add(sig_id_a)
+                    all_disallow_signature_ids.add(sig_id_b)
+            effective_cluster_model_params = cluster_model_params
+            if isinstance(self.cluster_model, FastCluster):
+                fastcluster_params: dict[str, Any] = dict(cluster_model_params or {})
+                fastcluster_params.setdefault("preserve_input", False)
+                effective_cluster_model_params = fastcluster_params
+            make_dists_seconds = 0.0
+            cluster_seconds = 0.0
+            make_dists_telemetry: dict[str, int | float | str] = {}
+            for block_key, signatures in block_dict.items():
+                make_block_start = time.perf_counter()
+                block_dists = self.make_distance_matrices_from_rust_featurizer(
+                    {block_key: signatures},
+                    rust_featurizer,
+                    partial_supervision=partial_supervision,
+                    incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
+                    runtime_context=runtime_context,
+                    total_ram_bytes=total_ram_bytes,
+                )
+                make_dists_seconds += time.perf_counter() - make_block_start
+                block_make_dists_telemetry = dict(getattr(self, "_last_rust_featurizer_make_dists_telemetry", {}) or {})
+                for key, value in block_make_dists_telemetry.items():
+                    if isinstance(value, int | float) and not isinstance(value, bool):
+                        make_dists_telemetry[key] = float(make_dists_telemetry.get(key, 0.0)) + float(value)
+                    elif key not in make_dists_telemetry:
+                        make_dists_telemetry[key] = value
+                cluster_block_start = time.perf_counter()
+                labels = self._cluster_one_block_with_logging(
+                    signatures,
+                    block_dists[block_key],
+                    effective_cluster_model_params,
+                    cast(Any, proxy_dataset),
+                    all_disallow_signature_ids,
+                    block_key=block_key,
+                )
+                cluster_seconds += time.perf_counter() - cluster_block_start
+                for signature, label in zip(signatures, labels, strict=True):
+                    pred_clusters[block_key + "_" + str(label)].append(signature)
+            make_dists_telemetry["total_seconds"] = float(make_dists_seconds)
+            make_dists_telemetry["block_count"] = int(len(block_dict))
+            make_dists_telemetry["pair_count"] = int(
+                sum(len(signatures) * (len(signatures) - 1) // 2 for signatures in block_dict.values())
+            )
+            out_dists = None
+        else:
+            make_dists_seconds = 0.0
+            cluster_start = time.perf_counter()
+            pred_clusters, out_dists = self.predict_helper(
                 block_dict,
-                rust_featurizer,
+                cast(Any, proxy_dataset),
+                dists=dists,
+                cluster_model_params=cluster_model_params,
                 partial_supervision=partial_supervision,
+                use_s2_clusters=False,
                 incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
                 runtime_context=runtime_context,
                 total_ram_bytes=total_ram_bytes,
             )
-            make_dists_seconds = time.perf_counter() - make_dists_start
-        else:
-            make_dists_seconds = 0.0
-        cluster_start = time.perf_counter()
-        pred_clusters, out_dists = self.predict_helper(
-            block_dict,
-            cast(Any, proxy_dataset),
-            dists=dists,
-            cluster_model_params=cluster_model_params,
-            partial_supervision=partial_supervision,
-            use_s2_clusters=False,
-            incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
-            runtime_context=runtime_context,
-            total_ram_bytes=total_ram_bytes,
-        )
-        cluster_seconds = time.perf_counter() - cluster_start
-        make_dists_telemetry = (
-            dict(getattr(self, "_last_rust_featurizer_make_dists_telemetry", {}) or {}) if built_dists else {}
-        )
+            cluster_seconds = time.perf_counter() - cluster_start
+            make_dists_telemetry = {}
         telemetry = {
             "make_dists_seconds": float(make_dists_seconds),
             "cluster_from_dists_seconds": float(cluster_seconds),
@@ -3118,13 +3201,14 @@ class Clusterer:
                 "use the ANDData predict path until Arrow reference-feature artifacts are available."
             )
 
-        _require_arrow_name_counts_index_for_clusterer(self, arrow_paths, context="Arrow prediction")
+        arrow_path_payload = normalize_arrow_paths(arrow_paths)
+        _require_arrow_name_counts_index_for_clusterer(self, arrow_path_payload, context="Arrow prediction")
         signature_ids = list(
             dict.fromkeys(str(signature_id) for signatures in block_dict.values() for signature_id in signatures)
         )
         featurizer_start = time.perf_counter()
         rust_featurizer = build_rust_featurizer_from_arrow_paths(
-            {str(key): str(value) for key, value in arrow_paths.items()},
+            arrow_path_payload,
             signature_ids=signature_ids,
             name_tuples=name_tuples,
             load_name_counts=bool(load_name_counts),
@@ -3134,7 +3218,7 @@ class Clusterer:
             num_threads=self.n_jobs,
         )
         arrow_featurizer_seconds = time.perf_counter() - featurizer_start
-        cluster_seed_disallows = _cluster_seed_disallows_from_arrow_paths(arrow_paths)
+        cluster_seed_disallows = _cluster_seed_disallows_from_arrow_paths(arrow_path_payload)
         if cluster_seeds_disallow is not None:
             cluster_seed_disallows.update(normalize_cluster_seed_disallow_pairs(cluster_seeds_disallow))
         signature_id_set = set(signature_ids)
@@ -3152,7 +3236,6 @@ class Clusterer:
             incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
             runtime_context=runtime_context,
             total_ram_bytes=total_ram_bytes,
-            cluster_seeds_disallow=cluster_seed_disallows,
         )
         predict_seconds = time.perf_counter() - predict_start
         nested_telemetry = dict(getattr(self, "_last_rust_featurizer_predict_telemetry", {}) or {})
@@ -3588,7 +3671,7 @@ class Clusterer:
                 )
                 cluster_seeds_require_original = copy.deepcopy(getattr(dataset, "cluster_seeds_require", {}) or {})
                 presplit_start = time.perf_counter()
-                split_cluster_seeds_require, _recluster_map, _cluster_seeds_require_inverse = (
+                split_cluster_seeds_require, _recluster_map, _cluster_seeds_require_inverse, _split_inverse = (
                     self._build_incremental_seed_setup(
                         dataset,
                         partial_supervision,
@@ -3651,9 +3734,10 @@ class Clusterer:
                 and len(block_dict_multiple_letter_first_names) > 0
                 and not use_s2_clusters
             ):
+                arrow_path_payload = normalize_arrow_paths(arrow_paths_for_predict)
                 _require_arrow_name_counts_index_for_clusterer(
                     self,
-                    arrow_paths_for_predict,
+                    arrow_path_payload,
                     context="Arrow prediction",
                 )
                 signature_ids = list(
@@ -3670,7 +3754,7 @@ class Clusterer:
                 )
                 stage_start = time.perf_counter()
                 rust_featurizer = build_rust_featurizer_from_arrow_paths(
-                    {str(key): str(value) for key, value in arrow_paths_for_predict.items()},
+                    arrow_path_payload,
                     signature_ids=signature_ids,
                     name_tuples=getattr(dataset, "name_tuples", "filtered"),
                     load_name_counts=_uses_name_count_features(self),
@@ -3707,9 +3791,9 @@ class Clusterer:
                 restore_rust_cluster_seeds_on_exit=restore_rust_cluster_seeds_on_exit,
                 total_ram_bytes=total_ram_bytes,
             )
-            self._last_subblocked_altered_presplit_telemetry = subblocked_altered_telemetry
             return dict(pred_clusters), None
         finally:
+            self._last_subblocked_altered_presplit_telemetry = subblocked_altered_telemetry
             if arrow_paths_for_predict_bundle is not None:
                 arrow_paths_for_predict_bundle.close()
             if cluster_seeds_require_original is not None:
@@ -4240,6 +4324,7 @@ class Clusterer:
         dict[str, int | str],
         dict[int | str, int | str],
         dict[int | str, list[str]],
+        dict[int | str, list[str]],
     ]:
         seed_setup_start = time.perf_counter()
         altered_presplit_predict_seconds = 0.0
@@ -4264,9 +4349,7 @@ class Clusterer:
             else:
                 cluster_num_value = str(cluster_num)
             cluster_seeds_require[str(signature_id)] = cluster_num_value
-        cluster_seeds_require_inverse: dict[int | str, list[str]] = defaultdict(list)
-        for signature_id, cluster_num in cluster_seeds_require.items():
-            cluster_seeds_require_inverse[cluster_num].append(signature_id)
+        cluster_seeds_require_inverse = _cluster_seeds_require_inverse(cluster_seeds_require)
 
         altered_cluster_signatures = _dataset_altered_cluster_signatures(dataset, arrow_paths)
         request_cluster_seed_disallows = _cluster_seed_disallows_for_request(dataset, arrow_paths)
@@ -4295,9 +4378,9 @@ class Clusterer:
             model_cache_fingerprint = _model_presplit_cache_fingerprint(self)
             name_tuples = getattr(dataset, "name_tuples", "filtered")
             if arrow_paths is not None:
-                presplit_arrow_paths = {
-                    str(key): str(value) for key, value in arrow_paths.items() if str(key) != "cluster_seeds"
-                }
+                presplit_arrow_paths = normalize_arrow_paths(
+                    {key: value for key, value in arrow_paths.items() if str(key) != "cluster_seeds"}
+                )
                 presplit_block_dict: dict[str, list[str]] = {}
                 block_key_to_cluster_num: dict[str, int | str] = {}
                 signature_to_cluster_num: dict[str, int | str] = {}
@@ -4463,7 +4546,8 @@ class Clusterer:
             "seed_setup_cluster_seeds_source": source_cluster_seeds_origin,
             "seed_setup_cluster_seeds_from_arrow": int(source_cluster_seeds_origin == "arrow"),
         }
-        return cluster_seeds_require, recluster_map, cluster_seeds_require_inverse
+        split_cluster_seeds_require_inverse = _cluster_seeds_require_inverse(cluster_seeds_require)
+        return cluster_seeds_require, recluster_map, cluster_seeds_require_inverse, split_cluster_seeds_require_inverse
 
     def _convert_sum_count_to_average_distances(
         self,
@@ -4495,10 +4579,16 @@ class Clusterer:
         runtime_context: RuntimeContext,
         total_ram_bytes: int | None = None,
         arrow_paths: Mapping[str, Any] | None = None,
+        split_cluster_seeds_require_inverse: Mapping[int | str, Sequence[str]] | None = None,
     ) -> dict[str, list[str]]:
         """Apply supplied seed-link decisions, then recluster abstained signatures."""
 
         logger.info("Assigning unassigned signatures for incremental clustering")
+        compatibility_cluster_seeds_require_inverse = (
+            split_cluster_seeds_require_inverse
+            if split_cluster_seeds_require_inverse is not None
+            else cluster_seeds_require_inverse
+        )
         pred_clusters = defaultdict(list)
         singleton_signatures = []
         for cluster_id, seed_signature_ids in cluster_seeds_require_inverse.items():
@@ -4510,6 +4600,7 @@ class Clusterer:
                 continue
 
             best_cluster_id = linked_signature_to_cluster[unassigned_signature]
+            compatibility_cluster_id = best_cluster_id
             # undo the altered-cluster split if applicable
             new_name_disallowed = False
             if best_cluster_id in recluster_map:
@@ -4517,7 +4608,10 @@ class Clusterer:
 
                 if prevent_new_incompatibilities:
                     # restrict reclusterings that would add a new name incompatibility to the main cluster
-                    main_cluster_signatures = cluster_seeds_require_inverse[best_cluster_id]
+                    main_cluster_signatures = compatibility_cluster_seeds_require_inverse.get(
+                        compatibility_cluster_id,
+                        cluster_seeds_require_inverse.get(best_cluster_id, []),
+                    )
                     all_firsts = set(
                         _signature_first_for_rules(dataset.signatures[signature_id])
                         for signature_id in main_cluster_signatures
@@ -4641,6 +4735,7 @@ class Clusterer:
         partial_supervision: dict[tuple[str, str], int | float],
         runtime_context: RuntimeContext,
         total_ram_bytes: int | None = None,
+        split_cluster_seeds_require_inverse: dict[int | str, list[str]] | None = None,
     ) -> dict[str, list[str]]:
         config = self._incremental_experiment_config()
         # NEW!
@@ -4728,6 +4823,7 @@ class Clusterer:
             partial_supervision,
             runtime_context,
             total_ram_bytes=total_ram_bytes,
+            split_cluster_seeds_require_inverse=split_cluster_seeds_require_inverse,
         )
 
     def _predict_incremental_promoted_linker(
@@ -4934,7 +5030,12 @@ class Clusterer:
         if partial_supervision is None:
             partial_supervision = {}
         logger.info(f"Beginning incremental clustering for {len(block_signatures)} signatures...")
-        cluster_seeds_require, recluster_map, cluster_seeds_require_inverse = self._build_incremental_seed_setup(
+        (
+            cluster_seeds_require,
+            recluster_map,
+            cluster_seeds_require_inverse,
+            split_cluster_seeds_require_inverse,
+        ) = self._build_incremental_seed_setup(
             dataset,
             partial_supervision,
             runtime_context,
@@ -4964,7 +5065,7 @@ class Clusterer:
             signature_to_cluster_to_average_dist[unassigned_signature][cluster_id] = (
                 (previous_average * previous_count + float(dist)) / (previous_count + 1),
                 previous_count + 1,
-                min(float(previous_min), float(dist)) if previous_count > 0 else float(dist),
+                min(float(previous_min), float(dist)),
             )
 
         for possibly_unassigned_signature in block_signatures:
@@ -5068,6 +5169,7 @@ class Clusterer:
             partial_supervision,
             runtime_context,
             total_ram_bytes=total_ram_bytes,
+            split_cluster_seeds_require_inverse=split_cluster_seeds_require_inverse,
         )
         phase_b_required_bytes = len(unassigned_signature_ids) * (len(unassigned_signature_ids) - 1) // 2 * 8
         return _build_incremental_result(
@@ -5075,28 +5177,4 @@ class Clusterer:
             phase_b_mode="exact",
             phase_b_budget_bytes=phase_b_required_bytes,
             phase_b_required_bytes=phase_b_required_bytes,
-        )
-
-    def predict_incremental_helper(
-        self,
-        block_signatures: list[str],
-        dataset: ANDData,
-        prevent_new_incompatibilities: bool = True,
-        partial_supervision: dict[tuple[str, str], int | float] | None = None,
-        runtime_context: RuntimeContext | None = None,
-        total_ram_bytes: int | None = None,
-    ) -> dict[str, Any]:
-        """Deprecated shim for `predict_incremental`; use the public method instead."""
-        warnings.warn(
-            "Clusterer.predict_incremental_helper is deprecated; use predict_incremental instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._predict_incremental_helper(
-            block_signatures,
-            dataset,
-            prevent_new_incompatibilities=prevent_new_incompatibilities,
-            partial_supervision=partial_supervision,
-            runtime_context=runtime_context,
-            total_ram_bytes=total_ram_bytes,
         )

@@ -249,14 +249,19 @@ def _sorted_subblock_merge_candidates(
     """Return legacy subblock merge candidates with key metadata parsed once."""
 
     small_enough_keys = [key for key, value in output.items() if len(value) < maximum_size]
-    metadata = {key: _subblock_merge_candidate_metadata(key, len(output[key])) for key in small_enough_keys}
+    metadata = {}
+    mergeable_keys = []
+    for key in small_enough_keys:
+        row = _subblock_merge_candidate_metadata(key, len(output[key]))
+        if row[3] is None:
+            continue
+        metadata[key] = row
+        mergeable_keys.append(key)
     candidates: list[tuple[tuple[str, str], float]] = []
-    for pair in combinations(small_enough_keys, 2):
+    for pair in combinations(mergeable_keys, 2):
         size_1, first_name_1, middle_name_1, name_for_splits_1, lookup_1 = metadata[pair[0]]
         size_2, first_name_2, middle_name_2, name_for_splits_2, lookup_2 = metadata[pair[1]]
         if size_1 + size_2 >= maximum_size:
-            continue
-        if name_for_splits_1 is None or name_for_splits_2 is None:
             continue
         both_multi_letter = len(first_name_1) > 1 and len(first_name_2) > 1
         both_single_letter_with_middle = (

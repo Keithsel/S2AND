@@ -43,7 +43,6 @@ X_test, y_test = test
 
 pairwise_model = PairwiseModeler(
     n_iter=25,
-    calibrate=True,
     monotone_constraints=featurization_info.lightgbm_monotone_constraints,
 )
 pairwise_model.fit(X_train, y_train, X_val, y_val)
@@ -67,6 +66,7 @@ pairwise_metrics = pairwise_eval(
     pairwise_model.classifier,
     figs_path="figs/",
     title="example",
+    shap_feature_names=featurization_info.get_feature_names(),
 )
 print(pairwise_metrics)
 ```

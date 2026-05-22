@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -41,6 +42,23 @@ def normalize_cluster_seed_disallow_pairs(
     return tuple(normalized)
 
 
+def _strict_string_tuple(value: Any, *, field_name: str, skip_none: bool = False) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str | bytes):
+        raise ValueError(f"{field_name} must be a sequence, not a scalar string")
+    if not isinstance(value, Sequence):
+        raise ValueError(f"{field_name} must be a sequence")
+    items: list[str] = []
+    for item in value:
+        if item is None:
+            if skip_none:
+                continue
+            raise ValueError(f"{field_name} cannot contain null values")
+        items.append(str(item))
+    return tuple(items)
+
+
 @dataclass(frozen=True)
 class FeatureBlockSignature:
     """One signature row in the inference contract."""
@@ -61,8 +79,16 @@ class FeatureBlockSignature:
     def __post_init__(self) -> None:
         object.__setattr__(self, "signature_id", str(self.signature_id))
         object.__setattr__(self, "paper_id", str(self.paper_id))
-        object.__setattr__(self, "author_affiliations", tuple(str(value) for value in self.author_affiliations))
-        object.__setattr__(self, "source_author_ids", tuple(str(value) for value in self.source_author_ids))
+        object.__setattr__(
+            self,
+            "author_affiliations",
+            _strict_string_tuple(self.author_affiliations, field_name="FeatureBlockSignature.author_affiliations"),
+        )
+        object.__setattr__(
+            self,
+            "source_author_ids",
+            _strict_string_tuple(self.source_author_ids, field_name="FeatureBlockSignature.source_author_ids"),
+        )
         if not self.signature_id:
             raise ValueError("FeatureBlockSignature.signature_id must be non-empty")
         if not self.paper_id:
@@ -149,9 +175,13 @@ class FeatureBlock:
     specter_paper_ids: tuple[str, ...] = ()
     specter_embeddings: np.ndarray | None = None
     schema_version: str = FEATURE_BLOCK_SCHEMA_VERSION
+    _signature_ids_cache: tuple[str, ...] = field(init=False, repr=False, compare=False)
+    _signature_order_cache: FeatureBlockSignatureOrder = field(init=False, repr=False, compare=False)
+    _signature_id_to_index_cache: Mapping[str, int] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        signature_ids = self.signature_ids
+        signature_ids = tuple(signature.signature_id for signature in self.signatures)
+        object.__setattr__(self, "_signature_ids_cache", signature_ids)
         if len(set(signature_ids)) != len(signature_ids):
             raise ValueError("FeatureBlock signatures must have unique signature_id values")
         paper_ids = tuple(paper.paper_id for paper in self.papers)
@@ -164,6 +194,16 @@ class FeatureBlock:
         if missing_queries:
             raise ValueError(f"query_signature_ids are missing from FeatureBlock signatures: {missing_queries}")
         object.__setattr__(self, "query_signature_ids", query_signature_ids)
+        signature_order = FeatureBlockSignatureOrder(
+            signature_ids=signature_ids,
+            query_signature_ids=query_signature_ids,
+        )
+        object.__setattr__(self, "_signature_order_cache", signature_order)
+        object.__setattr__(
+            self,
+            "_signature_id_to_index_cache",
+            MappingProxyType(signature_order.signature_id_to_index),
+        )
 
         require_pair_list: list[tuple[str, str]] = []
         seen_require_signature_ids: set[str] = set()
@@ -212,22 +252,19 @@ class FeatureBlock:
     def signature_ids(self) -> tuple[str, ...]:
         """Return signature ids in this block's deterministic order."""
 
-        return tuple(signature.signature_id for signature in self.signatures)
+        return self._signature_ids_cache
 
     @property
     def signature_order(self) -> FeatureBlockSignatureOrder:
         """Return the signature order used by numeric linker arrays."""
 
-        return FeatureBlockSignatureOrder(
-            signature_ids=self.signature_ids,
-            query_signature_ids=self.query_signature_ids,
-        )
+        return self._signature_order_cache
 
     @property
-    def signature_id_to_index(self) -> dict[str, int]:
+    def signature_id_to_index(self) -> Mapping[str, int]:
         """Return a signature-id to row-index map."""
 
-        return self.signature_order.signature_id_to_index
+        return self._signature_id_to_index_cache
 
     @property
     def seed_component_members(self) -> dict[str, tuple[str, ...]]:
@@ -340,6 +377,8 @@ def feature_block_signature_order_from_raw_candidate_plan(plan: Mapping[str, Any
             continue
         seen.add(signature_id)
         ordered_ids.append(signature_id)
+    if not ordered_ids:
+        raise ValueError("raw candidate plan must select at least one signature")
     return FeatureBlockSignatureOrder(signature_ids=tuple(ordered_ids), query_signature_ids=query_signature_ids)
 
 
@@ -377,8 +416,9 @@ def feature_block_for_signature_order(
             paper_id: np.asarray(feature_block.specter_embeddings[index], dtype=np.float32)
             for index, paper_id in enumerate(feature_block.specter_paper_ids)
         }
-        for paper_id in feature_block.specter_paper_ids:
-            if paper_id in paper_id_set and paper_id in specter_by_paper_id:
+        for paper in papers:
+            paper_id = paper.paper_id
+            if paper_id in specter_by_paper_id:
                 specter_paper_ids.append(paper_id)
                 specter_rows.append(specter_by_paper_id[paper_id])
     return FeatureBlock(

@@ -22,7 +22,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
@@ -41,9 +41,14 @@ const DROPPED_AFFIXES: [&str; 48] = [
 
 const FNV_OFFSET: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
-const ARROW_BATCH_LOOKUP_INDEX_MAGIC: &[u8; 8] = b"S2ABI001";
-const ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN: usize = 32;
+const ARROW_BATCH_LOOKUP_INDEX_MAGIC_V1: &[u8; 8] = b"S2ABI001";
+const ARROW_BATCH_LOOKUP_INDEX_MAGIC: &[u8; 8] = b"S2ABI002";
+const ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN_V1: usize = 32;
+const ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN: usize = 48;
 const ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN: usize = 16;
+const ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN: &[u8] =
+    b"s2and-arrow-batch-lookup-index-source-v2\0";
+const ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES: u64 = 65_536;
 
 fn is_dropped_affix(token: &str) -> bool {
     DROPPED_AFFIXES.contains(&token)
@@ -229,6 +234,52 @@ impl RawNameCountIndexFile {
                 "name-count index file {} has invalid record/blob offsets",
                 path.display()
             )));
+        }
+        if record_count > 1 {
+            let read_pair = |index: usize| {
+                let offset = NAME_COUNTS_INDEX_HEADER_LEN + index * NAME_COUNTS_INDEX_RECORD_LEN;
+                (
+                    read_u64_le_unchecked(&mmap, offset),
+                    read_u64_le_unchecked(&mmap, offset + 8),
+                )
+            };
+            let max_checks = 4096usize;
+            let stride = std::cmp::max(1, record_count / max_checks);
+            let mut previous_index = 0usize;
+            let mut previous_pair = read_pair(0);
+            let mut index = 1usize;
+            while index < record_count {
+                let pair = read_pair(index);
+                if pair < previous_pair {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "name-count index file {} is not sorted for kind {}: record {} {:?} follows record {} {:?}",
+                        path.display(),
+                        kind.key(),
+                        index,
+                        pair,
+                        previous_index,
+                        previous_pair
+                    )));
+                }
+                previous_index = index;
+                previous_pair = pair;
+                index = index.saturating_add(stride);
+            }
+            let last_index = record_count - 1;
+            if previous_index != last_index {
+                let pair = read_pair(last_index);
+                if pair < previous_pair {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "name-count index file {} is not sorted for kind {}: record {} {:?} follows record {} {:?}",
+                        path.display(),
+                        kind.key(),
+                        last_index,
+                        pair,
+                        previous_index,
+                        previous_pair
+                    )));
+                }
+            }
         }
         Ok(Self {
             mmap,
@@ -644,7 +695,6 @@ struct RetrievalExperimentalConfig {
 #[pyclass]
 struct RustHybridCentroidRetriever {
     summaries: Vec<RetrievalSummaryData>,
-    max_block_component_size: usize,
     component_index_by_key: HashMap<String, usize>,
     coauthor_cluster_df: HashMap<u64, usize>,
     non_mega_coauthor_cluster_df: HashMap<u64, usize>,
@@ -705,6 +755,55 @@ struct PairAggregateBuffers {
     sums: Vec<f64>,
     mins: Vec<f64>,
     maxs: Vec<f64>,
+}
+
+fn checked_retrieved_row_index(base_row_index: u32, local_row_index: usize) -> PyResult<u32> {
+    let local_row_index = u32::try_from(local_row_index).map_err(|_| {
+        pyo3::exceptions::PyOverflowError::new_err("retrieved candidate row count exceeds u32")
+    })?;
+    base_row_index.checked_add(local_row_index).ok_or_else(|| {
+        pyo3::exceptions::PyOverflowError::new_err("retrieved candidate row count exceeds u32")
+    })
+}
+
+struct LinkerPairDistanceAccumulator {
+    counts: Vec<u32>,
+    sums: Vec<f64>,
+    mins: Vec<f64>,
+    top_distances: Vec<f64>,
+    hard_disallow_pair_count: u64,
+}
+
+impl LinkerPairDistanceAccumulator {
+    fn new(row_count: usize) -> Self {
+        Self {
+            counts: vec![0_u32; row_count],
+            sums: vec![0.0_f64; row_count],
+            mins: vec![f64::INFINITY; row_count],
+            top_distances: vec![f64::INFINITY; row_count * 5],
+            hard_disallow_pair_count: 0,
+        }
+    }
+
+    fn merge_from(&mut self, other: Self) {
+        for row in 0..self.counts.len() {
+            self.counts[row] = self.counts[row].saturating_add(other.counts[row]);
+            self.sums[row] += other.sums[row];
+            if other.mins[row] < self.mins[row] {
+                self.mins[row] = other.mins[row];
+            }
+            let top_start = row * 5;
+            for value in other.top_distances[top_start..top_start + 5].iter() {
+                RustFeaturizer::update_top5_distance(
+                    &mut self.top_distances[top_start..top_start + 5],
+                    *value,
+                );
+            }
+        }
+        self.hard_disallow_pair_count = self
+            .hard_disallow_pair_count
+            .saturating_add(other.hard_disallow_pair_count);
+    }
 }
 
 impl RustHybridCentroidRetriever {
@@ -803,7 +902,6 @@ impl RustHybridCentroidRetriever {
         query_data: &RetrievalQueryData,
         candidate_indices: &[usize],
         top_k: usize,
-        max_block_component_size: usize,
         override_index: Option<usize>,
         override_summary: Option<&RetrievalSummaryData>,
     ) -> Vec<(usize, f32)> {
@@ -819,7 +917,6 @@ impl RustHybridCentroidRetriever {
                     score_experimental_hybrid_centroid_query(
                         query_data,
                         summary,
-                        max_block_component_size,
                         weights,
                         config,
                         &self.coauthor_cluster_df,
@@ -976,7 +1073,6 @@ impl RustHybridCentroidRetriever {
             current_query,
             &selection.indices,
             effective_top_k,
-            self.max_block_component_size,
             None,
             None,
         );
@@ -1098,7 +1194,6 @@ impl RustHybridCentroidRetriever {
         query_data: &RetrievalQueryData,
         candidate_indices: &[usize],
         top_k: usize,
-        max_block_component_size: usize,
         num_threads: Option<usize>,
         override_index: Option<usize>,
         override_summary: Option<&RetrievalSummaryData>,
@@ -1124,7 +1219,6 @@ impl RustHybridCentroidRetriever {
                             score_experimental_hybrid_centroid_query(
                                 query_data,
                                 summary,
-                                max_block_component_size,
                                 weights,
                                 config,
                                 &self.coauthor_cluster_df,
@@ -1153,7 +1247,6 @@ impl RustHybridCentroidRetriever {
         query_data: &RetrievalQueryData,
         candidate_indices: &[usize],
         top_k: usize,
-        max_block_component_size: usize,
         num_threads: Option<usize>,
         override_index: Option<usize>,
         override_summary: Option<&RetrievalSummaryData>,
@@ -1178,7 +1271,6 @@ impl RustHybridCentroidRetriever {
                             score_hybrid_centroid_query(
                                 query_data,
                                 summary,
-                                max_block_component_size,
                                 weights,
                             ),
                         )
@@ -2051,12 +2143,28 @@ fn term_set_from_normalized_text(text: &str) -> HashSet<String> {
 }
 
 fn normalize_orcid_owned(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+    let mut compact = String::with_capacity(16);
+    for ch in value.trim().chars() {
+        if ch.is_ascii_digit() {
+            compact.push(ch);
+        } else if ch == 'X' || ch == 'x' {
+            compact.push('X');
+        }
     }
+    let bytes = compact.as_bytes();
+    if bytes.len() != 16
+        || bytes[..15].iter().any(|byte| !byte.is_ascii_digit())
+        || !(bytes[15].is_ascii_digit() || bytes[15] == b'X')
+    {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}-{}",
+        &compact[0..4],
+        &compact[4..8],
+        &compact[8..12],
+        &compact[12..16]
+    ))
 }
 
 #[derive(Clone)]
@@ -2137,6 +2245,54 @@ fn arrow_error_to_py(context: &str, path: &str, err: impl std::fmt::Display) -> 
     pyo3::exceptions::PyValueError::new_err(format!("{context} '{}': {err}", path))
 }
 
+fn source_file_sample_fingerprint(path: &str, source_size: u64) -> PyResult<u64> {
+    let mut file = File::open(path).map_err(|err| {
+        io_error_to_py(
+            "failed to open Arrow IPC file for fingerprinting",
+            path,
+            err,
+        )
+    })?;
+    let mut digest = fnv64(ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN);
+    digest = fnv64_update(digest, &source_size.to_le_bytes());
+    let first_len =
+        std::cmp::min(ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES, source_size) as usize;
+    let mut buffer = vec![0u8; first_len];
+    if first_len > 0 {
+        file.read_exact(&mut buffer).map_err(|err| {
+            io_error_to_py(
+                "failed to read Arrow IPC file fingerprint prefix",
+                path,
+                err,
+            )
+        })?;
+        digest = fnv64_update(digest, &buffer);
+    }
+    if source_size > ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES {
+        let suffix_start = std::cmp::max(
+            ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES,
+            source_size - ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES,
+        );
+        file.seek(SeekFrom::Start(suffix_start)).map_err(|err| {
+            io_error_to_py(
+                "failed to seek Arrow IPC file fingerprint suffix",
+                path,
+                err,
+            )
+        })?;
+        let mut suffix = vec![0u8; (source_size - suffix_start) as usize];
+        file.read_exact(&mut suffix).map_err(|err| {
+            io_error_to_py(
+                "failed to read Arrow IPC file fingerprint suffix",
+                path,
+                err,
+            )
+        })?;
+        digest = fnv64_update(digest, &suffix);
+    }
+    Ok(digest)
+}
+
 fn read_arrow_batches(path: &str) -> PyResult<Vec<RecordBatch>> {
     let file = File::open(path)
         .map_err(|err| io_error_to_py("failed to open Arrow IPC file", path, err))?;
@@ -2154,10 +2310,11 @@ fn read_arrow_batches(path: &str) -> PyResult<Vec<RecordBatch>> {
 struct ArrowBatchLookupIndex {
     mmap: Mmap,
     record_count: usize,
+    header_len: usize,
 }
 
 impl ArrowBatchLookupIndex {
-    fn open(path: &str, source_arrow_path: &str) -> PyResult<Self> {
+    fn open(path: &str, source_arrow_path: &str, key_column: &str) -> PyResult<Self> {
         let file = File::open(path)
             .map_err(|err| io_error_to_py("failed to open Arrow batch lookup index", path, err))?;
         let mmap = unsafe {
@@ -2165,14 +2322,25 @@ impl ArrowBatchLookupIndex {
                 io_error_to_py("failed to memory-map Arrow batch lookup index", path, err)
             })?
         };
-        if mmap.len() < ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN {
+        if mmap.len() < ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN_V1 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Arrow batch lookup index '{path}' is shorter than its header"
             )));
         }
-        if &mmap[0..8] != ARROW_BATCH_LOOKUP_INDEX_MAGIC {
+        let magic = &mmap[0..8];
+        if magic != ARROW_BATCH_LOOKUP_INDEX_MAGIC && magic != ARROW_BATCH_LOOKUP_INDEX_MAGIC_V1 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Arrow batch lookup index '{path}' has invalid magic bytes"
+            )));
+        }
+        let header_len = if magic == ARROW_BATCH_LOOKUP_INDEX_MAGIC {
+            ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN
+        } else {
+            ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN_V1
+        };
+        if mmap.len() < header_len {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Arrow batch lookup index '{path}' is shorter than its header"
             )));
         }
         let source_metadata = fs::metadata(source_arrow_path).map_err(|err| {
@@ -2189,6 +2357,11 @@ impl ArrowBatchLookupIndex {
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos() as u64)
             .unwrap_or(0);
+        let record_count = u64::from_le_bytes(
+            mmap[8..16]
+                .try_into()
+                .expect("slice length is checked by fixed header length"),
+        ) as usize;
         let indexed_source_size = u64::from_le_bytes(
             mmap[16..24]
                 .try_into()
@@ -2199,19 +2372,45 @@ impl ArrowBatchLookupIndex {
                 .try_into()
                 .expect("indexed source-mtime slice has fixed length"),
         );
-        if indexed_source_size != source_size || indexed_source_mtime_ns != source_mtime_ns {
+        if magic == ARROW_BATCH_LOOKUP_INDEX_MAGIC {
+            let indexed_key_column_hash = u64::from_le_bytes(
+                mmap[32..40]
+                    .try_into()
+                    .expect("indexed key-column hash slice has fixed length"),
+            );
+            let expected_key_column_hash = fnv64(key_column.as_bytes());
+            if indexed_key_column_hash != expected_key_column_hash {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Arrow batch lookup index '{path}' was built for a different key column: \
+                     indexed hash={indexed_key_column_hash} expected hash={expected_key_column_hash} \
+                     key_column='{key_column}'"
+                )));
+            }
+            let indexed_source_fingerprint = u64::from_le_bytes(
+                mmap[40..48]
+                    .try_into()
+                    .expect("indexed source fingerprint slice has fixed length"),
+            );
+            let source_fingerprint =
+                source_file_sample_fingerprint(source_arrow_path, source_size)?;
+            if indexed_source_size != source_size
+                || indexed_source_mtime_ns != source_mtime_ns
+                || indexed_source_fingerprint != source_fingerprint
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Arrow batch lookup index '{path}' is stale for '{source_arrow_path}': \
+                     indexed size/mtime/fingerprint=({indexed_source_size}, {indexed_source_mtime_ns}, {indexed_source_fingerprint}) \
+                     current size/mtime/fingerprint=({source_size}, {source_mtime_ns}, {source_fingerprint})"
+                )));
+            }
+        } else if indexed_source_size != source_size || indexed_source_mtime_ns != source_mtime_ns {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Arrow batch lookup index '{path}' is stale for '{source_arrow_path}': \
                  indexed size/mtime=({indexed_source_size}, {indexed_source_mtime_ns}) \
                  current size/mtime=({source_size}, {source_mtime_ns})"
             )));
         }
-        let record_count = u64::from_le_bytes(
-            mmap[8..16]
-                .try_into()
-                .expect("slice length is checked by fixed header length"),
-        ) as usize;
-        let expected_len = ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN
+        let expected_len = header_len
             .checked_add(
                 record_count
                     .checked_mul(ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN)
@@ -2232,15 +2431,19 @@ impl ArrowBatchLookupIndex {
                 mmap.len()
             )));
         }
-        Ok(Self { mmap, record_count })
+        Ok(Self {
+            mmap,
+            record_count,
+            header_len,
+        })
     }
 
-    fn record_offset(index: usize) -> usize {
-        ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN + index * ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN
+    fn record_offset(&self, index: usize) -> usize {
+        self.header_len + index * ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN
     }
 
     fn record_hash(&self, index: usize) -> u64 {
-        let offset = Self::record_offset(index);
+        let offset = self.record_offset(index);
         u64::from_le_bytes(
             self.mmap[offset..offset + 8]
                 .try_into()
@@ -2249,7 +2452,7 @@ impl ArrowBatchLookupIndex {
     }
 
     fn record_batch_index(&self, index: usize) -> u32 {
-        let offset = Self::record_offset(index) + 8;
+        let offset = self.record_offset(index) + 8;
         u32::from_le_bytes(
             self.mmap[offset..offset + 4]
                 .try_into()
@@ -2294,12 +2497,13 @@ struct IndexedArrowReadStats {
 fn read_indexed_arrow_batches(
     path: &str,
     index_path: &str,
+    key_column: &str,
     keep_ids: &HashSet<String>,
 ) -> PyResult<(Vec<RecordBatch>, IndexedArrowReadStats)> {
     if keep_ids.is_empty() {
         return Ok((Vec::new(), IndexedArrowReadStats::default()));
     }
-    let index = ArrowBatchLookupIndex::open(index_path, path)?;
+    let index = ArrowBatchLookupIndex::open(index_path, path, key_column)?;
     let mut batch_indices: Vec<usize> =
         index.batch_indices_for_keys(keep_ids).into_iter().collect();
     batch_indices.sort_unstable();
@@ -2762,7 +2966,8 @@ fn read_raw_arrow_signatures_indexed(
     index_path: &str,
     keep_signature_ids: &HashSet<String>,
 ) -> PyResult<(HashMap<String, RawArrowSignature>, IndexedArrowReadStats)> {
-    let (batches, stats) = read_indexed_arrow_batches(path, index_path, keep_signature_ids)?;
+    let (batches, stats) =
+        read_indexed_arrow_batches(path, index_path, "signature_id", keep_signature_ids)?;
     Ok((
         read_raw_arrow_signatures_from_batches(path, batches, Some(keep_signature_ids))?,
         stats,
@@ -2863,7 +3068,8 @@ fn read_raw_arrow_papers_indexed(
     index_path: &str,
     keep_paper_ids: &HashSet<String>,
 ) -> PyResult<(HashMap<String, RawArrowPaper>, IndexedArrowReadStats)> {
-    let (batches, stats) = read_indexed_arrow_batches(path, index_path, keep_paper_ids)?;
+    let (batches, stats) =
+        read_indexed_arrow_batches(path, index_path, "paper_id", keep_paper_ids)?;
     Ok((
         read_raw_arrow_papers_from_batches(path, batches, Some(keep_paper_ids))?,
         stats,
@@ -2952,7 +3158,8 @@ fn read_raw_arrow_paper_authors_indexed(
     index_path: &str,
     keep_paper_ids: &HashSet<String>,
 ) -> PyResult<(HashMap<String, Vec<(i64, String)>>, IndexedArrowReadStats)> {
-    let (batches, stats) = read_indexed_arrow_batches(path, index_path, keep_paper_ids)?;
+    let (batches, stats) =
+        read_indexed_arrow_batches(path, index_path, "paper_id", keep_paper_ids)?;
     Ok((
         read_raw_arrow_paper_authors_from_batches(path, batches, Some(keep_paper_ids))?,
         stats,
@@ -2965,7 +3172,6 @@ fn read_raw_arrow_paper_authors_from_batches(
     keep_paper_ids: Option<&HashSet<String>>,
 ) -> PyResult<HashMap<String, Vec<(i64, String)>>> {
     let mut out: HashMap<String, Vec<(i64, String)>> = HashMap::new();
-    let mut seen_paper_author_positions = HashSet::<(String, i64)>::new();
     for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
         let paper_id_values = ArrowStringColumn::from_array(paper_id_col.as_ref(), "paper_id")?;
@@ -2983,13 +3189,6 @@ fn read_raw_arrow_paper_authors_from_batches(
             }
             let paper_id = paper_id_value.into_owned();
             let position = arrow_required_i64(position_col.as_ref(), row, "position")?;
-            let paper_author_key = (paper_id.clone(), position);
-            if !seen_paper_author_positions.insert(paper_author_key.clone()) {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "paper_authors Arrow contains duplicate (paper_id, position): {:?}",
-                    paper_author_key
-                )));
-            }
             let author_name = arrow_optional_string(author_name_col.as_ref(), row, "author_name")?
                 .unwrap_or_default();
             out.entry(paper_id)
@@ -2997,8 +3196,16 @@ fn read_raw_arrow_paper_authors_from_batches(
                 .push((position, author_name));
         }
     }
-    for authors in out.values_mut() {
+    for (paper_id, authors) in out.iter_mut() {
         authors.sort_by_key(|(position, _name)| *position);
+        for window in authors.windows(2) {
+            if window[0].0 == window[1].0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "paper_authors Arrow contains duplicate (paper_id, position): ({:?}, {})",
+                    paper_id, window[0].0
+                )));
+            }
+        }
     }
     Ok(out)
 }
@@ -3084,7 +3291,8 @@ fn read_raw_arrow_specter_indexed(
     index_path: &str,
     keep_paper_ids: &HashSet<String>,
 ) -> PyResult<(HashMap<String, Vec<f32>>, IndexedArrowReadStats)> {
-    let (batches, stats) = read_indexed_arrow_batches(path, index_path, keep_paper_ids)?;
+    let (batches, stats) =
+        read_indexed_arrow_batches(path, index_path, "paper_id", keep_paper_ids)?;
     Ok((
         read_raw_arrow_specter_from_batches(path, batches, Some(keep_paper_ids))?,
         stats,
@@ -3249,6 +3457,63 @@ fn extract_name_counts_index_path(paths: &Bound<'_, PyAny>) -> PyResult<Option<S
     extract_path_mapping_string(paths, "name_counts_index", false)
 }
 
+struct SignatureTextFields<'a> {
+    author_first: &'a str,
+    author_middle: &'a str,
+    author_last: &'a str,
+    author_suffix: &'a str,
+    affiliations: &'a [String],
+}
+
+struct PaperTextFields<'a> {
+    title: &'a str,
+    venue: &'a str,
+    journal_name: &'a str,
+}
+
+fn ensure_unidecode_for_signature_texts<'a>(
+    unidecode_fn: &Bound<'_, PyAny>,
+    signatures: impl IntoIterator<Item = SignatureTextFields<'a>>,
+    unidecode_char_map: &mut HashMap<char, String>,
+) -> PyResult<()> {
+    for signature in signatures {
+        ensure_unidecode_for_text(unidecode_fn, signature.author_first, unidecode_char_map)?;
+        ensure_unidecode_for_text(unidecode_fn, signature.author_middle, unidecode_char_map)?;
+        ensure_unidecode_for_text(unidecode_fn, signature.author_last, unidecode_char_map)?;
+        ensure_unidecode_for_text(unidecode_fn, signature.author_suffix, unidecode_char_map)?;
+        for affiliation in signature.affiliations.iter() {
+            ensure_unidecode_for_text(unidecode_fn, affiliation, unidecode_char_map)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_unidecode_for_paper_texts<'a>(
+    unidecode_fn: &Bound<'_, PyAny>,
+    papers: impl IntoIterator<Item = PaperTextFields<'a>>,
+    unidecode_char_map: &mut HashMap<char, String>,
+) -> PyResult<()> {
+    for paper in papers {
+        ensure_unidecode_for_text(unidecode_fn, paper.title, unidecode_char_map)?;
+        ensure_unidecode_for_text(unidecode_fn, paper.venue, unidecode_char_map)?;
+        ensure_unidecode_for_text(unidecode_fn, paper.journal_name, unidecode_char_map)?;
+    }
+    Ok(())
+}
+
+fn ensure_unidecode_for_paper_author_texts<'a>(
+    unidecode_fn: &Bound<'_, PyAny>,
+    paper_authors: impl IntoIterator<Item = &'a [(i64, String)]>,
+    unidecode_char_map: &mut HashMap<char, String>,
+) -> PyResult<()> {
+    for authors in paper_authors {
+        for (_position, author_name) in authors.iter() {
+            ensure_unidecode_for_text(unidecode_fn, author_name, unidecode_char_map)?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_unidecode_for_raw_arrow_inputs(
     unidecode_fn: &Bound<'_, PyAny>,
     signatures: &HashMap<String, RawArrowSignature>,
@@ -3256,25 +3521,31 @@ fn ensure_unidecode_for_raw_arrow_inputs(
     paper_authors: &HashMap<String, Vec<(i64, String)>>,
     unidecode_char_map: &mut HashMap<char, String>,
 ) -> PyResult<()> {
-    for signature in signatures.values() {
-        ensure_unidecode_for_text(unidecode_fn, &signature.author_first, unidecode_char_map)?;
-        ensure_unidecode_for_text(unidecode_fn, &signature.author_middle, unidecode_char_map)?;
-        ensure_unidecode_for_text(unidecode_fn, &signature.author_last, unidecode_char_map)?;
-        ensure_unidecode_for_text(unidecode_fn, &signature.author_suffix, unidecode_char_map)?;
-        for affiliation in signature.affiliations.iter() {
-            ensure_unidecode_for_text(unidecode_fn, affiliation, unidecode_char_map)?;
-        }
-    }
-    for paper in papers.values() {
-        ensure_unidecode_for_text(unidecode_fn, &paper.title, unidecode_char_map)?;
-        ensure_unidecode_for_text(unidecode_fn, &paper.venue, unidecode_char_map)?;
-        ensure_unidecode_for_text(unidecode_fn, &paper.journal_name, unidecode_char_map)?;
-    }
-    for authors in paper_authors.values() {
-        for (_position, author_name) in authors.iter() {
-            ensure_unidecode_for_text(unidecode_fn, author_name, unidecode_char_map)?;
-        }
-    }
+    ensure_unidecode_for_signature_texts(
+        unidecode_fn,
+        signatures.values().map(|signature| SignatureTextFields {
+            author_first: &signature.author_first,
+            author_middle: &signature.author_middle,
+            author_last: &signature.author_last,
+            author_suffix: &signature.author_suffix,
+            affiliations: &signature.affiliations,
+        }),
+        unidecode_char_map,
+    )?;
+    ensure_unidecode_for_paper_texts(
+        unidecode_fn,
+        papers.values().map(|paper| PaperTextFields {
+            title: &paper.title,
+            venue: &paper.venue,
+            journal_name: &paper.journal_name,
+        }),
+        unidecode_char_map,
+    )?;
+    ensure_unidecode_for_paper_author_texts(
+        unidecode_fn,
+        paper_authors.values().map(Vec::as_slice),
+        unidecode_char_map,
+    )?;
     Ok(())
 }
 
@@ -3313,11 +3584,12 @@ fn build_raw_arrow_feature(
 
     let mut coauthor_blocks = HashSet::new();
     let mut paper_author_count = 0usize;
+    let signature_position = signature.position.unwrap_or(0);
     if let Some(authors) = paper_authors {
         paper_author_count = authors.len();
         for (position, author_name) in authors.iter() {
             let normalized = normalize_text_compat_from_map(author_name, false, unidecode_char_map);
-            if Some(*position) == signature.position {
+            if *position == signature_position {
                 continue;
             }
             if normalized.is_empty() {
@@ -3524,12 +3796,12 @@ fn euclidean_distance_f32(left: &[f32], right: &[f32]) -> f64 {
         .sqrt()
 }
 
-fn select_raw_arrow_exemplars(vectors: &[Vec<f32>], max_exemplars: usize) -> Vec<Vec<f32>> {
+fn select_raw_arrow_exemplars(vectors: &[&[f32]], max_exemplars: usize) -> Vec<Vec<f32>> {
     if max_exemplars == 0 || vectors.is_empty() {
         return Vec::new();
     }
     if vectors.len() <= max_exemplars {
-        return vectors.to_vec();
+        return vectors.iter().map(|vector| vector.to_vec()).collect();
     }
     let dim = vectors[0].len();
     let mut centroid = vec![0.0f32; dim];
@@ -3558,7 +3830,7 @@ fn select_raw_arrow_exemplars(vectors: &[Vec<f32>], max_exemplars: usize) -> Vec
     let mut min_distances = vec![f64::INFINITY; vectors.len()];
     for (idx, vector) in vectors.iter().enumerate() {
         if idx != best_index {
-            min_distances[idx] = euclidean_distance_f32(vector, &vectors[best_index]);
+            min_distances[idx] = euclidean_distance_f32(vector, vectors[best_index]);
         }
     }
 
@@ -3583,7 +3855,7 @@ fn select_raw_arrow_exemplars(vectors: &[Vec<f32>], max_exemplars: usize) -> Vec
             if selected_flags[candidate_idx] {
                 continue;
             }
-            let distance = euclidean_distance_f32(vector, &vectors[idx]);
+            let distance = euclidean_distance_f32(vector, vectors[idx]);
             if distance < min_distances[candidate_idx] {
                 min_distances[candidate_idx] = distance;
             }
@@ -3591,7 +3863,7 @@ fn select_raw_arrow_exemplars(vectors: &[Vec<f32>], max_exemplars: usize) -> Vec
     }
     selected
         .into_iter()
-        .map(|idx| vectors[idx].clone())
+        .map(|idx| vectors[idx].to_vec())
         .collect()
 }
 
@@ -3610,7 +3882,7 @@ fn build_raw_arrow_summary(
     let mut title_counts: HashMap<u64, usize> = HashMap::new();
     let mut years = Vec::<i64>::new();
     let mut orcid_hashes = Vec::<u64>::new();
-    let mut specter_vectors = Vec::<Vec<f32>>::new();
+    let mut specter_vectors = Vec::<&[f32]>::new();
     let mut max_paper_author_count = 0usize;
 
     for signature_id in signature_ids {
@@ -3650,7 +3922,7 @@ fn build_raw_arrow_summary(
             orcid_hashes.push(orcid_hash);
         }
         if let Some(specter) = feature.query.specter.as_ref() {
-            specter_vectors.push((**specter).clone());
+            specter_vectors.push(specter.as_slice());
         }
         max_paper_author_count = max_paper_author_count.max(feature.paper_author_count);
     }
@@ -4240,13 +4512,8 @@ fn extract_string_hashes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
     Ok(hashes)
 }
 
-fn normalize_orcid_str(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+fn normalize_orcid_str(value: &str) -> Option<String> {
+    normalize_orcid_owned(value)
 }
 
 fn extract_orcid_hashes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
@@ -4805,7 +5072,6 @@ fn specter_exemplar_score(query: &RetrievalQueryData, summary: &RetrievalSummary
 fn score_hybrid_centroid_query(
     query: &RetrievalQueryData,
     summary: &RetrievalSummaryData,
-    _max_block_component_size: usize,
     weights: RetrievalHybridWeights,
 ) -> f32 {
     let coauthor_score = counter_query_overlap_hashes(
@@ -4894,7 +5160,6 @@ fn should_rescue_candidate_mega_coauthors(
 fn score_experimental_hybrid_centroid_query(
     query: &RetrievalQueryData,
     summary: &RetrievalSummaryData,
-    _max_block_component_size: usize,
     weights: RetrievalHybridWeights,
     config: RetrievalExperimentalConfig,
     coauthor_cluster_df: &HashMap<u64, usize>,
@@ -7800,7 +8065,8 @@ impl RustFeaturizer {
                 ids
             }
         };
-        signature_ids.dedup();
+        let mut seen_signature_ids = HashSet::<String>::with_capacity(signature_ids.len());
+        signature_ids.retain(|signature_id| seen_signature_ids.insert(signature_id.clone()));
         let missing_signature_ids = signature_ids
             .iter()
             .filter(|signature_id| !raw_signatures.contains_key(*signature_id))
@@ -7930,6 +8196,15 @@ impl RustFeaturizer {
         }
 
         let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
+        if preprocess {
+            ensure_unidecode_for_raw_arrow_inputs(
+                &unidecode,
+                &raw_signatures,
+                &raw_papers,
+                &raw_authors_by_paper,
+                &mut unidecode_char_map,
+            )?;
+        }
         let mut defaulted_signature_author_position_count = 0usize;
         let mut signature_inputs = Vec::<ArrowSignatureInput>::with_capacity(signature_ids.len());
         for signature_id in signature_ids.iter() {
@@ -7938,31 +8213,6 @@ impl RustFeaturizer {
                     "Arrow signatures input is missing signature_id '{signature_id}'"
                 ))
             })?;
-            if preprocess {
-                ensure_unidecode_for_text(
-                    &unidecode,
-                    &raw_signature.author_first,
-                    &mut unidecode_char_map,
-                )?;
-                ensure_unidecode_for_text(
-                    &unidecode,
-                    &raw_signature.author_middle,
-                    &mut unidecode_char_map,
-                )?;
-                ensure_unidecode_for_text(
-                    &unidecode,
-                    &raw_signature.author_last,
-                    &mut unidecode_char_map,
-                )?;
-                ensure_unidecode_for_text(
-                    &unidecode,
-                    &raw_signature.author_suffix,
-                    &mut unidecode_char_map,
-                )?;
-                for affiliation in raw_signature.affiliations.iter() {
-                    ensure_unidecode_for_text(&unidecode, affiliation, &mut unidecode_char_map)?;
-                }
-            }
             let position = raw_signature.position.unwrap_or_else(|| {
                 defaulted_signature_author_position_count += 1;
                 0
@@ -7978,28 +8228,6 @@ impl RustFeaturizer {
                 affiliation_values: raw_signature.affiliations.clone(),
                 orcid: raw_signature.orcid.clone(),
             });
-        }
-        if preprocess {
-            for paper_id in needed_paper_ids.iter() {
-                if let Some(paper) = raw_papers.get(paper_id) {
-                    ensure_unidecode_for_text(&unidecode, &paper.title, &mut unidecode_char_map)?;
-                    ensure_unidecode_for_text(&unidecode, &paper.venue, &mut unidecode_char_map)?;
-                    ensure_unidecode_for_text(
-                        &unidecode,
-                        &paper.journal_name,
-                        &mut unidecode_char_map,
-                    )?;
-                }
-                if let Some(authors) = raw_authors_by_paper.get(paper_id) {
-                    for (_position, author_name) in authors.iter() {
-                        ensure_unidecode_for_text(
-                            &unidecode,
-                            author_name,
-                            &mut unidecode_char_map,
-                        )?;
-                    }
-                }
-            }
         }
 
         let mut paper_inputs = Vec::<ArrowPaperInput>::with_capacity(needed_paper_ids.len());
@@ -8283,14 +8511,7 @@ impl RustFeaturizer {
                                 coauthors,
                                 position: entry.position,
                                 paper_id: entry.paper_id.clone(),
-                                name_counts: name_counts.or_else(|| {
-                                    Some(NameCountsData {
-                                        first: f64::NAN,
-                                        first_last: f64::NAN,
-                                        last: f64::NAN,
-                                        last_first_initial: f64::NAN,
-                                    })
-                                }),
+                                name_counts,
                                 adv_name: Some(first_without_apostrophe),
                             },
                         )
@@ -8506,12 +8727,6 @@ impl RustFeaturizer {
                 extract_string_list(&signature.getattr("author_affiliations")?)?;
             let orcid: Option<String> = signature.getattr("author_orcid")?.extract()?;
 
-            ensure_unidecode_for_text(&unidecode, &raw_first, &mut unidecode_char_map)?;
-            ensure_unidecode_for_text(&unidecode, &raw_middle, &mut unidecode_char_map)?;
-            ensure_unidecode_for_text(&unidecode, &raw_last, &mut unidecode_char_map)?;
-            for affiliation in affiliation_values.iter() {
-                ensure_unidecode_for_text(&unidecode, affiliation, &mut unidecode_char_map)?;
-            }
             signature_inputs.push(FeatureBlockSignatureInput {
                 sig_id,
                 paper_id,
@@ -8524,6 +8739,19 @@ impl RustFeaturizer {
                 orcid,
             });
         }
+        ensure_unidecode_for_signature_texts(
+            &unidecode,
+            signature_inputs
+                .iter()
+                .map(|signature| SignatureTextFields {
+                    author_first: &signature.raw_first,
+                    author_middle: &signature.raw_middle,
+                    author_last: &signature.raw_last,
+                    author_suffix: "",
+                    affiliations: &signature.affiliation_values,
+                }),
+            &mut unidecode_char_map,
+        )?;
 
         let mut raw_authors_by_paper: HashMap<PaperId, Vec<(i64, String)>> = HashMap::new();
         let paper_authors_obj = feature_block.getattr("paper_authors")?;
@@ -8531,17 +8759,14 @@ impl RustFeaturizer {
         for item in PyIterator::from_object(&paper_authors_obj)? {
             let author = item?;
             let paper_id = extract_id_string(&author.getattr("paper_id")?)?;
-            let position = author
-                .getattr("position")?
-                .extract::<i64>()
-                .unwrap_or_else(|_| {
+            let position = match author.getattr("position")?.extract::<Option<i64>>()? {
+                Some(value) => value,
+                None => {
                     defaulted_paper_author_position_count += 1;
                     0
-                });
+                }
+            };
             let author_name: String = author.getattr("author_name")?.extract()?;
-            if preprocess {
-                ensure_unidecode_for_text(&unidecode, &author_name, &mut unidecode_char_map)?;
-            }
             raw_authors_by_paper
                 .entry(paper_id)
                 .or_insert_with(Vec::new)
@@ -8549,6 +8774,13 @@ impl RustFeaturizer {
         }
         for authors in raw_authors_by_paper.values_mut() {
             authors.sort_by_key(|(position, _name)| *position);
+        }
+        if preprocess {
+            ensure_unidecode_for_paper_author_texts(
+                &unidecode,
+                raw_authors_by_paper.values().map(Vec::as_slice),
+                &mut unidecode_char_map,
+            )?;
         }
 
         let papers_obj = feature_block.getattr("papers")?;
@@ -8571,11 +8803,6 @@ impl RustFeaturizer {
                 .getattr("journal_name")?
                 .extract::<Option<String>>()?
                 .unwrap_or_default();
-            if preprocess {
-                ensure_unidecode_for_text(&unidecode, &raw_title, &mut unidecode_char_map)?;
-                ensure_unidecode_for_text(&unidecode, &raw_venue, &mut unidecode_char_map)?;
-                ensure_unidecode_for_text(&unidecode, &raw_journal, &mut unidecode_char_map)?;
-            }
             let raw_authors = raw_authors_by_paper.remove(&paper_id).unwrap_or_default();
             let year: Option<i64> = match paper.getattr("year")?.extract::<Option<i64>>()? {
                 Some(value) if value > 0 => Some(value),
@@ -8613,6 +8840,17 @@ impl RustFeaturizer {
                 predicted_language,
                 is_reliable,
             });
+        }
+        if preprocess {
+            ensure_unidecode_for_paper_texts(
+                &unidecode,
+                paper_inputs.iter().map(|paper| PaperTextFields {
+                    title: &paper.raw_title,
+                    venue: &paper.raw_venue,
+                    journal_name: &paper.raw_journal,
+                }),
+                &mut unidecode_char_map,
+            )?;
         }
         let parse_seconds = parse_start.elapsed().as_secs_f64();
 
@@ -8881,14 +9119,7 @@ impl RustFeaturizer {
                                 coauthors,
                                 position: entry.position,
                                 paper_id: entry.paper_id.clone(),
-                                name_counts: name_counts.or_else(|| {
-                                    Some(NameCountsData {
-                                        first: f64::NAN,
-                                        first_last: f64::NAN,
-                                        last: f64::NAN,
-                                        last_first_initial: f64::NAN,
-                                    })
-                                }),
+                                name_counts,
                                 adv_name: Some(first_without_apostrophe),
                             },
                         )
@@ -10133,7 +10364,6 @@ impl RustFeaturizer {
         Bound<'py, PyArray2<f64>>,
         u64,
     )> {
-        let _ = num_threads;
         let owner_row_indices = row_indices.as_slice()?;
         let model_distances = pair_distances.as_slice()?;
         let pair_count = owner_row_indices.len();
@@ -10168,50 +10398,77 @@ impl RustFeaturizer {
             }
         }
 
-        let mut counts = vec![0_u32; row_count];
-        let mut sums = vec![0.0_f64; row_count];
-        let mut mins = vec![f64::INFINITY; row_count];
-        let mut top_distances = vec![f64::INFINITY; row_count * 5];
-        let mut hard_disallow_pair_count = 0_u64;
-
-        for pair_offset in 0..pair_count {
-            let label = labels.map(|values| values[pair_offset]).unwrap_or(f64::NAN);
-            let value = if label.is_nan() {
-                model_distances[pair_offset]
-            } else {
-                label + large_integer
+        let accumulate_range =
+            |start: usize, end: usize| -> Result<LinkerPairDistanceAccumulator, String> {
+                let mut accumulator = LinkerPairDistanceAccumulator::new(row_count);
+                for pair_offset in start..end {
+                    let label = labels.map(|values| values[pair_offset]).unwrap_or(f64::NAN);
+                    let value = if label.is_nan() {
+                        model_distances[pair_offset]
+                    } else {
+                        label + large_integer
+                    };
+                    if value.is_nan() {
+                        return Err("pairwise model returned NaN distance".to_string());
+                    }
+                    let row = owner_row_indices[pair_offset] as usize;
+                    accumulator.counts[row] = accumulator.counts[row].saturating_add(1);
+                    accumulator.sums[row] += value;
+                    if value < accumulator.mins[row] {
+                        accumulator.mins[row] = value;
+                    }
+                    if value >= hard_disallow_distance {
+                        accumulator.hard_disallow_pair_count =
+                            accumulator.hard_disallow_pair_count.saturating_add(1);
+                    }
+                    let top_start = row * 5;
+                    Self::update_top5_distance(
+                        &mut accumulator.top_distances[top_start..top_start + 5],
+                        value,
+                    );
+                }
+                Ok(accumulator)
             };
-            if value.is_nan() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "pairwise model returned NaN distance",
-                ));
-            }
-            let row = owner_row_indices[pair_offset] as usize;
-            counts[row] = counts[row].saturating_add(1);
-            sums[row] += value;
-            if value < mins[row] {
-                mins[row] = value;
-            }
-            if value >= hard_disallow_distance {
-                hard_disallow_pair_count = hard_disallow_pair_count.saturating_add(1);
-            }
-            let top_start = row * 5;
-            Self::update_top5_distance(&mut top_distances[top_start..top_start + 5], value);
-        }
 
-        let top_array = numpy::ndarray::Array2::from_shape_vec((row_count, 5), top_distances)
-            .map_err(|err| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to build top-distance matrix: {}",
-                    err
-                ))
-            })?;
+        let accumulator = if num_threads.is_some_and(|threads| threads > 1) && pair_count > 1 {
+            py.allow_threads(|| {
+                let compute = || {
+                    let requested_threads = num_threads.unwrap_or(1).max(1);
+                    let shard_count = requested_threads.min(pair_count);
+                    let chunk_size = pair_count.div_ceil(shard_count);
+                    let partials = (0..pair_count)
+                        .step_by(chunk_size)
+                        .collect::<Vec<_>>()
+                        .into_par_iter()
+                        .map(|start| accumulate_range(start, (start + chunk_size).min(pair_count)))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut merged = LinkerPairDistanceAccumulator::new(row_count);
+                    for partial in partials {
+                        merged.merge_from(partial);
+                    }
+                    Ok::<LinkerPairDistanceAccumulator, String>(merged)
+                };
+                install_with_optional_rayon_pool(num_threads, compute)
+            })
+            .map_err(pyo3::exceptions::PyValueError::new_err)?
+        } else {
+            accumulate_range(0, pair_count).map_err(pyo3::exceptions::PyValueError::new_err)?
+        };
+
+        let top_array =
+            numpy::ndarray::Array2::from_shape_vec((row_count, 5), accumulator.top_distances)
+                .map_err(|err| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to build top-distance matrix: {}",
+                        err
+                    ))
+                })?;
         Ok((
-            numpy::ndarray::Array1::from_vec(counts).to_pyarray(py),
-            numpy::ndarray::Array1::from_vec(sums).to_pyarray(py),
-            numpy::ndarray::Array1::from_vec(mins).to_pyarray(py),
+            numpy::ndarray::Array1::from_vec(accumulator.counts).to_pyarray(py),
+            numpy::ndarray::Array1::from_vec(accumulator.sums).to_pyarray(py),
+            numpy::ndarray::Array1::from_vec(accumulator.mins).to_pyarray(py),
             top_array.to_pyarray(py),
-            hard_disallow_pair_count,
+            accumulator.hard_disallow_pair_count,
         ))
     }
 
@@ -10383,6 +10640,32 @@ impl RustFeaturizer {
 
     fn signature_ids(&self) -> Vec<String> {
         self.signature_id_order().to_vec()
+    }
+
+    fn signature_rule_metadata(&self) -> Vec<(String, Option<String>, Option<String>)> {
+        self.signature_id_order()
+            .iter()
+            .filter_map(|signature_id| {
+                self.signatures.get(signature_id).map(|signature| {
+                    (
+                        signature_id.clone(),
+                        signature.first.clone(),
+                        signature.orcid.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn signature_name_counts_present(&self) -> Vec<(String, bool)> {
+        self.signature_id_order()
+            .iter()
+            .filter_map(|signature_id| {
+                self.signatures
+                    .get(signature_id)
+                    .map(|signature| (signature_id.clone(), signature.name_counts.is_some()))
+            })
+            .collect()
     }
 
     fn cluster_seeds_require(&self) -> Vec<(String, String)> {
@@ -11518,14 +11801,8 @@ impl RustHybridCentroidRetriever {
             component_index_by_key.insert(summary.component_key.clone(), packed_summaries.len());
             packed_summaries.push(summary);
         }
-        let max_block_component_size = packed_summaries
-            .iter()
-            .map(|summary| summary.size)
-            .max()
-            .unwrap_or(0);
         Ok(Self {
             summaries: packed_summaries,
-            max_block_component_size,
             component_index_by_key,
             coauthor_cluster_df,
             non_mega_coauthor_cluster_df,
@@ -11571,7 +11848,6 @@ impl RustHybridCentroidRetriever {
             &query_data,
             &selection.indices,
             effective_top_k,
-            self.max_block_component_size,
             num_threads,
             None,
             None,
@@ -11731,18 +12007,9 @@ impl RustHybridCentroidRetriever {
                 .iter()
                 .enumerate()
             {
-                let local_row_index = u32::try_from(local_row_index).map_err(|_| {
-                    pyo3::exceptions::PyOverflowError::new_err(
-                        "retrieved candidate row count exceeds u32",
-                    )
-                })?;
-                let row_index = base_row_index.checked_add(local_row_index).ok_or_else(|| {
-                    pyo3::exceptions::PyOverflowError::new_err(
-                        "retrieved candidate row count exceeds u32",
-                    )
-                })?;
+                let row_index = checked_retrieved_row_index(base_row_index, local_row_index)?;
                 let query_signature_index =
-                    query_result.row_query_signature_indices[local_row_index as usize];
+                    query_result.row_query_signature_indices[local_row_index];
                 for member_index in member_indices.iter() {
                     left_signature_indices.push(query_signature_index);
                     right_signature_indices.push(*member_index);
@@ -11889,7 +12156,6 @@ impl RustHybridCentroidRetriever {
             &query_data,
             &selection.indices,
             effective_top_k,
-            self.max_block_component_size,
             num_threads,
             None,
             None,
@@ -11897,14 +12163,13 @@ impl RustHybridCentroidRetriever {
         )
     }
 
-    #[pyo3(signature = (query, component_keys, top_k, max_block_component_size, num_threads = None, override_summary = None))]
+    #[pyo3(signature = (query, component_keys, top_k, num_threads = None, override_summary = None))]
     fn top_k_hybrid_centroid_subset(
         &self,
         py: Python<'_>,
         query: &Bound<'_, PyAny>,
         component_keys: &Bound<'_, PyAny>,
         top_k: usize,
-        max_block_component_size: usize,
         num_threads: Option<usize>,
         override_summary: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Vec<String>, Vec<f32>)> {
@@ -11955,7 +12220,6 @@ impl RustHybridCentroidRetriever {
             &query_data,
             &candidate_indices,
             top_k,
-            max_block_component_size,
             num_threads,
             override_index,
             override_data.as_ref(),
@@ -11964,14 +12228,13 @@ impl RustHybridCentroidRetriever {
         )
     }
 
-    #[pyo3(signature = (query, component_keys, top_k, max_block_component_size, weights, num_threads = None, override_summary = None))]
+    #[pyo3(signature = (query, component_keys, top_k, weights, num_threads = None, override_summary = None))]
     fn top_k_weighted_hybrid_centroid_subset(
         &self,
         py: Python<'_>,
         query: &Bound<'_, PyAny>,
         component_keys: &Bound<'_, PyAny>,
         top_k: usize,
-        max_block_component_size: usize,
         weights: Vec<f64>,
         num_threads: Option<usize>,
         override_summary: Option<&Bound<'_, PyAny>>,
@@ -12024,7 +12287,6 @@ impl RustHybridCentroidRetriever {
             &query_data,
             &candidate_indices,
             top_k,
-            max_block_component_size,
             num_threads,
             override_index,
             override_data.as_ref(),
@@ -12037,7 +12299,6 @@ impl RustHybridCentroidRetriever {
             query,
             component_keys,
             top_k,
-            max_block_component_size,
             weights,
             first_name_mode = "prefix",
             specter_mode = "centroid",
@@ -12063,7 +12324,6 @@ impl RustHybridCentroidRetriever {
         query: &Bound<'_, PyAny>,
         component_keys: &Bound<'_, PyAny>,
         top_k: usize,
-        max_block_component_size: usize,
         weights: Vec<f64>,
         first_name_mode: &str,
         specter_mode: &str,
@@ -12151,7 +12411,6 @@ impl RustHybridCentroidRetriever {
             &query_data,
             &candidate_indices,
             top_k,
-            max_block_component_size,
             num_threads,
             override_index,
             override_data.as_ref(),
@@ -12169,7 +12428,6 @@ impl RustHybridCentroidRetriever {
         num_threads: Option<usize>,
         override_summary: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyDict>> {
-        let _resolved_num_threads = num_threads;
         let query_data = extract_retrieval_query(query)?;
         let mut candidate_indices = Vec::new();
         for item in PyIterator::from_object(component_keys)? {
@@ -12206,16 +12464,30 @@ impl RustHybridCentroidRetriever {
             None
         };
 
-        let payload = PyDict::new(py);
-        for candidate_index in candidate_indices {
-            let summary = if override_index == Some(candidate_index) {
-                override_data
-                    .as_ref()
-                    .unwrap_or_else(|| unreachable!("override_index implies override_data"))
-            } else {
-                &self.summaries[candidate_index]
+        let feature_rows = py.allow_threads(|| {
+            let compute = || {
+                candidate_indices
+                    .par_iter()
+                    .map(|candidate_index| {
+                        let summary = if override_index == Some(*candidate_index) {
+                            override_data.as_ref().unwrap_or_else(|| {
+                                unreachable!("override_index implies override_data")
+                            })
+                        } else {
+                            &self.summaries[*candidate_index]
+                        };
+                        (
+                            summary.component_key.clone(),
+                            chooser_summary_features(&query_data, summary),
+                        )
+                    })
+                    .collect::<Vec<_>>()
             };
-            let feature_values = chooser_summary_features(&query_data, summary);
+            install_with_optional_rayon_pool(num_threads, compute)
+        });
+
+        let payload = PyDict::new(py);
+        for (component_key, feature_values) in feature_rows {
             let feature_dict = PyDict::new(py);
             feature_dict.set_item("middle_initial_compatibility", feature_values[0])?;
             feature_dict.set_item("affiliation_overlap", feature_values[1])?;
@@ -12225,7 +12497,7 @@ impl RustHybridCentroidRetriever {
             feature_dict.set_item("title_overlap", feature_values[5])?;
             feature_dict.set_item("specter_centroid_similarity", feature_values[6])?;
             feature_dict.set_item("specter_exemplar_similarity", feature_values[7])?;
-            payload.set_item(summary.component_key.as_str(), feature_dict)?;
+            payload.set_item(component_key.as_str(), feature_dict)?;
         }
         Ok(payload.unbind())
     }
@@ -12396,14 +12668,14 @@ fn linker_normalize_alpha(value: &str) -> String {
 }
 
 fn linker_normalized_alpha_vec(values: &[String]) -> Vec<String> {
-    let mut cache = HashMap::<String, String>::new();
+    let mut cache = HashMap::<&str, String>::new();
     let mut out = Vec::with_capacity(values.len());
     for value in values {
-        if let Some(normalized) = cache.get(value) {
+        if let Some(normalized) = cache.get(value.as_str()) {
             out.push(normalized.clone());
         } else {
             let normalized = linker_normalize_alpha(value);
-            cache.insert(value.clone(), normalized.clone());
+            cache.insert(value.as_str(), normalized.clone());
             out.push(normalized);
         }
     }
@@ -12956,7 +13228,7 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     let specter_batch_index_path = optional_path_from_py_dict(paths, "specter_batch_index")?;
 
     let read_cluster_seeds_start = Instant::now();
-    let (raw_component_order, raw_members_by_component) =
+    let (raw_component_order, mut raw_members_by_component) =
         read_raw_arrow_cluster_seeds(&cluster_seeds_path)?;
     let read_cluster_seeds_secs = read_cluster_seeds_start.elapsed().as_secs_f64();
 
@@ -12966,8 +13238,7 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     let mut excluded_query_seed_count = 0usize;
     for component_key in raw_component_order {
         let members = raw_members_by_component
-            .get(&component_key)
-            .cloned()
+            .remove(&component_key)
             .unwrap_or_default();
         let mut filtered_members = Vec::with_capacity(members.len());
         for signature_id in members {
@@ -13073,7 +13344,7 @@ fn raw_block_query_candidate_plan_arrow<'py>(
                             f64,
                         )> {
                             let start = Instant::now();
-                            let loaded = match specter_path.as_ref() {
+                            let (loaded, stats) = match specter_path.as_ref() {
                                 Some(path) => {
                                     let (loaded, stats) = read_raw_arrow_specter_with_optional_index(
                                         path,
@@ -13081,11 +13352,10 @@ fn raw_block_query_candidate_plan_arrow<'py>(
                                         &needed_paper_ids,
                                         true,
                                     )?;
-                                    Some((loaded, stats))
+                                    (loaded, stats)
                                 }
-                                None => Some((HashMap::new(), IndexedArrowReadStats::default())),
+                                None => (HashMap::new(), IndexedArrowReadStats::default()),
                             };
-                            let (loaded, stats) = loaded.unwrap();
                             Ok((
                                 if specter_path.is_some() { Some(loaded) } else { None },
                                 stats,
@@ -13236,14 +13506,8 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         );
         increment_df_from_counter(&summary.affiliation_counts, &mut affiliation_cluster_df);
     }
-    let max_block_component_size = summaries
-        .iter()
-        .map(|summary| summary.size)
-        .max()
-        .unwrap_or(0);
     let retriever = RustHybridCentroidRetriever {
         summaries,
-        max_block_component_size,
         component_index_by_key,
         coauthor_cluster_df,
         non_mega_coauthor_cluster_df,
@@ -13354,18 +13618,7 @@ fn raw_block_query_candidate_plan_arrow<'py>(
             .iter()
             .enumerate()
         {
-            let local_row_index_u32 = u32::try_from(local_row_index).map_err(|_| {
-                pyo3::exceptions::PyOverflowError::new_err(
-                    "retrieved candidate row count exceeds u32",
-                )
-            })?;
-            let row_index = base_row_index
-                .checked_add(local_row_index_u32)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyOverflowError::new_err(
-                        "retrieved candidate row count exceeds u32",
-                    )
-                })?;
+            let row_index = checked_retrieved_row_index(base_row_index, local_row_index)?;
             let query_signature_index = query_result.row_query_signature_indices[local_row_index];
             for member_index in member_indices.iter() {
                 left_signature_indices.push(query_signature_index);
@@ -13550,10 +13803,11 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     let pair_signature_ids_secs = pair_signature_ids_start.elapsed().as_secs_f64();
 
     let component_members_payload_start = Instant::now();
-    let retrieved_component_keys: HashSet<String> = row_component_keys.iter().cloned().collect();
+    let retrieved_component_keys: HashSet<&str> =
+        row_component_keys.iter().map(String::as_str).collect();
     let component_members = PyDict::new(py);
     for component_key in component_order.iter() {
-        if !retrieved_component_keys.contains(component_key) {
+        if !retrieved_component_keys.contains(component_key.as_str()) {
             continue;
         }
         component_members.set_item(
@@ -13759,7 +14013,6 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         let compute = || {
             let RustHybridCentroidRetriever {
                 summaries,
-                max_block_component_size: _,
                 component_index_by_key,
                 coauthor_cluster_df,
                 non_mega_coauthor_cluster_df,
@@ -13810,6 +14063,19 @@ mod tests {
                 .unwrap_or_else(|| unreachable!("assert above guarantees error"));
             assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
         });
+    }
+
+    #[test]
+    fn orcid_normalization_canonicalizes_common_forms() {
+        assert_eq!(
+            normalize_orcid_owned(" https://orcid.org/0000-0002-1825-0097 "),
+            Some("0000-0002-1825-0097".to_string())
+        );
+        assert_eq!(
+            normalize_orcid_owned("ORCID: 000000021825009x"),
+            Some("0000-0002-1825-009X".to_string())
+        );
+        assert_eq!(normalize_orcid_owned("0000-0002-1825"), None);
     }
 }
 

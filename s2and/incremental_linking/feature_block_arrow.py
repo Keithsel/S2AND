@@ -23,19 +23,24 @@ from s2and.incremental_linking.feature_block_contract import (
     _optional_bool,
     _optional_int,
     _optional_str,
+    _strict_string_tuple,
     feature_block_signature_order_from_raw_candidate_plan,
     normalize_cluster_seed_disallow_pairs,
 )
 
 NAME_COUNTS_INDEX_SCHEMA_VERSION = "name_counts_index_v1"
 ARROW_PHYSICAL_LAYOUT_SCHEMA_VERSION = "s2and_arrow_physical_v1"
-ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION = "arrow_batch_lookup_index_v1"
+ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION = "arrow_batch_lookup_index_v2"
 _NAME_COUNTS_INDEX_MAGIC = b"S2NCI001"
-_ARROW_BATCH_LOOKUP_INDEX_MAGIC = b"S2ABI001"
+_ARROW_BATCH_LOOKUP_INDEX_MAGIC_V1 = b"S2ABI001"
+_ARROW_BATCH_LOOKUP_INDEX_MAGIC = b"S2ABI002"
 _NAME_COUNTS_INDEX_HASH_DOMAIN = b"s2and-name-counts-index-v1\x00"
+_ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN = b"s2and-arrow-batch-lookup-index-source-v2\x00"
+_ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES = 65_536
 _NAME_COUNTS_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQ")
 _NAME_COUNTS_INDEX_RECORD_STRUCT = struct.Struct("<QQQIId")
-_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQ")
+_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT_V1 = struct.Struct("<8sQQQ")
+_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQQQ")
 _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT = struct.Struct("<QII")
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
@@ -109,6 +114,38 @@ def write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, An
             writer.write_table(table)
 
 
+def read_cluster_seeds_arrow(path: Path) -> dict[str, str]:
+    """Read and validate a canonical Arrow cluster-seed table."""
+
+    import pyarrow as pa
+
+    with pa.memory_map(str(path), "r") as source:
+        table = pa.ipc.open_file(source).read_all()
+    missing_columns = sorted({"signature_id", "cluster_id"} - set(table.column_names))
+    if missing_columns:
+        raise ValueError(f"cluster seeds Arrow is missing required columns: {missing_columns}")
+    rows: dict[str, str] = {}
+    for index in range(table.num_rows):
+        signature_value = table["signature_id"][index].as_py()
+        cluster_value = table["cluster_id"][index].as_py()
+        if signature_value is None or cluster_value is None:
+            raise ValueError("cluster seeds Arrow cannot contain null signature_id or cluster_id values")
+        signature_id = str(signature_value)
+        cluster_id = str(cluster_value)
+        if not signature_id:
+            raise ValueError("cluster seeds Arrow cannot contain empty signature_id values")
+        if not cluster_id:
+            raise ValueError(f"cluster seeds Arrow cannot contain empty cluster_id values: {signature_id!r}")
+        existing_cluster_id = rows.get(signature_id)
+        if existing_cluster_id is not None and existing_cluster_id != cluster_id:
+            raise ValueError(
+                f"cluster seeds Arrow assigns signature_id {signature_id!r} to multiple clusters: "
+                f"{existing_cluster_id!r} and {cluster_id!r}"
+            )
+        rows[signature_id] = cluster_id
+    return rows
+
+
 def write_cluster_seed_disallows_arrow(path: Path, pairs: Iterable[tuple[Any, Any]]) -> None:
     """Write the canonical Arrow cluster-seed disallow table."""
 
@@ -172,6 +209,17 @@ def cluster_seed_disallows_from_arrow_paths(arrow_paths: Mapping[str, Any] | Non
     return set(read_cluster_seed_disallows_arrow(path))
 
 
+def _stringified_arrow_paths(paths: Mapping[Any, Any], *, omit_none: bool = False) -> dict[str, str]:
+    stringified: dict[str, str] = {}
+    for key, value in paths.items():
+        if value is None:
+            if omit_none:
+                continue
+            raise ValueError(f"Arrow path for {key!r} is None")
+        stringified[str(key)] = str(value)
+    return stringified
+
+
 def arrow_paths_with_temporary_cluster_seeds(
     arrow_paths: Mapping[str, Any],
     cluster_seeds_require: Mapping[Any, Any],
@@ -182,7 +230,7 @@ def arrow_paths_with_temporary_cluster_seeds(
 ) -> TemporaryArrowPaths:
     """Return Arrow paths with a request-scoped cluster-seeds sidecar."""
 
-    paths = {str(key): str(value) for key, value in arrow_paths.items()}
+    paths = _stringified_arrow_paths(arrow_paths)
     if (
         reuse_existing_cluster_seeds_when_empty
         and not cluster_seeds_require
@@ -286,17 +334,45 @@ def _raise_if_record_batch_limit_exceeded(
 
 def _read_arrow_batch_lookup_index_header(index_path: Path) -> dict[str, int | str]:
     with index_path.open("rb") as infile:
-        header = infile.read(_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size)
-    if len(header) != _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size:
-        raise ValueError(f"Arrow batch lookup index is truncated: {index_path!s}")
-    magic, record_count, source_size, source_mtime_ns = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.unpack(header)
-    if magic != _ARROW_BATCH_LOOKUP_INDEX_MAGIC:
+        header_prefix = infile.read(_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT_V1.size)
+        if len(header_prefix) != _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT_V1.size:
+            raise ValueError(f"Arrow batch lookup index is truncated: {index_path!s}")
+        magic = header_prefix[:8]
+        if magic == _ARROW_BATCH_LOOKUP_INDEX_MAGIC:
+            header_suffix = infile.read(
+                _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size - _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT_V1.size
+            )
+            header = header_prefix + header_suffix
+            if len(header) != _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size:
+                raise ValueError(f"Arrow batch lookup index is truncated: {index_path!s}")
+            (
+                _magic,
+                record_count,
+                source_size,
+                source_mtime_ns,
+                key_column_hash,
+                source_fingerprint,
+            ) = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.unpack(header)
+            return {
+                "magic": magic.decode("ascii"),
+                "record_count": int(record_count),
+                "source_size": int(source_size),
+                "source_mtime_ns": int(source_mtime_ns),
+                "key_column_hash": int(key_column_hash),
+                "source_fingerprint": int(source_fingerprint),
+            }
+    if magic != _ARROW_BATCH_LOOKUP_INDEX_MAGIC_V1:
         raise ValueError(f"Arrow batch lookup index has invalid magic bytes: {index_path!s}")
+    _magic, record_count, source_size, source_mtime_ns = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT_V1.unpack(
+        header_prefix
+    )
     return {
         "magic": magic.decode("ascii"),
         "record_count": int(record_count),
         "source_size": int(source_size),
         "source_mtime_ns": int(source_mtime_ns),
+        "key_column_hash": 0,
+        "source_fingerprint": 0,
     }
 
 
@@ -318,9 +394,12 @@ def write_arrow_batch_lookup_index(
         arrow_path_obj = Path(arrow_path)
         index_header = _read_arrow_batch_lookup_index_header(output_path)
         source_stat = arrow_path_obj.stat()
+        key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
         if (
             int(index_header["source_size"]) != source_stat.st_size
             or int(index_header["source_mtime_ns"]) != source_stat.st_mtime_ns
+            or int(index_header["key_column_hash"]) != key_column_hash
+            or int(index_header["source_fingerprint"]) != _source_file_sample_fingerprint(arrow_path_obj)
         ):
             raise ValueError(
                 f"Arrow batch lookup index is stale for {arrow_path_obj!s}: {output_path!s}. "
@@ -370,6 +449,8 @@ def write_arrow_batch_lookup_index(
     records.sort()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     source_stat = arrow_path_obj.stat()
+    key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
+    source_fingerprint = _source_file_sample_fingerprint(arrow_path_obj)
     with output_path.open("wb") as outfile:
         outfile.write(
             _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.pack(
@@ -377,6 +458,8 @@ def write_arrow_batch_lookup_index(
                 len(records),
                 source_stat.st_size,
                 source_stat.st_mtime_ns,
+                key_column_hash,
+                source_fingerprint,
             )
         )
         for key_hash, batch_index in records:
@@ -387,6 +470,8 @@ def write_arrow_batch_lookup_index(
         "magic": _ARROW_BATCH_LOOKUP_INDEX_MAGIC.decode("ascii"),
         "row_count": row_count,
         "record_count": len(records),
+        "key_column_hash": key_column_hash,
+        "source_fingerprint": source_fingerprint,
         "record_batch_count": record_batch_count,
         "actual_max_batch_rows": max_batch_rows,
         "max_record_batch_rows": int(max_record_batch_rows or 0),
@@ -403,7 +488,7 @@ def write_raw_arrow_batch_lookup_indexes(
     """Write optional batch lookup indexes for raw Arrow planner inputs."""
 
     output_path = Path(output_dir) if output_dir is not None else None
-    indexed_paths = {str(key): str(value) for key, value in paths.items()}
+    indexed_paths = _stringified_arrow_paths(paths, omit_none=True)
     metrics: dict[str, dict[str, int | str | bool]] = {}
     for arrow_key, key_column in RAW_PLANNER_ARROW_KEY_COLUMNS.items():
         arrow_value = paths.get(arrow_key)
@@ -538,11 +623,33 @@ def write_name_counts_arrow(output_dir: str | Path, *, overwrite: bool = False) 
     return str(output_path), metrics
 
 
-def _fnv64_bytes(value: bytes) -> int:
-    digest = _FNV64_OFFSET
+def _fnv64_update(digest: int, value: bytes) -> int:
     for byte in value:
         digest ^= byte
         digest = (digest * _FNV64_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return digest
+
+
+def _fnv64_bytes(value: bytes) -> int:
+    return _fnv64_update(_FNV64_OFFSET, value)
+
+
+def _source_file_sample_fingerprint(path: Path) -> int:
+    source_size = path.stat().st_size
+    digest = _fnv64_bytes(_ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN)
+    digest = _fnv64_update(digest, int(source_size).to_bytes(8, "little", signed=False))
+    with path.open("rb") as infile:
+        digest = _fnv64_update(
+            digest,
+            infile.read(min(_ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES, source_size)),
+        )
+        if source_size > _ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES:
+            suffix_start = max(
+                _ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES,
+                source_size - _ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES,
+            )
+            infile.seek(suffix_start)
+            digest = _fnv64_update(digest, infile.read(source_size - suffix_start))
     return digest
 
 
@@ -618,6 +725,16 @@ def _name_counts_index_complete(index_dir: Path) -> bool:
     return manifest_paths is not None and all(path.exists() for path in manifest_paths.values())
 
 
+def _remove_stale_name_counts_generations(index_dir: Path, current_generation_name: str) -> None:
+    generations_dir = index_dir / "generations"
+    if not generations_dir.exists():
+        return
+    for child in generations_dir.iterdir():
+        if child.name == current_generation_name or child.name.startswith(".") or not child.is_dir():
+            continue
+        shutil.rmtree(child)
+
+
 def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) -> tuple[str, dict[str, int | bool]]:
     """Write the global name-count lookup as exact-verified sorted binary indexes."""
 
@@ -679,6 +796,7 @@ def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) 
                 raise FileNotFoundError(f"name-count index generation is incomplete: {path}")
         tmp_manifest_path.replace(manifest_path)
         manifest_published = True
+        _remove_stale_name_counts_generations(index_dir, generation_name)
     finally:
         if tmp_manifest_path.exists():
             tmp_manifest_path.unlink()
@@ -907,12 +1025,19 @@ def _feature_block_signature_from_arrow_row(signature_id: str, row: Mapping[str,
         author_middle=_optional_str(row.get("author_middle")),
         author_last=_optional_str(row.get("author_last")),
         author_suffix=_optional_str(row.get("author_suffix")),
-        author_affiliations=tuple(str(value) for value in (row.get("author_affiliations") or ())),
+        author_affiliations=_strict_string_tuple(
+            row.get("author_affiliations"),
+            field_name="signatures.author_affiliations",
+        ),
         author_orcid=_optional_str(row.get("author_orcid")),
         author_position=_optional_int(row.get("author_position"), field_name="signatures.author_position"),
         author_block=_optional_str(row.get("author_block")),
         author_email=_optional_str(row.get("author_email")),
-        source_author_ids=tuple(str(value) for value in (row.get("source_author_ids") or ()) if value is not None),
+        source_author_ids=_strict_string_tuple(
+            row.get("source_author_ids"),
+            field_name="signatures.source_author_ids",
+            skip_none=True,
+        ),
     )
 
 

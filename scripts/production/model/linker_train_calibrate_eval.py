@@ -1114,7 +1114,6 @@ def _score_candidate_summaries_with_frozen_rust_policy(
     query: retrieval.QueryFeatures,
     summaries: Mapping[str, retrieval.ClusterSummary],
     retriever: Any,
-    max_block_component_size: int,
     n_jobs: int,
 ) -> dict[str, float]:
     """Score one query's candidate rows with the frozen Rust retrieval policy."""
@@ -1142,7 +1141,6 @@ def _score_candidate_summaries_with_frozen_rust_policy(
         query=query,
         retriever=retriever,
         component_keys=component_keys,
-        max_block_component_size=max(1, int(max_block_component_size)),
         override_summary=override_summary,
         num_threads=max(1, int(n_jobs)),
         weights=FROZEN_RETRIEVAL_POLICY.weights_for_query(query),
@@ -2120,7 +2118,6 @@ def _materialize_minimal_raw_dataset_rows(
             query=query,
             summaries=summaries,
             retriever=context.rust_hybrid_centroid_retriever,
-            max_block_component_size=context.max_block_component_size,
             n_jobs=n_jobs,
         )
         current_retrieval_ranks = _current_retrieval_ranks_from_scores(retrieval_scores, retrieval_ranks)

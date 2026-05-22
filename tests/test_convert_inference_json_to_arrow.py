@@ -6,8 +6,9 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
+import scripts.convert_to_arrow as convert_module
 from s2and.incremental_linking.feature_block import FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION
-from scripts.convert_inference_json_to_arrow import _build_parser, convert_inference_json_to_arrow
+from scripts.convert_to_arrow import convert_service_json_to_arrow
 
 
 def _read_table(path: str) -> pa.Table:
@@ -50,7 +51,7 @@ def _minimal_service_payload(signature_id: str = "s1", paper_id: int = 1) -> dic
     }
 
 
-def test_convert_inference_json_to_arrow_preserves_seed_and_altered_tables(
+def test_convert_service_json_to_arrow_preserves_seed_and_altered_tables(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -139,7 +140,7 @@ def test_convert_inference_json_to_arrow_preserves_seed_and_altered_tables(
     input_json = tmp_path / "service_payload.json"
     input_json.write_text(json.dumps(payload), encoding="utf-8")
 
-    manifest = convert_inference_json_to_arrow(
+    manifest = convert_service_json_to_arrow(
         input_json=input_json,
         output_root=tmp_path / "arrow",
         dataset_name="service_payload",
@@ -179,7 +180,110 @@ def test_convert_inference_json_to_arrow_preserves_seed_and_altered_tables(
     assert manifest["raw_planner_batch_indexes"]["signatures_batch_index"]["record_count"] == 3
 
 
-def test_convert_inference_json_to_arrow_source_json_is_opt_in(
+def test_convert_service_json_to_arrow_accepts_service_shaped_cluster_seeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+    payload = _minimal_service_payload("s1", 1)
+    payload["signatures"] = [
+        payload["signatures"][0],
+        {
+            **payload["signatures"][0],
+            "signature_id": "s2",
+            "paper_id": 2,
+        },
+        {
+            **payload["signatures"][0],
+            "signature_id": "q",
+            "paper_id": 3,
+        },
+    ]
+    payload["papers"] = [
+        payload["papers"][0],
+        {**payload["papers"][0], "paper_id": 2, "title": "Two"},
+        {**payload["papers"][0], "paper_id": 3, "title": "Three"},
+    ]
+    payload["cluster_seeds"] = {
+        "require": {"c0": ["s1", "s2"]},
+        "disallow": [["q", "s1"]],
+    }
+    input_json = tmp_path / "service_payload.json"
+    input_json.write_text(json.dumps(payload), encoding="utf-8")
+
+    manifest = convert_service_json_to_arrow(
+        input_json=input_json,
+        output_root=tmp_path / "arrow",
+        dataset_name="service_payload",
+        name_counts_index_root=tmp_path,
+        n_jobs=1,
+        overwrite=True,
+        skip_name_counts_index=True,
+    )
+
+    assert manifest["cluster_seeds_require_count"] == 2
+    assert manifest["cluster_seeds_disallow_count"] == 1
+
+
+def test_convert_service_json_to_arrow_falls_back_from_explicit_null_paper_embeddings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+    payload = _minimal_service_payload()
+    payload["paper_embeddings"] = None
+    payload["specter_embeddings"] = {"1": [0.1, 0.2]}
+    input_json = tmp_path / "service_payload.json"
+    input_json.write_text(json.dumps(payload), encoding="utf-8")
+
+    manifest = convert_service_json_to_arrow(
+        input_json=input_json,
+        output_root=tmp_path / "arrow",
+        dataset_name="service_payload",
+        name_counts_index_root=tmp_path,
+        n_jobs=1,
+        overwrite=True,
+        skip_name_counts_index=True,
+    )
+
+    assert manifest["paper_embedding_count"] == 1
+    assert _read_table(manifest["paths"]["specter"]).num_rows == 1
+
+
+def test_root_manifest_lock_removes_dead_pid_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    lock_path = tmp_path / "manifest.json.lock"
+    lock_path.write_text("999999", encoding="ascii")
+    monkeypatch.setattr(convert_module, "_pid_is_running", lambda _pid: False)
+
+    with convert_module._RootManifestLock(lock_path, attempts=1):
+        assert lock_path.exists()
+
+    assert not lock_path.exists()
+
+
+def test_convert_service_json_to_arrow_rejects_ambiguous_service_shaped_cluster_seeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+    payload = _minimal_service_payload()
+    payload["cluster_seeds"] = {"require": {"c0": ["s1"]}, "disallow": [], "unexpected": []}
+    input_json = tmp_path / "service_payload.json"
+    input_json.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported keys"):
+        convert_service_json_to_arrow(
+            input_json=input_json,
+            output_root=tmp_path / "arrow",
+            dataset_name="service_payload",
+            name_counts_index_root=tmp_path,
+            n_jobs=1,
+            overwrite=True,
+            skip_name_counts_index=True,
+        )
+
+
+def test_convert_service_json_to_arrow_source_json_is_opt_in(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -187,7 +291,7 @@ def test_convert_inference_json_to_arrow_source_json_is_opt_in(
     input_json = tmp_path / "service_payload.json"
     input_json.write_text(json.dumps(_minimal_service_payload()), encoding="utf-8")
 
-    manifest = convert_inference_json_to_arrow(
+    manifest = convert_service_json_to_arrow(
         input_json=input_json,
         output_root=tmp_path / "arrow",
         dataset_name="service_payload",
@@ -202,14 +306,7 @@ def test_convert_inference_json_to_arrow_source_json_is_opt_in(
         assert Path(manifest["paths"][key]).exists()
 
 
-def test_convert_inference_json_to_arrow_cli_defaults_keep_generated_index_output_local() -> None:
-    args = _build_parser().parse_args(["--input-json", "service_payload.json"])
-
-    assert args.name_counts_index_root is None
-    assert args.copy_source_json is False
-
-
-def test_convert_inference_json_to_arrow_rejects_duplicate_list_ids(tmp_path: Path) -> None:
+def test_convert_service_json_to_arrow_rejects_duplicate_list_ids(tmp_path: Path) -> None:
     input_json = tmp_path / "service_payload.json"
     input_json.write_text(
         json.dumps(
@@ -225,7 +322,7 @@ def test_convert_inference_json_to_arrow_rejects_duplicate_list_ids(tmp_path: Pa
     )
 
     with pytest.raises(ValueError, match="duplicate signature_id"):
-        convert_inference_json_to_arrow(
+        convert_service_json_to_arrow(
             input_json=input_json,
             output_root=tmp_path / "arrow",
             dataset_name="service_payload",
@@ -236,7 +333,7 @@ def test_convert_inference_json_to_arrow_rejects_duplicate_list_ids(tmp_path: Pa
         )
 
 
-def test_convert_inference_json_to_arrow_rejects_stale_output_without_overwrite(tmp_path: Path) -> None:
+def test_convert_service_json_to_arrow_rejects_stale_output_without_overwrite(tmp_path: Path) -> None:
     input_json = tmp_path / "service_payload.json"
     input_json.write_text("{}", encoding="utf-8")
     output_dir = tmp_path / "arrow" / "service_payload"
@@ -244,7 +341,7 @@ def test_convert_inference_json_to_arrow_rejects_stale_output_without_overwrite(
     (output_dir / "signatures.arrow").write_text("stale", encoding="utf-8")
 
     with pytest.raises(FileExistsError, match="Use --overwrite"):
-        convert_inference_json_to_arrow(
+        convert_service_json_to_arrow(
             input_json=input_json,
             output_root=tmp_path / "arrow",
             dataset_name="service_payload",
@@ -255,7 +352,7 @@ def test_convert_inference_json_to_arrow_rejects_stale_output_without_overwrite(
         )
 
 
-def test_convert_inference_json_to_arrow_overwrite_preserves_other_root_manifest_entries(
+def test_convert_service_json_to_arrow_overwrite_preserves_other_root_manifest_entries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -282,7 +379,7 @@ def test_convert_inference_json_to_arrow_overwrite_preserves_other_root_manifest
         encoding="utf-8",
     )
 
-    convert_inference_json_to_arrow(
+    convert_service_json_to_arrow(
         input_json=input_json,
         output_root=output_root,
         dataset_name="new_dataset",
@@ -303,7 +400,7 @@ def test_convert_inference_json_to_arrow_overwrite_preserves_other_root_manifest
     ]
 
 
-def test_convert_inference_json_to_arrow_rejects_malformed_root_manifest_before_dataset_manifest(
+def test_convert_service_json_to_arrow_rejects_malformed_root_manifest_before_dataset_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -325,7 +422,7 @@ def test_convert_inference_json_to_arrow_rejects_malformed_root_manifest_before_
     )
 
     with pytest.raises(ValueError, match=r"dataset_manifests\[0\].*dataset"):
-        convert_inference_json_to_arrow(
+        convert_service_json_to_arrow(
             input_json=input_json,
             output_root=output_root,
             dataset_name="new_dataset",
@@ -338,7 +435,7 @@ def test_convert_inference_json_to_arrow_rejects_malformed_root_manifest_before_
     assert not (output_root / "new_dataset" / "manifest.json").exists()
 
 
-def test_convert_inference_json_to_arrow_rejects_legacy_root_manifest(
+def test_convert_service_json_to_arrow_rejects_legacy_root_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -360,7 +457,7 @@ def test_convert_inference_json_to_arrow_rejects_legacy_root_manifest(
     )
 
     with pytest.raises(ValueError, match="legacy source_path/reports"):
-        convert_inference_json_to_arrow(
+        convert_service_json_to_arrow(
             input_json=input_json,
             output_root=output_root,
             dataset_name="new_dataset",

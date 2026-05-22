@@ -477,27 +477,3 @@ def test_repeated_rust_featurizer_rebuild_dummy_smoke(build_path, tmp_path):
     assert len(result["rss_peak_gb_by_iteration"]) == 3
     assert "rss_growth_fraction" in result
     assert all("rss_peak_gb" in iteration for iteration in result["iterations"])
-
-
-@pytest.mark.heavy
-@pytest.mark.skip(reason="Run explicitly with: uv run pytest -m heavy")
-def test_repeated_from_json_paths_aminer_opt_in(tmp_path):
-    aminer_signatures = Path(PROJECT_ROOT_PATH) / "data" / "aminer" / "aminer_signatures.json"
-    if not aminer_signatures.exists():
-        raise pytest.skip.Exception(f"AMiner signatures fixture unavailable: {aminer_signatures}")
-
-    stress_module = _load_stress_module()
-    output_path = tmp_path / "stress_rust_from_json_paths_aminer.json"
-    result = stress_module.run_rebuild_stress(
-        dataset="aminer",
-        build_path="from_json_paths",
-        repeats=6,
-        num_threads=1,
-        write_json=str(output_path),
-    )
-
-    assert result["dataset"] == "aminer"
-    assert result["build_path"] == "from_json_paths"
-    assert result["success_count"] == 6
-    assert result["failure_count"] == 0
-    assert output_path.exists()

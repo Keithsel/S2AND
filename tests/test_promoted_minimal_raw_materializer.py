@@ -567,7 +567,6 @@ def test_minimal_raw_retrieval_score_uses_frozen_rust_policy() -> None:
         query=query,
         summaries={"c1": summary},
         retriever=retriever,
-        max_block_component_size=1,
         n_jobs=1,
     )
 

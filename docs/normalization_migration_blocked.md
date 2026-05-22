@@ -1,6 +1,6 @@
 # Normalization Unification Migration Plan
 
-Execution status (2026-03-02)
+Execution status (last reconfirmed 2026-05-22; originally entered blocked state 2026-03-02)
 - Blocked: normalization work is on hold until the required data/artifacts are ready.
 - Keep this plan separate from the active execution plan in `docs/work_plan.md`.
 - When unblocked, landing Bundle 5 (artifact format unification) first reduces churn so Phase 3 regeneration
@@ -54,7 +54,7 @@ Rust Alignment Decisions (effective February 20, 2026)
 4) Retraining contract
    - Before enabling canonical mode by default, production retraining and production inference must use the same canonical normalization + Sinonym path.
 5) Rust coupling
-   - Rust `from_json_paths` migration in must treat normalization helper ports as policy-sensitive changes, not pure performance refactors.
+   - Rust `from_json_paths` migration must treat normalization helper ports as policy-sensitive changes, not pure performance refactors.
 
 Current State (post-Sinonym hyphen pass)
 - Given-name canonicalization currently preserves hyphenated Chinese given names:
@@ -68,7 +68,8 @@ Current State (post-Sinonym hyphen pass)
   - Subblocking: ORCID prefix map lookup has a first-token fallback for multi-token first names.
   - Name tuples in constraints and incremental new-name guarding: shared helper
     `first_names_name_compatible(...)` probes exact, joined, and first-token forms for compatibility with legacy tuples.
-  - Sinonym overwrite block recomputation compacts surnames for blocking (`q ouyang`) when overwriting blocks.
+  - Sinonym overwrite block recomputation preserves spaced compound surnames for blocking (`q ou yang`) when overwriting
+    blocks.
 
 Target End State
 - One canonical normalization path for first/middle/last consumed by all codepaths.

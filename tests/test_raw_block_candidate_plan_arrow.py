@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import struct
 from collections import Counter
 from pathlib import Path
@@ -9,6 +11,7 @@ import pytest
 
 from s2and.incremental_linking.feature_block import (
     feature_block_from_arrow_paths,
+    write_arrow_batch_lookup_index,
     write_name_counts_index,
     write_raw_arrow_batch_lookup_indexes,
 )
@@ -17,7 +20,7 @@ from s2and.incremental_linking.retrieval import (
     RAW_CANDIDATE_PLAN_ROW_KEYS,
     build_linker_retrieval_batch_from_raw_candidate_plan,
 )
-from s2and.incremental_linking.runtime import subset_raw_candidate_plan_for_query_ids
+from s2and.incremental_linking.runtime import _raw_candidate_plan_seed_setup, subset_raw_candidate_plan_for_query_ids
 from tests.helpers import build_cluster_summary, build_query_features
 
 pa = pytest.importorskip("pyarrow")
@@ -25,8 +28,37 @@ s2and_rust = pytest.importorskip("s2and_rust", reason="s2and_rust is unavailable
 
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
-_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQ")
+_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQQQ")
 _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT = struct.Struct("<QII")
+_NAME_COUNTS_INDEX_HEADER_LEN = 32
+_NAME_COUNTS_INDEX_RECORD_LEN = 40
+
+
+def test_subset_raw_candidate_plan_fast_path_rejects_out_of_range_query_index() -> None:
+    raw_plan = {
+        "query_signature_ids": ["q0", "q1", "q2"],
+        "query_views": ["full", "full", "full"],
+        "query_authors": ["Alice", "Bob", "Carol"],
+        "row_count": 1,
+        "pair_count": 1,
+        "row_query_signature_indices": np.asarray([1], dtype=np.uint32),
+        "row_component_keys": ["c1"],
+        "pair_row_indices": np.asarray([0], dtype=np.uint32),
+        "left_signature_indices": np.asarray([0], dtype=np.uint32),
+        "right_signature_indices": np.asarray([3], dtype=np.uint32),
+        "component_members": {"c1": ["s1"]},
+        "telemetry": {},
+    }
+
+    with pytest.raises(ValueError, match="outside the selected contiguous query range"):
+        subset_raw_candidate_plan_for_query_ids(raw_plan, ["q1"])
+
+
+def test_raw_candidate_plan_seed_setup_rejects_duplicate_seed_signature() -> None:
+    raw_plan = {"component_members": {"c1": ["s1", "s2"], "c2": ["s1"]}}
+
+    with pytest.raises(ValueError, match="assigns signature_id 's1' to multiple components"):
+        _raw_candidate_plan_seed_setup(raw_plan)
 
 
 def _fnv64_bytes(value: bytes) -> int:
@@ -40,7 +72,9 @@ def _fnv64_bytes(value: bytes) -> int:
 def _append_batch_index_record(index_path: str, *, key: str, batch_index: int) -> None:
     path = Path(index_path)
     raw = path.read_bytes()
-    magic, record_count, source_size, source_mtime_ns = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.unpack_from(raw, 0)
+    magic, record_count, source_size, source_mtime_ns, key_column_hash, source_fingerprint = (
+        _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.unpack_from(raw, 0)
+    )
     offset = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size
     record_size = _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.size
     records = [
@@ -49,7 +83,16 @@ def _append_batch_index_record(index_path: str, *, key: str, batch_index: int) -
     ]
     records.append((_fnv64_bytes(key.encode("utf-8")), int(batch_index), 0))
     records.sort()
-    payload = bytearray(_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.pack(magic, len(records), source_size, source_mtime_ns))
+    payload = bytearray(
+        _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.pack(
+            magic,
+            len(records),
+            source_size,
+            source_mtime_ns,
+            key_column_hash,
+            source_fingerprint,
+        )
+    )
     for record in records:
         payload.extend(_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.pack(*record))
     path.write_bytes(payload)
@@ -103,6 +146,23 @@ def _write_tiny_name_counts_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     )
     index_path, _metrics = write_name_counts_index(tmp_path)
     return index_path
+
+
+def _swap_first_two_name_count_records(index_root: str | Path, kind: str) -> None:
+    index_path = Path(index_root)
+    manifest = json.loads((index_path / "manifest.json").read_text(encoding="utf-8"))
+    record_path = Path(manifest["files"][kind]["path"])
+    if not record_path.is_absolute():
+        record_path = index_path / record_path
+    payload = bytearray(record_path.read_bytes())
+    first_start = _NAME_COUNTS_INDEX_HEADER_LEN
+    second_start = first_start + _NAME_COUNTS_INDEX_RECORD_LEN
+    third_start = second_start + _NAME_COUNTS_INDEX_RECORD_LEN
+    first_record = bytes(payload[first_start:second_start])
+    second_record = bytes(payload[second_start:third_start])
+    payload[first_start:second_start] = second_record
+    payload[second_start:third_start] = first_record
+    record_path.write_bytes(payload)
 
 
 def _base_arrow_paths(tmp_path: Path) -> dict[str, str]:
@@ -487,6 +547,50 @@ def test_raw_arrow_candidate_plan_rejects_stale_batch_index(tmp_path: Path) -> N
         )
 
 
+def test_arrow_batch_lookup_index_rejects_wrong_key_column_reuse(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path)
+    bad_index_path, _metrics = write_arrow_batch_lookup_index(
+        paths["signatures"],
+        tmp_path / "signatures.bad_key_batch_index.bin",
+        key_column="paper_id",
+        table_name="signatures",
+        overwrite=True,
+    )
+    indexed_paths = dict(paths)
+    indexed_paths["signatures_batch_index"] = bad_index_path
+
+    with pytest.raises(ValueError, match="different key column"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            indexed_paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
+
+
+def test_arrow_batch_lookup_index_rejects_same_size_same_mtime_source_change(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path)
+    indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
+    signatures_path = Path(paths["signatures"])
+    stat = signatures_path.stat()
+    payload = signatures_path.read_bytes()
+    assert b"q1" in payload
+    signatures_path.write_bytes(payload.replace(b"q1", b"qX", 1))
+    os.utime(signatures_path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    with pytest.raises(ValueError, match="stale"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            indexed_paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
+
+
 def test_raw_arrow_candidate_plan_rejects_duplicate_signature_ids(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
         pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
@@ -593,6 +697,26 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_specter_paper_ids(tmp_path: 
         _raw_plan_for_base_paths(paths)
 
 
+def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
+        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+
+    featurizer = s2and_rust.RustFeaturizer.from_arrow_paths(
+        paths,
+        ["q1", "s1", "q1", "s2", "s1"],
+        set(),
+        None,
+        True,
+        False,
+        0.0,
+        10000.0,
+        1,
+    )
+
+    assert tuple(featurizer.signature_ids()) == ("q1", "s1", "s2")
+
+
 def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> None:
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
         pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
@@ -659,7 +783,13 @@ def test_raw_arrow_candidate_plan_orcid_override_returns_all_matches(tmp_path: P
             "author_suffix": pa.array(["", "", "", "", ""], type=pa.string()),
             "author_affiliations": pa.array([[], [], [], [], []], type=pa.list_(pa.string())),
             "author_orcid": pa.array(
-                ["0000-0001", "0000-0001", "0000-0001", "0000-0001", None],
+                [
+                    "https://orcid.org/0000-0002-1825-0097",
+                    "0000-0002-1825-0097",
+                    "ORCID: 0000000218250097",
+                    "0000-0002-1825-0097",
+                    None,
+                ],
                 type=pa.string(),
             ),
             "author_position": pa.array([0, 0, 0, 0, 0], type=pa.int64()),
@@ -706,6 +836,70 @@ def test_raw_arrow_candidate_plan_orcid_override_returns_all_matches(tmp_path: P
     assert set(plan["row_component_keys"]) == {"c_good", "c_middle", "c_year"}
     assert "c_none" not in plan["row_component_keys"]
     assert plan["row_orcid_match"].tolist() == [1, 1, 1]
+
+
+def test_raw_arrow_candidate_plan_missing_query_position_skips_position_zero_self_author(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    signatures = pa.table(
+        {
+            "signature_id": pa.array(["q1", "s_self", "s_real"], type=pa.string()),
+            "paper_id": pa.array(["p_q", "p_self", "p_real"], type=pa.string()),
+            "author_first": pa.array(["Alice", "Alice", "Alice"], type=pa.string()),
+            "author_middle": pa.array(["", "", ""], type=pa.string()),
+            "author_last": pa.array(["Wang", "Wang", "Wang"], type=pa.string()),
+            "author_suffix": pa.array(["", "", ""], type=pa.string()),
+            "author_affiliations": pa.array([[], [], []], type=pa.list_(pa.string())),
+            "author_orcid": pa.array([None, None, None], type=pa.string()),
+            "author_position": pa.array([None, 0, 0], type=pa.int64()),
+        }
+    )
+    papers = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p_self", "p_real"], type=pa.string()),
+            "title": pa.array(["", "", ""], type=pa.string()),
+            "venue": pa.array(["", "", ""], type=pa.string()),
+            "journal_name": pa.array(["", "", ""], type=pa.string()),
+            "year": pa.array([2024, 2024, 2024], type=pa.int64()),
+        }
+    )
+    paper_authors = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p_q", "p_self", "p_self", "p_real", "p_real"], type=pa.string()),
+            "position": pa.array([0, 1, 0, 1, 0, 1], type=pa.int64()),
+            "author_name": pa.array(
+                ["Alice Wang", "Ann Smith", "Alice Wang", "Alice Wang", "Alice Wang", "Ann Smith"],
+                type=pa.string(),
+            ),
+        }
+    )
+    cluster_seeds = pa.table(
+        {
+            "signature_id": pa.array(["s_self", "s_real"], type=pa.string()),
+            "cluster_id": pa.array(["c_self", "c_real"], type=pa.string()),
+        }
+    )
+    paths = {
+        "signatures": _write_ipc(tmp_path / "signatures.arrow", signatures),
+        "papers": _write_ipc(tmp_path / "papers.arrow", papers),
+        "paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors),
+        "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
+    }
+
+    plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+
+    overlap_by_component = dict(zip(plan["row_component_keys"], plan["coauthor_overlap"], strict=True))
+    assert overlap_by_component["c_self"] == 0.0
+    assert overlap_by_component["c_real"] > 0.0
 
 
 def test_raw_arrow_candidate_plan_matches_multi_query_auto_views_and_specter(tmp_path: Path) -> None:
@@ -1219,6 +1413,57 @@ def test_rust_featurizer_from_arrow_paths_matches_feature_block(tmp_path: Path) 
     assert direct.get_constraint("q1", "s2") == incumbent.get_constraint("q1", "s2") == 10000.0
 
 
+def test_rust_featurizer_missing_name_counts_presence_is_consistent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
+        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    feature_block = feature_block_from_arrow_paths(paths, raw_candidate_plan=_raw_plan_for_base_paths(paths))
+    signature_ids = ["q1", "s1", "s2"]
+
+    from_arrow = s2and_rust.RustFeaturizer.from_arrow_paths(
+        paths,
+        signature_ids,
+        set(),
+        None,
+        True,
+        False,
+        0.0,
+        10000.0,
+        1,
+    )
+    from_feature_block = s2and_rust.RustFeaturizer.from_feature_block(
+        feature_block,
+        set(),
+        None,
+        True,
+        False,
+        0.0,
+        10000.0,
+        1,
+    )
+
+    assert from_arrow.signature_name_counts_present() == [("q1", False), ("s1", False), ("s2", False)]
+    assert from_feature_block.signature_name_counts_present() == from_arrow.signature_name_counts_present()
+
+    paths_with_index = dict(paths)
+    paths_with_index["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index_artifact", monkeypatch)
+    with_name_counts = s2and_rust.RustFeaturizer.from_arrow_paths(
+        paths_with_index,
+        signature_ids,
+        set(),
+        None,
+        True,
+        False,
+        0.0,
+        10000.0,
+        1,
+    )
+    assert with_name_counts.signature_name_counts_present() == [("q1", True), ("s1", True), ("s2", True)]
+
+
 def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1307,6 +1552,30 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
         s2and_rust.RustFeaturizer.from_arrow_paths(
             alias_only_paths,
             signature_ids,
+            set(),
+            None,
+            True,
+            False,
+            0.0,
+            10000.0,
+            1,
+        )
+
+
+def test_rust_featurizer_rejects_unsorted_name_counts_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
+        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paths["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index_artifact", monkeypatch)
+    _swap_first_two_name_count_records(paths["name_counts_index"], "first")
+
+    with pytest.raises(ValueError, match="not sorted"):
+        s2and_rust.RustFeaturizer.from_arrow_paths(
+            paths,
+            ["q1", "s1", "s2"],
             set(),
             None,
             True,

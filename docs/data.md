@@ -20,10 +20,18 @@ checked into this repo under `s2and/data/production_model_v1.21/`.
 The current production model is a native bundle directory:
 
 - `s2and/data/production_model_v1.21/manifest.json`
+- `s2and/data/production_model_v1.21/clusterer.json`
 - `s2and/data/production_model_v1.21/pairwise/main.lgb`
 - `s2and/data/production_model_v1.21/pairwise/nameless.lgb`
+- `s2and/data/production_model_v1.21/pairwise/metadata.json`
+- `s2and/data/production_model_v1.21/pairwise/main_prediction_fixture.json`
+- `s2and/data/production_model_v1.21/pairwise/nameless_prediction_fixture.json`
 - `s2and/data/production_model_v1.21/incremental_linker/booster.lgb`
 - `s2and/data/production_model_v1.21/incremental_linker/metadata.json`
+- `s2and/data/production_model_v1.21/reproducibility/incremental_linker_training_target.json`
+
+See [production_inference.md](production_inference.md) for what each file is
+for.
 
 This bundle is included in package data, so prediction does not require a
 separate model download. The older `production_model_v1.2.pickle` is retained
@@ -42,8 +50,9 @@ at:
 s2and/data/production_model_v1.21/reproducibility/incremental_linker_training_target.json
 ```
 
-It is not a runtime model; it records feature order and training params for the
-replay script.
+Prediction logic does not consume it, but bundle load validation includes its
+manifest checksum. It records feature order and training params for the replay
+script.
 
 The promoted linker train/calibrate/eval replay data is also published under
 the same S3 release prefix. Download it when you need to rebuild or audit the

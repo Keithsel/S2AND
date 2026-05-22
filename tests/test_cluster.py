@@ -148,3 +148,17 @@ class TestClusterer(unittest.TestCase):
         }
         with pytest.raises(KeyError, match="Missing precomputed distance matrix for block"):
             self.dummy_clusterer.predict_helper(block, self.dummy_dataset, dists={})
+
+    def test_predict_from_rust_featurizer_rejects_disallows_with_precomputed_dists(self):
+        block = {
+            "a sattar": ["0", "1"],
+        }
+
+        with pytest.raises(ValueError, match="cluster_seeds_disallow cannot be enforced"):
+            self.dummy_clusterer.predict_from_rust_featurizer(
+                block,
+                object(),
+                dists={"a sattar": np.asarray([0.1], dtype=np.float64)},
+                cluster_seeds_require={},
+                cluster_seeds_disallow={("0", "1")},
+            )

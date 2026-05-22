@@ -89,6 +89,30 @@ def test_rust_retrieval_batch_returns_flat_pair_plan() -> None:
     assert "affiliation_overlap" in batch.row_signals
 
 
+def test_rust_chooser_feature_rows_subset_honors_num_threads() -> None:
+    if not hasattr(s2and_rust.RustHybridCentroidRetriever, "chooser_feature_rows_subset"):
+        pytest.skip("chooser_feature_rows_subset is unavailable")
+    query = build_query_features(first="alice", has_coauthors=True, has_affiliations=True)
+    summaries = [
+        build_cluster_summary(
+            component_key="c1",
+            size=2,
+            first_name_counts=Counter({"alice": 2}),
+            coauthor_counts=Counter({"a smith": 2}),
+            affiliation_counts=Counter({"lab": 2}),
+        ),
+        build_cluster_summary(component_key="c2", size=1, first_name_counts=Counter({"bob": 1})),
+    ]
+    retriever = s2and_rust.RustHybridCentroidRetriever(summaries, include_exemplars=True)
+
+    single_thread_rows = retriever.chooser_feature_rows_subset(query, ["c1", "c2"], num_threads=1)
+    multi_thread_rows = retriever.chooser_feature_rows_subset(query, ["c1", "c2"], num_threads=2)
+
+    assert multi_thread_rows == single_thread_rows
+    assert set(single_thread_rows) == {"c1", "c2"}
+    assert "coauthor_overlap" in single_thread_rows["c1"]
+
+
 def test_rust_retrieval_batch_preserves_single_character_title_and_venue_terms() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
         pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
@@ -268,7 +292,7 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
         first="alice",
         middle_initials=frozenset({"q"}),
         year=2024,
-        orcid="0000-0001",
+        orcid="0000-0001-2345-6789",
         has_full_first=True,
     )
     summaries = [
@@ -278,7 +302,7 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
             middle_initial_counts=Counter({"q": 1}),
             year_min=2024,
             year_max=2024,
-            orcid_values=frozenset({"0000-0001"}),
+            orcid_values=frozenset({"0000-0001-2345-6789"}),
         ),
         build_cluster_summary(
             component_key="orcid_middle_conflict",
@@ -286,7 +310,7 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
             middle_initial_counts=Counter({"z": 1}),
             year_min=2024,
             year_max=2024,
-            orcid_values=frozenset({"0000-0001"}),
+            orcid_values=frozenset({"0000-0001-2345-6789"}),
         ),
         build_cluster_summary(
             component_key="orcid_year_conflict",
@@ -294,7 +318,7 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
             middle_initial_counts=Counter({"q": 1}),
             year_min=1900,
             year_max=1900,
-            orcid_values=frozenset({"0000-0001"}),
+            orcid_values=frozenset({"0000-0001-2345-6789"}),
         ),
         build_cluster_summary(
             component_key="non_orcid_candidate",
@@ -366,7 +390,6 @@ def test_rust_experimental_retrieval_rescues_high_coverage_mega_candidates() -> 
         query,
         ["c_rescue", "c_nonmega", "c_partial"],
         top_k=3,
-        max_block_component_size=1,
         weights=[0.0, 1.0, 0.0, 0.0, 0.0],
         first_name_mode="prefix",
         specter_mode="centroid",
@@ -392,7 +415,6 @@ def test_rust_experimental_retrieval_rescues_high_coverage_mega_candidates() -> 
         query,
         ["c_rescue", "c_nonmega", "c_partial"],
         top_k=3,
-        max_block_component_size=1,
         weights=[0.0, 1.0, 0.0, 0.0, 0.0],
         first_name_mode="prefix",
         specter_mode="centroid",

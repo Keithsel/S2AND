@@ -373,7 +373,6 @@ def rank_top_summaries_rust_hybrid_centroid(
     query: QueryFeatures,
     retriever: RustHybridCentroidRetrieverHandle,
     component_keys: list[str],
-    max_block_component_size: int,
     override_summary: ClusterSummary | None = None,
     num_threads: int | None = None,
     weights: tuple[float, ...] | list[float],
@@ -383,8 +382,6 @@ def rank_top_summaries_rust_hybrid_centroid(
 
     if not component_keys:
         return []
-    if max_block_component_size <= 0:
-        raise ValueError("max_block_component_size must be positive")
     if scoring_config is None:
         raise ValueError("scoring_config is required")
     resolved_num_threads = _resolve_rust_num_threads(num_threads)
@@ -392,7 +389,6 @@ def rank_top_summaries_rust_hybrid_centroid(
         query,
         component_keys,
         top_k=len(component_keys),
-        max_block_component_size=int(max_block_component_size),
         weights=[float(value) for value in weights],
         num_threads=resolved_num_threads,
         override_summary=override_summary,

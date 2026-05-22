@@ -80,7 +80,9 @@ Notes:
 - `cluster_seeds.arrow` is required only for seeded/incremental datasets. It can
   be omitted for unseeded full prediction and offline eval.
 - `cluster_seed_disallows.arrow` preserves pairwise seed disallow constraints.
-  Omit it when the request has no seed disallows; an explicit path must exist.
+  Hand-authored artifacts can omit it when the request has no seed disallows;
+  converters may emit an empty table instead. An explicit path must exist when
+  present.
 - When using `write_feature_block_arrow_from_anddata(...)` for
   seeded/incremental artifacts, pass `include_empty_cluster_seeds=True` so empty
   seed/disallow tables are still emitted.
@@ -196,10 +198,12 @@ index per file. At runtime, the selected embedding file is passed under the
 `specter` path key, and S2AND uses the adjacent
 `<embedding-stem>.specter_batch_index.bin` sidecar when present.
 
-The batch-index format is S2AND-owned and versioned by
-`arrow_batch_lookup_index_v1`. Each record maps a 64-bit FNV-1a hash of the
-lookup key to an IPC record-batch index; the Rust reader verifies exact ids
-after loading the selected batches, so hash collisions do not change results.
+The batch-index format is S2AND-owned. Current writers emit
+`arrow_batch_lookup_index_v2` / `S2ABI002`, which records the key-column hash and
+source fingerprint in addition to key-to-batch records. Rust still accepts
+legacy v1 indexes. Each record maps a 64-bit FNV-1a hash of the lookup key to an
+IPC record-batch index; the Rust reader verifies exact ids after loading the
+selected batches, so hash collisions do not change results.
 
 ---
 
@@ -220,8 +224,8 @@ Use the existing `FeatureBlock` writer as the reference implementation for table
 values and Arrow physical layout:
 `s2and.incremental_linking.feature_block.write_feature_block_arrow_from_anddata`.
 That writer returns table paths and does not write `manifest.json`; manifests
-are producer-owned. The converter scripts in `scripts/convert_*_to_arrow.py`
-are reference producers for manifest shape. An independent assembly pipeline is
+are producer-owned. `scripts/convert_to_arrow.py` is the reference producer for
+manifest shape. An independent assembly pipeline is
 fine, but it must produce the same table values as the writer and the same
 manifest contract as this document.
 
@@ -326,7 +330,9 @@ strings.
 ### `cluster_seed_disallows.arrow`
 
 Optional for incremental/seeded prediction through the Arrow promoted path.
-Omit the file when no seed disallows are present; an explicit path must exist.
+Omit the file when no seed disallows are present, or emit a valid empty table
+when using a converter configured to keep seed/disallow tables explicit. An
+explicit path must exist when present.
 
 | Column | Arrow type | Nulls | Meaning |
 |---|---:|---:|---|
@@ -382,31 +388,20 @@ Production prediction does not need this file.
 
 ## Name Counts
 
-Preferred production layout:
+Manifest expectations from this spec:
 
-1. Provide a shared/global `s2and/data/name_counts_index/` sidecar when the
-   selected model uses name-count features.
+1. Provide a shared/global `s2and/data/name_counts_index/` sidecar (referenced
+   from manifests via the `name_counts_index` path key) when the selected model
+   uses name-count features.
 2. Keep `name_counts.arrow` only for generation, inspection, and parity
-   debugging.
+   debugging — it is not a runtime fallback for `name_counts_index/`.
+3. Do not build a request-time pipeline that loads `name_counts.arrow` into
+   Python dicts/lists. That defeats the purpose of this contract.
 
-The shared binary index layout is:
-
-```text
-s2and/data/name_counts_index/
-  manifest.json
-  generations/<generation-id>/
-    first.bin
-    last.bin
-    first_last.bin
-    last_first_initial.bin
-```
-
-`manifest.json` must have `schema_version: "name_counts_index_v1"` and points
-to one complete immutable generation. Writers publish a new generation by
-replacing only the manifest after all binary files are written.
-
-Do not build a pipeline that loads `name_counts.arrow` into Python dicts/lists
-for production request handling. That defeats the purpose of this contract.
+The on-disk layout, manifest schema (`schema_version: "name_counts_index_v1"`),
+binary record format, and immutable-generation publication ritual are owned by
+[`artifact_formats.md` -- Name Counts](artifact_formats.md#name-counts). New
+writers must publish through that contract.
 
 ---
 
@@ -554,7 +549,10 @@ Recommended additional fields:
 Root-level `manifest.json` should use schema `inference_arrow_bundle_v1` and
 list dataset directories and their manifest paths in `dataset_manifests` when an
 artifact bundle contains multiple datasets. Keep per-input `source_path` values
-in dataset manifests; do not write a root-level `source_path`.
+in dataset manifests; do not write a root-level `source_path`. Older mini Arrow
+artifacts may still have the legacy `reports` root shape; `scripts/convert_to_arrow.py`
+can read that shape when updating a bundle, but new writes should use
+`dataset_manifests`.
 
 ---
 
@@ -615,7 +613,7 @@ Recommended smoke checks:
 PowerShell:
 
 ```powershell
-uv run python scripts/convert_s2and_mini_to_arrow.py `
+uv run python scripts/convert_to_arrow.py benchmark `
   --source-root s2and/data/s2and_mini `
   --output-root s2and/data/s2and_mini_arrow `
   --n-jobs 20 `
@@ -630,7 +628,7 @@ uv run python scripts/eval_prod_models.py --dataset mini --n_jobs 20 --seed 42
 Bash:
 
 ```bash
-uv run python scripts/convert_s2and_mini_to_arrow.py \
+uv run python scripts/convert_to_arrow.py benchmark \
   --source-root s2and/data/s2and_mini \
   --output-root s2and/data/s2and_mini_arrow \
   --n-jobs 20 \

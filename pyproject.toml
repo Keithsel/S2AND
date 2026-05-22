@@ -96,6 +96,7 @@ minversion = "7.0"
 testpaths = ["tests"]
 markers = [
     "heavy: opt-in stress / integration tests; run with -m heavy",
+    "requires_lfs: tests that require Git LFS artifacts to be materialized",
 ]
 
 # Ruff config (used for lint + format)

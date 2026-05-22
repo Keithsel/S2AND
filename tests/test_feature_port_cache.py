@@ -244,6 +244,67 @@ def test_rust_featurizer_cache_keeps_distinct_build_options(monkeypatch):
     assert _cache_size() == 2
 
 
+def test_rust_featurizer_cache_tracks_cluster_seed_version():
+    dataset = DummyDataset("seed_version_cache_dataset", mode="train")
+
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset._cluster_seeds_version = 1
+    second = feature_port._get_rust_featurizer(dataset)
+
+    assert second is not first
+    assert DummyRustFeaturizer.created == ["seed_version_cache_dataset", "seed_version_cache_dataset"]
+    assert _cache_size() == 2
+
+
+def test_rust_featurizer_cache_rejects_invalid_cluster_seed_version():
+    dataset = DummyDataset("bad_seed_version_cache_dataset", mode="train")
+
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset._cluster_seeds_version = "bad"
+
+    with pytest.raises(ValueError, match="invalid literal"):
+        feature_port._get_rust_featurizer(dataset)
+
+    assert first.dataset_name == "bad_seed_version_cache_dataset"
+    assert DummyRustFeaturizer.created == ["bad_seed_version_cache_dataset"]
+    assert _cache_size() == 1
+
+
+def test_rust_featurizer_cache_rejects_none_cluster_seed_version():
+    dataset = DummyDataset("none_seed_version_cache_dataset", mode="train")
+
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset._cluster_seeds_version = None
+
+    with pytest.raises(TypeError):
+        feature_port._get_rust_featurizer(dataset)
+
+    assert first.dataset_name == "none_seed_version_cache_dataset"
+    assert DummyRustFeaturizer.created == ["none_seed_version_cache_dataset"]
+    assert _cache_size() == 1
+
+
+def test_build_rust_featurizer_from_arrow_paths_rejects_none_path(monkeypatch):
+    class ArrowRustFeaturizer(DummyRustFeaturizer):
+        @classmethod
+        def from_arrow_paths(cls, *_args, **_kwargs):
+            raise AssertionError("from_arrow_paths should not be called for invalid paths")
+
+    class ArrowRustModule:
+        __version__ = "0.51.0"
+        RustFeaturizer = ArrowRustFeaturizer
+
+    monkeypatch.setattr(feature_port, "s2and_rust", ArrowRustModule)
+
+    with pytest.raises(ValueError, match="papers.*None"):
+        feature_port.build_rust_featurizer_from_arrow_paths(
+            {
+                "signatures": "signatures.arrow",
+                "papers": None,
+            }
+        )
+
+
 def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
     d1 = DummyDataset("parallel_d1", mode="train")
     d2 = DummyDataset("parallel_d2", mode="train")

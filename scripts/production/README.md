@@ -38,8 +38,11 @@ runtime production model until the linker is added.
 ```powershell
 uv run python scripts/production/model/train_linker_and_finalize.py `
   --production-bundle-version 1.3 `
+  --target-json s2and/data/production_model_v1.3/reproducibility/incremental_linker_training_target.json `
   --pairwise-model-path s2and/data/production_model_v1.3 `
   --save-production-bundle-to s2and/data/production_model_v1.3 `
+  --linker-artifact-version v1.3 `
+  --output-dir scratch/production_linker_v1.3 `
   --run-full
 ```
 

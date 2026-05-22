@@ -7,7 +7,7 @@
 | Script | What it does | Key output |
 |---|---|---|
 | `rust_suite.py compare` | Featurize random pairs on one dataset, compare Python vs Rust outputs | Feature parity report, runtime speedup, RSS reduction |
-| `rust_suite.py transfer-mini` | Train union model across 3 datasets at reduced scale (~30 min) | Per-stage timing, peak RSS, clustering quality (python vs rust) |
+| `rust_suite.py transfer-mini` | Smoke-scale KISTI transfer run by default; pass the full preset for the historical 3-dataset reduced-scale run | Per-stage timing, peak RSS, clustering quality (python vs rust) |
 | `rust_suite.py prod-inference` | Run inference with pre-trained prod model + cProfile | Function-level hotspots, latency, RSS, clustering metrics |
 | `rust_suite.py featurizer-reuse` | Repeated KISTI predictions, same-object vs re-instantiated | Featurizer cache hit rate, per-iteration timing, RSS |
 | `rust_suite.py largest-block` | Profile Python vs Rust on one large block | Partition diff (digest + per-signature), latency, RSS; optional `--quality-check` + `--constraint-sample` |
@@ -44,7 +44,7 @@
 | `make_inventors_split_and_histograms.py` | Split inventors data and generate histograms (defaults to a local ignored output path) |
 | `make_inventors_hf_specter_embeddings.py` | Generate SPECTER embeddings for inventors dataset (defaults to a local ignored output path) |
 | `extract_big_block_dataset.py` | Convert a monolithic big-block export into `ANDData`-friendly `signatures.json`, `papers.json`, and `specter.pickle` files; supports both pretty-printed and minified JSON exports |
-| `convert_inference_json_to_arrow.py` | Convert service-shaped inference JSON into direct Rust Arrow inputs, preserving required seed assignments, seed disallows, and `altered_cluster_signatures.arrow`; generated name-count indexes default under the output root, and JSON sidecars require `--copy-source-json` |
+| `convert_to_arrow.py` | Convert service JSON, benchmark datasets, linker replay raw inputs, and shared name-counts into Arrow runtime artifacts; subcommands are `service-json`, `benchmark`, `linker-replay`, `name-counts-index`, and `validate` |
 | `analyze_giant_block_subblocking.py` | Sweep subblocking thresholds on an extracted giant block and write preservation metrics, plots, and tables |
 | `bench_preprocess_phases.py` | Benchmark preprocessing phases (papers, signatures) across serial / threads / processes |
 
@@ -74,7 +74,7 @@ Scripts in `archive/` are historical and generally not intended to be rerun.
 | `archive/sota.py` | Historical state-of-the-art results table script from the paper |
 | `archive/make_s2and_mini_dataset.py` | Historical mini-dataset creation utility |
 | `archive/make_s2and_name_tuples.py` | Historical name tuples creation (superseded; don't rerun) |
-| `archive/LLM_based_filtering_of_name_tuples.py` | Filter name tuples using Gemini 2.5 Pro (costs money to re-run) |
+| `archive/LLM_based_filtering_of_name_tuples.py` | Historical Gemini-based name-tuple filtering helper (costs money to re-run) |
 | `archive/paper_experiments.sh` | Historical paper-era command set; reproduce from the `s2and_paper` branch instead of current `main` |
 | `archive/find_largest_block.py` | Scan dataset signature files and find the single largest block |
 | `archive/blog_post_eval.py` | Min edit distance numbers for blog post (Python-only legacy) |

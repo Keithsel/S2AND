@@ -1,5 +1,7 @@
 # Threading and parallelism
 
+Status date: 2026-05-22
+
 S2AND uses multiple libraries that can each create their own thread pools (Rust Rayon, LightGBM/OpenMP, BLAS, etc.).
 If those pools are configured independently, runs can oversubscribe CPU cores and show higher-than-expected CPU usage.
 
@@ -10,8 +12,8 @@ This doc describes the intended “single knob” behavior and the practical rul
 Within the Python API, treat `n_jobs` as the canonical concurrency setting for a run:
 
 - **Rust backend**: Python passes `num_threads=n_jobs` into the Rust extension for batch constraints + featurization.
-- **LightGBM inference**: `Clusterer.n_jobs` propagates into the underlying estimators, and prediction passes
-  `num_threads=n_jobs` when supported.
+- **LightGBM inference**: `Clusterer.n_jobs` propagates into the underlying estimators; prediction uses the
+  estimator's configured threading rather than passing a separate `num_threads` override to `predict_proba()`.
 - **Python preprocessing**: `ANDData(n_jobs=...)` controls the limited (and platform-dependent) pooling used in some
   preprocessing phases (see “Python preprocessing parallelism” below).
 
@@ -145,7 +147,3 @@ threads than expected. This thread-pool reuse is unrelated to the public `use_ca
 
 If you need to guarantee that all worker threads fully exit between runs, use process boundaries (run each workload in a
 fresh Python process).
-
-## Date
-
-2026-03-16

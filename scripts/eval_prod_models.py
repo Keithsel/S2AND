@@ -193,15 +193,25 @@ def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suff
 
 
 def arrow_datasets_available(arrow_root: str | None, datasets: list[str], specter_suffixes: list[str]) -> bool:
+    return first_missing_arrow_dataset_error(arrow_root, datasets, specter_suffixes) is None
+
+
+def first_missing_arrow_dataset_error(
+    arrow_root: str | None,
+    datasets: list[str],
+    specter_suffixes: list[str],
+) -> FileNotFoundError | None:
     if arrow_root is None:
-        return False
+        return FileNotFoundError("Missing Arrow data root")
     for dataset_name in datasets:
         for specter_suffix in specter_suffixes:
             try:
                 resolve_arrow_dataset_paths(arrow_root, dataset_name, specter_suffix)
-            except FileNotFoundError:
-                return False
-    return True
+            except FileNotFoundError as exc:
+                return FileNotFoundError(
+                    f"Missing Arrow files for dataset={dataset_name!r}, specter_suffix={specter_suffix!r}: {exc}"
+                )
+    return None
 
 
 def read_arrow_s2_blocks(signatures_arrow_path: str) -> dict[str, list[str]]:
@@ -210,8 +220,10 @@ def read_arrow_s2_blocks(signatures_arrow_path: str) -> dict[str, list[str]]:
     with pa.memory_map(signatures_arrow_path, "r") as source:
         table = pa.ipc.open_file(source).read_all().select(["signature_id", "author_block"])
     block_dict: dict[str, list[str]] = defaultdict(list)
-    for row in table.to_pylist():
-        block_dict[str(row["author_block"])].append(str(row["signature_id"]))
+    signature_ids = table.column("signature_id").to_pylist()
+    author_blocks = table.column("author_block").to_pylist()
+    for signature_id, author_block in zip(signature_ids, author_blocks, strict=True):
+        block_dict[str(author_block)].append(str(signature_id))
     return dict(block_dict)
 
 
@@ -398,18 +410,14 @@ def main() -> None:
             raise ValueError(f"Unknown dataset(s) for --dataset {args.dataset}: {unknown_datasets}")
         datasets = requested_datasets
     active_specter_suffixes = [str(suffix) for suffix in (args.specter_suffixes or specter_suffixes)]
-    arrow_available = (
-        args.dataset == "mini"
-        and not train_flag
-        and arrow_datasets_available(
-            arrow_data_root,
-            datasets,
-            active_specter_suffixes,
-        )
+    missing_arrow_error = (
+        first_missing_arrow_dataset_error(arrow_data_root, datasets, active_specter_suffixes)
+        if args.dataset == "mini" and not train_flag
+        else FileNotFoundError("Arrow eval is unavailable for this configuration")
     )
-    if args.use_arrow and not arrow_available:
-        # Raise the precise missing-file error for the first requested combination.
-        resolve_arrow_dataset_paths(arrow_data_root, datasets[0], active_specter_suffixes[0])
+    arrow_available = args.dataset == "mini" and not train_flag and missing_arrow_error is None
+    if args.use_arrow and missing_arrow_error is not None:
+        raise missing_arrow_error
     use_arrow = bool(args.use_arrow or (arrow_available and not args.no_arrow))
 
     print(

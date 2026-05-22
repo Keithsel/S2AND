@@ -108,25 +108,7 @@ def _load_cluster_seeds_require(
     }
 
 
-def _distance_report(left: np.ndarray, right: np.ndarray) -> dict[str, Any]:
-    left_array = np.asarray(left, dtype=np.float64)
-    right_array = np.asarray(right, dtype=np.float64)
-    if left_array.shape != right_array.shape:
-        return {
-            "shape_match": False,
-            "left_shape": tuple(int(value) for value in left_array.shape),
-            "right_shape": tuple(int(value) for value in right_array.shape),
-        }
-    diff = np.abs(left_array - right_array)
-    return {
-        "shape_match": True,
-        "max_absdiff": float(diff.max()) if diff.size else 0.0,
-        "nonzero_absdiff_count": int(np.count_nonzero(diff > 0.0)),
-        "allclose_equal_nan": bool(np.allclose(left_array, right_array, rtol=0.0, atol=0.0, equal_nan=True)),
-    }
-
-
-def _numeric_array_report(left: np.ndarray, right: np.ndarray) -> dict[str, Any]:
+def _numeric_report(left: np.ndarray, right: np.ndarray, *, treat_nan_as_mismatch: bool) -> dict[str, Any]:
     left_array = np.asarray(left, dtype=np.float64)
     right_array = np.asarray(right, dtype=np.float64)
     if left_array.shape != right_array.shape:
@@ -137,11 +119,11 @@ def _numeric_array_report(left: np.ndarray, right: np.ndarray) -> dict[str, Any]
         }
     left_nan = np.isnan(left_array)
     right_nan = np.isnan(right_array)
-    finite_mask = ~(left_nan | right_nan)
-    diff = np.abs(left_array[finite_mask] - right_array[finite_mask])
+    comparable_mask = ~(left_nan | right_nan)
+    diff = np.abs(left_array[comparable_mask] - right_array[comparable_mask])
     return {
         "shape_match": True,
-        "nan_mismatch_count": int(np.count_nonzero(left_nan != right_nan)),
+        "nan_mismatch_count": int(np.count_nonzero(left_nan != right_nan)) if treat_nan_as_mismatch else 0,
         "max_absdiff": float(diff.max()) if diff.size else 0.0,
         "nonzero_absdiff_count": int(np.count_nonzero(diff > 0.0)),
         "allclose_equal_nan": bool(np.allclose(left_array, right_array, rtol=0.0, atol=0.0, equal_nan=True)),
@@ -254,7 +236,7 @@ def _feature_constraint_report(
     )
     return {
         "pair_count": int(len(pairs)),
-        "feature_matrix": _numeric_array_report(incumbent_features, arrow_features),
+        "feature_matrix": _numeric_report(incumbent_features, arrow_features, treat_nan_as_mismatch=True),
         "constraints": _constraint_report(
             incumbent_featurizer,
             arrow_featurizer,
@@ -274,6 +256,8 @@ def _assert_exact(report: dict[str, Any]) -> None:
         constraints = feature_comparison["constraints"]
         if not feature_matrix.get("allclose_equal_nan", False) or feature_matrix.get("nan_mismatch_count") != 0:
             raise AssertionError(f"feature matrix mismatch: {feature_matrix}")
+        if not constraints.get("left_indices_equal", False) or not constraints.get("right_indices_equal", False):
+            raise AssertionError(f"constraint index mismatch: {constraints}")
         if not constraints.get("values_equal", False):
             raise AssertionError(f"constraint mismatch: {constraints}")
     if not report.get("clusters_exact_match", False):
@@ -321,6 +305,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         specter_embeddings,
         selected_signature_ids,
     )
+    del signatures, papers, specter_embeddings
     timings["load_filter_papers_specter_seconds"] = time.perf_counter() - start
 
     cluster_seeds_require = _load_cluster_seeds_require(
@@ -365,7 +350,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     timings["write_complete_arrow_seconds"] = time.perf_counter() - start
 
     start = time.perf_counter()
-    name_counts_artifact_dir = args.name_counts_artifact_dir or args.name_artifact_dir or args.output_dir
+    name_artifact_dir = args.name_artifact_dir or args.output_dir
+    name_counts_artifact_dir = name_artifact_dir
     name_counts_arrow_path, name_counts_arrow_metrics = write_name_counts_arrow(name_counts_artifact_dir)
     arrow_paths["name_counts"] = name_counts_arrow_path
     timings["write_name_counts_arrow_seconds"] = time.perf_counter() - start
@@ -376,7 +362,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     timings["write_name_counts_index_seconds"] = time.perf_counter() - start
 
     start = time.perf_counter()
-    name_pairs_artifact_dir = args.name_pairs_artifact_dir or args.name_artifact_dir or args.output_dir
+    name_pairs_artifact_dir = name_artifact_dir
     name_pairs_arrow_path, name_pairs_arrow_metrics = write_name_pairs_arrow(
         getattr(dataset, "name_tuples", set()),
         name_pairs_artifact_dir,
@@ -459,7 +445,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     timings["arrow_cluster_from_dists_seconds"] = time.perf_counter() - start
 
     distance_comparison = {
-        block_key: _distance_report(incumbent_dists[block_key], arrow_dists[block_key]) for block_key in block_dict
+        block_key: _numeric_report(
+            incumbent_dists[block_key],
+            arrow_dists[block_key],
+            treat_nan_as_mismatch=False,
+        )
+        for block_key in block_dict
     }
     report = {
         "fixture_dir": str(args.fixture_dir),
@@ -498,8 +489,6 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--name-artifact-dir", type=Path, default=None)
-    parser.add_argument("--name-counts-artifact-dir", type=Path, default=None)
-    parser.add_argument("--name-pairs-artifact-dir", type=Path, default=None)
     parser.add_argument("--model-path", type=Path, default=Path("s2and/data/production_model_v1.21"))
     parser.add_argument("--block-size", type=int, required=True)
     parser.add_argument("--n-jobs", type=int, default=20)

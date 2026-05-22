@@ -5,7 +5,7 @@ This document describes every cache-like mechanism in S2AND and how it relates t
 
 ## Public API
 
-`use_cache` is the single public cache control on the main APIs:
+`use_cache` is the public control for the persistent pair-feature cache on the main pair-featurization APIs:
 
 - `featurize(..., use_cache=...)`
 - `many_pairs_featurize(..., use_cache=...)`
@@ -20,6 +20,8 @@ Important nuance:
 
 - `use_cache` does not disable same-process Rust featurizer reuse.
 - `use_cache` does not disable the artifact download cache used by `s2and.file_cache.cached_path`.
+- Direct Arrow/Rust production prediction paths bypass the persistent pair-feature SQLite cache; `use_cache` only affects
+  prediction paths that materialize pair features through the Python cache-aware featurization layer.
 
 ## Cache Inventory
 
@@ -27,6 +29,7 @@ Important nuance:
 | --- | --- | --- | --- |
 | Pair-feature cache | Yes | Reuse computed pairwise feature rows across repeated featurization/prediction | `<S2AND_CACHE>/<dataset>/<featurizer_version>/pair_features.sqlite3` |
 | Rust featurizer in-memory reuse | No | Reuse an already-built Rust featurizer within the current Python process | memory only |
+| Direct Arrow/Rust prediction inputs | No | Read request/runtime Arrow artifacts directly without pair-feature SQLite caching | request or bundle artifact paths |
 | Artifact download cache | No | Avoid re-downloading remote artifacts fetched through `cached_path()` | `<S2AND_CACHE>/artifacts` |
 
 `S2AND_CACHE` defaults to `~/.s2and`.

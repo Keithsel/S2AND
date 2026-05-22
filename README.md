@@ -19,7 +19,7 @@ The repository supports both Python-only use and a Rust-accelerated runtime for 
 | Download the benchmark datasets | [Download Data or Model](#download-data-or-model) | [docs/data.md](docs/data.md) |
 | Train or evaluate a model | [Training and Evaluation Essentials](#training-and-evaluation-essentials) | [docs/training.md](docs/training.md) |
 | Build a production release bundle | `scripts/production/` | [docs/production_inference.md](docs/production_inference.md) |
-| Operate Rust-backed large-scale inference | [Runtime and Scaling](#runtime-and-scaling) | [docs/rust/runtime.md](docs/rust/runtime.md), [docs/subclustering.md](docs/subclustering.md), [docs/threading.md](docs/threading.md) |
+| Operate Rust-backed large-scale inference | [Runtime and Scaling](#runtime-and-scaling) | [docs/rust/runtime.md](docs/rust/runtime.md), [docs/subblocking.md](docs/subblocking.md), [docs/threading.md](docs/threading.md) |
 | Work on the repo itself | [Development](#development) | [docs/development.md](docs/development.md) |
 
 ## Install
@@ -115,7 +115,8 @@ When running repo scripts, prefer `uv run --no-project` so imports resolve from 
 
 Key points:
 
-- `production_model_v1.21/` is the current recommended model. It bundles the v1.2 pairwise model and the promoted Rust incremental linker.
+- `production_model_v1.21/` is the current recommended model. Its pairwise artifacts come from the v1.2 source model,
+  and it bundles the promoted Rust incremental linker.
 - Starting with S2AND `0.50.0`, production model releases are directory bundles named `production_model_vX.Y/`; new production releases should not be published as pickle files.
 - Git LFS is only a source-checkout concern. Published `s2and` wheels and sdists include the hydrated model files.
 - Use directory bundles for workflows that need a linker model. The legacy `v1.0`, `v1.1`, and `v1.2` pickle artifacts contain only the legacy pickled model state and do not bundle `incremental_linker/` artifacts.
@@ -220,7 +221,6 @@ X_val, y_val = val
 
 pairwise_model = PairwiseModeler(
     n_iter=25,
-    calibrate=True,
     monotone_constraints=featurization_info.lightgbm_monotone_constraints,
 )
 pairwise_model.fit(X_train, y_train, X_val, y_val)
@@ -269,7 +269,7 @@ Details:
 - Runtime contract: [docs/rust/runtime.md](docs/rust/runtime.md)
 - Cache semantics: [docs/caching.md](docs/caching.md)
 - Threading guidance: [docs/threading.md](docs/threading.md)
-- Subblocking and memory tradeoffs: [docs/subclustering.md](docs/subclustering.md)
+- Subblocking and memory tradeoffs: [docs/subblocking.md](docs/subblocking.md)
 - Environment variables: [docs/environment.md](docs/environment.md)
 
 ## Documentation Map
@@ -348,7 +348,7 @@ Notes:
 
 - Index (start here): `docs/README.md`
 - Next steps: `docs/work_plan.md`
-- Backlog: `docs/work_plan.md` (Backlog section)
+- Open work: `docs/work_plan.md`
 
 ---
 
@@ -358,7 +358,9 @@ The original paper-era environment and scripts live on the `s2and_paper` branch.
 
 ## Licensing
 
-The code in this repo is released under the Apache 2.0 license. The dataset is released under ODC-BY. Some affiliation data comes directly from the Microsoft Academic Graph.
+Package metadata currently declares the Python package license as MIT, while the
+root `LICENSE` file is CC-BY-4.0. The released dataset is under ODC-BY. Some
+affiliation data comes directly from the Microsoft Academic Graph.
 
 ## Citation
 

@@ -21,6 +21,7 @@ from s2and.incremental_linking.feature_block_contract import (
     _optional_bool,
     _optional_int,
     _optional_str,
+    _strict_string_tuple,
     feature_block_signature_order_from_raw_candidate_plan,
 )
 
@@ -229,12 +230,19 @@ def _feature_block_signature_from_raw_payload(
         author_middle=_optional_str(author_info.get("middle")),
         author_last=_optional_str(author_info.get("last")),
         author_suffix=_optional_str(author_info.get("suffix")),
-        author_affiliations=tuple(str(value) for value in (author_info.get("affiliations") or ())),
+        author_affiliations=_strict_string_tuple(
+            author_info.get("affiliations"),
+            field_name="signatures.author_info.affiliations",
+        ),
         author_orcid=_raw_orcid(author_info),
         author_position=_optional_int(author_info.get("position"), field_name="signatures.author_info.position"),
         author_block=_optional_str(author_info.get("block")),
         author_email=_optional_str(author_info.get("email")),
-        source_author_ids=tuple(str(value) for value in (raw_signature.get("sourced_author_ids") or ())),
+        source_author_ids=_strict_string_tuple(
+            raw_signature.get("sourced_author_ids"),
+            field_name="signatures.sourced_author_ids",
+            skip_none=True,
+        ),
     )
 
 
@@ -261,7 +269,7 @@ def _feature_block_paper_authors_from_raw_payload(
     rows: list[FeatureBlockPaperAuthor] = []
     for index, author in enumerate(raw_paper.get("authors") or ()):
         if not isinstance(author, Mapping):
-            continue
+            raise ValueError(f"papers.authors entries must be mappings for paper_id={paper_id!r}")
         position = _optional_int(author.get("position"), field_name="papers.authors.position")
         rows.append(
             FeatureBlockPaperAuthor(
@@ -343,7 +351,10 @@ def _feature_block_signature_from_anddata(dataset: Any, signature_id: str) -> Fe
         author_middle=_optional_str(getattr(signature, "author_info_middle", None)),
         author_last=_optional_str(getattr(signature, "author_info_last", None)),
         author_suffix=_optional_str(getattr(signature, "author_info_suffix", None)),
-        author_affiliations=tuple(str(value) for value in (getattr(signature, "author_info_affiliations", None) or ())),
+        author_affiliations=_strict_string_tuple(
+            getattr(signature, "author_info_affiliations", None),
+            field_name="signatures.author_info_affiliations",
+        ),
         author_orcid=_optional_str(getattr(signature, "author_info_orcid", None)),
         author_position=_optional_int(
             getattr(signature, "author_info_position", None),
@@ -351,7 +362,11 @@ def _feature_block_signature_from_anddata(dataset: Any, signature_id: str) -> Fe
         ),
         author_block=_optional_str(getattr(signature, "author_info_block", None)),
         author_email=_optional_str(getattr(signature, "author_info_email", None)),
-        source_author_ids=tuple(str(value) for value in (getattr(signature, "sourced_author_ids", None) or ())),
+        source_author_ids=_strict_string_tuple(
+            getattr(signature, "sourced_author_ids", None),
+            field_name="signatures.sourced_author_ids",
+            skip_none=True,
+        ),
     )
 
 
@@ -367,7 +382,7 @@ def _feature_block_papers_from_anddata(
             continue
         paper = getattr(dataset, "papers", {}).get(paper_id)
         if paper is None:
-            continue
+            raise ValueError(f"ANDData papers are missing signature paper_id: {paper_id!r}")
         seen.add(paper_id)
         papers.append(
             FeatureBlockPaper(
@@ -390,10 +405,9 @@ def _feature_block_paper_authors_from_papers(
     dataset: Any,
 ) -> tuple[FeatureBlockPaperAuthor, ...]:
     rows: list[FeatureBlockPaperAuthor] = []
+    dataset_papers = getattr(dataset, "papers", {})
     for paper_id in papers_by_id:
-        paper = getattr(dataset, "papers", {}).get(str(paper_id))
-        if paper is None:
-            continue
+        paper = dataset_papers[str(paper_id)]
         for index, author in enumerate(getattr(paper, "authors", None) or ()):
             position = _optional_int(getattr(author, "position", index), field_name="papers.authors.position")
             rows.append(

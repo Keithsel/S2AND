@@ -9,4 +9,4 @@ pointers needed to debug or regression-test the issue later.
 
 Current snapshots:
 
-- [docs/rust/profiling/2026-03-02.md](docs/rust/profiling/2026-03-02.md): gate rerun refresh snapshot.
+- [2026-03-02.md](2026-03-02.md): gate rerun refresh snapshot.

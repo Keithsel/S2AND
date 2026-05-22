@@ -1,6 +1,6 @@
 # Rust Runtime Contract
 
-Status date: 2026-03-02
+Status date: 2026-05-22
 
 This document defines the operational contract for the Rust extension: backend
 resolution, stage defaults, failure semantics, verification gates, and the risk
@@ -10,12 +10,16 @@ register. Active benchmark baselines live in `baselines.md`.
 
 ## Goal
 
-Primary train/eval command:
+Primary Rust gate commands are the canonical `scripts/rust_suite.py` workflows
+documented in [baselines.md](baselines.md):
+
 ```
-uv run python scripts/archive/transfer_experiment_internal.py \
-  --experiment_name inventors_s2and_union_eval \
-  --leave_self_in --skip_individual_models --random_seed 1 --n_jobs 8
+uv run python scripts/rust_suite.py compare ...
+uv run python scripts/rust_suite.py transfer-mini ...
+uv run python scripts/rust_suite.py stress-rebuild ...
 ```
+
+Archived transfer scripts are historical and are not the primary runtime gate.
 
 Project goals:
 1. Keep quality parity with Python.
@@ -44,8 +48,11 @@ Python path remains available via explicit backend and stage overrides at any ti
   - If Rust core capability is unavailable: resolve to Python.
   - If Rust core capability is available: resolve to Rust.
 - Invalid values raise `ValueError`.
-- Capability check is centralized in `s2and/rust_capabilities.py`:
-  core runtime requires extension importability + `RustFeaturizer.from_dataset`.
+- Capability detection is centralized in `s2and/runtime.py`; `s2and/rust_capabilities.py`
+  is a compatibility delegation layer.
+- Core runtime capability requires extension importability plus the current
+  Rust markers used by production paths, including dataset, JSON, Arrow,
+  indexed-featurization, constraints, seed, and name-count update support.
 
 ### Stage defaults (resolved backend = `rust`)
 
@@ -55,8 +62,10 @@ Python path remains available via explicit backend and stage overrides at any ti
 | `constraints` | Rust |
 | `pair_featurization` | Rust |
 
-- Inference defaults to JSON ingest (`from_json_paths`) when JSON paths are available.
-- Train/eval and non-path inference payloads use `from_dataset`.
+- Direct Arrow inputs are the preferred production inference boundary when
+  complete Arrow paths are available.
+- JSON ingest (`from_json_paths`) remains a compatibility and benchmark surface.
+- Train/eval and non-path compatibility payloads use `from_dataset`.
 - `S2AND_BACKEND` controls all stages uniformly.
 
 ### Failure semantics
@@ -92,7 +101,10 @@ These gates must pass before promoting any Rust defaults further.
 3. Rust featurizer cache/build lifecycle core machinery.
 
 **Intentionally divergent** (by design):
-1. Inference-only JSON ingest (`from_json_paths`) — requires file paths that train/eval doesn't have.
+1. Direct Arrow inference uses typed runtime files that train/eval does not
+   require.
+2. JSON ingest (`from_json_paths`) remains a compatibility path for file-shaped
+   inputs.
 
 ---
 
@@ -174,7 +186,7 @@ Maintenance checklist:
 | Risk | Notes |
 |---|---|
 | Featurizer cold-start serialization: global cache lock spans full build/load path | Lock scope is correct and necessary for atomicity. Contention under `n_jobs=4-8` not observed. |
-| Name-count precedence drift | Canonicalization shims (`_canonicalize_last_for_counts`, `_lasts_equivalent_for_constraint`) introduce implicit precedence assumptions. Shims will be removed after normalization migration phase 4. |
+| Name-count precedence drift | Canonicalization shims (`_canonicalize_last_for_counts`, `_lasts_equivalent_for_constraint`) introduce implicit precedence assumptions. Shims will be removed after normalization migration phase 4. That migration is currently **blocked** -- see [`../normalization_migration_blocked.md`](../normalization_migration_blocked.md). |
 
 ---
 

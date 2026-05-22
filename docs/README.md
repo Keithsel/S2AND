@@ -26,7 +26,7 @@ This directory holds both user-facing guides and internal engineering notes.
 - Environment variables: [environment.md](environment.md)
 - Cache semantics and layout: [caching.md](caching.md)
 - Threading and parallelism: [threading.md](threading.md)
-- Subblocking for large blocks: [subclustering.md](subclustering.md)
+- Subblocking for large blocks: [subblocking.md](subblocking.md)
 - Rust promotion baselines and gate commands: [rust/baselines.md](rust/baselines.md)
 - Rust inference architecture: [rust/inference_architecture.md](rust/inference_architecture.md)
 - Rust artifact formats: [rust/artifact_formats.md](rust/artifact_formats.md)
@@ -36,6 +36,7 @@ This directory holds both user-facing guides and internal engineering notes.
 ## Deep dives and engineering notes
 
 - Stage-wise memory telemetry notes: [stage_memory_estimates.md](stage_memory_estimates.md)
+- Release notes: [release_notes.md](release_notes.md)
 
 ## Planning and migration docs
 

@@ -398,20 +398,21 @@ def extract_query_features_from_feature_block(
                 paper_id=signature.paper_id,
                 author_position=author_position,
             )
+            affiliation_terms = _feature_block_affiliation_terms(signature)
             features = QueryFeatures(
                 first=first,
                 middle=middle,
                 first_initial=first[:1],
                 middle_initials=frozenset(token[0] for token in middle_tokens),
                 coauthor_blocks=coauthor_blocks,
-                affiliation_terms=_feature_block_affiliation_terms(signature),
+                affiliation_terms=affiliation_terms,
                 venue_terms=venue_terms,
                 year=year,
                 orcid=normalize_orcid(signature.author_orcid),
                 specter=specter,
                 has_specter=specter is not None,
                 has_coauthors=bool(coauthor_blocks),
-                has_affiliations=bool(signature.author_affiliations),
+                has_affiliations=bool(affiliation_terms),
                 has_full_first=len(first) > 1,
                 has_middle=bool(middle_tokens),
                 title_terms=title_terms,

@@ -14,7 +14,9 @@ This document collects the operational details for using the released S2AND prod
 Recommended default:
 
 - Use `production_model_v1.21/` unless you have a specific compatibility reason to load an older pickle.
-- The v1.21 bundle contains the v1.2 pairwise model and the v1.2 promoted Rust incremental linker.
+- The v1.21 bundle contains pairwise artifacts whose source model version is
+  v1.2 and the v1.2 promoted Rust incremental linker. Linker audit metadata may
+  record the enclosing bundle path/version used during finalization.
 - The bundle is checked into `s2and/data/` and included in package data, so prediction does not require a separate model download.
 
 Embedding source:
@@ -58,7 +60,8 @@ artifact pass validation, the target behavior is to use this promoted
 retrieval/linker/gate path because it has shown better runtime and quality than
 the long-standing legacy implementation.
 
-The file under `reproducibility/` is not loaded for inference. It records the
+The file under `reproducibility/` is not consumed by prediction logic. It is
+included in manifest checksum validation at bundle load time and records the
 53-feature replay target and LightGBM training params for rebuilding or auditing
 the promoted incremental linker.
 
@@ -111,7 +114,7 @@ Its main inputs are:
 - `--output-dir`: the scratch run directory for materialized features,
   summaries, and replay outputs.
 - `--save-artifact-to`: optional output directory for `booster.lgb` and
-- `metadata.json`; this is a low-level linker-only output.
+  `metadata.json`; this is a low-level linker-only output.
 - `--save-production-bundle-to`: preferred release output. It writes the linker
   under `incremental_linker/`, copies the target JSON into `reproducibility/`,
   refreshes linker audit metadata, and writes the final bundle manifest.
@@ -219,8 +222,8 @@ metrics are intentionally stale. Do not use it as the final release gate.
 7. Verify the promoted artifact and release wiring:
 
 ```powershell
-uv run pytest -q tests/test_promoted_linker_training_cli.py tests/test_linker_feature_assembly.py tests/test_incremental_linking_default_artifact.py
-uv run ruff check scripts/production/model/linker_train_calibrate_eval.py tests/test_promoted_linker_training_cli.py tests/test_linker_feature_assembly.py tests/test_incremental_linking_default_artifact.py
+uv run pytest -q tests/test_promoted_linker_training_cli.py tests/test_linker_feature_assembly.py tests/test_incremental_linking_default_artifact.py tests/test_production_model.py tests/test_production_model_cli_flow.py
+uv run ruff check scripts/production/model/linker_train_calibrate_eval.py tests/test_promoted_linker_training_cli.py tests/test_linker_feature_assembly.py tests/test_incremental_linking_default_artifact.py tests/test_production_model.py tests/test_production_model_cli_flow.py
 ```
 
 For repeated replay, `--feature-mode precomputed-promoted` is allowed only when
@@ -244,7 +247,9 @@ no shipped machine-local default for precomputed feature tables.
 
 ## Reference-feature behavior
 
-Models `v1.1` and `v1.2` were trained with `compute_reference_features=False`. That means they do not use features derived from cited references.
+Models `v1.21`, `v1.2`, and `v1.1` were trained with
+`compute_reference_features=False`. That means they do not use features derived
+from cited references.
 
 The disabled reference-derived features are:
 
@@ -257,14 +262,15 @@ The disabled reference-derived features are:
 
 Practical consequence:
 
-- For `v1.1` and `v1.2`, `papers.references` can be omitted or set to `null`.
+- For `v1.21`, `v1.2`, and `v1.1`, `papers.references` can be omitted or set
+  to `null`.
 - Signature fields are still required as usual.
 
 If you use `v1.0`, you must provide the paper-reference lists needed for those features.
 
 ## Minimal input contract
 
-Minimal paper entry for `v1.1` and `v1.2`:
+Minimal paper entry for `v1.21`, `v1.2`, and `v1.1`:
 
 ```json
 {
@@ -417,32 +423,33 @@ clusters = result["clusters"]
 ### Rust promoted incremental target
 
 The target behavior is that `Clusterer.predict_incremental(...)` uses the
-promoted Rust linker by default when `S2AND_BACKEND` selects Rust and the
-extension has the required promoted-incremental capabilities. Legacy output
-parity is not a release goal; the promoted path intentionally uses different
-retrieval, linker, and logistic-gate decisions.
+promoted Rust linker when `S2AND_BACKEND` selects Rust, the extension has the
+required promoted-incremental capabilities, and seed inputs are available from
+the dataset or Arrow artifacts. Without seed inputs, Rust mode falls back to the
+Python incremental helper for partition coverage. Legacy output parity is not a
+release goal; the promoted path intentionally uses different retrieval, linker,
+and logistic-gate decisions.
 
-`S2AND_BACKEND=rust` and `S2AND_BACKEND=auto` now route `predict_incremental`
-through the promoted linker when backend resolution selects Rust. There is no
-separate public force flag or artifact override: backend selection is the
-routing contract. Promoted query batching is available: `batching_threshold`
-caps the number of unassigned query signatures per promoted linker batch, while
-`total_ram_bytes` derives the default batch size when the caller does not pass a
-cap. The first meaningful promoted batch recalibrates rows/pairs per query for
-remaining batches, and telemetry records predicted/observed RSS deltas.
+There is no separate public force flag or artifact override: backend selection
+plus seed availability is the routing contract. Promoted query batching is
+available: `batching_threshold` caps the number of unassigned query signatures
+per promoted linker batch, while `total_ram_bytes` derives the default batch
+size when the caller does not pass a cap. The first meaningful promoted batch
+recalibrates rows/pairs per query for remaining batches, and telemetry records
+predicted/observed RSS deltas.
 
 The current Rust inference boundary, direct Arrow path, and remaining
 Python-heavy paths are summarized in
 [rust/inference_architecture.md](rust/inference_architecture.md).
 
-If seed-bearing FeatureBlock Arrow artifacts are available, promoted
+If FeatureBlock Arrow artifacts and seed inputs are available, promoted
 `predict_incremental(...)` uses the raw Arrow/Rust retrieval and scoring bridge
 by default for Phase A, then finishes residual abstains through the normal
-incremental completion path. Incremental Arrow routing requires
-`cluster_seeds.arrow`; artifacts without seed assignments fall back to the
-existing promoted `ANDData` path. `cluster_seed_disallows.arrow` is optional and
-means "no pairwise seed disallow constraints" when omitted, but an explicit path
-must exist.
+incremental completion path. Seeds can come from `cluster_seeds.arrow` or from
+`dataset.cluster_seeds_require`; when the latter is used, the runtime writes a
+request-local temporary seed table for Rust retrieval. `cluster_seed_disallows.arrow`
+is optional and means "no pairwise seed disallow constraints" when omitted, but
+an explicit path must exist.
 
 ### Incremental Seed Telemetry Contract
 
@@ -485,7 +492,7 @@ reported alongside promoted incremental telemetry.
 
 Supporting docs:
 
-- Subblocking behavior and tradeoffs: [subclustering.md](subclustering.md)
+- Subblocking behavior and tradeoffs: [subblocking.md](subblocking.md)
 - Threading guidance: [threading.md](threading.md)
 - Environment variables: [environment.md](environment.md)
 

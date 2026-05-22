@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,10 +23,53 @@ def _is_lfs_pointer(path: Path) -> bool:
 def _skip_if_missing_or_lfs_pointer(paths: list[Path]) -> None:
     missing = [str(path) for path in paths if not path.exists()]
     if missing:
+        if os.environ.get("CI"):
+            pytest.fail(f"missing LFS-backed artifact(s) in CI: {missing}")
         pytest.skip(f"missing LFS-backed artifact(s): {missing}")
     pointers = [str(path) for path in paths if _is_lfs_pointer(path)]
     if pointers:
+        if os.environ.get("CI"):
+            pytest.fail(f"Git LFS artifact(s) not materialized in CI: {pointers}")
         pytest.skip(f"Git LFS artifact(s) not materialized: {pointers}")
+
+
+def test_first_missing_arrow_dataset_error_reports_failing_pair(monkeypatch) -> None:
+    def fake_resolve(_arrow_root: str, dataset_name: str, specter_suffix: str) -> dict[str, str]:
+        if dataset_name == "second" and specter_suffix == "_specter2.pkl":
+            raise FileNotFoundError("missing specter2.arrow")
+        return {}
+
+    monkeypatch.setattr(eval_prod_models, "resolve_arrow_dataset_paths", fake_resolve)
+
+    error = eval_prod_models.first_missing_arrow_dataset_error(
+        "arrow-root",
+        ["first", "second"],
+        ["_specter.pickle", "_specter2.pkl"],
+    )
+
+    assert error is not None
+    assert "dataset='second'" in str(error)
+    assert "specter_suffix='_specter2.pkl'" in str(error)
+
+
+def test_read_arrow_s2_blocks_reads_columns_without_row_dicts(tmp_path: Path) -> None:
+    import pyarrow as pa
+
+    table = pa.table(
+        {
+            "signature_id": pa.array(["s1", "s2", "s3"], type=pa.string()),
+            "author_block": pa.array(["a smith", "a smith", "b jones"], type=pa.string()),
+        }
+    )
+    path = tmp_path / "signatures.arrow"
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+
+    assert eval_prod_models.read_arrow_s2_blocks(str(path)) == {
+        "a smith": ["s1", "s2"],
+        "b jones": ["s3"],
+    }
 
 
 def _read_minimal_incremental_signatures(signatures_path: Path) -> dict[str, Any]:
@@ -154,6 +198,7 @@ def test_cluster_eval_arrow_passes_name_counts_index_and_batch_indexes(monkeypat
     assert "clusters" not in captured["arrow_paths"]
 
 
+@pytest.mark.requires_lfs
 def test_pubmed_specter2_arrow_fixture_matches_production_eval() -> None:
     pytest.importorskip("s2and_rust")
 
@@ -201,6 +246,7 @@ def test_pubmed_specter2_arrow_fixture_matches_production_eval() -> None:
     assert cluster_metrics["B3 (P, R, F1)"] == pytest.approx((1.0, 0.892, 0.943), abs=5e-4)
 
 
+@pytest.mark.requires_lfs
 def test_pubmed_specter2_arrow_fixture_incremental_smoke_matches_expected_b3(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

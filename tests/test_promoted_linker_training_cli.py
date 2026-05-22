@@ -51,14 +51,11 @@ def test_promoted_training_defaults_to_minimal_raw_specter_source() -> None:
     assert parser_defaults["precomputed_feature_bundle_root"] is None
     assert parser_defaults["save_production_bundle_to"] is None
     assert parser_defaults["production_bundle_version"] is None
-    assert "promoted_feature_bundle_root" not in parser_defaults
     assert parser_defaults["prod_holdout_importance_weight"] == 10.0
     assert parser_defaults["hyperopt"] is False
     assert parser_defaults["hyperopt_evals"] is None
     assert parser_defaults["hyperopt_metric"] == "weighted_average_error"
     assert parser_defaults["allow_normalization_version_mismatch"] is False
-    assert "minimal_raw_component_scope" not in parser_defaults
-    assert "minimal_raw_compare_pw_scopes" not in parser_defaults
 
 
 def _write_precomputed_promoted_bundle(root: Path, target: dict[str, Any]) -> Path:

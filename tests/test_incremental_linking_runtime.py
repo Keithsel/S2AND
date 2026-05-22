@@ -77,10 +77,16 @@ def test_pairwise_predict_class0_does_not_require_num_threads_keyword_support() 
     predictions = runtime_module._predict_pairwise_class0(
         RejectsNumThreadsClassifier(),
         np.asarray([[0.25], [0.75]], dtype=np.float64),
-        num_threads=2,
     )
 
     assert np.allclose(predictions, [0.25, 0.75])
+
+
+def test_pairwise_model_feature_indices_preserve_group_order() -> None:
+    featurizer_info = FeaturizationInfo(features_to_use=["second", "first"])
+    featurizer_info.feature_group_to_index = {"first": [3, 1], "second": [5, 1]}
+
+    assert runtime_module._pairwise_model_feature_indices(featurizer_info) == (5, 1, 3)  # noqa: SLF001
 
 
 def test_distance_row_signals_distinguish_top3_and_top5_means() -> None:
@@ -310,6 +316,26 @@ def _promoted_gate_config(score: float = 0.0, margin: float = 0.0) -> dict[str, 
         missing_values=np.asarray([0.0], dtype=np.float64),
         calibration_mode="test",
     )
+
+
+def test_raw_arrow_runtime_rejects_none_path_before_rust_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_require_rust_runtime():
+        raise AssertionError("invalid Arrow paths should be rejected before raw Arrow planning")
+
+    monkeypatch.setattr(runtime_module.feature_port, "_require_rust_runtime", fail_require_rust_runtime)
+    clusterer = SimpleNamespace(
+        n_jobs=1,
+        featurizer_info=FeaturizationInfo(features_to_use=[]),
+        nameless_featurizer_info=None,
+    )
+
+    with pytest.raises(ValueError, match="signatures.*None"):
+        runtime_module.predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            clusterer,
+            StaticArtifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0)),
+            arrow_paths={"signatures": None, "papers": "papers.arrow", "paper_authors": "paper_authors.arrow"},
+            query_signature_ids=["q"],
+        )
 
 
 def _retrieval_batch(
@@ -1728,6 +1754,30 @@ def test_private_production_slice_rejects_require_outside_retrieval_window(
             queries=[object()],
             query_signature_ids=["q1"],
             partial_supervision={("q1", "s1"): 0},
+        )
+
+
+def test_from_retrieval_validates_partial_supervision_against_full_seed_map() -> None:
+    featurizer = FakeRuntimeFeaturizer(["q1", "s1", "s2"])
+    clusterer = FakeProductionClusterer({"s1": "c1"})
+    artifact = StaticArtifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0))
+    retrieval_batch = _production_retrieval_batch(
+        row_query_signature_indices=np.asarray([], dtype=np.uint32),
+        row_component_keys=(),
+    )
+
+    with pytest.raises(ValueError, match="partial_supervision_require_outside_retrieval_window"):
+        runtime_module._predict_incremental_link_or_abstain_production_from_retrieval_private(  # noqa: SLF001
+            clusterer,
+            artifact,  # type: ignore[arg-type]
+            dataset=None,
+            featurizer=featurizer,
+            retrieval_batch=retrieval_batch,
+            queries=[object()],
+            query_signature_ids=["q1"],
+            partial_supervision={("q1", "s2"): 0},
+            seed_setup=({"s1": "c1"}, {}, {"c1": ["s1"]}),
+            partial_supervision_seed_signature_to_component={"s1": "c1", "s2": "c2"},
         )
 
 

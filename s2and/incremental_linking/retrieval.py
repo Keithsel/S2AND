@@ -227,8 +227,8 @@ def build_linker_retrieval_batch_from_raw_candidate_plan(
             "raw candidate plan query_authors length must match query_signature_ids: "
             f"{len(raw_query_authors)} != {len(query_signature_ids)}"
         )
-    query_views = np.asarray([raw_query_views[int(offset)] for offset in row_query_offsets], dtype=object)
-    query_authors = np.asarray([raw_query_authors[int(offset)] for offset in row_query_offsets], dtype=object)
+    query_views = np.asarray(raw_query_views, dtype=object)[row_query_offsets]
+    query_authors = np.asarray(raw_query_authors, dtype=object)[row_query_offsets]
     query_first_tokens = _raw_plan_array(plan, "row_query_first_tokens", object, row_count)
     row_signals: dict[str, Any] = {
         "retrieval_score": retrieval_scores,

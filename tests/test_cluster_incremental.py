@@ -549,6 +549,7 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
     tmp_path,
 ):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_auto_incremental_arrow")
+    dataset.cluster_seeds_disallow = {("5", "6")}
     block = ["3", "4", "5", "6", "7", "8"]
     runtime_context = SimpleNamespace(
         operation="cluster_predict_incremental",
@@ -576,10 +577,21 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
         metadata = SimpleNamespace(retrieval_top_k=25)
 
     def fake_raw_arrow_linker(clusterer_arg, artifact_arg, **kwargs):
+        import pyarrow as pa
+
         captured["clusterer"] = clusterer_arg
         captured["artifact"] = artifact_arg
         captured["arrow_paths"] = dict(kwargs["arrow_paths"])
         captured["query_signature_ids"] = tuple(kwargs["query_signature_ids"])
+        with pa.memory_map(captured["arrow_paths"]["cluster_seed_disallows"], "r") as source:
+            disallow_table = pa.ipc.open_file(source).read_all()
+        captured["raw_disallow_rows"] = list(
+            zip(
+                disallow_table["signature_id_1"].to_pylist(),
+                disallow_table["signature_id_2"].to_pylist(),
+                strict=True,
+            )
+        )
         return SimpleNamespace(
             linked_signature_clusters={str(kwargs["query_signature_ids"][0]): "6"}
             if kwargs["query_signature_ids"]
@@ -617,6 +629,14 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
         lambda _path: FakeArtifact(),
     )
     monkeypatch.setattr(
+        production_module,
+        "compute_promoted_incremental_limits",
+        lambda **kwargs: _mock_promoted_limits(
+            query_count=int(kwargs["query_count"]),
+            query_batch_size=max(1, int(kwargs["query_count"])),
+        ),
+    )
+    monkeypatch.setattr(
         production_module.runtime_module,
         "predict_incremental_link_or_abstain_from_raw_arrow_paths",
         fake_raw_arrow_linker,
@@ -629,14 +649,17 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
     assert result["incremental_linker_query_view"] == "raw_arrow"
     assert result["incremental_linker_telemetry"]["arrow_promoted_incremental"] == 1
     assert result["incremental_linker_telemetry"]["seed_setup_altered_signature_count"] == 0
+    assert result["incremental_linker_telemetry"]["seed_arrow_disallow_count"] == 1
     assert result["incremental_linker_telemetry"]["incremental_finish_seconds"] >= 0.0
     assert sync_calls == []
-    generated_path_keys = {"cluster_seeds", "name_counts_index"}
+    generated_path_keys = {"cluster_seeds", "cluster_seed_disallows", "name_counts_index"}
     assert {key: value for key, value in captured["arrow_paths"].items() if key not in generated_path_keys} == {
         key: value for key, value in arrow_paths.items() if key not in generated_path_keys
     }
     assert captured["arrow_paths"]["cluster_seeds"].endswith(".arrow")
     assert captured["arrow_paths"]["cluster_seeds"] != arrow_paths["cluster_seeds"]
+    assert captured["arrow_paths"]["cluster_seed_disallows"].endswith(".arrow")
+    assert captured["raw_disallow_rows"] == [("5", "6")]
     assert captured["finish_dataset"] is dataset
     assert captured["finish_runtime_context"] is runtime_context
     assert captured["finish_linked"]
@@ -716,6 +739,156 @@ def test_predict_incremental_arrow_promoted_linker_closes_temp_seed_bundle_on_fa
         )
 
     assert closed == [True]
+
+
+def test_predict_incremental_arrow_promoted_linker_fails_closed_when_single_query_exceeds_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeArtifact:
+        metadata = SimpleNamespace(retrieval_top_k=25)
+
+    class FakeClusterer:
+        n_jobs = 1
+        suppress_orcid = True
+        _last_incremental_seed_setup_telemetry: dict[str, Any] = {}
+
+        def _build_incremental_seed_setup(self, *_args: object, **_kwargs: object):
+            return {"seed": "c_seed"}, {}, {"c_seed": ["seed"]}
+
+    raw_calls: list[object] = []
+    monkeypatch.setattr(
+        production_module.artifact_module,
+        "load_incremental_linking_artifact",
+        lambda _path: FakeArtifact(),
+    )
+    monkeypatch.setattr(
+        production_module,
+        "compute_promoted_incremental_limits",
+        lambda **_kwargs: _mock_promoted_limits(single_query_exceeds_budget=True),
+    )
+    monkeypatch.setattr(
+        production_module.runtime_module,
+        "predict_incremental_link_or_abstain_from_raw_arrow_paths",
+        lambda *args, **kwargs: raw_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(MemoryError, match="cannot fit a single query"):
+        production_module.predict_incremental_promoted_linker_from_arrow_paths(
+            FakeClusterer(),
+            ["seed", "query"],
+            cast(ANDData, SimpleNamespace(name_tuples=set())),
+            arrow_paths={
+                "signatures": "signatures.arrow",
+                "papers": "papers.arrow",
+                "paper_authors": "paper_authors.arrow",
+            },
+            artifact_dir=tmp_path,
+            prevent_new_incompatibilities=False,
+            partial_supervision={},
+            runtime_context=cast(Any, SimpleNamespace(run_id="test")),
+            total_ram_bytes=None,
+            batching_threshold=None,
+            resolve_total_ram_bytes=lambda _value: (100_000, "test"),
+            build_incremental_result=lambda *_args, **_kwargs: {},
+        )
+
+    assert raw_calls == []
+
+
+def test_predict_incremental_arrow_promoted_linker_uses_budget_batch_size(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeArtifact:
+        metadata = SimpleNamespace(retrieval_top_k=25)
+
+    class FakeClusterer:
+        n_jobs = 1
+        suppress_orcid = True
+        _last_incremental_seed_setup_telemetry = {"seed_setup_cluster_seeds_source": "arrow"}
+        _last_incremental_residual_phase_b_telemetry: dict[str, Any] = {}
+
+        def _build_incremental_seed_setup(self, *_args: object, **_kwargs: object):
+            return {"seed": "c_seed"}, {}, {"c_seed": ["seed"]}
+
+        def _finish_incremental_with_seed_links(self, unassigned_signature_ids, *_args: object, **_kwargs: object):
+            return {"finished": list(unassigned_signature_ids)}
+
+    class FakeRustModule:
+        def raw_block_query_candidate_plan_arrow(self, _paths: object, query_ids: list[str], **_kwargs: object):
+            raw_windows.append(tuple(query_ids))
+            return {"query_signature_ids": tuple(query_ids)}
+
+    raw_windows: list[tuple[str, ...]] = []
+    raw_batches: list[tuple[str, ...]] = []
+    limit_calls: list[dict[str, Any]] = []
+
+    def fake_limits(**kwargs: Any):
+        limit_calls.append(dict(kwargs))
+        return _mock_promoted_limits(query_count=int(kwargs["query_count"]), query_batch_size=1)
+
+    def fake_raw_arrow_linker(*_args: object, **kwargs: object):
+        query_ids = tuple(str(signature_id) for signature_id in kwargs["query_signature_ids"])
+        raw_batches.append(query_ids)
+        return SimpleNamespace(
+            linked_signature_clusters={signature_id: "c_seed" for signature_id in query_ids},
+            telemetry={"candidate_row_count": 1, "pair_count": 1, "query_count": len(query_ids)},
+        )
+
+    monkeypatch.setattr(
+        production_module.artifact_module,
+        "load_incremental_linking_artifact",
+        lambda _path: FakeArtifact(),
+    )
+    monkeypatch.setattr(production_module, "compute_promoted_incremental_limits", fake_limits)
+    monkeypatch.setattr(production_module.feature_port, "_require_rust_runtime", lambda: FakeRustModule())
+    monkeypatch.setattr(
+        production_module.feature_port,
+        "build_rust_featurizer_from_arrow_paths",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        production_module.runtime_module,
+        "feature_block_signature_order_from_raw_candidate_plan",
+        lambda raw_plan: SimpleNamespace(signature_ids=("seed", *raw_plan["query_signature_ids"])),
+    )
+    monkeypatch.setattr(
+        production_module.runtime_module,
+        "subset_raw_candidate_plan_for_query_ids",
+        lambda _raw_plan, query_ids, **_kwargs: {"query_signature_ids": tuple(query_ids)},
+    )
+    monkeypatch.setattr(
+        production_module.runtime_module,
+        "predict_incremental_link_or_abstain_from_raw_arrow_paths",
+        fake_raw_arrow_linker,
+    )
+
+    result = production_module.predict_incremental_promoted_linker_from_arrow_paths(
+        FakeClusterer(),
+        ["seed", "query-1", "query-2"],
+        cast(ANDData, SimpleNamespace(name_tuples="filtered")),
+        arrow_paths={
+            "signatures": "signatures.arrow",
+            "papers": "papers.arrow",
+            "paper_authors": "paper_authors.arrow",
+            "cluster_seeds": "cluster_seeds.arrow",
+        },
+        artifact_dir=tmp_path,
+        prevent_new_incompatibilities=False,
+        partial_supervision={},
+        runtime_context=cast(Any, SimpleNamespace(run_id="test")),
+        total_ram_bytes=None,
+        batching_threshold=None,
+        resolve_total_ram_bytes=lambda _value: (100_000, "test"),
+        build_incremental_result=lambda clusters, **kwargs: {"clusters": clusters, **kwargs},
+    )
+
+    assert limit_calls[0]["query_count"] == 2
+    assert raw_windows == [("query-1", "query-2")]
+    assert raw_batches == [("query-1",), ("query-2",)]
+    assert result["incremental_linker_telemetry"]["query_batch_size_max"] == 1
+    assert result["incremental_linker_telemetry"]["memory_initial_query_batch_size"] == 1
 
 
 def test_resolve_dataset_arrow_paths_discovers_raw_planner_batch_indexes(tmp_path: Path) -> None:
@@ -847,12 +1020,29 @@ def test_predict_from_arrow_paths_requires_name_counts_index_for_name_count_feat
             },
         )
 
+    with pytest.raises(ValueError, match="requires name_counts_index"):
+        clusterer.predict_from_arrow_paths(
+            {"block": ["s1"]},
+            {
+                "signatures": "signatures.arrow",
+                "papers": "papers.arrow",
+                "paper_authors": "paper_authors.arrow",
+                "name_counts_index": "missing_name_counts_index",
+            },
+        )
+
 
 def test_raw_arrow_runtime_requires_name_counts_index_for_name_count_features() -> None:
     clusterer = SimpleNamespace(featurizer_info=FeaturizationInfo(features_to_use=["name_counts"]))
 
     with pytest.raises(ValueError, match="requires name_counts_index"):
         production_module.runtime_module._require_arrow_name_counts_index(clusterer, {})  # noqa: SLF001
+
+    with pytest.raises(ValueError, match="requires name_counts_index"):
+        production_module.runtime_module._require_arrow_name_counts_index(  # noqa: SLF001
+            clusterer,
+            {"name_counts_index": "missing_name_counts_index"},
+        )
 
 
 def test_predict_incremental_arrow_promoted_linker_uses_seed_arrow_without_python_seed_map(
@@ -941,6 +1131,14 @@ def test_predict_incremental_arrow_promoted_linker_uses_seed_arrow_without_pytho
         production_module.artifact_module,
         "load_incremental_linking_artifact",
         lambda _path: FakeArtifact(),
+    )
+    monkeypatch.setattr(
+        production_module,
+        "compute_promoted_incremental_limits",
+        lambda **kwargs: _mock_promoted_limits(
+            query_count=int(kwargs["query_count"]),
+            query_batch_size=max(1, int(kwargs["query_count"])),
+        ),
     )
     monkeypatch.setattr(
         production_module.runtime_module,
@@ -1184,6 +1382,14 @@ def test_predict_incremental_arrow_promoted_linker_transforms_altered_seed_arrow
         production_module.artifact_module,
         "load_incremental_linking_artifact",
         lambda _path: FakeArtifact(),
+    )
+    monkeypatch.setattr(
+        production_module,
+        "compute_promoted_incremental_limits",
+        lambda **kwargs: _mock_promoted_limits(
+            query_count=int(kwargs["query_count"]),
+            query_batch_size=max(1, int(kwargs["query_count"])),
+        ),
     )
     monkeypatch.setattr(
         production_module.runtime_module,
@@ -2594,6 +2800,11 @@ def test_cluster_seeds_arrow_read_cache_reuses_parse_and_returns_copy(monkeypatc
 
     monkeypatch.setattr(pa.ipc, "open_file", counting_open_file)
 
+    def fail_read_bytes(self: Path):
+        raise AssertionError(f"cache fingerprint should not read Arrow bytes: {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+
     first = model_module._cluster_seeds_require_from_arrow_paths({"cluster_seeds": str(cluster_seeds_path)})
     first["seed0"] = "mutated"
     second = model_module._cluster_seeds_require_from_arrow_paths({"cluster_seeds": str(cluster_seeds_path)})
@@ -2609,6 +2820,13 @@ def test_cluster_seeds_arrow_read_cache_reuses_parse_and_returns_copy(monkeypatc
 
     assert third == {"seed0": "8", "seed1": "7", "seed2": "9"}
     assert open_file_call_count == 2
+
+
+def test_cluster_seeds_arrow_rejects_missing_explicit_path(tmp_path: Path):
+    missing_path = tmp_path / "missing_cluster_seeds.arrow"
+
+    with pytest.raises(FileNotFoundError, match="cluster_seeds"):
+        model_module._cluster_seeds_require_from_arrow_paths({"cluster_seeds": str(missing_path)})
 
 
 def test_cluster_seeds_arrow_rejects_duplicate_and_empty_rows(tmp_path: Path):

@@ -17,6 +17,7 @@ use pyo3::Bound;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -111,15 +112,6 @@ impl RawNameCountKind {
             RawNameCountKind::LastFirstInitial => "last_first_initial",
         }
     }
-
-    fn file_name(self) -> &'static str {
-        match self {
-            RawNameCountKind::First => "first.bin",
-            RawNameCountKind::Last => "last.bin",
-            RawNameCountKind::FirstLast => "first_last.bin",
-            RawNameCountKind::LastFirstInitial => "last_first_initial.bin",
-        }
-    }
 }
 
 const NAME_COUNTS_INDEX_MAGIC: &[u8; 8] = b"S2NCI001";
@@ -134,24 +126,25 @@ struct RawNameCountIndex {
     last_first_initial: RawNameCountIndexFile,
 }
 
+struct RawNameCountIndexPaths {
+    first: PathBuf,
+    last: PathBuf,
+    first_last: PathBuf,
+    last_first_initial: PathBuf,
+}
+
 impl RawNameCountIndex {
     fn open(path: &str) -> PyResult<Self> {
-        let dir = resolve_name_counts_index_dir(path)?;
+        let paths = resolve_name_counts_index_paths(path)?;
         Ok(Self {
-            first: RawNameCountIndexFile::open(
-                &dir.join(RawNameCountKind::First.file_name()),
-                RawNameCountKind::First,
-            )?,
-            last: RawNameCountIndexFile::open(
-                &dir.join(RawNameCountKind::Last.file_name()),
-                RawNameCountKind::Last,
-            )?,
+            first: RawNameCountIndexFile::open(&paths.first, RawNameCountKind::First)?,
+            last: RawNameCountIndexFile::open(&paths.last, RawNameCountKind::Last)?,
             first_last: RawNameCountIndexFile::open(
-                &dir.join(RawNameCountKind::FirstLast.file_name()),
+                &paths.first_last,
                 RawNameCountKind::FirstLast,
             )?,
             last_first_initial: RawNameCountIndexFile::open(
-                &dir.join(RawNameCountKind::LastFirstInitial.file_name()),
+                &paths.last_first_initial,
                 RawNameCountKind::LastFirstInitial,
             )?,
         })
@@ -330,17 +323,85 @@ impl RawNameCountMaps {
     }
 }
 
-fn resolve_name_counts_index_dir(path: &str) -> PyResult<PathBuf> {
-    let direct = PathBuf::from(path);
-    if direct.join(RawNameCountKind::First.file_name()).exists() {
-        return Ok(direct);
+fn name_counts_index_manifest_path(
+    index_dir: &Path,
+    files: &serde_json::Map<String, serde_json::Value>,
+    kind: &str,
+) -> PyResult<PathBuf> {
+    let path_value = files
+        .get(kind)
+        .and_then(|entry| entry.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index manifest {} is missing files.{}.path",
+                index_dir.join("manifest.json").display(),
+                kind
+            ))
+        })?;
+    let raw_path = PathBuf::from(path_value);
+    let resolved = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        index_dir.join(raw_path)
+    };
+    if !resolved.exists() {
+        return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
+            "name-count index manifest {} points to missing file {}",
+            index_dir.join("manifest.json").display(),
+            resolved.display()
+        )));
     }
+    Ok(resolved)
+}
+
+fn read_name_counts_index_manifest(index_dir: &Path) -> PyResult<RawNameCountIndexPaths> {
+    let manifest_path = index_dir.join("manifest.json");
+    let manifest_text = fs::read_to_string(&manifest_path).map_err(|err| {
+        pyo3::exceptions::PyIOError::new_err(format!(
+            "failed to read name-count index manifest {}: {}",
+            manifest_path.display(),
+            err
+        ))
+    })?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text).map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to parse name-count index manifest {}: {}",
+            manifest_path.display(),
+            err
+        ))
+    })?;
+    let files = manifest
+        .get("files")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index manifest {} is missing files",
+                manifest_path.display()
+            ))
+        })?;
+    Ok(RawNameCountIndexPaths {
+        first: name_counts_index_manifest_path(index_dir, files, "first")?,
+        last: name_counts_index_manifest_path(index_dir, files, "last")?,
+        first_last: name_counts_index_manifest_path(index_dir, files, "first_last")?,
+        last_first_initial: name_counts_index_manifest_path(
+            index_dir,
+            files,
+            "last_first_initial",
+        )?,
+    })
+}
+
+fn resolve_name_counts_index_paths(path: &str) -> PyResult<RawNameCountIndexPaths> {
+    let direct = PathBuf::from(path);
     let nested = direct.join("name_counts_index");
-    if nested.join(RawNameCountKind::First.file_name()).exists() {
-        return Ok(nested);
+    for index_dir in [&direct, &nested] {
+        if index_dir.join("manifest.json").exists() {
+            return read_name_counts_index_manifest(index_dir);
+        }
     }
     Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
-        "name-count index path {} does not contain first.bin",
+        "name-count index path {} does not contain manifest.json",
         path
     )))
 }
@@ -1154,6 +1215,8 @@ struct JsonIngestTelemetry {
     defaulted_paper_author_position_count: usize,
 }
 
+const RAYON_POOL_CACHE_MAX_ENTRIES: usize = 8;
+
 static RAYON_POOL_CACHE: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
 
 fn rayon_pool_cache() -> &'static Mutex<HashMap<usize, Arc<rayon::ThreadPool>>> {
@@ -1176,6 +1239,11 @@ fn cached_rayon_pool(thread_count: usize) -> Option<Arc<rayon::ThreadPool>> {
         .ok()?;
     let built_pool = Arc::new(built_pool);
     if let Ok(mut cache) = rayon_pool_cache().lock() {
+        if cache.len() >= RAYON_POOL_CACHE_MAX_ENTRIES && !cache.contains_key(&thread_count) {
+            if let Some(remove_key) = cache.keys().copied().find(|key| *key != thread_count) {
+                cache.remove(&remove_key);
+            }
+        }
         let pooled = cache
             .entry(thread_count)
             .or_insert_with(|| Arc::clone(&built_pool));
@@ -2308,6 +2376,109 @@ fn arrow_required_string(array: &dyn Array, row: usize, context: &str) -> PyResu
     })
 }
 
+enum ArrowStringColumn<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+    Int64(&'a Int64Array),
+    Int32(&'a Int32Array),
+    UInt64(&'a UInt64Array),
+    UInt32(&'a UInt32Array),
+    Null,
+}
+
+impl<'a> ArrowStringColumn<'a> {
+    fn from_array(array: &'a dyn Array, context: &str) -> PyResult<Self> {
+        match array.data_type() {
+            DataType::Utf8 => Ok(Self::Utf8(
+                array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyTypeError::new_err(format!(
+                            "{context} is not a Utf8 array"
+                        ))
+                    })?,
+            )),
+            DataType::LargeUtf8 => Ok(Self::LargeUtf8(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyTypeError::new_err(format!(
+                            "{context} is not a LargeUtf8 array"
+                        ))
+                    })?,
+            )),
+            DataType::Int64 => Ok(Self::Int64(
+                array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not an Int64 array"
+                    ))
+                })?,
+            )),
+            DataType::Int32 => Ok(Self::Int32(
+                array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{context} is not an Int32 array"
+                    ))
+                })?,
+            )),
+            DataType::UInt64 => Ok(Self::UInt64(
+                array
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyTypeError::new_err(format!(
+                            "{context} is not a UInt64 array"
+                        ))
+                    })?,
+            )),
+            DataType::UInt32 => Ok(Self::UInt32(
+                array
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyTypeError::new_err(format!(
+                            "{context} is not a UInt32 array"
+                        ))
+                    })?,
+            )),
+            DataType::Null => Ok(Self::Null),
+            other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "{context} must be a string or integer column, got {other:?}"
+            ))),
+        }
+    }
+
+    fn optional_value(&self, row: usize) -> Option<Cow<'a, str>> {
+        match self {
+            Self::Utf8(values) => (!values.is_null(row)).then(|| Cow::Borrowed(values.value(row))),
+            Self::LargeUtf8(values) => {
+                (!values.is_null(row)).then(|| Cow::Borrowed(values.value(row)))
+            }
+            Self::Int64(values) => {
+                (!values.is_null(row)).then(|| Cow::Owned(values.value(row).to_string()))
+            }
+            Self::Int32(values) => {
+                (!values.is_null(row)).then(|| Cow::Owned(values.value(row).to_string()))
+            }
+            Self::UInt64(values) => {
+                (!values.is_null(row)).then(|| Cow::Owned(values.value(row).to_string()))
+            }
+            Self::UInt32(values) => {
+                (!values.is_null(row)).then(|| Cow::Owned(values.value(row).to_string()))
+            }
+            Self::Null => None,
+        }
+    }
+
+    fn required_value(&self, row: usize, context: &str) -> PyResult<Cow<'a, str>> {
+        self.optional_value(row).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("{context} is null at row {row}"))
+        })
+    }
+}
+
 fn arrow_optional_string(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<String>> {
     if array.is_null(row) {
         return Ok(None);
@@ -2606,6 +2777,8 @@ fn read_raw_arrow_signatures_from_batches(
     let mut out = HashMap::new();
     for batch in batches {
         let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
+        let signature_id_values =
+            ArrowStringColumn::from_array(signature_id_col.as_ref(), "signature_id")?;
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
         let first_col = batch.column(arrow_column_index(&batch, "author_first", path)?);
         let middle_col = batch.column(arrow_column_index(&batch, "author_middle", path)?);
@@ -2618,16 +2791,17 @@ fn read_raw_arrow_signatures_from_batches(
         let email_col = arrow_optional_column_index(&batch, "author_email")
             .map(|index| batch.column(index).as_ref());
         for row in 0..batch.num_rows() {
-            let signature_id =
-                arrow_required_string(signature_id_col.as_ref(), row, "signature_id")?;
-            if keep_signature_ids.map_or(false, |keep| !keep.contains(&signature_id)) {
+            let signature_id_value = signature_id_values.required_value(row, "signature_id")?;
+            if keep_signature_ids.map_or(false, |keep| !keep.contains(signature_id_value.as_ref()))
+            {
                 continue;
             }
-            if signature_id.is_empty() {
+            if signature_id_value.is_empty() {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "signatures Arrow cannot contain empty signature_id values",
                 ));
             }
+            let signature_id = signature_id_value.into_owned();
             if out.contains_key(&signature_id) {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "signatures Arrow contains duplicate signature_id: {signature_id:?}"
@@ -2704,6 +2878,7 @@ fn read_raw_arrow_papers_from_batches(
     let mut out = HashMap::new();
     for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
+        let paper_id_values = ArrowStringColumn::from_array(paper_id_col.as_ref(), "paper_id")?;
         let title_col = batch.column(arrow_column_index(&batch, "title", path)?);
         let abstract_col = arrow_optional_column_index(&batch, "abstract")
             .map(|index| batch.column(index).as_ref());
@@ -2715,15 +2890,16 @@ fn read_raw_arrow_papers_from_batches(
         let is_reliable_col = arrow_optional_column_index(&batch, "is_reliable")
             .map(|index| batch.column(index).as_ref());
         for row in 0..batch.num_rows() {
-            let paper_id = arrow_required_string(paper_id_col.as_ref(), row, "paper_id")?;
-            if keep_paper_ids.map_or(false, |keep| !keep.contains(&paper_id)) {
+            let paper_id_value = paper_id_values.required_value(row, "paper_id")?;
+            if keep_paper_ids.map_or(false, |keep| !keep.contains(paper_id_value.as_ref())) {
                 continue;
             }
-            if paper_id.is_empty() {
+            if paper_id_value.is_empty() {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "papers Arrow cannot contain empty paper_id values",
                 ));
             }
+            let paper_id = paper_id_value.into_owned();
             if out.contains_key(&paper_id) {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "papers Arrow contains duplicate paper_id: {paper_id:?}"
@@ -2792,18 +2968,20 @@ fn read_raw_arrow_paper_authors_from_batches(
     let mut seen_paper_author_positions = HashSet::<(String, i64)>::new();
     for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
+        let paper_id_values = ArrowStringColumn::from_array(paper_id_col.as_ref(), "paper_id")?;
         let position_col = batch.column(arrow_column_index(&batch, "position", path)?);
         let author_name_col = batch.column(arrow_column_index(&batch, "author_name", path)?);
         for row in 0..batch.num_rows() {
-            let paper_id = arrow_required_string(paper_id_col.as_ref(), row, "paper_id")?;
-            if keep_paper_ids.map_or(false, |keep| !keep.contains(&paper_id)) {
+            let paper_id_value = paper_id_values.required_value(row, "paper_id")?;
+            if keep_paper_ids.map_or(false, |keep| !keep.contains(paper_id_value.as_ref())) {
                 continue;
             }
-            if paper_id.is_empty() {
+            if paper_id_value.is_empty() {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "paper_authors Arrow cannot contain empty paper_id values",
                 ));
             }
+            let paper_id = paper_id_value.into_owned();
             let position = arrow_required_i64(position_col.as_ref(), row, "position")?;
             let paper_author_key = (paper_id.clone(), position);
             if !seen_paper_author_positions.insert(paper_author_key.clone()) {
@@ -2922,17 +3100,19 @@ fn read_raw_arrow_specter_from_batches(
     let mut seen_paper_ids = HashSet::<String>::new();
     for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
+        let paper_id_values = ArrowStringColumn::from_array(paper_id_col.as_ref(), "paper_id")?;
         let embedding_col = batch.column(arrow_column_index(&batch, "embedding", path)?);
         for row in 0..batch.num_rows() {
-            let paper_id = arrow_required_string(paper_id_col.as_ref(), row, "paper_id")?;
-            if keep_paper_ids.map_or(false, |keep| !keep.contains(&paper_id)) {
+            let paper_id_value = paper_id_values.required_value(row, "paper_id")?;
+            if keep_paper_ids.map_or(false, |keep| !keep.contains(paper_id_value.as_ref())) {
                 continue;
             }
-            if paper_id.is_empty() {
+            if paper_id_value.is_empty() {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "specter Arrow cannot contain empty paper_id values",
                 ));
             }
+            let paper_id = paper_id_value.into_owned();
             if !seen_paper_ids.insert(paper_id.clone()) {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "specter Arrow contains duplicate paper_id: {paper_id:?}"
@@ -2952,6 +3132,74 @@ fn read_raw_arrow_specter_from_batches(
 
 fn read_raw_arrow_specter(path: &str) -> PyResult<HashMap<String, Vec<f32>>> {
     read_raw_arrow_specter_filtered(path, None)
+}
+
+fn read_raw_arrow_signatures_with_optional_index(
+    path: &str,
+    index_path: Option<&str>,
+    keep_signature_ids: Option<&HashSet<String>>,
+    full_scan_without_index: bool,
+) -> PyResult<(HashMap<String, RawArrowSignature>, IndexedArrowReadStats)> {
+    if let (Some(index_path), Some(keep_ids)) = (index_path, keep_signature_ids) {
+        return read_raw_arrow_signatures_indexed(path, index_path, keep_ids);
+    }
+    let loaded = if full_scan_without_index {
+        read_raw_arrow_signatures(path)?
+    } else {
+        read_raw_arrow_signatures_filtered(path, keep_signature_ids)?
+    };
+    Ok((loaded, IndexedArrowReadStats::default()))
+}
+
+fn read_raw_arrow_papers_with_optional_index(
+    path: &str,
+    index_path: Option<&str>,
+    keep_paper_ids: &HashSet<String>,
+    full_scan_without_index: bool,
+) -> PyResult<(HashMap<String, RawArrowPaper>, IndexedArrowReadStats)> {
+    if let Some(index_path) = index_path {
+        return read_raw_arrow_papers_indexed(path, index_path, keep_paper_ids);
+    }
+    let loaded = if full_scan_without_index {
+        read_raw_arrow_papers(path)?
+    } else {
+        read_raw_arrow_papers_filtered(path, Some(keep_paper_ids))?
+    };
+    Ok((loaded, IndexedArrowReadStats::default()))
+}
+
+fn read_raw_arrow_paper_authors_with_optional_index(
+    path: &str,
+    index_path: Option<&str>,
+    keep_paper_ids: &HashSet<String>,
+    full_scan_without_index: bool,
+) -> PyResult<(HashMap<String, Vec<(i64, String)>>, IndexedArrowReadStats)> {
+    if let Some(index_path) = index_path {
+        return read_raw_arrow_paper_authors_indexed(path, index_path, keep_paper_ids);
+    }
+    let loaded = if full_scan_without_index {
+        read_raw_arrow_paper_authors(path)?
+    } else {
+        read_raw_arrow_paper_authors_filtered(path, Some(keep_paper_ids))?
+    };
+    Ok((loaded, IndexedArrowReadStats::default()))
+}
+
+fn read_raw_arrow_specter_with_optional_index(
+    path: &str,
+    index_path: Option<&str>,
+    keep_paper_ids: &HashSet<String>,
+    full_scan_without_index: bool,
+) -> PyResult<(HashMap<String, Vec<f32>>, IndexedArrowReadStats)> {
+    if let Some(index_path) = index_path {
+        return read_raw_arrow_specter_indexed(path, index_path, keep_paper_ids);
+    }
+    let loaded = if full_scan_without_index {
+        read_raw_arrow_specter(path)?
+    } else {
+        read_raw_arrow_specter_filtered(path, Some(keep_paper_ids))?
+    };
+    Ok((loaded, IndexedArrowReadStats::default()))
 }
 
 fn read_raw_name_counts_index(path: &str) -> PyResult<RawNameCountMaps> {
@@ -2998,10 +3246,7 @@ fn extract_path_mapping_string(
 }
 
 fn extract_name_counts_index_path(paths: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
-    match extract_path_mapping_string(paths, "name_counts_index", false)? {
-        Some(path) => Ok(Some(path)),
-        None => extract_path_mapping_string(paths, "name_counts_index_dir", false),
-    }
+    extract_path_mapping_string(paths, "name_counts_index", false)
 }
 
 fn ensure_unidecode_for_raw_arrow_inputs(
@@ -3230,7 +3475,7 @@ fn mask_raw_arrow_query(
         return Ok((base.clone(), resolved_view.to_string()));
     }
 
-    let mut masked = RetrievalQueryData {
+    let masked = RetrievalQueryData {
         first: base
             .first
             .chars()
@@ -3252,24 +3497,6 @@ fn mask_raw_arrow_query(
     };
     match resolved_view {
         "initial_only" => {}
-        "initial_only_no_specter" => {
-            masked.specter = None;
-            masked.specter_norm = None;
-        }
-        "initial_only_sparse_metadata" => {
-            masked.coauthor_hashes.clear();
-            masked.coauthor_terms.clear();
-            masked.affiliation_hashes.clear();
-            masked.affiliation_terms.clear();
-        }
-        "initial_only_nearly_empty" => {
-            masked.coauthor_hashes.clear();
-            masked.coauthor_terms.clear();
-            masked.affiliation_hashes.clear();
-            masked.affiliation_terms.clear();
-            masked.specter = None;
-            masked.specter_norm = None;
-        }
         _ => return Err(format!("Unknown query view: {requested_view}")),
     }
     Ok((masked, resolved_view.to_string()))
@@ -3326,20 +3553,24 @@ fn select_raw_arrow_exemplars(vectors: &[Vec<f32>], max_exemplars: usize) -> Vec
         }
     }
     selected.push(best_index);
+    let mut selected_flags = vec![false; vectors.len()];
+    selected_flags[best_index] = true;
+    let mut min_distances = vec![f64::INFINITY; vectors.len()];
+    for (idx, vector) in vectors.iter().enumerate() {
+        if idx != best_index {
+            min_distances[idx] = euclidean_distance_f32(vector, &vectors[best_index]);
+        }
+    }
 
     while selected.len() < max_exemplars {
         let mut next_index = None;
         let mut next_distance = f64::NEG_INFINITY;
-        for (idx, vector) in vectors.iter().enumerate() {
-            if selected.contains(&idx) {
+        for (idx, distance) in min_distances.iter().enumerate() {
+            if selected_flags[idx] {
                 continue;
             }
-            let min_distance = selected
-                .iter()
-                .map(|selected_idx| euclidean_distance_f32(vector, &vectors[*selected_idx]))
-                .fold(f64::INFINITY, f64::min);
-            if min_distance > next_distance {
-                next_distance = min_distance;
+            if *distance > next_distance {
+                next_distance = *distance;
                 next_index = Some(idx);
             }
         }
@@ -3347,6 +3578,16 @@ fn select_raw_arrow_exemplars(vectors: &[Vec<f32>], max_exemplars: usize) -> Vec
             break;
         };
         selected.push(idx);
+        selected_flags[idx] = true;
+        for (candidate_idx, vector) in vectors.iter().enumerate() {
+            if selected_flags[candidate_idx] {
+                continue;
+            }
+            let distance = euclidean_distance_f32(vector, &vectors[idx]);
+            if distance < min_distances[candidate_idx] {
+                min_distances[candidate_idx] = distance;
+            }
+        }
     }
     selected
         .into_iter()
@@ -3575,9 +3816,7 @@ fn raw_arrow_name_count_rarity_row(
     if let Some(query_counts) = query_name_counts.as_ref() {
         let mut observed_minima: [Option<f64>; 6] = [None, None, None, None, None, None];
         for candidate_counts in summary_signals.name_counts_values.iter() {
-            let candidate_option = Some(candidate_counts.clone());
-            let query_option = Some(query_counts.clone());
-            let values = compute_name_counts_data(&query_option, &candidate_option);
+            let values = compute_name_counts_data(Some(query_counts), Some(candidate_counts));
             for (index, value) in values.iter().enumerate() {
                 update_minimum(&mut observed_minima[index], *value);
             }
@@ -5630,10 +5869,10 @@ fn max_propagate_nan(a: f64, b: f64) -> f64 {
 }
 
 fn compute_name_counts_data(
-    counts1: &Option<NameCountsData>,
-    counts2: &Option<NameCountsData>,
+    counts1: Option<&NameCountsData>,
+    counts2: Option<&NameCountsData>,
 ) -> [f64; 6] {
-    let (Some(c1), Some(c2)) = (counts1.as_ref(), counts2.as_ref()) else {
+    let (Some(c1), Some(c2)) = (counts1, counts2) else {
         return [f64::NAN; 6];
     };
     let min_first = nanmin(c1.first, c2.first);
@@ -6310,7 +6549,7 @@ impl RustFeaturizer {
         push_feat!(if same_lang { 1.0 } else { 0.0 });
         push_feat!((p1.is_reliable as i64 + p2.is_reliable as i64) as f64);
 
-        let counts = compute_name_counts_data(&s1.name_counts, &s2.name_counts);
+        let counts = compute_name_counts_data(s1.name_counts.as_ref(), s2.name_counts.as_ref());
         for value in counts.iter() {
             push_feat!(*value);
         }
@@ -7547,15 +7786,12 @@ impl RustFeaturizer {
             .map(|ids| ids.iter().cloned().collect());
 
         let parse_start = Instant::now();
-        let raw_signatures = match (
+        let (raw_signatures, _) = read_raw_arrow_signatures_with_optional_index(
+            &signatures_path,
+            signatures_batch_index_path.as_deref(),
             keep_signature_ids.as_ref(),
-            signatures_batch_index_path.as_ref(),
-        ) {
-            (Some(keep_ids), Some(index_path)) => {
-                read_raw_arrow_signatures_indexed(&signatures_path, index_path, keep_ids)?.0
-            }
-            _ => read_raw_arrow_signatures_filtered(&signatures_path, keep_signature_ids.as_ref())?,
-        };
+            false,
+        )?;
         let mut signature_ids = match requested_signature_ids {
             Some(ids) => ids,
             None => {
@@ -7582,32 +7818,28 @@ impl RustFeaturizer {
             .filter_map(|signature_id| raw_signatures.get(signature_id))
             .map(|signature| signature.paper_id.clone())
             .collect::<HashSet<_>>();
-        let raw_papers = match papers_batch_index_path.as_ref() {
-            Some(index_path) => {
-                read_raw_arrow_papers_indexed(&papers_path, index_path, &needed_paper_ids)?.0
-            }
-            None => read_raw_arrow_papers_filtered(&papers_path, Some(&needed_paper_ids))?,
-        };
-        let mut raw_authors_by_paper = match paper_authors_batch_index_path.as_ref() {
-            Some(index_path) => {
-                read_raw_arrow_paper_authors_indexed(
-                    &paper_authors_path,
-                    index_path,
+        let (raw_papers, _) = read_raw_arrow_papers_with_optional_index(
+            &papers_path,
+            papers_batch_index_path.as_deref(),
+            &needed_paper_ids,
+            false,
+        )?;
+        let (mut raw_authors_by_paper, _) = read_raw_arrow_paper_authors_with_optional_index(
+            &paper_authors_path,
+            paper_authors_batch_index_path.as_deref(),
+            &needed_paper_ids,
+            false,
+        )?;
+        let specter_by_paper = match specter_path.as_ref() {
+            Some(path) => {
+                read_raw_arrow_specter_with_optional_index(
+                    path,
+                    specter_batch_index_path.as_deref(),
                     &needed_paper_ids,
+                    false,
                 )?
                 .0
             }
-            None => {
-                read_raw_arrow_paper_authors_filtered(&paper_authors_path, Some(&needed_paper_ids))?
-            }
-        };
-        let specter_by_paper = match specter_path.as_ref() {
-            Some(path) => match specter_batch_index_path.as_ref() {
-                Some(index_path) => {
-                    read_raw_arrow_specter_indexed(path, index_path, &needed_paper_ids)?.0
-                }
-                None => read_raw_arrow_specter_filtered(path, Some(&needed_paper_ids))?,
-            },
             None => HashMap::new(),
         };
         let mut cluster_seeds_require = HashMap::<String, ClusterId>::new();
@@ -12683,14 +12915,11 @@ fn optional_path_from_py_dict(paths: &Bound<'_, PyDict>, key: &str) -> PyResult<
 fn optional_name_counts_index_path_from_py_dict(
     paths: &Bound<'_, PyDict>,
 ) -> PyResult<Option<String>> {
-    match optional_path_from_py_dict(paths, "name_counts_index")? {
-        Some(path) => Ok(Some(path)),
-        None => optional_path_from_py_dict(paths, "name_counts_index_dir"),
-    }
+    optional_path_from_py_dict(paths, "name_counts_index")
 }
 
 #[pyfunction]
-#[pyo3(signature = (paths, query_signature_ids, top_k = 25, query_view = "auto", orcid_enabled = true, num_threads = None, max_exemplars = 4, include_seed_assignments = false))]
+#[pyo3(signature = (paths, query_signature_ids, top_k = 25, query_view = "auto", orcid_enabled = true, num_threads = None, max_exemplars = 4))]
 fn raw_block_query_candidate_plan_arrow<'py>(
     py: Python<'py>,
     paths: &Bound<'py, PyDict>,
@@ -12700,7 +12929,6 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     orcid_enabled: bool,
     num_threads: Option<usize>,
     max_exemplars: usize,
-    include_seed_assignments: bool,
 ) -> PyResult<Py<PyDict>> {
     if top_k == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -12775,19 +13003,12 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         required_signature_ids.iter().cloned().collect();
 
     let read_signatures_start = Instant::now();
-    let mut signature_index_stats = IndexedArrowReadStats::default();
-    let signatures = match signatures_batch_index_path.as_ref() {
-        Some(index_path) => {
-            let (loaded, stats) = read_raw_arrow_signatures_indexed(
-                &signatures_path,
-                index_path,
-                &required_signature_id_set,
-            )?;
-            signature_index_stats = stats;
-            loaded
-        }
-        None => read_raw_arrow_signatures(&signatures_path)?,
-    };
+    let (signatures, signature_index_stats) = read_raw_arrow_signatures_with_optional_index(
+        &signatures_path,
+        signatures_batch_index_path.as_deref(),
+        Some(&required_signature_id_set),
+        true,
+    )?;
     let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
 
     for signature_id in required_signature_ids.iter() {
@@ -12820,19 +13041,12 @@ fn raw_block_query_candidate_plan_arrow<'py>(
                             f64,
                         )> {
                             let start = Instant::now();
-                            let mut stats = IndexedArrowReadStats::default();
-                            let loaded = match papers_batch_index_path.as_ref() {
-                                Some(index_path) => {
-                                    let (loaded, loaded_stats) = read_raw_arrow_papers_indexed(
-                                        &papers_path,
-                                        index_path,
-                                        &needed_paper_ids,
-                                    )?;
-                                    stats = loaded_stats;
-                                    loaded
-                                }
-                                None => read_raw_arrow_papers(&papers_path)?,
-                            };
+                            let (loaded, stats) = read_raw_arrow_papers_with_optional_index(
+                                &papers_path,
+                                papers_batch_index_path.as_deref(),
+                                &needed_paper_ids,
+                                true,
+                            )?;
                             Ok((loaded, stats, start.elapsed().as_secs_f64()))
                         },
                         || -> PyResult<(
@@ -12841,20 +13055,12 @@ fn raw_block_query_candidate_plan_arrow<'py>(
                             f64,
                         )> {
                             let start = Instant::now();
-                            let mut stats = IndexedArrowReadStats::default();
-                            let loaded = match paper_authors_batch_index_path.as_ref() {
-                                Some(index_path) => {
-                                    let (loaded, loaded_stats) =
-                                        read_raw_arrow_paper_authors_indexed(
-                                            &paper_authors_path,
-                                            index_path,
-                                            &needed_paper_ids,
-                                        )?;
-                                    stats = loaded_stats;
-                                    loaded
-                                }
-                                None => read_raw_arrow_paper_authors(&paper_authors_path)?,
-                            };
+                            let (loaded, stats) = read_raw_arrow_paper_authors_with_optional_index(
+                                &paper_authors_path,
+                                paper_authors_batch_index_path.as_deref(),
+                                &needed_paper_ids,
+                                true,
+                            )?;
                             Ok((loaded, stats, start.elapsed().as_secs_f64()))
                         },
                     )
@@ -12867,24 +13073,24 @@ fn raw_block_query_candidate_plan_arrow<'py>(
                             f64,
                         )> {
                             let start = Instant::now();
-                            let mut stats = IndexedArrowReadStats::default();
                             let loaded = match specter_path.as_ref() {
-                                Some(path) => match specter_batch_index_path.as_ref() {
-                                    Some(index_path) => {
-                                        let (loaded, loaded_stats) =
-                                            read_raw_arrow_specter_indexed(
-                                                path,
-                                                index_path,
-                                                &needed_paper_ids,
-                                            )?;
-                                        stats = loaded_stats;
-                                        Some(loaded)
-                                    }
-                                    None => Some(read_raw_arrow_specter(path)?),
-                                },
-                                None => None,
+                                Some(path) => {
+                                    let (loaded, stats) = read_raw_arrow_specter_with_optional_index(
+                                        path,
+                                        specter_batch_index_path.as_deref(),
+                                        &needed_paper_ids,
+                                        true,
+                                    )?;
+                                    Some((loaded, stats))
+                                }
+                                None => Some((HashMap::new(), IndexedArrowReadStats::default())),
                             };
-                            Ok((loaded, stats, start.elapsed().as_secs_f64()))
+                            let (loaded, stats) = loaded.unwrap();
+                            Ok((
+                                if specter_path.is_some() { Some(loaded) } else { None },
+                                stats,
+                                start.elapsed().as_secs_f64(),
+                            ))
                         },
                         || -> PyResult<(RawNameCountMaps, f64)> {
                             let start = Instant::now();
@@ -13416,8 +13622,6 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     telemetry.set_item("unidecode_char_count", unidecode_char_map.len())?;
     telemetry.set_item("timings", &timings)?;
 
-    let mut seed_signature_ids_for_payload = Some(seed_signature_ids);
-    let mut seed_component_keys_for_payload = Some(seed_component_keys);
     let payload_start = Instant::now();
     let payload = PyDict::new(py);
     payload.set_item("schema_version", "raw_arrow_candidate_plan_v1")?;
@@ -13426,20 +13630,6 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     payload.set_item("query_signature_ids", query_signature_ids)?;
     payload.set_item("query_views", query_views)?;
     payload.set_item("query_authors", query_authors)?;
-    if include_seed_assignments {
-        payload.set_item(
-            "seed_signature_ids",
-            seed_signature_ids_for_payload.take().ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("missing seed_signature_ids payload")
-            })?,
-        )?;
-        payload.set_item(
-            "seed_component_keys",
-            seed_component_keys_for_payload.take().ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("missing seed_component_keys payload")
-            })?,
-        )?;
-    }
     payload.set_item("component_members", component_members)?;
     payload.set_item(
         "left_signature_indices",
@@ -13589,12 +13779,8 @@ fn raw_block_query_candidate_plan_arrow<'py>(
             parallel_drop_hashmap(author_signals_by_query_signature_id);
             parallel_drop_vec(summaries);
             parallel_drop_vec(component_order);
-            if let Some(seed_signature_ids) = seed_signature_ids_for_payload {
-                parallel_drop_vec(seed_signature_ids);
-            }
-            if let Some(seed_component_keys) = seed_component_keys_for_payload {
-                parallel_drop_vec(seed_component_keys);
-            }
+            parallel_drop_vec(seed_signature_ids);
+            parallel_drop_vec(seed_component_keys);
             drop(component_index_by_key);
             drop(coauthor_cluster_df);
             drop(non_mega_coauthor_cluster_df);

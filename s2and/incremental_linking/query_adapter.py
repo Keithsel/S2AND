@@ -130,6 +130,17 @@ class RustHybridCentroidRetrieverHandle:
 
 
 @dataclass(frozen=True)
+class FeatureBlockQueryContext:
+    """Precomputed lookup tables for repeated `FeatureBlock` query extraction."""
+
+    signatures_by_id: Mapping[str, Any]
+    papers_by_id: Mapping[str, Any]
+    author_records_by_paper: Mapping[str, tuple[tuple[int, str], ...]]
+    specter_by_paper: Mapping[str, np.ndarray]
+    feature_cache: dict[str, QueryFeatures]
+
+
+@dataclass(frozen=True)
 class IncrementalLinkerInputs:
     """Inputs needed by the private production link-or-abstain runtime."""
 
@@ -276,6 +287,22 @@ def _feature_block_specter_by_paper(feature_block: FeatureBlock) -> dict[str, np
     }
 
 
+def build_feature_block_query_context(
+    feature_block: FeatureBlock,
+    *,
+    feature_cache: dict[str, QueryFeatures] | None = None,
+) -> FeatureBlockQueryContext:
+    """Build reusable lookup tables for repeated query extraction."""
+
+    return FeatureBlockQueryContext(
+        signatures_by_id=_feature_block_signature_by_id(feature_block),
+        papers_by_id=_feature_block_paper_by_id(feature_block),
+        author_records_by_paper=_feature_block_author_records_by_paper(feature_block),
+        specter_by_paper=_feature_block_specter_by_paper(feature_block),
+        feature_cache={} if feature_cache is None else feature_cache,
+    )
+
+
 def _feature_block_affiliation_terms(signature: Any) -> frozenset[str]:
     if not signature.author_affiliations:
         return EMPTY_STRING_SET
@@ -318,82 +345,87 @@ def _feature_block_query_author(signature: Any) -> str:
     return normalize_text(" ".join(str(part).strip() for part in parts if part is not None and str(part).strip()))
 
 
+def _apply_orcid_feature_policy(features: QueryFeatures, *, orcid_enabled: bool) -> QueryFeatures:
+    if orcid_enabled or features.orcid is None:
+        return features
+    return replace(features, orcid=None)
+
+
 def extract_query_features_from_feature_block(
     feature_block: FeatureBlock,
     signature_id: str,
     *,
     feature_cache: dict[str, QueryFeatures] | None = None,
+    query_context: FeatureBlockQueryContext | None = None,
     orcid_enabled: bool = False,
 ) -> QueryFeatures:
     """Extract production query features directly from a `FeatureBlock`."""
 
-    if feature_cache is not None and signature_id in feature_cache:
-        features = feature_cache[signature_id]
+    signature_key = str(signature_id)
+    if query_context is None and feature_cache is not None and signature_key in feature_cache:
+        features = feature_cache[signature_key]
     else:
-        signatures_by_id = _feature_block_signature_by_id(feature_block)
-        papers_by_id = _feature_block_paper_by_id(feature_block)
-        author_records_by_paper = _feature_block_author_records_by_paper(feature_block)
-        specter_by_paper = _feature_block_specter_by_paper(feature_block)
-        signature = signatures_by_id[str(signature_id)]
-        paper = papers_by_id.get(signature.paper_id)
-        first, middle = split_first_middle_hyphen_aware(signature.author_first or "", signature.author_middle or "")
-        author_position = None if signature.author_position is None else int(signature.author_position)
-        author_records = _feature_block_author_records(author_records_by_paper, signature.paper_id)
-        paper_author_names = frozenset(name for _position, name in author_records if name)
-        local10_author_names = (
-            EMPTY_STRING_SET
-            if author_position is None
-            else frozenset(
-                name
-                for position, name in author_records
-                if name and int(position) != author_position and abs(int(position) - author_position) <= 10
+        context = query_context or build_feature_block_query_context(feature_block, feature_cache=feature_cache)
+        if signature_key in context.feature_cache:
+            features = context.feature_cache[signature_key]
+        else:
+            signature = context.signatures_by_id[signature_key]
+            paper = context.papers_by_id.get(signature.paper_id)
+            first, middle = split_first_middle_hyphen_aware(signature.author_first or "", signature.author_middle or "")
+            author_position = None if signature.author_position is None else int(signature.author_position)
+            author_records = _feature_block_author_records(context.author_records_by_paper, signature.paper_id)
+            paper_author_names = frozenset(name for _position, name in author_records if name)
+            local10_author_names = (
+                EMPTY_STRING_SET
+                if author_position is None
+                else frozenset(
+                    name
+                    for position, name in author_records
+                    if name and int(position) != author_position and abs(int(position) - author_position) <= 10
+                )
             )
-        )
-        venue_terms = EMPTY_STRING_SET
-        title_terms = EMPTY_STRING_SET
-        year = None
-        if paper is not None:
-            venue_terms = _normalize_term_set(" ".join(part for part in [paper.venue, paper.journal_name] if part))
-            title_terms = _normalize_term_set(paper.title)
-            year = paper.year
-        specter = specter_by_paper.get(signature.paper_id)
-        middle_tokens = [token for token in middle.split() if token]
-        coauthor_blocks = _feature_block_coauthor_blocks(
-            author_records_by_paper,
-            paper_id=signature.paper_id,
-            author_position=author_position,
-        )
-        features = QueryFeatures(
-            first=first,
-            middle=middle,
-            first_initial=first[:1],
-            middle_initials=frozenset(token[0] for token in middle_tokens),
-            coauthor_blocks=coauthor_blocks,
-            affiliation_terms=_feature_block_affiliation_terms(signature),
-            venue_terms=venue_terms,
-            year=year,
-            orcid=normalize_orcid(signature.author_orcid),
-            specter=specter,
-            has_specter=specter is not None,
-            has_coauthors=bool(coauthor_blocks),
-            has_affiliations=bool(signature.author_affiliations),
-            has_full_first=len(first) > 1,
-            has_middle=bool(middle_tokens),
-            title_terms=title_terms,
-            name_counts=None,
-            paper_author_count=len(author_records),
-            paper_author_names=paper_author_names,
-            author_position=author_position,
-            local10_author_names=local10_author_names,
-            signature_id=str(signature_id),
-            query_author=_feature_block_query_author(signature),
-        )
-        if feature_cache is not None:
-            feature_cache[signature_id] = features
+            venue_terms = EMPTY_STRING_SET
+            title_terms = EMPTY_STRING_SET
+            year = None
+            if paper is not None:
+                venue_terms = _normalize_term_set(" ".join(part for part in [paper.venue, paper.journal_name] if part))
+                title_terms = _normalize_term_set(paper.title)
+                year = paper.year
+            specter = context.specter_by_paper.get(signature.paper_id)
+            middle_tokens = [token for token in middle.split() if token]
+            coauthor_blocks = _feature_block_coauthor_blocks(
+                context.author_records_by_paper,
+                paper_id=signature.paper_id,
+                author_position=author_position,
+            )
+            features = QueryFeatures(
+                first=first,
+                middle=middle,
+                first_initial=first[:1],
+                middle_initials=frozenset(token[0] for token in middle_tokens),
+                coauthor_blocks=coauthor_blocks,
+                affiliation_terms=_feature_block_affiliation_terms(signature),
+                venue_terms=venue_terms,
+                year=year,
+                orcid=normalize_orcid(signature.author_orcid),
+                specter=specter,
+                has_specter=specter is not None,
+                has_coauthors=bool(coauthor_blocks),
+                has_affiliations=bool(signature.author_affiliations),
+                has_full_first=len(first) > 1,
+                has_middle=bool(middle_tokens),
+                title_terms=title_terms,
+                name_counts=None,
+                paper_author_count=len(author_records),
+                paper_author_names=paper_author_names,
+                author_position=author_position,
+                local10_author_names=local10_author_names,
+                signature_id=signature_key,
+                query_author=_feature_block_query_author(signature),
+            )
+            context.feature_cache[signature_key] = features
 
-    if orcid_enabled or features.orcid is None:
-        return features
-    return replace(features, orcid=None)
+    return _apply_orcid_feature_policy(features, orcid_enabled=orcid_enabled)
 
 
 def extract_query_features(
@@ -469,7 +501,7 @@ def extract_query_features(
     return replace(features, orcid=None)
 
 
-def mask_query_features(base: QueryFeatures, view: str, *, orcid_enabled: bool = False) -> QueryFeatures:
+def mask_query_features(base: QueryFeatures, view: QueryView, *, orcid_enabled: bool = False) -> QueryFeatures:
     """Apply the promoted retrieval query-view policy."""
 
     if view == "full":
@@ -503,26 +535,6 @@ def mask_query_features(base: QueryFeatures, view: str, *, orcid_enabled: bool =
     )
     if view == "initial_only":
         return masked
-    if view == "initial_only_no_specter":
-        return replace(masked, specter=None, has_specter=False)
-    if view == "initial_only_sparse_metadata":
-        return replace(
-            masked,
-            coauthor_blocks=EMPTY_STRING_SET,
-            affiliation_terms=EMPTY_STRING_SET,
-            has_coauthors=False,
-            has_affiliations=False,
-        )
-    if view == "initial_only_nearly_empty":
-        return replace(
-            masked,
-            coauthor_blocks=EMPTY_STRING_SET,
-            affiliation_terms=EMPTY_STRING_SET,
-            specter=None,
-            has_specter=False,
-            has_coauthors=False,
-            has_affiliations=False,
-        )
     raise ValueError(f"Unknown query view: {view}")
 
 
@@ -693,6 +705,7 @@ def build_cluster_summary_from_feature_block(
     signature_ids: Sequence[str],
     max_exemplars: int,
     feature_cache: dict[str, QueryFeatures] | None = None,
+    query_context: FeatureBlockQueryContext | None = None,
     orcid_enabled: bool = False,
     block_key: str = "incremental",
 ) -> ClusterSummary:
@@ -716,12 +729,13 @@ def build_cluster_summary_from_feature_block(
     member_local10_author_names: list[frozenset[str]] = []
     member_signature_ids: list[str] = []
     member_title_terms: list[frozenset[str]] = []
+    context = query_context or build_feature_block_query_context(feature_block, feature_cache=feature_cache)
 
     for signature_id in signature_ids:
         features = extract_query_features_from_feature_block(
             feature_block,
             str(signature_id),
-            feature_cache=feature_cache,
+            query_context=context,
             orcid_enabled=orcid_enabled,
         )
         if len(features.first) > 1:

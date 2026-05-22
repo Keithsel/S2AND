@@ -168,7 +168,13 @@ def _constraint_values_equal(left: list[Any], right: list[Any]) -> bool:
         if left_value is None or right_value is None:
             if left_value is not None or right_value is not None:
                 return False
-        elif float(left_value) != float(right_value):
+        elif not np.allclose(
+            np.asarray([float(left_value)]),
+            np.asarray([float(right_value)]),
+            rtol=0.0,
+            atol=0.0,
+            equal_nan=True,
+        ):
             return False
     return True
 
@@ -205,12 +211,22 @@ def _constraint_report(
         featurizer=arrow_featurizer,
     )
     value_mismatch_count = 0
-    for left_value, right_value in zip(inc_values, arrow_values, strict=False):
-        if left_value is None or right_value is None:
-            value_mismatch_count += int(left_value is not None or right_value is not None)
-        else:
-            value_mismatch_count += int(float(left_value) != float(right_value))
-    value_mismatch_count += abs(len(inc_values) - len(arrow_values))
+    if len(inc_values) == len(arrow_values):
+        for left_value, right_value in zip(inc_values, arrow_values, strict=True):
+            if left_value is None or right_value is None:
+                value_mismatch_count += int(left_value is not None or right_value is not None)
+            else:
+                value_mismatch_count += int(
+                    not np.allclose(
+                        np.asarray([float(left_value)]),
+                        np.asarray([float(right_value)]),
+                        rtol=0.0,
+                        atol=0.0,
+                        equal_nan=True,
+                    )
+                )
+    else:
+        value_mismatch_count = abs(len(inc_values) - len(arrow_values))
     return {
         "left_indices_equal": inc_left == arrow_left,
         "right_indices_equal": inc_right == arrow_right,
@@ -445,7 +461,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     distance_comparison = {
         block_key: _distance_report(incumbent_dists[block_key], arrow_dists[block_key]) for block_key in block_dict
     }
-    return {
+    report = {
         "fixture_dir": str(args.fixture_dir),
         "output_dir": str(args.output_dir),
         "dataset": str(meta["dataset"]),
@@ -469,9 +485,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "arrow_cluster_count": int(len(arrow_clusters)),
         "incumbent_cluster_sizes_top10": sorted((len(v) for v in incumbent_clusters.values()), reverse=True)[:10],
         "arrow_cluster_sizes_top10": sorted((len(v) for v in arrow_clusters.values()), reverse=True)[:10],
-        "incumbent_clusters": _jsonable(incumbent_clusters),
-        "arrow_clusters": _jsonable(arrow_clusters),
     }
+    if incumbent_clusters != arrow_clusters:
+        report["incumbent_clusters"] = _jsonable(incumbent_clusters)
+        report["arrow_clusters"] = _jsonable(arrow_clusters)
+    return report
 
 
 def main() -> None:

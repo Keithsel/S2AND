@@ -397,7 +397,8 @@ When `S2AND_BACKEND` resolves to Rust and complete FeatureBlock Arrow artifacts
 are available, `Clusterer.predict(...)` routes through the direct Arrow/Rust
 featurizer by default. Callers can provide explicit paths by setting
 `dataset.arrow_paths` to at least `signatures`, `papers`, and `paper_authors`
-paths; models that use SPECTER features also require `specter`. If no Arrow
+paths; models that use SPECTER features also require `specter`, and models
+that use name-count features require `name_counts_index`. If no complete Arrow
 artifacts are available, the normal `ANDData` path remains the fallback.
 
 Incremental prediction with explicit RAM budget:
@@ -438,9 +439,49 @@ If seed-bearing FeatureBlock Arrow artifacts are available, promoted
 `predict_incremental(...)` uses the raw Arrow/Rust retrieval and scoring bridge
 by default for Phase A, then finishes residual abstains through the normal
 incremental completion path. Incremental Arrow routing requires
-`cluster_seeds.arrow` and `cluster_seed_disallows.arrow`; artifacts without seed
-assignments fall back to the existing promoted `ANDData` path. Write an empty
-`cluster_seed_disallows.arrow` when the request has no disallow constraints.
+`cluster_seeds.arrow`; artifacts without seed assignments fall back to the
+existing promoted `ANDData` path. `cluster_seed_disallows.arrow` is optional and
+means "no pairwise seed disallow constraints" when omitted, but an explicit path
+must exist.
+
+### Incremental Seed Telemetry Contract
+
+Seed setup telemetry is part of the promoted incremental compatibility surface.
+Refactors may move the implementation, but these keys must keep their names and
+meanings until callers have an explicit migration path.
+
+| Key | Meaning | Emitter |
+|---|---|---|
+| `seed_setup_seconds` | Wall time spent building request seed state. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_seed_signature_count` | Number of signatures with seed assignments after request seed setup. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_component_count` | Number of unique seed components after request seed setup. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_altered_signature_count` | Count of altered-cluster signatures considered during seed setup. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_altered_presplit_block_count` | Altered-cluster blocks sent through pre-split reclustering. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_altered_presplit_signature_count` | Altered-cluster signatures sent through pre-split reclustering. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_altered_presplit_predict_seconds` | Wall time spent in altered-cluster pre-split prediction. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_altered_presplit_cache_hit_count` | Pre-split reclustering cache hits. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_altered_presplit_cache_miss_count` | Pre-split reclustering cache misses. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_altered_presplit_orcid_skip_count` | Altered-cluster reclustering skips caused by compatible normalized ORCID groups. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_recluster_map_entry_count` | Number of temporary recluster component ids mapped back to source components. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_altered_cluster_count` | Number of source altered clusters involved in seed setup. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_cluster_seeds_source` | Seed assignment authority used for the request, currently `python` or `arrow`. | `Clusterer._build_incremental_seed_setup` |
+| `seed_setup_cluster_seeds_from_arrow` | Integer flag for `seed_setup_cluster_seeds_source == "arrow"`. | `Clusterer._build_incremental_seed_setup` |
+
+The bulk subblocked altered-profile pre-split path emits a second prefix. These
+keys are stored on `_last_subblocked_altered_presplit_telemetry` and may also be
+reported alongside promoted incremental telemetry.
+
+| Key | Meaning | Emitter |
+|---|---|---|
+| `bulk_altered_presplit_applied` | Integer flag indicating whether the bulk pre-split path ran. | `Clusterer.predict` |
+| `bulk_altered_presplit_seconds` | Wall time spent in the bulk pre-split setup. | `Clusterer.predict` |
+| `bulk_altered_presplit_seed_signature_count` | Number of seed signatures after bulk pre-split seed setup. | `Clusterer.predict` |
+| `bulk_altered_presplit_recluster_map_entry_count` | Number of temporary recluster ids mapped back to source components. | `Clusterer.predict` |
+| `bulk_altered_presplit_block_count` | Altered pre-split block count copied from `seed_setup_altered_presplit_block_count`. | `Clusterer.predict` |
+| `bulk_altered_presplit_signature_count` | Altered pre-split signature count copied from `seed_setup_altered_presplit_signature_count`. | `Clusterer.predict` |
+| `bulk_altered_presplit_cache_hit_count` | Cache-hit count copied from `seed_setup_altered_presplit_cache_hit_count`. | `Clusterer.predict` |
+| `bulk_altered_presplit_cache_miss_count` | Cache-miss count copied from `seed_setup_altered_presplit_cache_miss_count`. | `Clusterer.predict` |
+| `bulk_altered_presplit_orcid_skip_count` | ORCID-skip count copied from `seed_setup_altered_presplit_orcid_skip_count`. | `Clusterer.predict` |
 
 Supporting docs:
 

@@ -517,9 +517,46 @@ def test_predict_from_arrow_paths_rejects_reference_features(monkeypatch):
         )
 
 
+def test_predict_from_arrow_paths_merges_explicit_disallows(monkeypatch):
+    captured = {}
+
+    def fake_build_from_arrow_paths(*_args, **_kwargs):
+        return object()
+
+    def fake_predict_from_rust_featurizer(self, block_dict, rust_featurizer, **kwargs):
+        captured["self"] = self
+        captured["block_dict"] = block_dict
+        captured["rust_featurizer"] = rust_featurizer
+        captured["partial_supervision"] = dict(kwargs["partial_supervision"])
+        captured["cluster_seeds_disallow"] = set(kwargs["cluster_seeds_disallow"])
+        return {"block": ["0", "1", "2"]}, None
+
+    monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", fake_build_from_arrow_paths)
+    monkeypatch.setattr(Clusterer, "predict_from_rust_featurizer", fake_predict_from_rust_featurizer)
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+    result, dists = clusterer.predict_from_arrow_paths(
+        {"block": ["0", "1", "2"]},
+        {"signatures": "signatures.arrow", "papers": "papers.arrow", "paper_authors": "paper_authors.arrow"},
+        partial_supervision={("0", "1"): 0, ("0", "2"): 0},
+        cluster_seeds_disallow={("0", "1"), ("1", "2")},
+    )
+
+    assert result == {"block": ["0", "1", "2"]}
+    assert dists is None
+    assert captured["partial_supervision"] == {
+        ("0", "1"): 0,
+        ("0", "2"): 0,
+        ("1", "2"): LARGE_INTEGER,
+    }
+    assert captured["cluster_seeds_disallow"] == {("0", "1"), ("1", "2")}
+
+
 def test_predict_auto_routes_to_arrow_paths_when_dataset_advertises_them(tmp_path, monkeypatch):
     captured = {}
     dataset = _dummy_dataset("dummy_predict_auto_arrow")
+    dataset.name_tuples = {("alice", "a")}
+    dataset.cluster_seeds_disallow = {("0", "1")}
     arrow_paths = {}
     for key, filename in {
         "signatures": "signatures.arrow",
@@ -551,6 +588,8 @@ def test_predict_auto_routes_to_arrow_paths_when_dataset_advertises_them(tmp_pat
         captured["block_dict"] = block_dict
         captured["paths"] = dict(paths)
         captured["runtime_context"] = kwargs["runtime_context"]
+        captured["name_tuples"] = kwargs["name_tuples"]
+        captured["cluster_seeds_disallow"] = set(kwargs["cluster_seeds_disallow"])
         return {"arrow": ["0", "1"]}, None
 
     monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
@@ -566,6 +605,8 @@ def test_predict_auto_routes_to_arrow_paths_when_dataset_advertises_them(tmp_pat
     assert captured["block_dict"] == {"block": ["0", "1"]}
     assert captured["paths"] == arrow_paths
     assert captured["runtime_context"] is runtime_context
+    assert captured["name_tuples"] == {("alice", "a")}
+    assert captured["cluster_seeds_disallow"] == {("0", "1")}
 
 
 def test_predict_auto_declines_arrow_paths_missing_required_name_counts_index(tmp_path, monkeypatch):

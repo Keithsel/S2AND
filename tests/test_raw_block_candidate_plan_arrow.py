@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from collections import Counter
 from pathlib import Path
 
@@ -21,6 +22,37 @@ from tests.helpers import build_cluster_summary, build_query_features
 
 pa = pytest.importorskip("pyarrow")
 s2and_rust = pytest.importorskip("s2and_rust", reason="s2and_rust is unavailable")
+
+_FNV64_OFFSET = 14695981039346656037
+_FNV64_PRIME = 1099511628211
+_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQ")
+_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT = struct.Struct("<QII")
+
+
+def _fnv64_bytes(value: bytes) -> int:
+    digest = _FNV64_OFFSET
+    for byte in value:
+        digest ^= byte
+        digest = (digest * _FNV64_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return digest
+
+
+def _append_batch_index_record(index_path: str, *, key: str, batch_index: int) -> None:
+    path = Path(index_path)
+    raw = path.read_bytes()
+    magic, record_count, source_size, source_mtime_ns = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.unpack_from(raw, 0)
+    offset = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size
+    record_size = _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.size
+    records = [
+        _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.unpack_from(raw, offset + index * record_size)
+        for index in range(record_count)
+    ]
+    records.append((_fnv64_bytes(key.encode("utf-8")), int(batch_index), 0))
+    records.sort()
+    payload = bytearray(_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.pack(magic, len(records), source_size, source_mtime_ns))
+    for record in records:
+        payload.extend(_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.pack(*record))
+    path.write_bytes(payload)
 
 
 def _write_ipc(path: Path, table: pa.Table) -> str:
@@ -228,6 +260,22 @@ def test_raw_arrow_candidate_plan_matches_existing_rust_retriever(tmp_path: Path
     assert raw_plan["telemetry"]["signature_count"] == 3
 
 
+def test_raw_arrow_candidate_plan_rejects_hidden_query_view(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+
+    with pytest.raises(ValueError, match="Unknown query view"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            paths,
+            ["q1"],
+            top_k=2,
+            query_view="initial_only_no_specter",
+            orcid_enabled=False,
+            num_threads=1,
+        )
+
+
 def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
         pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
@@ -318,7 +366,12 @@ def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(t
     _assert_raw_candidate_plans_equal(indexed_plan, full_scan_plan)
     telemetry = indexed_plan["telemetry"]
     assert telemetry["indexed_arrow_candidate_plan"] is True
+    assert full_scan_plan["telemetry"]["indexed_arrow_candidate_plan"] is False
     assert full_scan_plan["telemetry"]["signature_count"] == 3 + irrelevant_count
+    assert full_scan_plan["telemetry"]["signature_rows_scanned"] == 0
+    assert full_scan_plan["telemetry"]["paper_rows_scanned"] == 0
+    assert full_scan_plan["telemetry"]["paper_author_rows_scanned"] == 0
+    assert full_scan_plan["telemetry"]["specter_rows_scanned"] == 0
     assert telemetry["signature_count"] == 3
     assert telemetry["paper_count"] == 3
     assert telemetry["paper_author_paper_count"] == 3
@@ -328,6 +381,91 @@ def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(t
     assert telemetry["paper_author_rows_scanned"] == 3
     assert telemetry["specter_rows_scanned"] == 3
     assert index_metrics["signatures_batch_index"]["record_count"] == len(signature_ids)
+
+
+def test_raw_arrow_candidate_plan_extra_hash_selected_batch_is_exact_filtered(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    signatures = pa.table(
+        {
+            "signature_id": pa.array(["q1", "s1", "s2", "bad"], type=pa.string()),
+            "paper_id": pa.array(["p_q", "p1", "p2", None], type=pa.string()),
+            "author_first": pa.array(["Alice", "Alice", "Bob", "Bad"], type=pa.string()),
+            "author_middle": pa.array(["", "", "", ""], type=pa.string()),
+            "author_last": pa.array(["Wang", "Wang", "Jones", "Row"], type=pa.string()),
+            "author_suffix": pa.array(["", "", "", ""], type=pa.string()),
+            "author_affiliations": pa.array([["AI Lab"], ["AI Lab"], ["Other Lab"], []], type=pa.list_(pa.string())),
+            "author_orcid": pa.array([None, None, None, None], type=pa.string()),
+            "author_position": pa.array([0, 0, 0, 0], type=pa.int64()),
+        }
+    )
+    papers = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
+            "title": pa.array(["Graph Models", "Graph Models", "Different Topic"], type=pa.string()),
+            "venue": pa.array(["NeurIPS", "NeurIPS", "ICML"], type=pa.string()),
+            "journal_name": pa.array(["", "", ""], type=pa.string()),
+            "year": pa.array([2020, 2020, 2010], type=pa.int64()),
+        }
+    )
+    paper_authors = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
+            "position": pa.array([0, 0, 0], type=pa.int64()),
+            "author_name": pa.array(["Alice Wang", "Alice Wang", "Bob Jones"], type=pa.string()),
+        }
+    )
+    cluster_seeds = pa.table(
+        {
+            "signature_id": pa.array(["s1", "s2"], type=pa.string()),
+            "cluster_id": pa.array(["c_match", "c_other"], type=pa.string()),
+        }
+    )
+    paths = {
+        "signatures": _write_ipc_batches(tmp_path / "signatures.arrow", signatures, batch_size=1),
+        "papers": _write_ipc_batches(tmp_path / "papers.arrow", papers, batch_size=1),
+        "paper_authors": _write_ipc_batches(tmp_path / "paper_authors.arrow", paper_authors, batch_size=1),
+        "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
+    }
+    indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
+    _append_batch_index_record(indexed_paths["signatures_batch_index"], key="q1", batch_index=3)
+
+    plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        indexed_paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+
+    assert plan["right_signature_ids"] == ["s1", "s2"]
+    assert plan["telemetry"]["signature_count"] == 3
+    assert plan["telemetry"]["signature_rows_scanned"] == 4
+
+
+def test_rust_featurizer_from_arrow_paths_empty_indexed_keep_set_skips_stale_validation(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
+        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
+    for key in ("signatures", "papers", "paper_authors"):
+        with Path(paths[key]).open("ab") as outfile:
+            outfile.write(b"\0")
+
+    featurizer = s2and_rust.RustFeaturizer.from_arrow_paths(
+        indexed_paths,
+        [],
+        set(),
+        None,
+        True,
+        False,
+        0.0,
+        10000.0,
+        1,
+    )
+
+    assert tuple(featurizer.signature_ids()) == ()
 
 
 def test_raw_arrow_candidate_plan_rejects_stale_batch_index(tmp_path: Path) -> None:
@@ -850,6 +988,8 @@ def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metada
 
     assert plan["telemetry"]["excluded_query_seed_count"] == 1
     assert plan["component_members"]["c_self"] == ["s1"]
+    assert "seed_signature_ids" not in plan
+    assert "seed_component_keys" not in plan
     assert "q1" not in plan["right_signature_ids"]
     assert plan["query_views"] == ["full"]
 
@@ -939,6 +1079,36 @@ def test_raw_arrow_candidate_plan_rejects_name_counts_arrow_without_index(tmp_pa
             }
         ),
     )
+
+    with pytest.raises(ValueError, match="requires name_counts_index"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
+
+
+def test_raw_arrow_candidate_plan_rejects_name_counts_index_dir_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paths["name_counts"] = _write_ipc(
+        tmp_path / "name_counts.arrow",
+        pa.table(
+            {
+                "kind": pa.array(["first"], type=pa.string()),
+                "name": pa.array(["alice"], type=pa.string()),
+                "count": pa.array([10.0], type=pa.float64()),
+            }
+        ),
+    )
+    paths["name_counts_index_dir"] = _write_tiny_name_counts_index(tmp_path / "index", monkeypatch)
 
     with pytest.raises(ValueError, match="requires name_counts_index"):
         s2and_rust.raw_block_query_candidate_plan_arrow(
@@ -1121,6 +1291,21 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
     with pytest.raises(ValueError, match="requires name_counts_index"):
         s2and_rust.RustFeaturizer.from_arrow_paths(
             arrow_only_paths,
+            signature_ids,
+            set(),
+            None,
+            True,
+            False,
+            0.0,
+            10000.0,
+            1,
+        )
+
+    alias_only_paths = dict(arrow_paths)
+    alias_only_paths["name_counts_index_dir"] = alias_only_paths.pop("name_counts_index")
+    with pytest.raises(ValueError, match="requires name_counts_index"):
+        s2and_rust.RustFeaturizer.from_arrow_paths(
+            alias_only_paths,
             signature_ids,
             set(),
             None,

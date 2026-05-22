@@ -1,6 +1,6 @@
 # Rust Artifact Formats
 
-Status date: 2026-05-20
+Status date: 2026-05-22
 
 This is the current artifact-format decision table for Rust-backed inference.
 It replaces the older artifact-divergence migration log.
@@ -13,8 +13,8 @@ It replaces the older artifact-divergence migration log.
 | Papers | `papers.arrow` Arrow IPC table | Required direct-Rust input. Contains title, abstract-presence signal, venue, journal, year, language, and reliability fields. |
 | Paper authors | `paper_authors.arrow` Arrow IPC table | Required for coauthor and paper-author row signals. |
 | Cluster seeds | `cluster_seeds.arrow` Arrow IPC table | Required for seeded/incremental Arrow prediction. Omit for unseeded full prediction. |
-| Cluster seed disallows | `cluster_seed_disallows.arrow` Arrow IPC table | Required for seeded/incremental Arrow prediction to preserve pairwise seed disallow constraints. Write an empty table when none are present. |
-| SPECTER | Arrow fixed-size-list `float32` table | Preferred direct-path embedding input. Include the embedding version required by the model. |
+| Cluster seed disallows | `cluster_seed_disallows.arrow` Arrow IPC table | Optional for seeded/incremental Arrow prediction. Include it when pairwise seed disallow constraints are present; omitted means no disallows. |
+| SPECTER | `specter.arrow` Arrow fixed-size-list `float32` table | Preferred direct-path embedding input. Include the embedding version required by the model. |
 | Name counts | `s2and/data/name_counts_index/` sorted binary sidecar | Preferred Rust hot-path lookup artifact for models that use name-count features. |
 | Name-count Arrow table | `name_counts.arrow` long-form Arrow table | Generation, inspection, and parity fallback only. Do not cold-read it per request when the index is available. |
 | Name aliases | Packaged filtered text file | Shared runtime default. Avoid per-dataset alias artifacts unless running an explicit experiment. |
@@ -28,17 +28,46 @@ The preferred production layout is:
 ```text
 s2and/data/name_counts_index/
   manifest.json
-  first.bin
-  last.bin
-  first_last.bin
-  last_first_initial.bin
+  generations/<generation-id>/
+    first.bin
+    last.bin
+    first_last.bin
+    last_first_initial.bin
 ```
 
-`manifest.json` must have `schema_version: "name_counts_index_v1"`.
+`manifest.json` must have `schema_version: "name_counts_index_v1"` and a
+`files` object with `first`, `last`, `first_last`, and `last_first_initial`
+entries. Each entry contains a `path`, `record_count`, and `byte_count`; new
+writers set each `path` to `generations/<generation-id>/<kind>.bin`.
+
+Writers publish by writing every binary file into a temporary generation
+directory, renaming that directory into `generations/`, validating that every
+manifest path exists, and replacing `manifest.json` last. Readers therefore see
+either the old complete manifest or the new complete manifest. A failed
+overwrite must leave the previous manifest and generation readable.
+
+Each `.bin` file starts with magic `S2NCI001` and stores sorted records with
+layout:
+
+```text
+header: magic:8, record_count:u64, blob_offset:u64, blob_len:u64
+record: hash1:u64, hash2:u64, name_offset:u64, name_len:u32, reserved:u32, count:f64
+blob: concatenated UTF-8 name bytes
+```
+
+Lookup uses two FNV-64 hashes plus exact byte-string verification, so hash
+collisions do not produce false name-count hits.
 
 Do not embed per-signature name-count values in `signatures.arrow`. That path
 has been removed from the runtime direction. Do not build a production request
 path that loads `name_counts.arrow` into Python dicts/lists.
+
+The legacy direct-file layout with `first.bin`, `last.bin`, `first_last.bin`,
+and `last_first_initial.bin` directly under `name_counts_index/` is no longer a
+runtime contract. Readers require `manifest.json`, and writers regenerate a
+manifest-backed generation instead of reusing direct files. Production manifests
+should use the `name_counts_index` key; do not emit the old
+`name_counts_index_dir` alias.
 
 ## Deprioritized Or Rejected
 

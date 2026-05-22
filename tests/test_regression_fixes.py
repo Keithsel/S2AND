@@ -46,6 +46,84 @@ def test_model_predict_class0_does_not_require_num_threads_keyword_support():
     assert backend == "python"
 
 
+def test_cacheable_value_preserves_list_order_but_sorts_sets():
+    assert model_module._cacheable_value(["year_diff", "name_counts"]) != model_module._cacheable_value(
+        ["name_counts", "year_diff"]
+    )
+    assert model_module._cacheable_value({"year_diff", "name_counts"}) == model_module._cacheable_value(
+        {"name_counts", "year_diff"}
+    )
+
+
+def _expected_upper_triangle_pairs_for_range(
+    block_size: int,
+    start_offset: int,
+    max_pairs: int | None,
+) -> list[tuple[int, int]]:
+    total_pairs = block_size * (block_size - 1) // 2
+    count = total_pairs - start_offset if max_pairs is None else min(max_pairs, total_pairs - start_offset)
+    row = 0
+    remaining_offset = start_offset
+    while row < block_size - 1:
+        row_len = block_size - row - 1
+        if remaining_offset < row_len:
+            break
+        remaining_offset -= row_len
+        row += 1
+    col = row + 1 + remaining_offset
+    pairs = []
+    for _ in range(count):
+        pairs.append((row, col))
+        col += 1
+        if col >= block_size:
+            row += 1
+            col = row + 1
+    return pairs
+
+
+@pytest.mark.parametrize(
+    ("block_size", "start_offset", "max_pairs"),
+    [
+        (6, 0, 4),
+        (6, 1, 4),
+        (6, 14, 4),
+        (6, 15, 4),
+        (2000, 0, 7),
+        (2000, 1998, 7),
+        (2000, 1999, 7),
+        (2000, 999_500, 7),
+        (2000, 1_998_995, 7),
+        (2000, 1_999_000, 7),
+    ],
+)
+def test_upper_triangle_indices_for_range_matches_row_major_order(
+    block_size: int,
+    start_offset: int,
+    max_pairs: int | None,
+):
+    left, right = model_module._upper_triangle_indices_for_range(block_size, start_offset, max_pairs)
+    assert list(zip(left.tolist(), right.tolist(), strict=True)) == _expected_upper_triangle_pairs_for_range(
+        block_size,
+        start_offset,
+        max_pairs,
+    )
+
+
+def test_residual_first_initial_groups_union_normalized_orcids():
+    dataset = SimpleNamespace(
+        signatures={
+            "s1": _subblocking_signature("alice", orcid="0000-0000-0000-0001"),
+            "s2": _subblocking_signature("bob", orcid="0000000000000001"),
+            "s3": _subblocking_signature("carol", orcid=None),
+        }
+    )
+    clusterer = SimpleNamespace(use_default_constraints_as_supervision=True, suppress_orcid=False)
+
+    groups = model_module._residual_phase_b_first_initial_groups(clusterer, dataset, ["s1", "s2", "s3"], {})
+
+    assert {frozenset(group) for group in groups} == {frozenset({"s1", "s2"}), frozenset({"s3"})}
+
+
 def _run_make_subblocks_with_fixed_first_pass(monkeypatch, signatures, first_pass_output, *, maximum_size: int):
     anddata = SimpleNamespace(signatures=signatures, random_seed=0)
     call_count = {"value": 0}

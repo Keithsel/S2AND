@@ -39,6 +39,15 @@ from s2and.incremental_linking.logistic_gate import (
     build_runtime_logistic_gate_matrix,
     load_logistic_gate_config,
 )
+from s2and.incremental_linking.policy import (
+    clusterer_uses_name_count_features as _policy_clusterer_uses_name_count_features,
+)
+from s2and.incremental_linking.policy import (
+    require_arrow_name_counts_index_for_clusterer as _require_arrow_name_counts_index_for_clusterer,
+)
+from s2and.incremental_linking.policy import (
+    resolve_load_name_counts_policy as _resolve_load_name_counts_policy,
+)
 from s2and.incremental_linking.retrieval import (
     RAW_CANDIDATE_PLAN_PAIR_KEYS,
     RAW_CANDIDATE_PLAN_ROW_KEYS,
@@ -59,22 +68,11 @@ _PAIRWISE_AGGREGATE_NAN_VALUE: float = 0.0
 
 
 def _clusterer_uses_name_count_features(clusterer: Any) -> bool:
-    for attr_name in ("featurizer_info", "nameless_featurizer_info"):
-        featurizer_info = getattr(clusterer, attr_name, None)
-        features_to_use = getattr(featurizer_info, "features_to_use", ())
-        if "name_counts" in features_to_use:
-            return True
-    return False
+    return _policy_clusterer_uses_name_count_features(clusterer)
 
 
 def _require_arrow_name_counts_index(clusterer: Any, arrow_paths: Mapping[str, Any]) -> None:
-    if _clusterer_uses_name_count_features(clusterer) and not (
-        arrow_paths.get("name_counts_index") or arrow_paths.get("name_counts_index_dir")
-    ):
-        raise ValueError(
-            "Raw Arrow scoring with selected name_counts features requires name_counts_index. "
-            "Pass the S2AND name-count index directory in arrow_paths['name_counts_index']."
-        )
+    _require_arrow_name_counts_index_for_clusterer(clusterer, arrow_paths, context="Raw Arrow scoring")
 
 
 @dataclass(frozen=True)
@@ -1492,6 +1490,7 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
     }
     linked_signature_clusters = naturalize_incremental_clusters(raw_linked_clusters, recluster_map)
     component_keys = candidate_batch.row_component_keys or ()
+    retrieved_component_keys = {str(value) for value in component_keys}
     telemetry: dict[str, int | float | str] = {
         **private_result.telemetry,
         **{f"pairwise_{key}": value for key, value in pairwise_model_result.telemetry.items()},
@@ -1503,7 +1502,7 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
         "retrieval_top_k": int(
             retrieval_top_k if retrieval_top_k is not None else _max_retrieval_rank(candidate_batch)
         ),
-        "retrieved_component_count": int(len(component_keys)),
+        "retrieved_component_count": int(len(retrieved_component_keys)),
     }
     return LinkOrAbstainProductionResult(
         feature_matrix=private_result.feature_matrix,
@@ -1777,6 +1776,11 @@ def subset_raw_candidate_plan_for_query_ids(
         for offset, raw_value in enumerate(raw_values):
             index = int(raw_value)
             if index < old_query_count:
+                if index not in old_to_new_query_offset:
+                    raise ValueError(
+                        "raw candidate plan contains a query signature index outside the requested query subset: "
+                        f"{index}"
+                    )
                 remapped[offset] = old_to_new_query_offset[index]
             else:
                 remapped[offset] = new_query_count + (index - old_query_count)
@@ -1813,23 +1817,6 @@ def subset_raw_candidate_plan_for_query_ids(
 def _raw_candidate_plan_seed_setup(
     raw_candidate_plan: Mapping[str, Any],
 ) -> tuple[dict[str, int | str], dict[int | str, int | str], dict[int | str, list[str]]]:
-    seed_signature_ids = raw_candidate_plan.get("seed_signature_ids")
-    seed_component_keys = raw_candidate_plan.get("seed_component_keys")
-    if isinstance(seed_signature_ids, Sequence) and not isinstance(seed_signature_ids, str | bytes):
-        if not isinstance(seed_component_keys, Sequence) or isinstance(seed_component_keys, str | bytes):
-            raise ValueError("raw candidate plan seed_component_keys must accompany seed_signature_ids")
-        if len(seed_signature_ids) != len(seed_component_keys):
-            raise ValueError(
-                "raw candidate plan seed_signature_ids and seed_component_keys must have equal length: "
-                f"{len(seed_signature_ids)} != {len(seed_component_keys)}"
-            )
-        return _identity_seed_setup(
-            {
-                str(signature_id): str(component_key)
-                for signature_id, component_key in zip(seed_signature_ids, seed_component_keys, strict=True)
-            }
-        )
-
     component_members = raw_candidate_plan.get("component_members")
     if not isinstance(component_members, Mapping):
         raise ValueError("raw candidate plan must include component_members for scoring")
@@ -1867,7 +1854,7 @@ def predict_incremental_link_or_abstain_from_raw_feature_block(
     n_jobs: int | None = None,
     total_ram_bytes: int | None = None,
     max_exemplars: int = 4,
-    load_name_counts: bool | dict[str, Any] = False,
+    load_name_counts: bool | None | dict[str, Any] = None,
     name_tuples: set[tuple[str, str]] | str | None = "filtered",
 ) -> LinkOrAbstainProductionResult:
     """Score a raw candidate plan through `FeatureBlock` without full-block `ANDData`.
@@ -1877,20 +1864,24 @@ def predict_incremental_link_or_abstain_from_raw_feature_block(
     Rust featurizer directly from `FeatureBlock`, and does not rerun retrieval.
     """
 
-    if isinstance(load_name_counts, dict):
-        raise ValueError("raw FeatureBlock scoring accepts load_name_counts as a bool, not a dict")
     resolved_runtime_context = runtime_context or build_runtime_context("incremental_link_or_abstain_raw_feature_block")
     n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
     stage_start = time.perf_counter()
+    orcid_enabled = not bool(getattr(clusterer, "suppress_orcid", False))
     signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
     mini_feature_block = feature_block_for_signature_order(feature_block, signature_order)
     order_seconds = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
+    resolved_load_name_counts = _resolve_load_name_counts_policy(
+        clusterer,
+        load_name_counts,
+        context="raw FeatureBlock scoring",
+    )
     featurizer = feature_port.build_rust_featurizer_from_feature_block(
         mini_feature_block,
         name_tuples=name_tuples,
-        load_name_counts=bool(load_name_counts),
+        load_name_counts=resolved_load_name_counts,
         preprocess=True,
         compute_reference_features=False,
         num_threads=n_jobs_resolved,
@@ -1914,12 +1905,16 @@ def predict_incremental_link_or_abstain_from_raw_feature_block(
 
     stage_start = time.perf_counter()
     feature_cache: dict[str, query_adapter_module.QueryFeatures] = {}
+    query_context = query_adapter_module.build_feature_block_query_context(
+        mini_feature_block,
+        feature_cache=feature_cache,
+    )
     base_query_by_signature_id = {
         query_signature_id: query_adapter_module.extract_query_features_from_feature_block(
             mini_feature_block,
             query_signature_id,
-            feature_cache=feature_cache,
-            orcid_enabled=True,
+            query_context=query_context,
+            orcid_enabled=orcid_enabled,
         )
         for query_signature_id in query_signature_ids
     }
@@ -1927,7 +1922,7 @@ def predict_incremental_link_or_abstain_from_raw_feature_block(
         query_signature_id: query_adapter_module.mask_query_features(
             base_query_by_signature_id[query_signature_id],
             query_view,
-            orcid_enabled=True,
+            orcid_enabled=orcid_enabled,
         )
         for query_signature_id, query_view in zip(query_signature_ids, query_views, strict=True)
     }
@@ -1940,8 +1935,8 @@ def predict_incremental_link_or_abstain_from_raw_feature_block(
             component_key=component_key,
             signature_ids=member_signature_ids,
             max_exemplars=max_exemplars,
-            feature_cache=feature_cache,
-            orcid_enabled=True,
+            query_context=query_context,
+            orcid_enabled=orcid_enabled,
         )
         for component_key, member_signature_ids in component_members.items()
     }
@@ -2009,7 +2004,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     n_jobs: int | None = None,
     total_ram_bytes: int | None = None,
     max_exemplars: int = 4,
-    load_name_counts: bool | dict[str, Any] = False,
+    load_name_counts: bool | None | dict[str, Any] = None,
     name_tuples: set[tuple[str, str]] | str | None = "filtered",
     orcid_enabled: bool = True,
     raw_candidate_plan: Mapping[str, Any] | None = None,
@@ -2017,8 +2012,6 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
 ) -> LinkOrAbstainProductionResult:
     """Retrieve and score raw Arrow IPC inputs through Rust without `ANDData`."""
 
-    if isinstance(load_name_counts, dict):
-        raise ValueError("raw Arrow scoring accepts load_name_counts as a bool, not a dict")
     resolved_runtime_context = runtime_context or build_runtime_context("incremental_link_or_abstain_raw_arrow")
     n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
     top_k_resolved = int(artifact.metadata.retrieval_top_k if top_k is None else top_k)
@@ -2037,7 +2030,6 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
             orcid_enabled=bool(orcid_enabled),
             num_threads=n_jobs_resolved,
             max_exemplars=int(max_exemplars),
-            include_seed_assignments=bool(partial_supervision),
         )
         raw_arrow_retrieval_seconds = time.perf_counter() - stage_start
     else:
@@ -2047,12 +2039,17 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
 
     stage_start = time.perf_counter()
     signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
+    resolved_load_name_counts = _resolve_load_name_counts_policy(
+        clusterer,
+        load_name_counts,
+        context="raw Arrow scoring",
+    )
     if rust_featurizer is None:
         featurizer = feature_port.build_rust_featurizer_from_arrow_paths(
             arrow_path_payload,
             signature_ids=signature_order.signature_ids,
             name_tuples=name_tuples,
-            load_name_counts=bool(load_name_counts) or _clusterer_uses_name_count_features(clusterer),
+            load_name_counts=resolved_load_name_counts,
             preprocess=True,
             compute_reference_features=False,
             num_threads=n_jobs_resolved,
@@ -2072,8 +2069,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     stage_start = time.perf_counter()
     query_placeholders = _raw_candidate_plan_query_placeholders(raw_candidate_plan, query_signature_id_strings)
     seed_setup = _raw_candidate_plan_seed_setup(raw_candidate_plan)
-    seed_signature_ids = raw_candidate_plan.get("seed_signature_ids", ())
-    seed_signature_count = len(seed_signature_ids) if isinstance(seed_signature_ids, Sequence) else 0
+    seed_signature_count = sum(len(members) for members in seed_setup[2].values())
     plan_telemetry = raw_candidate_plan.get("telemetry")
     if seed_signature_count == 0 and isinstance(plan_telemetry, Mapping):
         seed_signature_count = int(plan_telemetry.get("seed_signature_count", 0) or 0)
@@ -2138,7 +2134,7 @@ def predict_incremental_link_or_abstain_from_raw_payloads(
     n_jobs: int | None = None,
     total_ram_bytes: int | None = None,
     max_exemplars: int = 4,
-    load_name_counts: bool | dict[str, Any] = False,
+    load_name_counts: bool | None | dict[str, Any] = None,
     name_tuples: set[tuple[str, str]] | str | None = "filtered",
 ) -> LinkOrAbstainProductionResult:
     """Build a raw `FeatureBlock` from payloads and score a raw candidate plan."""

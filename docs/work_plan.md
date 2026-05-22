@@ -1,6 +1,6 @@
 # Work Plan
 
-Status date: 2026-05-20
+Status date: 2026-05-22
 
 This file is only the active Rust/platform backlog. Current architecture and
 artifact decisions live in:
@@ -40,6 +40,153 @@ artifact decisions live in:
   runtime bundles that use name-count features.
 - Keep `name_counts.arrow` available for generation, inspection, and parity
   debugging, not as the default request-time read.
+
+### Arrow S3 Release
+
+Target a new public release prefix:
+`s3://ai2-s2-research-public/s2and-release-arrow`.
+
+This release should be an Arrow-native data/runtime artifact release, not a
+mirror of the legacy JSON/pickle bucket. It should omit `.feature_cache/`.
+
+Preferred layout:
+
+```text
+s2and-release-arrow/
+  manifest.json
+  LICENSE.txt
+  lid.176.bin
+  production_model_v1.0.pickle
+  production_model_v1.1.pickle
+  production_model_v1.2.pickle
+  name_counts_index/
+    manifest.json
+    generations/<generation-id>/
+      first.bin
+      last.bin
+      first_last.bin
+      last_first_initial.bin
+  aminer/
+  arnetminer/
+  inspire/
+  kisti/
+  medline/
+  pubmed/
+  qian/
+  zbmath/
+    manifest.json
+    signatures.arrow
+    papers.arrow
+    paper_authors.arrow
+    specter.arrow
+    *.batch_index.bin
+    <dataset>_clusters.json
+    splits/
+  linker_replay_20260513/
+    manifest.json
+    bundle.json
+    datasets/<dataset>/
+      manifest.json
+      signatures.arrow
+      papers.arrow
+      paper_authors.arrow
+      specter2.arrow
+      *.batch_index.bin
+    components/
+    labels/
+    splits/
+```
+
+- Convert table-shaped runtime inputs.
+  - Convert each benchmark `<dataset>_signatures.json` to
+    `signatures.arrow`.
+  - Convert each benchmark `<dataset>_papers.json` to `papers.arrow` and
+    `paper_authors.arrow`.
+  - Convert each benchmark `<dataset>_specter.pickle` to `specter.arrow`.
+  - Convert linker replay `raw/<dataset>/signatures.json` to
+    `linker_replay_20260513/datasets/<dataset>/signatures.arrow`.
+  - Convert linker replay `raw/<dataset>/papers.json` to `papers.arrow` and
+    `paper_authors.arrow`.
+  - Convert linker replay `embeddings/<dataset>/specter2.pkl` to
+    `specter2.arrow`.
+  - Convert `name_counts.pickle` to `name_counts_index/`; do not publish
+    `name_counts.arrow` in this release.
+  - Generate and ship Arrow batch lookup indexes beside the Arrow files.
+- Keep small metadata and offline evaluation artifacts in their existing
+  formats.
+  - Keep `LICENSE.txt` and `lid.176.bin` unchanged.
+  - Copy `production_model_v1.0.pickle`, `production_model_v1.1.pickle`, and
+    `production_model_v1.2.pickle` exactly as legacy model artifacts.
+  - Keep `<dataset>_clusters.json` as eval-only truth.
+  - Keep train/test split keys, pair CSVs, replay split CSVs, replay
+    `summary.json`, `bundle.json`, and manifests, with paths and checksums
+    updated where they refer to converted artifacts.
+  - Keep linker replay `components/*.parquet` and `labels/*.parquet` as-is
+    because they are already typed columnar offline artifacts.
+- Omit or quarantine artifacts that are not part of the Arrow-native release.
+  - Omit `.feature_cache/`; it is a historical precomputed feature cache and
+    should not be copied into the Arrow release.
+  - Omit `full_union_seed_*.pickle` from the Arrow-native release, or place it
+    under an explicit `legacy/` prefix if paper-era compatibility requires it.
+  - Do not duplicate raw JSON files after conversion. The existing
+    `s2and-release` bucket remains the legacy JSON source.
+
+### Retire Non-Arrow Production Inference Path
+
+Goal: production inference must enter Rust through Arrow artifacts only. JSON,
+`ANDData`, `FeatureBlock`, and `RustFeaturizer.from_dataset` remain allowed for
+training, fixtures, parity tests, and compatibility scripts, but not for
+production inference.
+
+- Define the production boundary.
+  - Production full-block prediction requires complete Arrow paths:
+    `signatures`, `papers`, `paper_authors`, required embedding table, and
+    `name_counts_index` when the model uses name-count features.
+  - Production seeded/incremental prediction additionally requires
+    `cluster_seeds`, `cluster_seed_disallows`, and
+    `altered_cluster_signatures` when altered claimed profiles are present.
+  - Missing Arrow artifacts should fail with an explicit error in production
+    mode rather than silently falling back to `ANDData`.
+- Update script entrypoints.
+  - Convert `scripts/tutorial_for_predicting_with_the_prod_model.py` to accept
+    Arrow input paths or an Arrow bundle root and route through
+    `Clusterer.predict_from_arrow_paths(...)`.
+  - Expand `scripts/eval_prod_models.py --use-arrow` beyond the current mini
+    restriction, or split the mini-only smoke test from real production eval.
+  - Convert `scripts/_rust_suite/prod_inference_cmd.py` to benchmark Arrow as
+    the production path; keep `from_dataset` only as an explicit legacy/parity
+    mode if still needed.
+  - Retire or relabel non-Arrow production-inference claims in rust-suite docs.
+- Make artifact conversion mandatory before production inference.
+  - Keep `scripts/convert_inference_json_to_arrow.py` as the supported bridge
+    from service-shaped JSON to Arrow.
+  - Ensure the converter always emits the artifacts required by production
+    models, including `name_counts_index`.
+  - Add a small validation command or test that opens the produced Arrow bundle
+    and checks the production-required keys.
+- Tighten runtime routing.
+  - In production Rust mode, remove silent fallback from Arrow-routed
+    `Clusterer.predict(...)` when Arrow artifacts are incomplete.
+  - Preserve fallback only under an explicit compatibility/test mode.
+  - Ensure errors name the missing Arrow artifact keys and the caller/script
+    that should generate them.
+- Keep verification gates focused.
+  - Keep bounded Arrow full-predict parity tests against the `ANDData` oracle.
+  - Keep raw Arrow incremental tests for candidate rows, pair rows, row
+    signals, probabilities, and final decisions.
+  - Add or adjust script-level smoke tests for
+    `scripts/convert_inference_json_to_arrow.py`, the Arrow prod-model tutorial
+    flow, the Arrow prod eval flow, and the Arrow rust-suite production
+    benchmark flow.
+- Clean up after migration.
+  - Update `docs/production_inference.md` to state that production Rust
+    inference requires Arrow artifacts.
+  - Update `docs/rust/inference_architecture.md` so non-Arrow Rust loaders are
+    described as compatibility, training, or test surfaces only.
+  - Remove or quarantine stale non-Arrow production-inference commands from
+    `scripts/README.md`.
+  - Keep training/materialization scripts on `ANDData`; they are not part of
+    the production inference removal.
 
 ### Remaining Python-Heavy Paths
 

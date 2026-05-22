@@ -15,7 +15,12 @@ import s2and.incremental_linking.query_adapter as query_adapter_module
 import s2and.incremental_linking.runtime as runtime_module
 from s2and import feature_port, memory_budget
 from s2and.data import ANDData
-from s2and.incremental_linking.feature_block import TemporaryArrowPaths, arrow_paths_with_temporary_cluster_seeds
+from s2and.incremental_linking.feature_block import (
+    TemporaryArrowPaths,
+    arrow_paths_with_temporary_cluster_seeds,
+    cluster_seed_disallows_from_arrow_paths,
+)
+from s2and.incremental_linking.policy import request_cluster_seed_disallow_parts
 from s2and.runtime import RuntimeContext
 
 logger = logging.getLogger("s2and")
@@ -72,6 +77,14 @@ def _raw_window_plan_telemetry_fields(raw_candidate_plan: Mapping[str, Any]) -> 
             if isinstance(value, int | float):
                 fields[f"raw_arrow_window_plan_{key}"] = float(value)
     return fields
+
+
+def _request_cluster_seed_disallows(
+    dataset: ANDData,
+    arrow_paths: Mapping[str, Any],
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]], set[tuple[str, str]]]:
+    arrow_disallows = cluster_seed_disallows_from_arrow_paths(arrow_paths)
+    return request_cluster_seed_disallow_parts(dataset, arrow_disallows)
 
 
 def promoted_incremental_component_sizes(cluster_seeds_require: Mapping[str, int | str]) -> dict[str, int]:
@@ -745,17 +758,58 @@ def predict_incremental_promoted_linker_from_arrow_paths(
     unassigned_signature_ids = [
         str(signature_id) for signature_id in block_signatures if str(signature_id) not in cluster_seeds_require
     ]
+    component_sizes = promoted_incremental_component_sizes(cluster_seeds_require)
+    retrieval_top_k = int(artifact.metadata.retrieval_top_k)
+    orcid_enabled = not bool(getattr(clusterer, "suppress_orcid", False))
+    orcid_fanout_by_query = (
+        promoted_incremental_orcid_fanout_by_query(
+            dataset,
+            unassigned_signature_ids,
+            cluster_seeds_require,
+            orcid_enabled=orcid_enabled,
+        )
+        if hasattr(dataset, "signatures")
+        else {}
+    )
+    base_candidate_rows_per_query, base_pairs_per_query = _top_k_candidate_floors(component_sizes, retrieval_top_k)
+    initial_row_floor, initial_pair_floor = _orcid_fanout_floor_estimates(
+        orcid_fanout_by_query,
+        unassigned_signature_ids,
+    )
+    initial_row_total_floor, initial_pair_total_floor = _orcid_fanout_floor_totals(
+        orcid_fanout_by_query,
+        unassigned_signature_ids,
+        base_candidate_rows_per_query=base_candidate_rows_per_query,
+        base_pairs_per_query=base_pairs_per_query,
+    )
+    initial_limits = compute_promoted_incremental_limits(
+        query_count=len(unassigned_signature_ids),
+        component_sizes=component_sizes,
+        retrieval_top_k=retrieval_top_k,
+        total_ram_bytes=resolved_total_ram_bytes,
+        max_query_batch_size=batching_threshold,
+        candidate_rows_per_query_floor=initial_row_floor,
+        pairs_per_query_floor=initial_pair_floor,
+        candidate_rows_total_floor=initial_row_total_floor,
+        pairs_total_floor=initial_pair_total_floor,
+    )
+    resolved_total_ram_bytes = int(initial_limits.total_ram_bytes)
+    raise_if_promoted_incremental_batch_over_budget(initial_limits)
     linked_signature_clusters: dict[str, int | str] = {}
     batch_telemetries: list[Mapping[str, int | float | str]] = []
     batch_sizes: list[int] = []
-    query_batch_size = max(1, int(batching_threshold or len(unassigned_signature_ids) or 1))
-    orcid_enabled = not bool(getattr(clusterer, "suppress_orcid", False))
+    query_batch_size = max(1, int(initial_limits.query_batch_size or 1))
     name_tuples = getattr(dataset, "name_tuples", "filtered")
+    request_disallows, dataset_disallows, arrow_disallows = _request_cluster_seed_disallows(
+        dataset,
+        base_arrow_path_payload,
+    )
     seed_arrow_start = time.perf_counter()
     seed_arrow_reused_source = (
         str(seed_setup_telemetry.get("seed_setup_cluster_seeds_source", "")) == "arrow"
         and len(recluster_map) == 0
         and "cluster_seeds" in base_arrow_path_payload
+        and request_disallows == arrow_disallows
     )
     if seed_arrow_reused_source:
         arrow_path_payload = dict(base_arrow_path_payload)
@@ -765,6 +819,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             base_arrow_path_payload,
             cluster_seeds_require,
             prefix="s2and_arrow_incremental_cluster_seeds_",
+            cluster_seeds_disallow=request_disallows,
         )
         arrow_path_payload = arrow_path_bundle.paths
     seed_arrow_assignment_seconds = time.perf_counter() - seed_arrow_start
@@ -794,12 +849,11 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                 raw_candidate_plan = rust_module.raw_block_query_candidate_plan_arrow(
                     arrow_path_payload,
                     list(query_plan_window),
-                    top_k=int(artifact.metadata.retrieval_top_k),
+                    top_k=retrieval_top_k,
                     query_view="auto",
                     orcid_enabled=bool(orcid_enabled),
                     num_threads=clusterer.n_jobs,
                     max_exemplars=4,
-                    include_seed_assignments=bool(partial_supervision),
                 )
                 raw_window_plan_seconds += time.perf_counter() - raw_window_start
                 raw_window_plan_count += 1
@@ -844,7 +898,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                     artifact,
                     arrow_paths=arrow_path_payload,
                     query_signature_ids=query_batch,
-                    top_k=int(artifact.metadata.retrieval_top_k),
+                    top_k=retrieval_top_k,
                     partial_supervision=partial_supervision,
                     runtime_context=runtime_context,
                     n_jobs=clusterer.n_jobs,
@@ -863,6 +917,8 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             batch_telemetries,
             batch_sizes=batch_sizes,
             configured_batch_size=batching_threshold,
+            initial_limits=initial_limits,
+            final_limits=initial_limits,
         )
         merged_telemetry.setdefault("seed_signature_count", int(len(cluster_seeds_require)))
         merged_telemetry.setdefault("seed_component_count", int(len(cluster_seeds_require_inverse)))
@@ -904,6 +960,8 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             "incremental_finish_seconds": float(finish_seconds),
             "seed_arrow_assignment_seconds": float(seed_arrow_assignment_seconds),
             "seed_arrow_reused_source": int(bool(seed_arrow_reused_source)),
+            "seed_arrow_dataset_disallow_count": int(len(dataset_disallows)),
+            "seed_arrow_disallow_count": int(len(request_disallows)),
             "arrow_promoted_incremental": 1,
             "arrow_path_count": len(arrow_path_payload),
             "raw_arrow_window_plan_count": int(raw_window_plan_count),

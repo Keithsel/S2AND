@@ -7,7 +7,7 @@ import math
 import time
 import warnings
 from collections import OrderedDict, defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -38,8 +38,24 @@ from s2and.incremental_linking.feature_block import (
     RAW_PLANNER_ARROW_BATCH_INDEX_KEYS,
     TemporaryArrowPaths,
     arrow_paths_with_temporary_cluster_seeds,
+    cluster_seed_disallows_path_from_arrow_paths,
     normalize_cluster_seed_disallow_pairs,
+    read_cluster_seed_disallows_arrow,
+    write_cluster_seed_disallows_arrow,
     write_cluster_seeds_arrow,
+)
+from s2and.incremental_linking.policy import (
+    arrow_paths_have_name_counts_index as _arrow_paths_have_name_counts_index,
+)
+from s2and.incremental_linking.policy import (
+    clusterer_uses_name_count_features,
+    request_cluster_seed_disallow_parts,
+)
+from s2and.incremental_linking.policy import (
+    existing_name_counts_index_path as _existing_name_counts_index_path,
+)
+from s2and.incremental_linking.policy import (
+    require_arrow_name_counts_index_for_clusterer as _require_arrow_name_counts_index_for_clusterer,
 )
 from s2and.incremental_linking.production import (
     predict_incremental_promoted_linker,
@@ -70,12 +86,12 @@ DEFAULT_INCREMENTAL_LINKER_ARTIFACT_DIR = Path(_PACKAGE_DATA_DIR) / "production_
 _ALTERED_PRESPLIT_CACHE_MAX_ENTRIES = 128
 _CLUSTER_SEEDS_ARROW_CACHE_MAX_ENTRIES = 16
 _CLUSTER_SEEDS_ARROW_CACHE: OrderedDict[
-    tuple[str, int | None, int | None],
+    tuple[str, int | None, int | None, int | None],
     tuple[tuple[str, int | str], ...],
 ] = OrderedDict()
 _CLUSTER_SEED_DISALLOWS_ARROW_CACHE_MAX_ENTRIES = 16
 _CLUSTER_SEED_DISALLOWS_ARROW_CACHE: OrderedDict[
-    tuple[str, int | None, int | None],
+    tuple[str, int | None, int | None, int | None],
     tuple[tuple[str, str], ...],
 ] = OrderedDict()
 
@@ -108,18 +124,20 @@ def _cacheable_value(value: Any) -> Any:
         return value
     if isinstance(value, Mapping):
         return tuple(sorted((str(key), _cacheable_value(item)) for key, item in value.items()))
-    if isinstance(value, set | frozenset | list | tuple):
+    if isinstance(value, set | frozenset):
         return tuple(sorted((_cacheable_value(item) for item in value), key=repr))
+    if isinstance(value, list | tuple):
+        return tuple(_cacheable_value(item) for item in value)
     return repr(value)
 
 
-def _path_cache_fingerprint(path_value: Any) -> tuple[str, int | None, int | None]:
+def _path_cache_fingerprint(path_value: Any) -> tuple[str, int | None, int | None, int | None]:
     path = Path(str(path_value))
     try:
         stat = path.stat()
     except OSError:
-        return str(path_value), None, None
-    return str(path), int(stat.st_size), int(stat.st_mtime_ns)
+        return str(path_value), None, None, None
+    return str(path), int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)
 
 
 def _arrow_paths_cache_fingerprint(arrow_paths: Mapping[str, Any] | None) -> tuple[tuple[str, Any], ...]:
@@ -290,30 +308,7 @@ def _uses_embedding_features(clusterer: Any) -> bool:
 
 
 def _uses_name_count_features(clusterer: Any) -> bool:
-    return _uses_feature(getattr(clusterer, "featurizer_info", None), "name_counts") or _uses_feature(
-        getattr(clusterer, "nameless_featurizer_info", None),
-        "name_counts",
-    )
-
-
-def _arrow_paths_have_name_counts_index(paths: Mapping[str, Any]) -> bool:
-    return _existing_name_counts_index_path(paths) is not None
-
-
-def _existing_name_counts_index_path(paths: Mapping[str, Any]) -> str | None:
-    for key in ("name_counts_index", "name_counts_index_dir"):
-        path_value = paths.get(key)
-        if path_value is not None and Path(str(path_value)).exists():
-            return str(path_value)
-    return None
-
-
-def _require_arrow_name_counts_index_for_clusterer(clusterer: Any, arrow_paths: Mapping[str, Any]) -> None:
-    if _uses_name_count_features(clusterer) and not _arrow_paths_have_name_counts_index(arrow_paths):
-        raise ValueError(
-            "Arrow prediction with selected name_counts features requires name_counts_index. "
-            "Pass the S2AND name-count index directory in arrow_paths['name_counts_index']."
-        )
+    return clusterer_uses_name_count_features(clusterer)
 
 
 def _coerce_existing_arrow_paths(
@@ -346,11 +341,10 @@ def _coerce_existing_arrow_paths(
             formatted = ", ".join(f"{key}={paths[key]}" for key in missing_files)
             raise FileNotFoundError(f"dataset Arrow paths point to missing files: {formatted}")
         return None
-    for key in ("name_counts_index", "name_counts_index_dir"):
-        if key in paths and not Path(paths[key]).exists():
-            if strict:
-                raise FileNotFoundError(f"dataset Arrow path {key}={paths[key]} does not exist")
-            return None
+    if "name_counts_index" in paths and not Path(paths["name_counts_index"]).exists():
+        if strict:
+            raise FileNotFoundError(f"dataset Arrow path name_counts_index={paths['name_counts_index']} does not exist")
+        return None
     return paths
 
 
@@ -396,7 +390,7 @@ def _resolve_name_counts_index_path(arrow_dataset_dir: Path) -> str | None:
             raise ValueError(f"Arrow manifest is not valid JSON: {manifest_path}") from exc
         manifest_paths = manifest.get("paths", {})
         if isinstance(manifest_paths, Mapping):
-            path_value = manifest_paths.get("name_counts_index") or manifest_paths.get("name_counts_index_dir")
+            path_value = manifest_paths.get("name_counts_index")
             if path_value is not None:
                 resolved = _resolve_existing_arrow_manifest_path(path_value, arrow_dataset_dir)
                 if resolved is not None:
@@ -419,11 +413,9 @@ def _add_name_counts_index_path(paths: dict[str, str], arrow_dataset_dir: Path) 
     existing = _existing_name_counts_index_path(paths)
     if existing is not None:
         paths["name_counts_index"] = existing
-        paths.pop("name_counts_index_dir", None)
         return
-    for key in ("name_counts_index", "name_counts_index_dir"):
-        if key in paths:
-            raise FileNotFoundError(f"dataset Arrow path {key}={paths[key]} does not exist")
+    if "name_counts_index" in paths:
+        raise FileNotFoundError(f"dataset Arrow path name_counts_index={paths['name_counts_index']} does not exist")
     resolved = _resolve_name_counts_index_path(arrow_dataset_dir)
     if resolved is not None:
         paths["name_counts_index"] = resolved
@@ -522,7 +514,21 @@ def _resolve_dataset_arrow_paths(
     return None
 
 
-_write_cluster_seeds_arrow = write_cluster_seeds_arrow
+def _evict_arrow_path_cache_entries(cache: OrderedDict[Any, Any], path: Path) -> None:
+    path_key = str(path)
+    for cache_key in tuple(cache):
+        if cache_key and cache_key[0] == path_key:
+            del cache[cache_key]
+
+
+def _write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, Any]) -> None:
+    write_cluster_seeds_arrow(path, cluster_seeds_require)
+    _evict_arrow_path_cache_entries(_CLUSTER_SEEDS_ARROW_CACHE, path)
+
+
+def _write_cluster_seed_disallows_arrow(path: Path, pairs: Iterable[tuple[Any, Any]]) -> None:
+    write_cluster_seed_disallows_arrow(path, pairs)
+    _evict_arrow_path_cache_entries(_CLUSTER_SEED_DISALLOWS_ARROW_CACHE, path)
 
 
 def _read_cluster_seeds_arrow(path: Path) -> dict[str, int | str]:
@@ -571,7 +577,7 @@ def _cluster_seeds_require_from_arrow_paths(arrow_paths: Mapping[str, Any] | Non
         return {}
     path = Path(str(path_value))
     if not path.exists():
-        return {}
+        raise FileNotFoundError(f"Arrow path cluster_seeds={path} does not exist")
     return _read_cluster_seeds_arrow(path)
 
 
@@ -582,23 +588,7 @@ def _read_cluster_seed_disallows_arrow(path: Path) -> set[tuple[str, str]]:
         _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.move_to_end(cache_key)
         return set(cached_items)
 
-    import pyarrow as pa
-
-    with pa.memory_map(str(path), "r") as source:
-        table = pa.ipc.open_file(source).read_all()
-    missing = sorted({"signature_id_1", "signature_id_2"}.difference(table.column_names))
-    if missing:
-        raise ValueError(f"cluster seed disallows Arrow is missing required columns: {missing}")
-    disallow_rows: list[tuple[str, str]] = []
-    for left, right in zip(
-        table["signature_id_1"].to_pylist(),
-        table["signature_id_2"].to_pylist(),
-        strict=True,
-    ):
-        if left is None or right is None:
-            raise ValueError("cluster seed disallows Arrow cannot contain null signature ids")
-        disallow_rows.append((str(left), str(right)))
-    disallow_pairs = set(normalize_cluster_seed_disallow_pairs(disallow_rows))
+    disallow_pairs = set(read_cluster_seed_disallows_arrow(path))
     _CLUSTER_SEED_DISALLOWS_ARROW_CACHE[cache_key] = tuple(disallow_pairs)
     _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.move_to_end(cache_key)
     while len(_CLUSTER_SEED_DISALLOWS_ARROW_CACHE) > _CLUSTER_SEED_DISALLOWS_ARROW_CACHE_MAX_ENTRIES:
@@ -607,13 +597,8 @@ def _read_cluster_seed_disallows_arrow(path: Path) -> set[tuple[str, str]]:
 
 
 def _cluster_seed_disallows_from_arrow_paths(arrow_paths: Mapping[str, Any] | None) -> set[tuple[str, str]]:
-    if arrow_paths is None:
-        return set()
-    path_value = arrow_paths.get("cluster_seed_disallows")
-    if path_value is None:
-        return set()
-    path = Path(str(path_value))
-    if not path.exists():
+    path = cluster_seed_disallows_path_from_arrow_paths(arrow_paths)
+    if path is None:
         return set()
     return _read_cluster_seed_disallows_arrow(path)
 
@@ -622,11 +607,11 @@ def _cluster_seed_disallows_for_request(
     dataset: Any,
     arrow_paths: Mapping[str, Any] | None,
 ) -> set[tuple[str, str]]:
-    disallow_pairs = set(
-        normalize_cluster_seed_disallow_pairs(getattr(dataset, "cluster_seeds_disallow", set()) or set())
+    request_disallows, _dataset_disallows, _arrow_disallows = request_cluster_seed_disallow_parts(
+        dataset,
+        _cluster_seed_disallows_from_arrow_paths(arrow_paths),
     )
-    disallow_pairs.update(_cluster_seed_disallows_from_arrow_paths(arrow_paths))
-    return disallow_pairs
+    return request_disallows
 
 
 def _temporary_arrow_paths_with_current_cluster_seeds(
@@ -642,6 +627,7 @@ def _temporary_arrow_paths_with_current_cluster_seeds(
         getattr(dataset, "cluster_seeds_require", {}) or {},
         prefix="s2and_arrow_cluster_seeds_",
         reuse_existing_cluster_seeds_when_empty=reuse_existing_cluster_seeds_when_empty,
+        cluster_seeds_disallow=_cluster_seed_disallows_for_request(dataset, arrow_paths),
     )
 
 
@@ -881,9 +867,9 @@ def _residual_phase_b_first_initial_groups(
         union(representative, signature_id)
 
     if not bool(getattr(clusterer, "suppress_orcid", False)):
-        orcid_representatives: dict[Any, str] = {}
+        orcid_representatives: dict[str, str] = {}
         for signature_id in residual_signature_ids:
-            orcid = getattr(signatures[signature_id], "author_info_orcid", None)
+            orcid = _normalized_orcid_for_presplit_skip(dataset, signature_id)
             if orcid is None:
                 continue
             representative = orcid_representatives.setdefault(orcid, signature_id)
@@ -1844,25 +1830,24 @@ def _upper_triangle_indices_for_range(
     if count <= 0:
         return np.zeros(0, dtype=np.intp), np.zeros(0, dtype=np.intp)
 
-    left = np.empty(count, dtype=np.intp)
-    right = np.empty(count, dtype=np.intp)
-    row = 0
-    remaining_offset = start
-    while row < block_size - 1:
-        row_len = block_size - row - 1
-        if remaining_offset < row_len:
-            break
-        remaining_offset -= row_len
-        row += 1
-    col = row + 1 + remaining_offset
-    for out_index in range(count):
-        left[out_index] = row
-        right[out_index] = col
-        col += 1
-        if col >= block_size:
-            row += 1
-            col = row + 1
-    return left, right
+    linear = np.arange(start, start + count, dtype=np.int64)
+    block_size_int = int(block_size)
+    discriminant = (2 * block_size_int - 1) ** 2 - 8 * linear
+    left = np.floor(((2 * block_size_int - 1) - np.sqrt(discriminant)) / 2).astype(np.int64)
+    row_start = left * (2 * block_size_int - left - 1) // 2
+
+    too_high = row_start > linear
+    if np.any(too_high):
+        left[too_high] -= 1
+        row_start = left * (2 * block_size_int - left - 1) // 2
+    next_row_start = (left + 1) * (2 * block_size_int - left - 2) // 2
+    too_low = next_row_start <= linear
+    if np.any(too_low):
+        left[too_low] += 1
+        row_start = left * (2 * block_size_int - left - 1) // 2
+
+    right = left + 1 + (linear - row_start)
+    return left.astype(np.intp, copy=False), right.astype(np.intp, copy=False)
 
 
 @dataclass(frozen=True)
@@ -3123,6 +3108,7 @@ class Clusterer:
         load_name_counts: bool = False,
         name_counts_path: str | None = None,
         name_tuples: set[tuple[str, str]] | str | None = "filtered",
+        cluster_seeds_disallow: Iterable[tuple[Any, Any]] | None = None,
     ) -> tuple[dict[str, list[str]], dict[str, np.ndarray] | None]:
         """Predict full blocks directly from Arrow IPC inputs through Rust."""
 
@@ -3132,7 +3118,7 @@ class Clusterer:
                 "use the ANDData predict path until Arrow reference-feature artifacts are available."
             )
 
-        _require_arrow_name_counts_index_for_clusterer(self, arrow_paths)
+        _require_arrow_name_counts_index_for_clusterer(self, arrow_paths, context="Arrow prediction")
         signature_ids = list(
             dict.fromkeys(str(signature_id) for signatures in block_dict.values() for signature_id in signatures)
         )
@@ -3149,13 +3135,20 @@ class Clusterer:
         )
         arrow_featurizer_seconds = time.perf_counter() - featurizer_start
         cluster_seed_disallows = _cluster_seed_disallows_from_arrow_paths(arrow_paths)
+        if cluster_seeds_disallow is not None:
+            cluster_seed_disallows.update(normalize_cluster_seed_disallow_pairs(cluster_seeds_disallow))
+        signature_id_set = set(signature_ids)
+        effective_partial_supervision = dict(partial_supervision or {})
+        for left, right in cluster_seed_disallows:
+            if left in signature_id_set and right in signature_id_set:
+                effective_partial_supervision.setdefault((left, right), LARGE_INTEGER)
         predict_start = time.perf_counter()
         result = self.predict_from_rust_featurizer(
             block_dict,
             rust_featurizer,
             dists=dists,
             cluster_model_params=cluster_model_params,
-            partial_supervision=partial_supervision,
+            partial_supervision=effective_partial_supervision,
             incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
             runtime_context=runtime_context,
             total_ram_bytes=total_ram_bytes,
@@ -3658,7 +3651,11 @@ class Clusterer:
                 and len(block_dict_multiple_letter_first_names) > 0
                 and not use_s2_clusters
             ):
-                _require_arrow_name_counts_index_for_clusterer(self, arrow_paths_for_predict)
+                _require_arrow_name_counts_index_for_clusterer(
+                    self,
+                    arrow_paths_for_predict,
+                    context="Arrow prediction",
+                )
                 signature_ids = list(
                     dict.fromkeys(
                         str(signature_id)
@@ -3675,7 +3672,7 @@ class Clusterer:
                 rust_featurizer = build_rust_featurizer_from_arrow_paths(
                     {str(key): str(value) for key, value in arrow_paths_for_predict.items()},
                     signature_ids=signature_ids,
-                    name_tuples="filtered",
+                    name_tuples=getattr(dataset, "name_tuples", "filtered"),
                     load_name_counts=_uses_name_count_features(self),
                     preprocess=True,
                     compute_reference_features=False,
@@ -3824,7 +3821,8 @@ class Clusterer:
                 runtime_context=runtime_context,
                 total_ram_bytes=total_ram_bytes,
                 load_name_counts=_uses_name_count_features(self),
-                name_tuples="filtered",
+                name_tuples=getattr(dataset, "name_tuples", "filtered"),
+                cluster_seeds_disallow=_cluster_seed_disallows_for_request(dataset, arrow_paths),
             )
             end = time.time()
             total_predict_time = end - start
@@ -4758,24 +4756,20 @@ class Clusterer:
             )
         if arrow_paths is not None:
             logger.info("Running promoted incremental linker through Arrow/Rust paths")
-            arrow_paths_bundle = _temporary_arrow_paths_with_current_cluster_seeds(dataset, arrow_paths)
-            try:
-                return predict_incremental_promoted_linker_from_arrow_paths(
-                    self,
-                    block_signatures,
-                    dataset,
-                    arrow_paths=arrow_paths_bundle.paths,
-                    artifact_dir=artifact_dir,
-                    prevent_new_incompatibilities=prevent_new_incompatibilities,
-                    partial_supervision=partial_supervision,
-                    runtime_context=runtime_context,
-                    total_ram_bytes=total_ram_bytes,
-                    batching_threshold=batching_threshold,
-                    resolve_total_ram_bytes=_resolve_total_ram_bytes_for_incremental,
-                    build_incremental_result=_build_incremental_result,
-                )
-            finally:
-                arrow_paths_bundle.close()
+            return predict_incremental_promoted_linker_from_arrow_paths(
+                self,
+                block_signatures,
+                dataset,
+                arrow_paths=arrow_paths,
+                artifact_dir=artifact_dir,
+                prevent_new_incompatibilities=prevent_new_incompatibilities,
+                partial_supervision=partial_supervision,
+                runtime_context=runtime_context,
+                total_ram_bytes=total_ram_bytes,
+                batching_threshold=batching_threshold,
+                resolve_total_ram_bytes=_resolve_total_ram_bytes_for_incremental,
+                build_incremental_result=_build_incremental_result,
+            )
         return predict_incremental_promoted_linker(
             self,
             block_signatures,

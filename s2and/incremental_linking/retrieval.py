@@ -29,9 +29,9 @@ RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS: tuple[tuple[str, str, Any], ...] = (
     ("row_query_first_tokens", "query_first_token", object),
     ("row_query_years", "query_year", np.int32),
     ("row_query_year_missing", "query_year_missing", np.uint8),
-    ("row_query_has_affiliations", "query_has_affiliations", np.float32),
-    ("row_query_has_coauthors", "query_has_coauthors", np.float32),
-    ("row_orcid_match", "orcid_match", np.float32),
+    ("row_query_has_affiliations", "query_has_affiliations", np.uint8),
+    ("row_query_has_coauthors", "query_has_coauthors", np.uint8),
+    ("row_orcid_match", "orcid_match", np.uint8),
     ("middle_initial_compatibility", "middle_initial_compatibility", np.float32),
     ("affiliation_overlap", "affiliation_overlap", np.float32),
     ("coauthor_overlap", "coauthor_overlap", np.float32),
@@ -125,13 +125,14 @@ def _signature_indices_from_ids(
     *,
     field_name: str,
 ) -> np.ndarray:
-    indices = np.empty(len(signature_ids), dtype=np.uint32)
-    for offset, signature_id in enumerate(signature_ids):
-        key = str(signature_id)
-        if key not in signature_id_to_index:
-            raise KeyError(f"{field_name} contains signature_id not present in signature_id_to_index: {key!r}")
-        indices[offset] = int(signature_id_to_index[key])
-    return indices
+    try:
+        return np.asarray(
+            [int(signature_id_to_index[str(signature_id)]) for signature_id in signature_ids], dtype=np.uint32
+        )
+    except KeyError as exc:
+        raise KeyError(
+            f"{field_name} contains signature_id not present in signature_id_to_index: {str(exc.args[0])!r}"
+        ) from exc
 
 
 def _signature_id_to_index_from_order(
@@ -341,9 +342,9 @@ def build_linker_retrieval_batch_rust(
         "first_name_bucket": first_name_bucket_array(query_first_tokens, query_views),
         "query_year": np.asarray(plan["row_query_years"], dtype=np.int32),
         "query_year_missing": np.asarray(plan["row_query_year_missing"], dtype=np.uint8),
-        "query_has_affiliations": np.asarray(plan["row_query_has_affiliations"], dtype=np.float32),
-        "query_has_coauthors": np.asarray(plan["row_query_has_coauthors"], dtype=np.float32),
-        "orcid_match": np.asarray(plan["row_orcid_match"], dtype=np.float32),
+        "query_has_affiliations": np.asarray(plan["row_query_has_affiliations"], dtype=np.uint8),
+        "query_has_coauthors": np.asarray(plan["row_query_has_coauthors"], dtype=np.uint8),
+        "orcid_match": np.asarray(plan["row_orcid_match"], dtype=np.uint8),
         "middle_initial_compatibility": np.asarray(plan["middle_initial_compatibility"], dtype=np.float32),
         "affiliation_overlap": np.asarray(plan["affiliation_overlap"], dtype=np.float32),
         "coauthor_overlap": np.asarray(plan["coauthor_overlap"], dtype=np.float32),

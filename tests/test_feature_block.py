@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import struct
 from pathlib import Path
@@ -7,11 +8,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import s2and.incremental_linking.feature_block_arrow as feature_block_arrow_module
 from s2and.data import ANDData, NameCounts
+from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.feature_block import (
     RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS,
     FeatureBlockSignatureOrder,
     arrow_ipc_physical_layout,
+    cluster_seed_disallows_from_arrow_paths,
     feature_block_for_signature_order,
     feature_block_from_anddata,
     feature_block_from_arrow_paths,
@@ -45,6 +49,44 @@ from s2and.incremental_linking.runtime import (
     predict_incremental_link_or_abstain_from_raw_feature_block,
     predict_incremental_link_or_abstain_from_raw_payloads,
 )
+
+
+def test_feature_block_public_exports_remain_importable() -> None:
+    module = importlib.import_module("s2and.incremental_linking.feature_block")
+    expected_names = {
+        "RAW_PLANNER_ARROW_BATCH_INDEX_KEYS",
+        "RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS",
+        "TemporaryArrowPaths",
+        "FeatureBlock",
+        "FeatureBlockPaper",
+        "FeatureBlockPaperAuthor",
+        "FeatureBlockSignature",
+        "FeatureBlockSignatureOrder",
+        "arrow_ipc_physical_layout",
+        "arrow_paths_with_temporary_cluster_seeds",
+        "cluster_seed_disallows_from_arrow_paths",
+        "feature_block_for_signature_order",
+        "feature_block_from_anddata",
+        "feature_block_from_arrow_paths",
+        "feature_block_from_raw_payloads",
+        "feature_block_signature_order_from_raw_candidate_plan",
+        "feature_block_to_mini_anddata",
+        "normalize_cluster_seed_disallow_pairs",
+        "raw_planner_arrow_physical_layout",
+        "read_cluster_seed_disallows_arrow",
+        "write_arrow_batch_lookup_index",
+        "write_arrow_ipc_table",
+        "write_cluster_seed_disallows_arrow",
+        "write_cluster_seeds_arrow",
+        "write_feature_block_arrow_from_anddata",
+        "write_feature_block_arrow_tables",
+        "write_name_counts_arrow",
+        "write_name_counts_index",
+        "write_name_pairs_arrow",
+        "write_raw_arrow_batch_lookup_indexes",
+    }
+    missing = sorted(name for name in expected_names if not hasattr(module, name))
+    assert missing == []
 
 
 def _signature_payload(
@@ -175,8 +217,6 @@ def _raw_plan() -> dict[str, object]:
         "row_local_author_window10_overlap_count_max": np.asarray([1, 0], dtype=np.float32),
         "row_best_author_count_log_absdiff": np.asarray([0, 0], dtype=np.float32),
         "query_authors": ["ada lovelace"],
-        "seed_signature_ids": ["s1", "s2", "s3"],
-        "seed_component_keys": ["c_ada", "c_other", "c_other"],
         "component_members": {"c_ada": ["s1"], "c_other": ["s2", "s3"]},
     }
     return plan
@@ -354,6 +394,13 @@ def test_feature_block_from_arrow_paths_rejects_invalid_cluster_seed_disallows(t
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
+def test_cluster_seed_disallows_from_arrow_paths_rejects_missing_explicit_path(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing_cluster_seed_disallows.arrow"
+
+    with pytest.raises(FileNotFoundError, match="cluster_seed_disallows"):
+        cluster_seed_disallows_from_arrow_paths({"cluster_seed_disallows": str(missing_path)})
+
+
 def test_feature_block_from_arrow_paths_rejects_duplicate_signature_rows(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
@@ -393,6 +440,61 @@ def test_feature_block_from_arrow_paths_rejects_duplicate_paper_author_positions
 
     with pytest.raises(ValueError, match="duplicate"):
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_rejects_null_paper_author_position(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    null_position_authors = pa.table(
+        {
+            "paper_id": pa.array(["p_q"], type=pa.string()),
+            "position": pa.array([None], type=pa.int64()),
+            "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(null_position_authors, Path(arrow_paths["paper_authors"]))
+
+    with pytest.raises(ValueError, match="null position"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_rejects_malformed_optional_scalars(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    malformed_papers = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p1", "p2", "p3"], type=pa.string()),
+            "title": pa.array(["Notes", "Notes", "Compiler", "Compiler"], type=pa.string()),
+            "venue": pa.array(["Royal Society", "Royal Society", "", ""], type=pa.string()),
+            "journal_name": pa.array(["", "", "", ""], type=pa.string()),
+            "year": pa.array(["1843", "20xx", "1952", "1952"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(malformed_papers, Path(arrow_paths["papers"]))
+
+    with pytest.raises(ValueError, match="papers.year"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_reads_specter_when_requested(tmp_path: Path) -> None:
+    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
+    feature_block = feature_block_from_raw_payloads(
+        signatures=signatures,
+        papers=papers,
+        raw_candidate_plan=_raw_plan(),
+        cluster_seeds_require=cluster_seeds_require,
+        specter_embeddings={
+            "p_q": np.asarray([1.0, 0.0], dtype=np.float32),
+            "p1": np.asarray([0.5, 0.5], dtype=np.float32),
+            "p_unused": np.asarray([0.0, 1.0], dtype=np.float32),
+        },
+    )
+    arrow_paths = write_feature_block_arrow_tables(feature_block, tmp_path, include_empty_cluster_seeds=True)
+
+    materialized = feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan(), include_specter=True)
+
+    assert materialized.specter_paper_ids == ("p_q", "p1")
+    np.testing.assert_allclose(materialized.specter_embeddings, [[1.0, 0.0], [0.5, 0.5]])
 
 
 def test_write_arrow_ipc_table_writes_bounded_record_batches(tmp_path: Path) -> None:
@@ -451,7 +553,7 @@ def test_raw_planner_index_rejects_stale_python_reuse(tmp_path: Path) -> None:
     )
     write_raw_arrow_batch_lookup_indexes({"signatures": path}, tmp_path)
     write_arrow_ipc_table(
-        pa.table({"signature_id": pa.array(["s1", "s2", "s3"], type=pa.string())}),
+        pa.table({"signature_id": pa.array([f"s{index}" for index in range(200)], type=pa.string())}),
         path,
     )
 
@@ -490,10 +592,12 @@ def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     with pa.memory_map(pairs_path, "r") as source:
         pairs = pa.ipc.open_file(source).read_all().to_pylist()
     manifest = json.loads((Path(index_path) / "manifest.json").read_text(encoding="utf-8"))
-    header = (Path(index_path) / "first.bin").read_bytes()[:32]
+    first_path = Path(index_path) / manifest["files"]["first"]["path"]
+    header = first_path.read_bytes()[:32]
     magic, record_count, blob_offset, blob_len = struct.unpack("<8sQQQ", header)
     assert manifest["schema_version"] == "name_counts_index_v1"
     assert manifest["exact_string_verification"] is True
+    assert manifest["files"]["first"]["path"].startswith("generations/")
     assert magic == b"S2NCI001"
     assert record_count == 1
     assert blob_offset == 72
@@ -503,6 +607,66 @@ def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert write_name_counts_arrow(tmp_path)[1] == {"reused": True}
     assert write_name_counts_index(tmp_path)[1] == {"reused": True}
     assert write_name_pairs_arrow({("ada", "a")}, tmp_path)[1] == {"reused": True}
+
+
+def test_write_name_counts_index_does_not_reuse_legacy_direct_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import s2and.data as data_module
+
+    legacy_index_dir = tmp_path / "name_counts_index"
+    legacy_index_dir.mkdir()
+    for filename in ("first.bin", "last.bin", "first_last.bin", "last_first_initial.bin"):
+        (legacy_index_dir / filename).write_bytes(b"legacy")
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"ada": 3}, {"lovelace": 5}, {"ada lovelace": 2}, {"lovelace a": 7}),
+    )
+
+    index_path, index_metrics = write_name_counts_index(tmp_path)
+
+    assert index_metrics["reused"] is False
+    manifest = json.loads((Path(index_path) / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["files"]["first"]["path"].startswith("generations/")
+
+
+def test_write_name_counts_index_failed_overwrite_keeps_previous_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import s2and.data as data_module
+
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"ada": 3}, {"lovelace": 5}, {"ada lovelace": 2}, {"lovelace a": 7}),
+    )
+    index_path, _metrics = write_name_counts_index(tmp_path)
+    manifest_path = Path(index_path) / "manifest.json"
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+    original_first_path = Path(index_path) / json.loads(original_manifest)["files"]["first"]["path"]
+
+    real_write_file = feature_block_arrow_module._write_name_count_index_file  # noqa: SLF001
+
+    def fail_after_first_file(path: Path, kind: str, mapping: object) -> dict[str, int]:
+        if kind == "last":
+            raise RuntimeError("simulated index write failure")
+        return real_write_file(path, kind, mapping)
+
+    monkeypatch.setattr(feature_block_arrow_module, "_write_name_count_index_file", fail_after_first_file)
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"alan": 11}, {"turing": 13}, {"alan turing": 17}, {"turing a": 19}),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated index write failure"):
+        write_name_counts_index(tmp_path, overwrite=True)
+
+    assert manifest_path.read_text(encoding="utf-8") == original_manifest
+    assert original_first_path.exists()
 
 
 def test_feature_block_to_mini_anddata_materializes_only_requested_rows() -> None:
@@ -548,6 +712,43 @@ def test_feature_block_from_raw_payloads_uses_raw_plan_mini_order() -> None:
     assert feature_block.cluster_seeds_disallow == (("q", "s2"),)
     assert [paper.paper_id for paper in feature_block.papers] == ["p_q", "p1", "p2", "p3"]
     assert feature_block.specter_paper_ids == ("p_q", "p1")
+
+
+def test_feature_block_from_raw_payloads_rejects_missing_papers() -> None:
+    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
+    del papers["p3"]
+
+    with pytest.raises(ValueError, match="missing signature paper_ids"):
+        feature_block_from_raw_payloads(
+            signatures=signatures,
+            papers=papers,
+            raw_candidate_plan=_raw_plan(),
+            cluster_seeds_require=cluster_seeds_require,
+        )
+
+
+def test_feature_block_from_raw_payloads_rejects_malformed_optional_scalars() -> None:
+    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
+    signatures["s3"]["author_info"]["position"] = "later"
+
+    with pytest.raises(ValueError, match="signatures.author_info.position"):
+        feature_block_from_raw_payloads(
+            signatures=signatures,
+            papers=papers,
+            raw_candidate_plan=_raw_plan(),
+            cluster_seeds_require=cluster_seeds_require,
+        )
+
+    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
+    papers["p1"]["is_reliable"] = "maybe"
+
+    with pytest.raises(ValueError, match="papers.is_reliable"):
+        feature_block_from_raw_payloads(
+            signatures=signatures,
+            papers=papers,
+            raw_candidate_plan=_raw_plan(),
+            cluster_seeds_require=cluster_seeds_require,
+        )
 
 
 def test_feature_block_from_raw_payloads_accepts_anddata_specter_tuple_payload() -> None:
@@ -732,6 +933,7 @@ def test_raw_feature_block_scoring_wrapper_uses_direct_rust_feature_block_path(
     def fake_build_rust_featurizer_from_feature_block(feature_block_arg: object, **_kwargs: object) -> FakeFeaturizer:
         captured["feature_block_signature_ids"] = tuple(feature_block_arg.signature_ids)
         captured["feature_block_seed_map"] = dict(feature_block_arg.cluster_seeds_require)
+        captured["build_kwargs"] = dict(_kwargs)
         return FakeFeaturizer()
 
     def fail_get_rust_featurizer(*_args: object, **_kwargs: object) -> None:
@@ -741,6 +943,7 @@ def test_raw_feature_block_scoring_wrapper_uses_direct_rust_feature_block_path(
         retrieval_batch = kwargs["retrieval_batch"]
         captured["retrieval_left_indices"] = retrieval_batch.candidate_batch.left_signature_indices.tolist()
         captured["retrieval_right_indices"] = retrieval_batch.candidate_batch.right_signature_indices.tolist()
+        captured["queries"] = kwargs["queries"]
         extra_builder = kwargs["extra_row_signal_builder"]
         extra_signals = extra_builder(retrieval_batch, {1: "q"})
         captured["extra_signal_keys"] = sorted(extra_signals)
@@ -775,16 +978,27 @@ def test_raw_feature_block_scoring_wrapper_uses_direct_rust_feature_block_path(
     )
 
     result = predict_incremental_link_or_abstain_from_raw_feature_block(
-        type("Clusterer", (), {"n_jobs": 1})(),
+        type(
+            "Clusterer",
+            (),
+            {
+                "n_jobs": 1,
+                "suppress_orcid": True,
+                "featurizer_info": FeaturizationInfo(features_to_use=["name_counts"]),
+            },
+        )(),
         type("Artifact", (), {"metadata": type("Metadata", (), {"retrieval_top_k": 25})()})(),
         feature_block=feature_block,
         raw_candidate_plan=_raw_plan(),
-        load_name_counts=False,
         name_tuples=set(),
     )
 
     assert captured["feature_block_signature_ids"] == ("q", "s1", "s2", "s3")
     assert captured["feature_block_seed_map"] == {"s1": "c_ada", "s2": "c_other", "s3": "c_other"}
+    assert captured["build_kwargs"]["load_name_counts"] is True
+    queries = captured["queries"]
+    assert len(queries) == 1
+    assert queries[0].orcid is None
     assert captured["retrieval_left_indices"] == [1, 1, 1]
     assert captured["retrieval_right_indices"] == [2, 3, 0]
     assert "candidate_cluster_max_paper_author_count" in captured["extra_signal_keys"]
@@ -792,6 +1006,33 @@ def test_raw_feature_block_scoring_wrapper_uses_direct_rust_feature_block_path(
     assert result.telemetry["feature_block_signature_count"] == 4
     assert "feature_block_rust_featurizer_seconds" in result.telemetry
     assert result.telemetry["constraint_api_mode"] == "rust_index_arrays"
+
+
+def test_raw_feature_block_scoring_rejects_disabled_required_name_counts() -> None:
+    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
+    feature_block = feature_block_from_raw_payloads(
+        signatures=signatures,
+        papers=papers,
+        raw_candidate_plan=_raw_plan(),
+        cluster_seeds_require=cluster_seeds_require,
+    )
+
+    with pytest.raises(ValueError, match="load_name_counts=False"):
+        predict_incremental_link_or_abstain_from_raw_feature_block(
+            type(
+                "Clusterer",
+                (),
+                {
+                    "n_jobs": 1,
+                    "featurizer_info": FeaturizationInfo(features_to_use=["name_counts"]),
+                },
+            )(),
+            type("Artifact", (), {"metadata": type("Metadata", (), {"retrieval_top_k": 25})()})(),
+            feature_block=feature_block,
+            raw_candidate_plan=_raw_plan(),
+            load_name_counts=False,
+            name_tuples=set(),
+        )
 
 
 def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(

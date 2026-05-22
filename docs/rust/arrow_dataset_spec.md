@@ -30,7 +30,10 @@ Required in addition for seeded prediction or incremental prediction promoted
 through Arrow:
 
 - `cluster_seeds.arrow`
-- `cluster_seed_disallows.arrow`
+
+Optional for seeded prediction or incremental prediction promoted through Arrow:
+
+- `cluster_seed_disallows.arrow` when pairwise seed disallow constraints exist
 
 Required when incremental input contains altered claimed profiles:
 
@@ -77,15 +80,17 @@ Notes:
 - `cluster_seeds.arrow` is required only for seeded/incremental datasets. It can
   be omitted for unseeded full prediction and offline eval.
 - `cluster_seed_disallows.arrow` preserves pairwise seed disallow constraints.
-  Write an empty table when the request has no seed disallows.
+  Omit it when the request has no seed disallows; an explicit path must exist.
 - When using `write_feature_block_arrow_from_anddata(...)` for
   seeded/incremental artifacts, pass `include_empty_cluster_seeds=True` so empty
   seed/disallow tables are still emitted.
 - `altered_cluster_signatures.arrow` is required for incremental datasets whose
-  seed clusters include altered claimed profiles. It is the producer-owned
-  request artifact for this condition. `altered_cluster_signatures.txt` is
-  still supported as a compatibility fallback for older fixtures and
-  ANDData-compatible tooling.
+  seed clusters include altered claimed profiles. When an in-memory
+  `ANDData.altered_cluster_signatures` request value is present it is
+  authoritative; otherwise the Arrow file is the producer-owned request
+  artifact for this condition. `altered_cluster_signatures.txt` is still
+  supported as a compatibility fallback for older fixtures and ANDData-compatible
+  tooling.
 - `<dataset>_clusters.json` is ground truth for offline evaluation only. It is
   not part of production inference scoring.
 - `specter.arrow` is the SPECTER v1 embedding table. `specter2.arrow` is the
@@ -106,7 +111,7 @@ the path mapping should use these keys:
 | `paper_authors` | Path to `paper_authors.arrow` |
 | `specter` | Path to the embedding table selected for the current model, even if the file is physically named `specter2.arrow` |
 | `cluster_seeds` | Path to `cluster_seeds.arrow` for incremental/seeded prediction |
-| `cluster_seed_disallows` | Path to `cluster_seed_disallows.arrow` for pairwise seed disallow constraints |
+| `cluster_seed_disallows` | Optional path to `cluster_seed_disallows.arrow` for pairwise seed disallow constraints |
 | `altered_cluster_signatures` | Path to `altered_cluster_signatures.arrow` when altered claimed profiles are present; text fallback is accepted for legacy callers |
 | `clusters` | Path to eval-only ground-truth clusters JSON |
 | `name_counts_index` | Required shared/global name-count index directory when the selected model uses `name_counts`, normally `s2and/data/name_counts_index` |
@@ -320,8 +325,8 @@ strings.
 
 ### `cluster_seed_disallows.arrow`
 
-Required for incremental/seeded prediction through the Arrow promoted path.
-Write an empty table when no seed disallows are present.
+Optional for incremental/seeded prediction through the Arrow promoted path.
+Omit the file when no seed disallows are present; an explicit path must exist.
 
 | Column | Arrow type | Nulls | Meaning |
 |---|---:|---:|---|
@@ -389,13 +394,16 @@ The shared binary index layout is:
 ```text
 s2and/data/name_counts_index/
   manifest.json
-  first.bin
-  last.bin
-  first_last.bin
-  last_first_initial.bin
+  generations/<generation-id>/
+    first.bin
+    last.bin
+    first_last.bin
+    last_first_initial.bin
 ```
 
-`manifest.json` must have `schema_version: "name_counts_index_v1"`.
+`manifest.json` must have `schema_version: "name_counts_index_v1"` and points
+to one complete immutable generation. Writers publish a new generation by
+replacing only the manifest after all binary files are written.
 
 Do not build a pipeline that loads `name_counts.arrow` into Python dicts/lists
 for production request handling. That defeats the purpose of this contract.
@@ -455,9 +463,8 @@ Conditional `paths` entries:
 - `specter2` may be included as bundle inventory when both embedding versions
   are shipped, but runtime callers still pass the selected embedding as
   `specter`.
-- `cluster_seeds` and `cluster_seed_disallows` are required for seeded or
-  incremental Arrow prediction. `cluster_seed_disallows` should point to an
-  empty Arrow table when no disallows are present.
+- `cluster_seeds` is required for seeded or incremental Arrow prediction.
+  `cluster_seed_disallows` is optional; omit it when no disallows are present.
 - `altered_cluster_signatures` is required when altered claimed profiles are
   present.
 - `clusters` is eval-only ground truth.
@@ -544,8 +551,10 @@ Recommended additional fields:
 - `validation` summary with row counts, duplicate counts, missing reference
   counts, physical-layout checks, and parity-check command/output location.
 
-Root-level `manifest.json` should list dataset directories and their manifest
-paths when an artifact bundle contains multiple datasets.
+Root-level `manifest.json` should use schema `inference_arrow_bundle_v1` and
+list dataset directories and their manifest paths in `dataset_manifests` when an
+artifact bundle contains multiple datasets. Keep per-input `source_path` values
+in dataset manifests; do not write a root-level `source_path`.
 
 ---
 

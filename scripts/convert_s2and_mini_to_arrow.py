@@ -115,6 +115,7 @@ def convert_dataset(
 ) -> dict[str, Any]:
     from s2and.data import ANDData
     from s2and.incremental_linking.feature_block import (
+        FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION,
         RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS,
         arrow_ipc_physical_layout,
         raw_planner_arrow_physical_layout,
@@ -208,6 +209,7 @@ def convert_dataset(
     physical_layout["tables"]["specter2"] = {
         "key": "paper_id",
         "max_record_batch_rows": RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS["specter"],
+        "batch_index_path_key": "specter2_batch_index",
         "batch_index_path": specter2_index_path,
         "batch_index_present": True,
         **arrow_ipc_physical_layout(paths["specter2"]),
@@ -224,7 +226,7 @@ def convert_dataset(
     manifest = {
         "dataset": dataset,
         "source_dir": str(source_dir),
-        "schema": "feature_block_arrow_v2",
+        "schema": FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION,
         "signature_count": len(dataset_obj.signatures),
         "paper_count": len(dataset_obj.papers),
         "cluster_count": len(dataset_obj.clusters or {}),

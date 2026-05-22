@@ -8,33 +8,16 @@ from __future__ import annotations
 
 import json
 import struct
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 FEATURE_BLOCK_SCHEMA_VERSION = "feature_block_v2"
-
-FEATURE_BLOCK_INCLUDED_RESPONSIBILITIES: tuple[str, ...] = (
-    "signature_identity_and_author_fields",
-    "paper_metadata_used_by_inference",
-    "paper_author_rows_used_by_inference",
-    "seed_component_membership",
-    "constraint_seed_pairs",
-    "specter_embeddings",
-    "name_count_values_for_scoring",
-)
-
-FEATURE_BLOCK_EXCLUDED_ANDDATA_RESPONSIBILITIES: tuple[str, ...] = (
-    "train_eval_test_split_construction",
-    "pair_sampling_policy",
-    "legacy_artifact_migration",
-    "sinonym_overwrite_execution",
-    "reference_feature_generation",
-    "general_anddata_mutation_lifecycle",
-)
+FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION = "feature_block_arrow_v2"
 
 NAME_COUNTS_INDEX_SCHEMA_VERSION = "name_counts_index_v1"
 ARROW_PHYSICAL_LAYOUT_SCHEMA_VERSION = "s2and_arrow_physical_v1"
@@ -67,6 +50,106 @@ RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS: dict[str, int] = {
     "paper_authors": 16_384,
     "specter": 2_048,
 }
+
+
+@dataclass
+class TemporaryArrowPaths:
+    """Arrow path bundle with optional request-scoped temp resources."""
+
+    paths: dict[str, str]
+    _tmpdir: tempfile.TemporaryDirectory[str] | None = field(default=None, repr=False)
+
+    def close(self) -> None:
+        if self._tmpdir is not None:
+            self._tmpdir.cleanup()
+            self._tmpdir = None
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def normalize_cluster_seed_disallow_pairs(
+    pairs: Iterable[tuple[Any, Any]],
+    *,
+    valid_signature_ids: Iterable[str] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Return canonical undirected disallow pairs after schema validation."""
+
+    valid_signature_id_set = None if valid_signature_ids is None else {str(value) for value in valid_signature_ids}
+    normalized: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for left, right in pairs:
+        left_id = str(left)
+        right_id = str(right)
+        if not left_id or not right_id:
+            raise ValueError("cluster seed disallow pairs cannot contain empty signature ids")
+        if left_id == right_id:
+            raise ValueError(f"cluster seed disallow pair cannot be a self-pair: {left_id!r}")
+        if valid_signature_id_set is not None:
+            missing = sorted({left_id, right_id}.difference(valid_signature_id_set))
+            if missing:
+                raise ValueError(f"cluster seed disallow pair contains signatures missing from FeatureBlock: {missing}")
+        pair = tuple(sorted((left_id, right_id)))
+        if pair in seen:
+            raise ValueError(f"cluster seed disallow pair is duplicated: {pair}")
+        seen.add(pair)
+        normalized.append(pair)
+    return tuple(normalized)
+
+
+def write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, Any]) -> None:
+    """Write the canonical Arrow cluster-seed table."""
+
+    import pyarrow as pa
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    items: list[tuple[str, str]] = []
+    seen_signature_ids: set[str] = set()
+    for signature_id, cluster_id in cluster_seeds_require.items():
+        signature_key = str(signature_id)
+        cluster_key = str(cluster_id)
+        if not signature_key:
+            raise ValueError("cluster seeds Arrow cannot contain empty signature_id values")
+        if not cluster_key:
+            raise ValueError(f"cluster seeds Arrow cannot contain empty cluster_id values: {signature_key!r}")
+        if signature_key in seen_signature_ids:
+            raise ValueError(f"cluster seeds Arrow contains duplicate signature_id: {signature_key!r}")
+        seen_signature_ids.add(signature_key)
+        items.append((signature_key, cluster_key))
+    table = pa.table(
+        {
+            "signature_id": pa.array([signature_id for signature_id, _cluster_id in items], type=pa.string()),
+            "cluster_id": pa.array([cluster_id for _signature_id, cluster_id in items], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+
+
+def arrow_paths_with_temporary_cluster_seeds(
+    arrow_paths: Mapping[str, Any],
+    cluster_seeds_require: Mapping[Any, Any],
+    *,
+    prefix: str,
+    reuse_existing_cluster_seeds_when_empty: bool = False,
+) -> TemporaryArrowPaths:
+    """Return Arrow paths with a request-scoped cluster-seeds sidecar."""
+
+    paths = {str(key): str(value) for key, value in arrow_paths.items()}
+    if (
+        reuse_existing_cluster_seeds_when_empty
+        and not cluster_seeds_require
+        and paths.get("cluster_seeds") is not None
+        and Path(paths["cluster_seeds"]).exists()
+    ):
+        return TemporaryArrowPaths(paths=paths)
+
+    tmpdir = tempfile.TemporaryDirectory(prefix=prefix)
+    output_path = Path(tmpdir.name) / "cluster_seeds.arrow"
+    write_cluster_seeds_arrow(output_path, cluster_seeds_require)
+    paths["cluster_seeds"] = str(output_path)
+    return TemporaryArrowPaths(paths=paths, _tmpdir=tmpdir)
 
 
 @dataclass(frozen=True)
@@ -193,9 +276,20 @@ class FeatureBlock:
             raise ValueError(f"query_signature_ids are missing from FeatureBlock signatures: {missing_queries}")
         object.__setattr__(self, "query_signature_ids", query_signature_ids)
 
-        require_pairs = tuple(
-            (str(signature_id), str(component_id)) for signature_id, component_id in self.cluster_seeds_require
-        )
+        require_pair_list: list[tuple[str, str]] = []
+        seen_require_signature_ids: set[str] = set()
+        for signature_id, component_id in self.cluster_seeds_require:
+            signature_key = str(signature_id)
+            component_key = str(component_id)
+            if not signature_key:
+                raise ValueError("cluster_seeds_require cannot contain empty signature_id values")
+            if not component_key:
+                raise ValueError(f"cluster_seeds_require cannot contain empty component_id values: {signature_key!r}")
+            if signature_key in seen_require_signature_ids:
+                raise ValueError(f"cluster_seeds_require contains duplicate signature_id: {signature_key!r}")
+            seen_require_signature_ids.add(signature_key)
+            require_pair_list.append((signature_key, component_key))
+        require_pairs = tuple(require_pair_list)
         missing_require = sorted(
             signature_id for signature_id, _component_id in require_pairs if signature_id not in signature_id_set
         )
@@ -203,7 +297,10 @@ class FeatureBlock:
             raise ValueError(f"cluster_seeds_require contains signatures missing from FeatureBlock: {missing_require}")
         object.__setattr__(self, "cluster_seeds_require", require_pairs)
 
-        disallow_pairs = tuple((str(left), str(right)) for left, right in self.cluster_seeds_disallow)
+        disallow_pairs = normalize_cluster_seed_disallow_pairs(
+            self.cluster_seeds_disallow,
+            valid_signature_ids=signature_id_set,
+        )
         object.__setattr__(self, "cluster_seeds_disallow", disallow_pairs)
 
         specter_paper_ids = tuple(str(value) for value in self.specter_paper_ids)
@@ -416,6 +513,22 @@ def _raise_if_record_batch_limit_exceeded(
     )
 
 
+def _read_arrow_batch_lookup_index_header(index_path: Path) -> dict[str, int | str]:
+    with index_path.open("rb") as infile:
+        header = infile.read(_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size)
+    if len(header) != _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size:
+        raise ValueError(f"Arrow batch lookup index is truncated: {index_path!s}")
+    magic, record_count, source_size, source_mtime_ns = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.unpack(header)
+    if magic != _ARROW_BATCH_LOOKUP_INDEX_MAGIC:
+        raise ValueError(f"Arrow batch lookup index has invalid magic bytes: {index_path!s}")
+    return {
+        "magic": magic.decode("ascii"),
+        "record_count": int(record_count),
+        "source_size": int(source_size),
+        "source_mtime_ns": int(source_mtime_ns),
+    }
+
+
 def write_arrow_batch_lookup_index(
     arrow_path: str | Path,
     index_path: str | Path,
@@ -431,6 +544,17 @@ def write_arrow_batch_lookup_index(
 
     output_path = Path(index_path)
     if output_path.exists() and not overwrite:
+        arrow_path_obj = Path(arrow_path)
+        index_header = _read_arrow_batch_lookup_index_header(output_path)
+        source_stat = arrow_path_obj.stat()
+        if (
+            int(index_header["source_size"]) != source_stat.st_size
+            or int(index_header["source_mtime_ns"]) != source_stat.st_mtime_ns
+        ):
+            raise ValueError(
+                f"Arrow batch lookup index is stale for {arrow_path_obj!s}: {output_path!s}. "
+                "Rebuild it with overwrite=True."
+            )
         layout = arrow_ipc_physical_layout(arrow_path)
         _raise_if_record_batch_limit_exceeded(
             arrow_path=arrow_path,
@@ -442,6 +566,7 @@ def write_arrow_batch_lookup_index(
         return str(output_path), {
             "reused": True,
             "schema_version": ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION,
+            **index_header,
             **layout,
             "max_record_batch_rows": int(max_record_batch_rows or 0),
         }
@@ -947,6 +1072,26 @@ def feature_block_from_raw_payloads(
     )
 
 
+def _arrow_rows_by_unique_key(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    table_name: str,
+    key_column: str,
+) -> dict[str, Mapping[str, Any]]:
+    rows_by_key: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        key_value = row.get(key_column)
+        if key_value is None:
+            raise ValueError(f"{table_name} Arrow cannot contain null {key_column} values")
+        key = str(key_value)
+        if not key:
+            raise ValueError(f"{table_name} Arrow cannot contain empty {key_column} values")
+        if key in rows_by_key:
+            raise ValueError(f"{table_name} Arrow contains duplicate {key_column}: {key!r}")
+        rows_by_key[key] = row
+    return rows_by_key
+
+
 def feature_block_from_arrow_paths(
     paths: Mapping[str, Any],
     *,
@@ -965,7 +1110,11 @@ def feature_block_from_arrow_paths(
 
     signatures_table = _read_arrow_ipc_table(pa, paths["signatures"])
     signatures_table = _filter_arrow_table_by_values(pa, pc, signatures_table, "signature_id", selected_signature_ids)
-    signatures_by_id = {str(row["signature_id"]): row for row in signatures_table.to_pylist()}
+    signatures_by_id = _arrow_rows_by_unique_key(
+        signatures_table.to_pylist(),
+        table_name="signatures",
+        key_column="signature_id",
+    )
     missing_signatures = [
         signature_id for signature_id in selected_signature_ids if signature_id not in signatures_by_id
     ]
@@ -979,26 +1128,43 @@ def feature_block_from_arrow_paths(
     paper_ids = tuple(dict.fromkeys(row.paper_id for row in signature_rows))
     papers_table = _read_arrow_ipc_table(pa, paths["papers"])
     papers_table = _filter_arrow_table_by_values(pa, pc, papers_table, "paper_id", paper_ids)
-    papers_by_id = {str(row["paper_id"]): row for row in papers_table.to_pylist()}
-    paper_rows = tuple(
-        _feature_block_paper_from_arrow_row(paper_id, papers_by_id[paper_id])
-        for paper_id in paper_ids
-        if paper_id in papers_by_id
+    papers_by_id = _arrow_rows_by_unique_key(
+        papers_table.to_pylist(),
+        table_name="papers",
+        key_column="paper_id",
     )
+    missing_paper_ids = [paper_id for paper_id in paper_ids if paper_id not in papers_by_id]
+    if missing_paper_ids:
+        raise ValueError(f"Arrow papers are missing signature paper_ids: {missing_paper_ids[:10]}")
+    paper_rows = tuple(_feature_block_paper_from_arrow_row(paper_id, papers_by_id[paper_id]) for paper_id in paper_ids)
 
     paper_author_rows: tuple[FeatureBlockPaperAuthor, ...] = ()
     paper_authors_path = paths.get("paper_authors")
     if paper_authors_path is not None:
         paper_authors_table = _read_arrow_ipc_table(pa, paper_authors_path)
         paper_authors_table = _filter_arrow_table_by_values(pa, pc, paper_authors_table, "paper_id", paper_ids)
-        paper_author_rows = tuple(
-            FeatureBlockPaperAuthor(
-                paper_id=str(row["paper_id"]),
-                position=0 if row.get("position") is None else int(row["position"]),
-                author_name=str(row.get("author_name") or ""),
+        paper_author_row_list: list[FeatureBlockPaperAuthor] = []
+        seen_paper_author_positions: set[tuple[str, int]] = set()
+        for row in paper_authors_table.to_pylist():
+            paper_id_value = row.get("paper_id")
+            if paper_id_value is None:
+                raise ValueError("paper_authors Arrow cannot contain null paper_id values")
+            paper_id = str(paper_id_value)
+            if not paper_id:
+                raise ValueError("paper_authors Arrow cannot contain empty paper_id values")
+            position = 0 if row.get("position") is None else int(row["position"])
+            key = (paper_id, position)
+            if key in seen_paper_author_positions:
+                raise ValueError(f"paper_authors Arrow contains duplicate (paper_id, position): {key!r}")
+            seen_paper_author_positions.add(key)
+            paper_author_row_list.append(
+                FeatureBlockPaperAuthor(
+                    paper_id=paper_id,
+                    position=position,
+                    author_name=str(row.get("author_name") or ""),
+                )
             )
-            for row in paper_authors_table.to_pylist()
-        )
+        paper_author_rows = tuple(paper_author_row_list)
 
     seed_signature_ids = raw_candidate_plan.get("seed_signature_ids")
     seed_component_keys = raw_candidate_plan.get("seed_component_keys")

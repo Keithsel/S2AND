@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
+from s2and.incremental_linking.feature_block import FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION
 from scripts.convert_inference_json_to_arrow import convert_inference_json_to_arrow
 
 
@@ -112,6 +113,7 @@ def test_convert_inference_json_to_arrow_preserves_seed_and_altered_tables(
         skip_name_counts_index=True,
     )
 
+    assert manifest["schema"] == FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION
     assert manifest["signature_count"] == 3
     assert manifest["paper_count"] == 3
     assert manifest["cluster_seeds_require_count"] == 2
@@ -121,7 +123,7 @@ def test_convert_inference_json_to_arrow_preserves_seed_and_altered_tables(
     cluster_seed_rows = _read_table(manifest["paths"]["cluster_seeds"]).to_pydict()
     assert cluster_seed_rows == {"signature_id": ["s1", "s2"], "cluster_id": ["0", "0"]}
     cluster_seed_disallow_rows = _read_table(manifest["paths"]["cluster_seed_disallows"]).to_pydict()
-    assert cluster_seed_disallow_rows == {"signature_id_1": ["s1"], "signature_id_2": ["q"]}
+    assert cluster_seed_disallow_rows == {"signature_id_1": ["q"], "signature_id_2": ["s1"]}
     altered_path = Path(manifest["paths"]["altered_cluster_signatures"])
     assert altered_path.name == "altered_cluster_signatures.arrow"
     assert _read_table(str(altered_path)).to_pydict() == {"signature_id": ["s1"]}

@@ -31,25 +31,25 @@ Performance with SPECTERv2 data, on zbmath (B3): (0.975, 0.991, 0.983)
 
 ---
 
-Without retraining,
+Without retraining (production model artifacts, random seed 42, verified 2026-05-21):
 
-Performance with SPECTERv1 data, on arnetminer (B3): (0.977, 0.982, 0.979)
-Performance with SPECTERv2 data, on arnetminer (B3): (0.942, 0.982, 0.961)
+Performance with SPECTERv1 data, on arnetminer (B3): (0.988, 0.972, 0.98)
+Performance with SPECTERv2 data, on arnetminer (B3): (0.946, 0.982, 0.963)
 
-Performance with SPECTERv1 data, on inspire (B3): (0.993, 0.964, 0.978)
-Performance with SPECTERv2 data, on inspire (B3): (0.998, 0.952, 0.974)
+Performance with SPECTERv1 data, on inspire (B3): (0.994, 0.954, 0.973)
+Performance with SPECTERv2 data, on inspire (B3): (0.998, 0.927, 0.961)
 
-Performance with SPECTERv1 data, on kisti (B3): (0.96, 0.957, 0.959)
-Performance with SPECTERv2 data, on kisti (B3): (0.957, 0.968, 0.962)
+Performance with SPECTERv1 data, on kisti (B3): (0.964, 0.937, 0.95)
+Performance with SPECTERv2 data, on kisti (B3): (0.96, 0.96, 0.96)
 
-Performance with SPECTERv1 data, on pubmed (B3): (1.0, 0.968, 0.984)
+Performance with SPECTERv1 data, on pubmed (B3): (1.0, 0.895, 0.945)
 Performance with SPECTERv2 data, on pubmed (B3): (1.0, 0.892, 0.943)
 
-Performance with SPECTERv1 data, on qian (B3): (0.985, 0.955, 0.969)
-Performance with SPECTERv2 data, on qian (B3): (0.974, 0.962, 0.968)
+Performance with SPECTERv1 data, on qian (B3): (0.991, 0.937, 0.963)
+Performance with SPECTERv2 data, on qian (B3): (0.978, 0.964, 0.971)
 
-Performance with SPECTERv1 data, on zbmath (B3): (0.967, 0.955, 0.961)
-Performance with SPECTERv2 data, on zbmath (B3): (0.961, 0.97, 0.965)
+Performance with SPECTERv1 data, on zbmath (B3): (0.966, 0.986, 0.975)
+Performance with SPECTERv2 data, on zbmath (B3): (0.961, 0.992, 0.976)
 
 
 Usage:
@@ -74,6 +74,7 @@ import argparse
 import json
 import os
 from collections import defaultdict
+from pathlib import Path
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -152,9 +153,11 @@ def resolve_dataset_file(data_root: str, dataset_name: str, preferred_name: str,
 
 def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suffix: str) -> dict[str, str]:
     from s2and.incremental_linking.feature_block import RAW_PLANNER_ARROW_BATCH_INDEX_KEYS
+    from s2and.model import _resolve_name_counts_index_path
 
     dataset_root = os.path.join(arrow_root, dataset_name)
     specter_name = "specter2.arrow" if specter_suffix == "_specter2.pkl" else "specter.arrow"
+
     paths = {
         "signatures": os.path.join(dataset_root, "signatures.arrow"),
         "papers": os.path.join(dataset_root, "papers.arrow"),
@@ -162,10 +165,18 @@ def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suff
         "specter": os.path.join(dataset_root, specter_name),
         "clusters": os.path.join(dataset_root, f"{dataset_name}_clusters.json"),
     }
+    name_counts_index_path = _resolve_name_counts_index_path(Path(dataset_root))
+    if name_counts_index_path is not None:
+        paths["name_counts_index"] = name_counts_index_path
     missing = {key: path for key, path in paths.items() if not os.path.exists(path)}
     if missing:
         formatted = ", ".join(f"{key}={path}" for key, path in missing.items())
         raise FileNotFoundError(f"Missing Arrow dataset files for {dataset_name}: {formatted}")
+    if "name_counts_index" not in paths:
+        raise FileNotFoundError(
+            f"Missing Arrow name_counts_index for {dataset_name}. "
+            "Production mini eval models use name-count features and Arrow eval must use the index."
+        )
     for arrow_key, index_key in RAW_PLANNER_ARROW_BATCH_INDEX_KEYS.items():
         arrow_path = paths.get(arrow_key)
         if arrow_path is None:
@@ -284,16 +295,12 @@ def cluster_eval_arrow(
     )
     signature_to_cluster_id = read_signature_to_cluster_id(arrow_paths["clusters"])
     cluster_to_signatures = construct_cluster_to_signatures(signature_to_cluster_id, test_block_dict)
+    predict_arrow_paths = {key: value for key, value in arrow_paths.items() if key != "clusters"}
     pred_clusters, _ = clusterer.predict_from_arrow_paths(
         test_block_dict,
-        {
-            "signatures": arrow_paths["signatures"],
-            "papers": arrow_paths["papers"],
-            "paper_authors": arrow_paths["paper_authors"],
-            "specter": arrow_paths["specter"],
-        },
+        predict_arrow_paths,
         total_ram_bytes=1_000_000_000_000,
-        load_name_counts=False,
+        load_name_counts=True,
         name_tuples="filtered",
     )
     (

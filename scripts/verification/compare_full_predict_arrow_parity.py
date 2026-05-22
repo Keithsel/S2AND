@@ -393,7 +393,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         arrow_paths,
         signature_ids=selected_signature_ids,
         name_tuples=None,
-        load_name_counts=False,
+        load_name_counts=True,
         preprocess=True,
         compute_reference_features=False,
         num_threads=int(args.n_jobs),

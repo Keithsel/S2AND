@@ -13,7 +13,13 @@ from s2and.incremental_linking.gate_buckets import first_name_bucket_array, norm
 from s2and.incremental_linking.linker_pairwise import LinkerCandidateBatch
 
 _REQUIRED_RUST_PAIR_PLAN_KEYS: tuple[str, ...] = ("row_orcid_match",)
-_RAW_PLAN_ROW_SIGNAL_KEYS: tuple[tuple[str, str, Any], ...] = (
+RAW_CANDIDATE_PLAN_BATCH_ROW_KEYS: tuple[str, ...] = (
+    "row_query_signature_indices",
+    "row_component_keys",
+    "retrieval_scores",
+    "retrieval_ranks",
+)
+RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS: tuple[tuple[str, str, Any], ...] = (
     ("row_component_sizes", "cluster_size", np.float32),
     ("row_named_signature_counts", "named_signature_count", np.float32),
     ("row_dominant_first_names", "dominant_first_name", object),
@@ -58,6 +64,17 @@ _RAW_PLAN_ROW_SIGNAL_KEYS: tuple[tuple[str, str, Any], ...] = (
         np.float32,
     ),
     ("row_best_author_count_log_absdiff", "best_author_count_log_absdiff", np.float32),
+)
+RAW_CANDIDATE_PLAN_ROW_KEYS: tuple[str, ...] = (
+    *RAW_CANDIDATE_PLAN_BATCH_ROW_KEYS,
+    *(raw_key for raw_key, _signal_key, _dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS),
+)
+RAW_CANDIDATE_PLAN_PAIR_KEYS: tuple[str, ...] = (
+    "left_signature_indices",
+    "right_signature_indices",
+    "left_signature_ids",
+    "right_signature_ids",
+    "pair_row_indices",
 )
 
 
@@ -220,7 +237,7 @@ def build_linker_retrieval_batch_from_raw_candidate_plan(
         "query_author": query_authors,
         "first_name_bucket": first_name_bucket_array(query_first_tokens, query_views),
     }
-    for raw_key, signal_key, dtype in _RAW_PLAN_ROW_SIGNAL_KEYS:
+    for raw_key, signal_key, dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS:
         row_signals[signal_key] = _raw_plan_array(plan, raw_key, dtype, row_count)
     return LinkerRetrievalBatch(candidate_batch=candidate_batch, row_signals=row_signals)
 

@@ -62,6 +62,7 @@ def convert_inference_json_to_arrow(
 
     from s2and.data import ANDData
     from s2and.incremental_linking.feature_block import (
+        FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION,
         raw_planner_arrow_physical_layout,
         write_arrow_ipc_table,
         write_feature_block_arrow_from_anddata,
@@ -164,7 +165,7 @@ def convert_inference_json_to_arrow(
         paths["name_counts_index"] = name_counts_index_path
 
     manifest = {
-        "schema": "feature_block_arrow_v2",
+        "schema": FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION,
         "dataset": dataset_name,
         "source_path": str(input_json),
         "signature_count": len(dataset.signatures),

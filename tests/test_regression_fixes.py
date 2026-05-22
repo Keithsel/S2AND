@@ -453,7 +453,6 @@ def test_clusterer_predict_subblocked_single_letter_ignores_original_altered_pro
 
     def fake_predict_incremental(self, block_signatures, dataset_arg, *args, **kwargs):
         del self, args, kwargs
-        assert getattr(dataset_arg, "_s2and_disable_arrow_cluster_seeds", False) is True
         observed_altered.append(list(dataset_arg.altered_cluster_signatures or []))
         return {
             "clusters": {"merged": list(dataset_arg.cluster_seeds_require.keys()) + list(block_signatures)},
@@ -482,8 +481,6 @@ def test_clusterer_predict_subblocked_single_letter_ignores_original_altered_pro
 
     assert observed_altered == [[]]
     assert dataset.altered_cluster_signatures == original_altered
-    assert getattr(dataset, "_s2and_disable_altered_cluster_signatures", False) is False
-    assert getattr(dataset, "_s2and_disable_arrow_cluster_seeds", False) is False
 
 
 def test_clusterer_predict_subblocked_single_letter_suppresses_altered_arrow_path(monkeypatch, tmp_path):
@@ -541,7 +538,6 @@ def test_clusterer_predict_subblocked_single_letter_suppresses_altered_arrow_pat
 
     def fake_predict_incremental(self, block_signatures, dataset_arg, *args, **kwargs):
         del self, args, kwargs
-        assert getattr(dataset_arg, "_s2and_disable_arrow_cluster_seeds", False) is True
         observed_model_altered.append(
             model_module._dataset_altered_cluster_signatures(dataset_arg, dataset_arg.arrow_paths)
         )
@@ -572,8 +568,6 @@ def test_clusterer_predict_subblocked_single_letter_suppresses_altered_arrow_pat
 
     assert observed_model_altered == [[]]
     assert dataset.altered_cluster_signatures is None
-    assert getattr(dataset, "_s2and_disable_altered_cluster_signatures", False) is False
-    assert getattr(dataset, "_s2and_disable_arrow_cluster_seeds", False) is False
 
 
 def test_clusterer_predict_subblocked_single_letter_skips_sync_for_arrow_promoted_incremental(
@@ -623,7 +617,6 @@ def test_clusterer_predict_subblocked_single_letter_skips_sync_for_arrow_promote
     def fake_predict_incremental(self, block_signatures, dataset_arg, *args, **kwargs):
         del self, args
         assert kwargs["runtime_context"].use_rust is True
-        assert getattr(dataset_arg, "_s2and_disable_arrow_cluster_seeds", False) is True
         observed_seed_maps.append(dict(dataset_arg.cluster_seeds_require))
         return {
             "clusters": {"merged": list(dataset_arg.cluster_seeds_require.keys()) + list(block_signatures)},
@@ -660,8 +653,6 @@ def test_clusterer_predict_subblocked_single_letter_skips_sync_for_arrow_promote
     assert sync_snapshots == []
     assert evict_snapshots == [original_cluster_seeds]
     assert dict(dataset.cluster_seeds_require) == original_cluster_seeds
-    assert getattr(dataset, "_s2and_disable_altered_cluster_signatures", False) is False
-    assert getattr(dataset, "_s2and_disable_arrow_cluster_seeds", False) is False
 
 
 def test_clusterer_predict_subblocked_single_letter_restores_state_after_incremental_failure(monkeypatch):
@@ -715,8 +706,6 @@ def test_clusterer_predict_subblocked_single_letter_restores_state_after_increme
 
     assert dict(dataset.cluster_seeds_require) == original_cluster_seeds
     assert dataset.altered_cluster_signatures == original_altered
-    assert getattr(dataset, "_s2and_disable_altered_cluster_signatures", False) is False
-    assert getattr(dataset, "_s2and_disable_arrow_cluster_seeds", False) is False
 
 
 def test_clusterer_predict_subblocked_arrow_presplits_altered_profile_seeds(

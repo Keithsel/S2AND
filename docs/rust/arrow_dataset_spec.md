@@ -42,6 +42,8 @@ Offline evaluation datasets may also include:
 
 Do not create per-dataset `name_pairs.arrow` files for production datasets.
 Name aliases are a shared runtime resource.
+Do not include `name_pairs` or `name_tuples` path keys in production manifests
+or runtime path bundles unless an alias override is intentional.
 
 ---
 
@@ -76,10 +78,14 @@ Notes:
   be omitted for unseeded full prediction and offline eval.
 - `cluster_seed_disallows.arrow` preserves pairwise seed disallow constraints.
   Write an empty table when the request has no seed disallows.
+- When using `write_feature_block_arrow_from_anddata(...)` for
+  seeded/incremental artifacts, pass `include_empty_cluster_seeds=True` so empty
+  seed/disallow tables are still emitted.
 - `altered_cluster_signatures.arrow` is required for incremental datasets whose
   seed clusters include altered claimed profiles. It is the producer-owned
   request artifact for this condition. `altered_cluster_signatures.txt` is
-  accepted only as a legacy compatibility fallback.
+  still supported as a compatibility fallback for older fixtures and
+  ANDData-compatible tooling.
 - `<dataset>_clusters.json` is ground truth for offline evaluation only. It is
   not part of production inference scoring.
 - `specter.arrow` is the SPECTER v1 embedding table. `specter2.arrow` is the
@@ -103,12 +109,12 @@ the path mapping should use these keys:
 | `cluster_seed_disallows` | Path to `cluster_seed_disallows.arrow` for pairwise seed disallow constraints |
 | `altered_cluster_signatures` | Path to `altered_cluster_signatures.arrow` when altered claimed profiles are present; text fallback is accepted for legacy callers |
 | `clusters` | Path to eval-only ground-truth clusters JSON |
-| `name_counts_index` | Optional shared/global name-count index directory, normally `s2and/data/name_counts_index` |
+| `name_counts_index` | Required shared/global name-count index directory when the selected model uses `name_counts`, normally `s2and/data/name_counts_index` |
 | `name_counts` | Optional long-form Arrow name-count table for generation/inspection/parity, not preferred on the hot path |
 | `signatures_batch_index` | Optional S2AND-generated lookup index for `signatures.arrow`, used by indexed raw candidate planning |
 | `papers_batch_index` | Optional S2AND-generated lookup index for `papers.arrow`, used by indexed raw candidate planning |
 | `paper_authors_batch_index` | Optional S2AND-generated lookup index for `paper_authors.arrow`, used by indexed raw candidate planning |
-| `specter_batch_index` | Optional S2AND-generated lookup index for the selected embedding path passed as `specter`, used by indexed raw candidate planning |
+| `specter_batch_index` | Optional S2AND-generated lookup index for the selected embedding path passed as `specter`; the sidecar filename follows the selected file stem, for example `specter.specter_batch_index.bin` or `specter2.specter_batch_index.bin` |
 
 ---
 
@@ -141,8 +147,11 @@ The smaller request-scoped tables do not need a random-access physical layout:
 Implementation notes for producers:
 
 - Use Arrow IPC file format, not stream format.
-- In PyArrow, call `pyarrow.ipc.new_file(...)` and write tables with
-  `writer.write_table(table, max_chunksize=<limit>)`.
+- Prefer S2AND's `write_arrow_ipc_table(..., max_record_batch_rows=<limit>)`
+  helper. Independent PyArrow writers should use `pyarrow.ipc.new_file(...)`
+  and `writer.write_table(table, max_chunksize=<limit>)`, then verify the
+  emitted record batches with `arrow_ipc_physical_layout(...)` or an equivalent
+  check.
 - Preserve `signatures.arrow` row order. Record-batch boundaries must not
   change row contents or row order.
 - Keep `paper_authors.arrow` grouped by `paper_id`, then ordered by `position`
@@ -174,6 +183,9 @@ specter.specter_batch_index.bin
 specter2.specter_batch_index.bin
 ```
 
+The double stem is intentional: the first stem identifies the Arrow file and the
+trailing `<table>_batch_index` stem matches the manifest path key.
+
 When both `specter.arrow` and `specter2.arrow` are present, write one embedding
 index per file. At runtime, the selected embedding file is passed under the
 `specter` path key, and S2AND uses the adjacent
@@ -193,13 +205,20 @@ Rows must match the values that S2AND would expose after normal preprocessing:
 - `preprocess=True`
 - `use_sinonym_overwrite=False`
 - `use_orcid_id=True`
+- `block_type="s2"`
 - `name_tuples="filtered"`
+- `compute_reference_features=False`
+- `name_counts_last_first_initial_semantics="initial_char"`
 - `name_counts_index/` available when the selected model uses name-count features
 
-Use the existing `FeatureBlock` writer as the reference implementation:
+Use the existing `FeatureBlock` writer as the reference implementation for table
+values and Arrow physical layout:
 `s2and.incremental_linking.feature_block.write_feature_block_arrow_from_anddata`.
-An independent assembly pipeline is fine, but it must produce the same values as
-that writer.
+That writer returns table paths and does not write `manifest.json`; manifests
+are producer-owned. The converter scripts in `scripts/convert_*_to_arrow.py`
+are reference producers for manifest shape. An independent assembly pipeline is
+fine, but it must produce the same table values as the writer and the same
+manifest contract as this document.
 
 Important parity details:
 
@@ -262,7 +281,7 @@ One row per paper-author child row. Required columns:
 |---|---:|---:|---|
 | `paper_id` | `string` | no | Referenced paper id |
 | `position` | `int64` | no | Author position |
-| `author_name` | `string` | no | Author display/name string used by coauthor features |
+| `author_name` | `string` | no | Post-preprocessing/feature-compatible author name string used by coauthor features |
 
 Rows should be ordered by `paper_id` then `position` where practical. Ordering is
 not the identity contract, but stable ordering makes diffs and validation easier.
@@ -276,9 +295,11 @@ One row per embedded paper. Required columns:
 | `paper_id` | `string` | no | Referenced paper id |
 | `embedding` | `fixed_size_list<float32>[dimension]` | no | SPECTER vector |
 
-All vectors in one file must have the same dimension. If the model uses
-`embedding_similarity`, every paper referenced by `signatures.arrow` should have
-an embedding row for the selected embedding version. Missing embeddings can
+All vectors in one file must have the same dimension, and `paper_id` values
+must be unique. A missing embedding means there is no row for that `paper_id`;
+do not represent missing vectors with a null `embedding` value. If the model
+uses `embedding_similarity`, every paper referenced by `signatures.arrow` should
+have an embedding row for the selected embedding version. Missing embeddings can
 change scores and should fail validation unless the target model explicitly
 permits them.
 
@@ -294,6 +315,8 @@ Optional for unseeded full prediction.
 
 Only required seed assignments are persisted here. Pairwise seed disallow
 constraints are persisted separately in `cluster_seed_disallows.arrow`.
+`signature_id` values must be unique, and `cluster_id` values must be non-empty
+strings.
 
 ### `cluster_seed_disallows.arrow`
 
@@ -307,6 +330,8 @@ Write an empty table when no seed disallows are present.
 
 Each id must exist in `signatures.arrow`. Runtime treats the pair as
 undirected, matching existing `cluster_seeds_disallow` semantics.
+Pairs must not be self-pairs. Duplicate pairs, including reversed duplicates,
+should fail validation.
 
 ### `altered_cluster_signatures.arrow`
 
@@ -323,10 +348,11 @@ Required columns:
 Each id must exist in `signatures.arrow` and in `cluster_seeds.arrow`. At
 runtime, S2AND maps these signature ids through the seed assignments to identify
 the claimed seed components that need altered-profile pre-splitting.
+`signature_id` values must be unique.
 
 `altered_cluster_signatures.txt` with one signature id per line is still
-accepted by the Python runtime for older fixtures and ANDData-compatible tooling,
-but new production Arrow producers should emit the Arrow table.
+supported by the Python runtime for older fixtures and ANDData-compatible
+tooling, but new production Arrow producers should emit the Arrow table.
 
 ### `<dataset>_clusters.json`
 
@@ -335,10 +361,15 @@ Eval-only truth data. Keep the same shape as existing S2AND clusters JSON:
 ```json
 {
   "cluster_id": {
-    "signature_ids": ["signature_a", "signature_b"]
+    "cluster_id": "cluster_id",
+    "signature_ids": ["signature_a", "signature_b"],
+    "model_version": -1
   }
 }
 ```
+
+The `signature_ids` field is required by the S2AND loader. Other fields, such as
+`cluster_id` and `model_version`, are conventional metadata in existing bundles.
 
 Production prediction does not need this file.
 
@@ -373,15 +404,18 @@ for production request handling. That defeats the purpose of this contract.
 
 ## Name Aliases
 
-Production datasets must not contain per-dataset `name_pairs.arrow` files. The
-runtime default is the packaged filtered alias file:
+Production datasets must not contain per-dataset `name_pairs.arrow` files or
+manifest path keys. The runtime default is the packaged filtered alias file:
 
 ```text
 s2and_name_tuples_filtered.txt
 ```
 
 If a non-default alias set is ever needed, make it an explicit shared/global
-runtime artifact, not something duplicated into every dataset directory.
+runtime artifact, not something duplicated into every dataset directory. Runtime
+path bundles that include `name_pairs` or `name_tuples` override the packaged
+filtered aliases, so production callers should pass those keys only when the
+override is intentional.
 
 ---
 
@@ -390,7 +424,7 @@ runtime artifact, not something duplicated into every dataset directory.
 Each dataset directory must contain `manifest.json`. The manifest is not the hot
 path source of truth, but it is required for auditability and validation.
 
-Required fields for semantic Arrow artifacts:
+Required fields for every semantic Arrow manifest:
 
 ```json
 {
@@ -401,19 +435,44 @@ Required fields for semantic Arrow artifacts:
   "paths": {
     "signatures": "signatures.arrow",
     "papers": "papers.arrow",
-    "paper_authors": "paper_authors.arrow",
-    "cluster_seeds": "cluster_seeds.arrow",
-    "cluster_seed_disallows": "cluster_seed_disallows.arrow"
+    "paper_authors": "paper_authors.arrow"
   },
   "name_tuples": "default packaged filtered aliases"
 }
 ```
+
+The manifest `schema` value is the on-disk Arrow manifest schema. In Python it
+is exposed as
+`s2and.incremental_linking.feature_block.FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION`.
+Do not use the in-memory `FeatureBlock` schema constant for manifest
+validation.
+
+Conditional `paths` entries:
+
+- `specter` is required when the selected model uses `embedding_similarity`.
+  This is the selected embedding file for the run, even when the physical file is
+  named `specter2.arrow`.
+- `specter2` may be included as bundle inventory when both embedding versions
+  are shipped, but runtime callers still pass the selected embedding as
+  `specter`.
+- `cluster_seeds` and `cluster_seed_disallows` are required for seeded or
+  incremental Arrow prediction. `cluster_seed_disallows` should point to an
+  empty Arrow table when no disallows are present.
+- `altered_cluster_signatures` is required when altered claimed profiles are
+  present.
+- `clusters` is eval-only ground truth.
+- `name_counts_index` is required when the selected model uses name-count
+  features.
+- `paths.name_pairs` or `paths.name_tuples` must not be present in production
+  manifests unless the alias override is intentional. Top-level `name_tuples`
+  metadata is allowed to describe how the artifact was produced.
 
 Large-block optimized artifacts should also include:
 
 ```json
 {
   "paths": {
+    "specter": "specter.arrow",
     "signatures_batch_index": "signatures.signatures_batch_index.bin",
     "papers_batch_index": "papers.papers_batch_index.bin",
     "paper_authors_batch_index": "paper_authors.paper_authors_batch_index.bin",
@@ -431,11 +490,43 @@ Large-block optimized artifacts should also include:
         "actual_max_batch_rows": 0,
         "batch_index_path_key": "signatures_batch_index",
         "batch_index_present": true
+      },
+      "papers": {
+        "key": "paper_id",
+        "max_record_batch_rows": 16384,
+        "row_count": 0,
+        "record_batch_count": 0,
+        "actual_max_batch_rows": 0,
+        "batch_index_path_key": "papers_batch_index",
+        "batch_index_present": true
+      },
+      "paper_authors": {
+        "key": "paper_id",
+        "max_record_batch_rows": 16384,
+        "row_count": 0,
+        "record_batch_count": 0,
+        "actual_max_batch_rows": 0,
+        "batch_index_path_key": "paper_authors_batch_index",
+        "batch_index_present": true
+      },
+      "specter": {
+        "key": "paper_id",
+        "max_record_batch_rows": 2048,
+        "row_count": 0,
+        "record_batch_count": 0,
+        "actual_max_batch_rows": 0,
+        "batch_index_path_key": "specter_batch_index",
+        "batch_index_present": true
       }
     }
   }
 }
 ```
+
+Repeat the `physical_layout.tables` entry for every large lookup table shipped
+for indexed raw planning. If both `specter.arrow` and `specter2.arrow` are
+included, inventory both embedding layouts or clearly identify which embedding
+is selected for the manifest.
 
 Recommended additional fields:
 
@@ -445,7 +536,7 @@ Recommended additional fields:
 - `generator_version` or git commit.
 - `specter` metadata with `row_count`, `dimension`, and source artifact id for
   each embedding file.
-- `name_counts` metadata with the shared index path and schema version.
+- `name_counts_index` metadata with the shared index path and schema version.
 - `physical_layout.tables.<table>` entries for every large lookup table:
   `row_count`, `record_batch_count`, `actual_max_batch_rows`,
   `max_record_batch_rows`, lookup `key`, and batch-index presence.
@@ -470,16 +561,25 @@ Required checks:
 - Required columns exist with the exact Arrow types above.
 - `signature_id` values are unique.
 - `paper_id` values in `papers.arrow` are unique.
+- `paper_id` values in each selected embedding file are unique.
+- `(paper_id, position)` values in `paper_authors.arrow` are unique.
 - Every `signatures.paper_id` exists in `papers.arrow`.
 - Every `paper_authors.paper_id` exists in `papers.arrow`.
 - When embeddings are required, every referenced paper has an embedding in the
   selected SPECTER file.
 - `cluster_seeds.signature_id` is a subset of `signatures.signature_id`.
+- `cluster_seeds.signature_id` values are unique and every `cluster_id` is a
+  non-empty string.
 - `cluster_seed_disallows.signature_id_1` and
   `cluster_seed_disallows.signature_id_2` are subsets of
   `signatures.signature_id`.
+- `cluster_seed_disallows.arrow` contains no self-pairs and no duplicate
+  undirected pairs.
+- `altered_cluster_signatures.signature_id` is unique and is a subset of both
+  `signatures.signature_id` and `cluster_seeds.signature_id`.
 - `name_counts_index/manifest.json` exists when the selected model uses
   `name_counts`.
+- Manifest row counts match the corresponding Arrow table row counts.
 - `author_block` is present when the dataset will be used for block
   reconstruction or offline eval.
 - Signature row order matches the source `ANDData` order or the documented
@@ -503,6 +603,8 @@ Required physical-layout checks for large-block optimized artifacts:
 
 Recommended smoke checks:
 
+PowerShell:
+
 ```powershell
 uv run python scripts/convert_s2and_mini_to_arrow.py `
   --source-root s2and/data/s2and_mini `
@@ -514,6 +616,18 @@ uv run python scripts/convert_s2and_mini_to_arrow.py `
 ```powershell
 $env:S2AND_BACKEND='rust'
 uv run python scripts/eval_prod_models.py --dataset mini --n_jobs 20 --seed 42
+```
+
+Bash:
+
+```bash
+uv run python scripts/convert_s2and_mini_to_arrow.py \
+  --source-root s2and/data/s2and_mini \
+  --output-root s2and/data/s2and_mini_arrow \
+  --n-jobs 20 \
+  --overwrite
+
+S2AND_BACKEND=rust uv run python scripts/eval_prod_models.py --dataset mini --n_jobs 20 --seed 42
 ```
 
 The eval command should report `use_arrow=True` when the Arrow bundle is

@@ -494,7 +494,7 @@ struct RetrievalQueryData {
     title_hashes: Vec<u64>,
     year: Option<i64>,
     orcid_hash: Option<u64>,
-    specter: Option<Vec<f32>>,
+    specter: Option<Arc<Vec<f32>>>,
     specter_norm: Option<f64>,
 }
 
@@ -1621,6 +1621,9 @@ fn ensure_unidecode_for_text(
     text: &str,
     unidecode_char_map: &mut HashMap<char, String>,
 ) -> PyResult<()> {
+    if text.is_ascii() {
+        return Ok(());
+    }
     for ch in text.chars() {
         if ch.is_ascii() || unidecode_char_map.contains_key(&ch) {
             continue;
@@ -1631,6 +1634,27 @@ fn ensure_unidecode_for_text(
     Ok(())
 }
 
+fn normalize_ascii_text_compat(text: &str, special_case_apostrophes: bool) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut prev_space = true;
+    for byte in text.bytes() {
+        let lowered = byte.to_ascii_lowercase();
+        if lowered.is_ascii_alphabetic() {
+            normalized.push(lowered as char);
+            prev_space = false;
+        } else if special_case_apostrophes && lowered == b'\'' {
+            continue;
+        } else if !prev_space {
+            normalized.push(' ');
+            prev_space = true;
+        }
+    }
+    while normalized.ends_with(' ') {
+        normalized.pop();
+    }
+    normalized
+}
+
 fn normalize_text_compat_from_map(
     text: &str,
     special_case_apostrophes: bool,
@@ -1638,6 +1662,9 @@ fn normalize_text_compat_from_map(
 ) -> String {
     if text.is_empty() {
         return String::new();
+    }
+    if text.is_ascii() {
+        return normalize_ascii_text_compat(text, special_case_apostrophes);
     }
 
     let mut transliterated = String::with_capacity(text.len());
@@ -1993,9 +2020,12 @@ struct RawArrowFeature {
     query: RetrievalQueryData,
     name_counts: Option<NameCountsData>,
     paper_author_count: usize,
+    query_author: String,
+}
+
+struct RawArrowAuthorSignalData {
     paper_author_names: HashSet<String>,
     local10_author_names: HashSet<String>,
-    query_author: String,
 }
 
 struct RawArrowSummarySignalData {
@@ -2404,6 +2434,12 @@ fn arrow_optional_i64(array: &dyn Array, row: usize, context: &str) -> PyResult<
     }
 }
 
+fn arrow_required_i64(array: &dyn Array, row: usize, context: &str) -> PyResult<i64> {
+    arrow_optional_i64(array, row, context)?.ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("{context} is null at row {row}"))
+    })
+}
+
 fn arrow_optional_bool(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<bool>> {
     if array.is_null(row) {
         return Ok(None);
@@ -2587,6 +2623,16 @@ fn read_raw_arrow_signatures_from_batches(
             if keep_signature_ids.map_or(false, |keep| !keep.contains(&signature_id)) {
                 continue;
             }
+            if signature_id.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "signatures Arrow cannot contain empty signature_id values",
+                ));
+            }
+            if out.contains_key(&signature_id) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "signatures Arrow contains duplicate signature_id: {signature_id:?}"
+                )));
+            }
             let paper_id = arrow_required_string(paper_id_col.as_ref(), row, "paper_id")?;
             out.insert(
                 signature_id.clone(),
@@ -2673,6 +2719,16 @@ fn read_raw_arrow_papers_from_batches(
             if keep_paper_ids.map_or(false, |keep| !keep.contains(&paper_id)) {
                 continue;
             }
+            if paper_id.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "papers Arrow cannot contain empty paper_id values",
+                ));
+            }
+            if out.contains_key(&paper_id) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "papers Arrow contains duplicate paper_id: {paper_id:?}"
+                )));
+            }
             out.insert(
                 paper_id,
                 RawArrowPaper {
@@ -2733,6 +2789,7 @@ fn read_raw_arrow_paper_authors_from_batches(
     keep_paper_ids: Option<&HashSet<String>>,
 ) -> PyResult<HashMap<String, Vec<(i64, String)>>> {
     let mut out: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    let mut seen_paper_author_positions = HashSet::<(String, i64)>::new();
     for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
         let position_col = batch.column(arrow_column_index(&batch, "position", path)?);
@@ -2742,8 +2799,19 @@ fn read_raw_arrow_paper_authors_from_batches(
             if keep_paper_ids.map_or(false, |keep| !keep.contains(&paper_id)) {
                 continue;
             }
-            let position =
-                arrow_optional_i64(position_col.as_ref(), row, "position")?.unwrap_or(i64::MAX);
+            if paper_id.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "paper_authors Arrow cannot contain empty paper_id values",
+                ));
+            }
+            let position = arrow_required_i64(position_col.as_ref(), row, "position")?;
+            let paper_author_key = (paper_id.clone(), position);
+            if !seen_paper_author_positions.insert(paper_author_key.clone()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "paper_authors Arrow contains duplicate (paper_id, position): {:?}",
+                    paper_author_key
+                )));
+            }
             let author_name = arrow_optional_string(author_name_col.as_ref(), row, "author_name")?
                 .unwrap_or_default();
             out.entry(paper_id)
@@ -2766,6 +2834,7 @@ fn read_raw_arrow_cluster_seeds(
 ) -> PyResult<(Vec<String>, HashMap<String, Vec<String>>)> {
     let mut component_order = Vec::new();
     let mut members_by_component: HashMap<String, Vec<String>> = HashMap::new();
+    let mut seen_signature_ids = HashSet::<String>::new();
     for batch in read_arrow_batches(path)? {
         let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
         let cluster_id_col = batch.column(arrow_column_index(&batch, "cluster_id", path)?);
@@ -2773,6 +2842,21 @@ fn read_raw_arrow_cluster_seeds(
             let signature_id =
                 arrow_required_string(signature_id_col.as_ref(), row, "signature_id")?;
             let component_key = arrow_required_string(cluster_id_col.as_ref(), row, "cluster_id")?;
+            if signature_id.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "cluster_seeds Arrow cannot contain empty signature_id values",
+                ));
+            }
+            if component_key.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "cluster_seeds Arrow cannot contain empty cluster_id values: {signature_id:?}"
+                )));
+            }
+            if !seen_signature_ids.insert(signature_id.clone()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "cluster_seeds Arrow contains duplicate signature_id: {signature_id:?}"
+                )));
+            }
             if !members_by_component.contains_key(&component_key) {
                 component_order.push(component_key.clone());
             }
@@ -2793,7 +2877,18 @@ fn read_raw_arrow_cluster_seed_disallows(path: &str) -> PyResult<HashSet<(String
         for row in 0..batch.num_rows() {
             let left = arrow_required_string(left_col.as_ref(), row, "signature_id_1")?;
             let right = arrow_required_string(right_col.as_ref(), row, "signature_id_2")?;
-            out.insert(canonical_signature_pair_owned(left, right));
+            if left == right {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "cluster_seed_disallows contains a self-pair for signature_id={left:?}"
+                )));
+            }
+            let pair = canonical_signature_pair_owned(left, right);
+            if !out.insert(pair.clone()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "cluster_seed_disallows contains a duplicate undirected pair: {:?} / {:?}",
+                    pair.0, pair.1
+                )));
+            }
         }
     }
     Ok(out)
@@ -2824,6 +2919,7 @@ fn read_raw_arrow_specter_from_batches(
     keep_paper_ids: Option<&HashSet<String>>,
 ) -> PyResult<HashMap<String, Vec<f32>>> {
     let mut out = HashMap::new();
+    let mut seen_paper_ids = HashSet::<String>::new();
     for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
         let embedding_col = batch.column(arrow_column_index(&batch, "embedding", path)?);
@@ -2831,6 +2927,16 @@ fn read_raw_arrow_specter_from_batches(
             let paper_id = arrow_required_string(paper_id_col.as_ref(), row, "paper_id")?;
             if keep_paper_ids.map_or(false, |keep| !keep.contains(&paper_id)) {
                 continue;
+            }
+            if paper_id.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "specter Arrow cannot contain empty paper_id values",
+                ));
+            }
+            if !seen_paper_ids.insert(paper_id.clone()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "specter Arrow contains duplicate paper_id: {paper_id:?}"
+                )));
             }
             if let Some(vector) =
                 arrow_optional_f32_vector(embedding_col.as_ref(), row, "embedding")?
@@ -2931,7 +3037,7 @@ fn build_raw_arrow_feature(
     signature: &RawArrowSignature,
     paper: Option<&RawArrowPaper>,
     paper_authors: Option<&Vec<(i64, String)>>,
-    specter_by_paper_id: Option<&HashMap<String, Vec<f32>>>,
+    specter_by_paper_id: Option<&HashMap<String, Arc<Vec<f32>>>>,
     raw_name_counts: &RawNameCountMaps,
     name_prefixes: &HashSet<String>,
     affiliation_stopwords: &HashSet<String>,
@@ -2962,20 +3068,10 @@ fn build_raw_arrow_feature(
 
     let mut coauthor_blocks = HashSet::new();
     let mut paper_author_count = 0usize;
-    let mut paper_author_names = HashSet::new();
-    let mut local10_author_names = HashSet::new();
     if let Some(authors) = paper_authors {
         paper_author_count = authors.len();
         for (position, author_name) in authors.iter() {
             let normalized = normalize_text_compat_from_map(author_name, false, unidecode_char_map);
-            if !normalized.is_empty() {
-                paper_author_names.insert(normalized.clone());
-                if let Some(author_position) = signature.position {
-                    if *position != author_position && (*position - author_position).abs() <= 10 {
-                        local10_author_names.insert(normalized.clone());
-                    }
-                }
-            }
             if Some(*position) == signature.position {
                 continue;
             }
@@ -3041,7 +3137,7 @@ fn build_raw_arrow_feature(
     };
     let specter = specter_by_paper_id
         .and_then(|values| values.get(&signature.paper_id))
-        .cloned();
+        .map(Arc::clone);
     let specter_norm = specter.as_ref().map(|values| {
         values
             .iter()
@@ -3086,9 +3182,34 @@ fn build_raw_arrow_feature(
         },
         name_counts,
         paper_author_count,
+        query_author,
+    }
+}
+
+fn build_raw_arrow_author_signal_data(
+    signature: &RawArrowSignature,
+    paper_authors: Option<&Vec<(i64, String)>>,
+    unidecode_char_map: &HashMap<char, String>,
+) -> RawArrowAuthorSignalData {
+    let mut paper_author_names = HashSet::new();
+    let mut local10_author_names = HashSet::new();
+    if let Some(authors) = paper_authors {
+        for (position, author_name) in authors.iter() {
+            let normalized = normalize_text_compat_from_map(author_name, false, unidecode_char_map);
+            if normalized.is_empty() {
+                continue;
+            }
+            paper_author_names.insert(normalized.clone());
+            if let Some(author_position) = signature.position {
+                if *position != author_position && (*position - author_position).abs() <= 10 {
+                    local10_author_names.insert(normalized);
+                }
+            }
+        }
+    }
+    RawArrowAuthorSignalData {
         paper_author_names,
         local10_author_names,
-        query_author,
     }
 }
 
@@ -3288,7 +3409,7 @@ fn build_raw_arrow_summary(
             orcid_hashes.push(orcid_hash);
         }
         if let Some(specter) = feature.query.specter.as_ref() {
-            specter_vectors.push(specter.clone());
+            specter_vectors.push((**specter).clone());
         }
         max_paper_author_count = max_paper_author_count.max(feature.paper_author_count);
     }
@@ -3358,6 +3479,9 @@ fn build_raw_arrow_summary(
 fn build_raw_arrow_summary_signals(
     signature_ids: &[String],
     features_by_signature_id: &HashMap<String, RawArrowFeature>,
+    signatures: &HashMap<String, RawArrowSignature>,
+    paper_authors: &HashMap<String, Vec<(i64, String)>>,
+    unidecode_char_map: &HashMap<char, String>,
 ) -> Result<RawArrowSummarySignalData, String> {
     let mut name_counts_values = Vec::<NameCountsData>::new();
     let mut member_paper_author_names = Vec::<HashSet<String>>::with_capacity(signature_ids.len());
@@ -3376,9 +3500,20 @@ fn build_raw_arrow_summary_signals(
         if let Some(name_counts) = feature.name_counts.as_ref() {
             name_counts_values.push(name_counts.clone());
         }
-        member_paper_author_names.push(feature.paper_author_names.clone());
+        let signature = signatures.get(signature_id).ok_or_else(|| {
+            format!(
+                "cluster seed signature_id '{}' is missing from signatures",
+                signature_id
+            )
+        })?;
+        let author_signals = build_raw_arrow_author_signal_data(
+            signature,
+            paper_authors.get(&signature.paper_id),
+            unidecode_char_map,
+        );
+        member_paper_author_names.push(author_signals.paper_author_names);
         member_paper_author_counts.push(feature.paper_author_count);
-        member_local10_author_names.push(feature.local10_author_names.clone());
+        member_local10_author_names.push(author_signals.local10_author_names);
         member_signature_ids.push(signature_id.clone());
     }
 
@@ -3486,7 +3621,8 @@ fn set_intersection_count(left: &HashSet<String>, right: &HashSet<String>) -> us
 
 fn raw_arrow_paper_evidence_row(
     query_signature_id: &str,
-    query_feature: &RawArrowFeature,
+    query_paper_author_count: usize,
+    query_author_signals: &RawArrowAuthorSignalData,
     summary_signals: &RawArrowSummarySignalData,
 ) -> RawArrowPaperEvidenceRow {
     let mut best_author_jaccard = 0.0f64;
@@ -3505,12 +3641,13 @@ fn raw_arrow_paper_evidence_row(
             .zip(summary_signals.member_signature_ids.iter())
     {
         let intersection =
-            set_intersection_count(&query_feature.paper_author_names, candidate_names);
-        let union = query_feature.paper_author_names.len() + candidate_names.len() - intersection;
+            set_intersection_count(&query_author_signals.paper_author_names, candidate_names);
+        let union =
+            query_author_signals.paper_author_names.len() + candidate_names.len() - intersection;
         if union > 0 {
             best_author_jaccard = best_author_jaccard.max((intersection as f64) / (union as f64));
         }
-        let denominator = query_feature
+        let denominator = query_author_signals
             .paper_author_names
             .len()
             .min(candidate_names.len());
@@ -3522,10 +3659,10 @@ fn raw_arrow_paper_evidence_row(
 
         if query_signature_id != candidate_signature_id {
             let local10_intersection = set_intersection_count(
-                &query_feature.local10_author_names,
+                &query_author_signals.local10_author_names,
                 candidate_local10_names,
             );
-            let local10_union = query_feature.local10_author_names.len()
+            let local10_union = query_author_signals.local10_author_names.len()
                 + candidate_local10_names.len()
                 - local10_intersection;
             if local10_union > 0 {
@@ -3536,9 +3673,8 @@ fn raw_arrow_paper_evidence_row(
                 best_local10_overlap_count.max(local10_intersection as f64);
         }
 
-        let count_delta = ((query_feature.paper_author_count as f64).ln_1p()
-            - (*candidate_count as f64).ln_1p())
-        .abs();
+        let count_delta =
+            ((query_paper_author_count as f64).ln_1p() - (*candidate_count as f64).ln_1p()).abs();
         best_author_count_log_absdiff = Some(match best_author_count_log_absdiff {
             Some(current) => current.min(count_delta),
             None => count_delta,
@@ -4279,6 +4415,7 @@ fn extract_retrieval_query(obj: &Bound<'_, PyAny>) -> PyResult<RetrievalQueryDat
             .sum::<f64>()
             .sqrt()
     });
+    let specter = specter.map(Arc::new);
 
     Ok(RetrievalQueryData {
         first,
@@ -7388,6 +7525,14 @@ impl RustFeaturizer {
             Some(path) => Some(path),
             None => extract_path_mapping_string(paths, "name_tuples", false)?,
         };
+        let signatures_batch_index_path =
+            extract_path_mapping_string(paths, "signatures_batch_index", false)?;
+        let papers_batch_index_path =
+            extract_path_mapping_string(paths, "papers_batch_index", false)?;
+        let paper_authors_batch_index_path =
+            extract_path_mapping_string(paths, "paper_authors_batch_index", false)?;
+        let specter_batch_index_path =
+            extract_path_mapping_string(paths, "specter_batch_index", false)?;
 
         let requested_signature_ids = match signature_ids {
             Some(obj) if !obj.is_none() => Some(
@@ -7402,8 +7547,15 @@ impl RustFeaturizer {
             .map(|ids| ids.iter().cloned().collect());
 
         let parse_start = Instant::now();
-        let raw_signatures =
-            read_raw_arrow_signatures_filtered(&signatures_path, keep_signature_ids.as_ref())?;
+        let raw_signatures = match (
+            keep_signature_ids.as_ref(),
+            signatures_batch_index_path.as_ref(),
+        ) {
+            (Some(keep_ids), Some(index_path)) => {
+                read_raw_arrow_signatures_indexed(&signatures_path, index_path, keep_ids)?.0
+            }
+            _ => read_raw_arrow_signatures_filtered(&signatures_path, keep_signature_ids.as_ref())?,
+        };
         let mut signature_ids = match requested_signature_ids {
             Some(ids) => ids,
             None => {
@@ -7430,11 +7582,32 @@ impl RustFeaturizer {
             .filter_map(|signature_id| raw_signatures.get(signature_id))
             .map(|signature| signature.paper_id.clone())
             .collect::<HashSet<_>>();
-        let raw_papers = read_raw_arrow_papers_filtered(&papers_path, Some(&needed_paper_ids))?;
-        let mut raw_authors_by_paper =
-            read_raw_arrow_paper_authors_filtered(&paper_authors_path, Some(&needed_paper_ids))?;
+        let raw_papers = match papers_batch_index_path.as_ref() {
+            Some(index_path) => {
+                read_raw_arrow_papers_indexed(&papers_path, index_path, &needed_paper_ids)?.0
+            }
+            None => read_raw_arrow_papers_filtered(&papers_path, Some(&needed_paper_ids))?,
+        };
+        let mut raw_authors_by_paper = match paper_authors_batch_index_path.as_ref() {
+            Some(index_path) => {
+                read_raw_arrow_paper_authors_indexed(
+                    &paper_authors_path,
+                    index_path,
+                    &needed_paper_ids,
+                )?
+                .0
+            }
+            None => {
+                read_raw_arrow_paper_authors_filtered(&paper_authors_path, Some(&needed_paper_ids))?
+            }
+        };
         let specter_by_paper = match specter_path.as_ref() {
-            Some(path) => read_raw_arrow_specter_filtered(path, Some(&needed_paper_ids))?,
+            Some(path) => match specter_batch_index_path.as_ref() {
+                Some(index_path) => {
+                    read_raw_arrow_specter_indexed(path, index_path, &needed_paper_ids)?.0
+                }
+                None => read_raw_arrow_specter_filtered(path, Some(&needed_paper_ids))?,
+            },
             None => HashMap::new(),
         };
         let mut cluster_seeds_require = HashMap::<String, ClusterId>::new();
@@ -12632,64 +12805,122 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         .map(|signature| signature.paper_id.clone())
         .collect();
 
-    let read_papers_start = Instant::now();
-    let mut paper_index_stats = IndexedArrowReadStats::default();
-    let papers = match papers_batch_index_path.as_ref() {
-        Some(index_path) => {
-            let (loaded, stats) =
-                read_raw_arrow_papers_indexed(&papers_path, index_path, &needed_paper_ids)?;
-            paper_index_stats = stats;
-            loaded
-        }
-        None => read_raw_arrow_papers(&papers_path)?,
-    };
-    let read_papers_secs = read_papers_start.elapsed().as_secs_f64();
-
-    let read_paper_authors_start = Instant::now();
-    let mut paper_author_index_stats = IndexedArrowReadStats::default();
-    let paper_authors = match paper_authors_batch_index_path.as_ref() {
-        Some(index_path) => {
-            let (loaded, stats) = read_raw_arrow_paper_authors_indexed(
-                &paper_authors_path,
-                index_path,
-                &needed_paper_ids,
-            )?;
-            paper_author_index_stats = stats;
-            loaded
-        }
-        None => read_raw_arrow_paper_authors(&paper_authors_path)?,
-    };
-    let read_paper_authors_secs = read_paper_authors_start.elapsed().as_secs_f64();
-
-    let read_specter_start = Instant::now();
-    let mut specter_index_stats = IndexedArrowReadStats::default();
-    let specter_by_paper_id = match specter_path.as_ref() {
-        Some(path) => match specter_batch_index_path.as_ref() {
-            Some(index_path) => {
-                let (loaded, stats) =
-                    read_raw_arrow_specter_indexed(path, index_path, &needed_paper_ids)?;
-                specter_index_stats = stats;
-                Some(loaded)
-            }
-            None => Some(read_raw_arrow_specter(path)?),
-        },
-        None => None,
-    };
-    let read_specter_secs = read_specter_start.elapsed().as_secs_f64();
-
-    let read_name_counts_start = Instant::now();
-    let raw_name_counts = match name_counts_index_path.as_ref() {
-        Some(path) => read_raw_name_counts_index(path)?,
-        None => match name_counts_arrow_path.as_ref() {
-            Some(path) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "name_counts Arrow path '{path}' requires name_counts_index; refusing slow Arrow fallback"
-                )));
-            }
-            None => RawNameCountMaps::default(),
-        },
-    };
-    let read_name_counts_secs = read_name_counts_start.elapsed().as_secs_f64();
+    let metadata_reads_parallel_start = Instant::now();
+    let (
+        (papers_result, paper_authors_result),
+        (raw_specter_by_paper_id_result, raw_name_counts_result),
+    ) = py.allow_threads(|| {
+        let compute = || {
+            rayon::join(
+                || {
+                    rayon::join(
+                        || -> PyResult<(
+                            HashMap<String, RawArrowPaper>,
+                            IndexedArrowReadStats,
+                            f64,
+                        )> {
+                            let start = Instant::now();
+                            let mut stats = IndexedArrowReadStats::default();
+                            let loaded = match papers_batch_index_path.as_ref() {
+                                Some(index_path) => {
+                                    let (loaded, loaded_stats) = read_raw_arrow_papers_indexed(
+                                        &papers_path,
+                                        index_path,
+                                        &needed_paper_ids,
+                                    )?;
+                                    stats = loaded_stats;
+                                    loaded
+                                }
+                                None => read_raw_arrow_papers(&papers_path)?,
+                            };
+                            Ok((loaded, stats, start.elapsed().as_secs_f64()))
+                        },
+                        || -> PyResult<(
+                            HashMap<String, Vec<(i64, String)>>,
+                            IndexedArrowReadStats,
+                            f64,
+                        )> {
+                            let start = Instant::now();
+                            let mut stats = IndexedArrowReadStats::default();
+                            let loaded = match paper_authors_batch_index_path.as_ref() {
+                                Some(index_path) => {
+                                    let (loaded, loaded_stats) =
+                                        read_raw_arrow_paper_authors_indexed(
+                                            &paper_authors_path,
+                                            index_path,
+                                            &needed_paper_ids,
+                                        )?;
+                                    stats = loaded_stats;
+                                    loaded
+                                }
+                                None => read_raw_arrow_paper_authors(&paper_authors_path)?,
+                            };
+                            Ok((loaded, stats, start.elapsed().as_secs_f64()))
+                        },
+                    )
+                },
+                || {
+                    rayon::join(
+                        || -> PyResult<(
+                            Option<HashMap<String, Vec<f32>>>,
+                            IndexedArrowReadStats,
+                            f64,
+                        )> {
+                            let start = Instant::now();
+                            let mut stats = IndexedArrowReadStats::default();
+                            let loaded = match specter_path.as_ref() {
+                                Some(path) => match specter_batch_index_path.as_ref() {
+                                    Some(index_path) => {
+                                        let (loaded, loaded_stats) =
+                                            read_raw_arrow_specter_indexed(
+                                                path,
+                                                index_path,
+                                                &needed_paper_ids,
+                                            )?;
+                                        stats = loaded_stats;
+                                        Some(loaded)
+                                    }
+                                    None => Some(read_raw_arrow_specter(path)?),
+                                },
+                                None => None,
+                            };
+                            Ok((loaded, stats, start.elapsed().as_secs_f64()))
+                        },
+                        || -> PyResult<(RawNameCountMaps, f64)> {
+                            let start = Instant::now();
+                            let loaded = match name_counts_index_path.as_ref() {
+                                Some(path) => read_raw_name_counts_index(path)?,
+                                None => match name_counts_arrow_path.as_ref() {
+                                    Some(path) => {
+                                        return Err(pyo3::exceptions::PyValueError::new_err(
+                                            format!(
+                                                "name_counts Arrow path '{path}' requires name_counts_index; refusing slow Arrow fallback"
+                                            ),
+                                        ));
+                                    }
+                                    None => RawNameCountMaps::default(),
+                                },
+                            };
+                            Ok((loaded, start.elapsed().as_secs_f64()))
+                        },
+                    )
+                },
+            )
+        };
+        install_with_optional_rayon_pool(num_threads, compute)
+    });
+    let (papers, paper_index_stats, read_papers_secs) = papers_result?;
+    let (paper_authors, paper_author_index_stats, read_paper_authors_secs) = paper_authors_result?;
+    let (raw_specter_by_paper_id, specter_index_stats, read_specter_secs) =
+        raw_specter_by_paper_id_result?;
+    let (raw_name_counts, read_name_counts_secs) = raw_name_counts_result?;
+    let metadata_reads_parallel_secs = metadata_reads_parallel_start.elapsed().as_secs_f64();
+    let specter_by_paper_id = raw_specter_by_paper_id.map(|values| {
+        values
+            .into_iter()
+            .map(|(paper_id, vector)| (paper_id, Arc::new(vector)))
+            .collect::<HashMap<_, _>>()
+    });
 
     let text_context_start = Instant::now();
     let text_module = py.import("s2and.text")?;
@@ -12904,6 +13135,8 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     let mut right_signature_indices = Vec::<u32>::new();
     let mut pair_row_indices = Vec::<u32>::new();
     let mut summary_signals_by_component = HashMap::<String, RawArrowSummarySignalData>::new();
+    let mut author_signals_by_query_signature_id =
+        HashMap::<String, RawArrowAuthorSignalData>::new();
 
     for query_result in query_results {
         let mut query_result = query_result.map_err(pyo3::exceptions::PyKeyError::new_err)?;
@@ -12978,9 +13211,14 @@ fn raw_block_query_candidate_plan_arrow<'py>(
                         component_key
                     ))
                 })?;
-                let summary_signals =
-                    build_raw_arrow_summary_signals(members, &features_by_signature_id)
-                        .map_err(pyo3::exceptions::PyKeyError::new_err)?;
+                let summary_signals = build_raw_arrow_summary_signals(
+                    members,
+                    &features_by_signature_id,
+                    &signatures,
+                    &paper_authors,
+                    &unidecode_char_map,
+                )
+                .map_err(pyo3::exceptions::PyKeyError::new_err)?;
                 summary_signals_by_component.insert(component_key.clone(), summary_signals);
             }
             let summary_signals =
@@ -12998,8 +13236,35 @@ fn raw_block_query_candidate_plan_arrow<'py>(
                 summary,
                 summary_signals,
             );
-            let evidence =
-                raw_arrow_paper_evidence_row(query_signature_id, query_feature, summary_signals);
+            if !author_signals_by_query_signature_id.contains_key(query_signature_id) {
+                let query_signature = signatures.get(query_signature_id).ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!(
+                        "query signature_id '{}' is missing from signatures",
+                        query_signature_id
+                    ))
+                })?;
+                let author_signals = build_raw_arrow_author_signal_data(
+                    query_signature,
+                    paper_authors.get(&query_signature.paper_id),
+                    &unidecode_char_map,
+                );
+                author_signals_by_query_signature_id
+                    .insert(query_signature_id.clone(), author_signals);
+            }
+            let query_author_signals = author_signals_by_query_signature_id
+                .get(query_signature_id)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!(
+                        "query signature_id '{}' is missing raw author signals",
+                        query_signature_id
+                    ))
+                })?;
+            let evidence = raw_arrow_paper_evidence_row(
+                query_signature_id,
+                query_feature.paper_author_count,
+                query_author_signals,
+                summary_signals,
+            );
             row_last_name_count_min_rarity.push(rarity.last_name_count_min_rarity);
             row_candidate_last_name_count_min_rarity
                 .push(rarity.candidate_last_name_count_min_rarity);
@@ -13046,6 +13311,7 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     }
     let retrieval_secs = retrieval_start.elapsed().as_secs_f64();
 
+    let pair_signature_ids_start = Instant::now();
     let mut left_signature_ids = Vec::<String>::with_capacity(left_signature_indices.len());
     let mut right_signature_ids = Vec::<String>::with_capacity(right_signature_indices.len());
     let signature_index_count = query_signature_ids.len() + seed_signature_ids.len();
@@ -13075,7 +13341,9 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         };
         right_signature_ids.push(signature_id.clone());
     }
+    let pair_signature_ids_secs = pair_signature_ids_start.elapsed().as_secs_f64();
 
+    let component_members_payload_start = Instant::now();
     let retrieved_component_keys: HashSet<String> = row_component_keys.iter().cloned().collect();
     let component_members = PyDict::new(py);
     for component_key in component_order.iter() {
@@ -13090,6 +13358,7 @@ fn raw_block_query_candidate_plan_arrow<'py>(
                 .unwrap_or_default(),
         )?;
     }
+    let component_members_payload_secs = component_members_payload_start.elapsed().as_secs_f64();
 
     let timings = PyDict::new(py);
     timings.set_item("read_signatures_secs", read_signatures_secs)?;
@@ -13098,13 +13367,18 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     timings.set_item("read_cluster_seeds_secs", read_cluster_seeds_secs)?;
     timings.set_item("read_specter_secs", read_specter_secs)?;
     timings.set_item("read_name_counts_secs", read_name_counts_secs)?;
+    timings.set_item("metadata_reads_parallel_secs", metadata_reads_parallel_secs)?;
     timings.set_item("text_context_secs", text_context_secs)?;
     timings.set_item("feature_secs", feature_secs)?;
     timings.set_item("query_secs", query_secs)?;
     timings.set_item("summary_secs", summary_secs)?;
     timings.set_item("component_members_secs", component_members_secs)?;
     timings.set_item("retrieval_secs", retrieval_secs)?;
-    timings.set_item("total_secs", total_start.elapsed().as_secs_f64())?;
+    timings.set_item("pair_signature_ids_secs", pair_signature_ids_secs)?;
+    timings.set_item(
+        "component_members_payload_secs",
+        component_members_payload_secs,
+    )?;
 
     let telemetry = PyDict::new(py);
     telemetry.set_item("signature_count", signatures.len())?;
@@ -13140,10 +13414,11 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     telemetry.set_item("specter_batches_read", specter_index_stats.batches_read)?;
     telemetry.set_item("specter_rows_scanned", specter_index_stats.rows_scanned)?;
     telemetry.set_item("unidecode_char_count", unidecode_char_map.len())?;
-    telemetry.set_item("timings", timings)?;
+    telemetry.set_item("timings", &timings)?;
 
     let mut seed_signature_ids_for_payload = Some(seed_signature_ids);
     let mut seed_component_keys_for_payload = Some(seed_component_keys);
+    let payload_start = Instant::now();
     let payload = PyDict::new(py);
     payload.set_item("schema_version", "raw_arrow_candidate_plan_v1")?;
     payload.set_item("row_count", row_component_keys.len())?;
@@ -13286,7 +13561,10 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         row_best_author_count_log_absdiff.to_pyarray(py),
     )?;
     payload.set_item("telemetry", telemetry)?;
+    timings.set_item("payload_secs", payload_start.elapsed().as_secs_f64())?;
+    timings.set_item("total_secs", total_start.elapsed().as_secs_f64())?;
     let output = payload.unbind();
+    let drop_start = Instant::now();
     py.allow_threads(|| {
         let compute = || {
             let RustHybridCentroidRetriever {
@@ -13308,6 +13586,7 @@ fn raw_block_query_candidate_plan_arrow<'py>(
             parallel_drop_hashmap(members_by_component);
             parallel_drop_hashmap(component_member_indices);
             parallel_drop_hashmap(summary_signals_by_component);
+            parallel_drop_hashmap(author_signals_by_query_signature_id);
             parallel_drop_vec(summaries);
             parallel_drop_vec(component_order);
             if let Some(seed_signature_ids) = seed_signature_ids_for_payload {
@@ -13323,6 +13602,8 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         };
         install_with_optional_rayon_pool(num_threads, compute)
     });
+    timings.set_item("drop_secs", drop_start.elapsed().as_secs_f64())?;
+    timings.set_item("wall_secs", total_start.elapsed().as_secs_f64())?;
     Ok(output)
 }
 

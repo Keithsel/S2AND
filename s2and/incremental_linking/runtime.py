@@ -40,6 +40,8 @@ from s2and.incremental_linking.logistic_gate import (
     load_logistic_gate_config,
 )
 from s2and.incremental_linking.retrieval import (
+    RAW_CANDIDATE_PLAN_PAIR_KEYS,
+    RAW_CANDIDATE_PLAN_ROW_KEYS,
     LinkerRetrievalBatch,
     build_linker_retrieval_batch_from_raw_candidate_plan,
     build_linker_retrieval_batch_rust,
@@ -54,6 +56,25 @@ LinkAction = Literal["link", "abstain"]
 # NaNs internally; only the exported pw_* aggregate features are zero-filled.
 _PAIRWISE_MODEL_NAN_VALUE: float = float("nan")
 _PAIRWISE_AGGREGATE_NAN_VALUE: float = 0.0
+
+
+def _clusterer_uses_name_count_features(clusterer: Any) -> bool:
+    for attr_name in ("featurizer_info", "nameless_featurizer_info"):
+        featurizer_info = getattr(clusterer, attr_name, None)
+        features_to_use = getattr(featurizer_info, "features_to_use", ())
+        if "name_counts" in features_to_use:
+            return True
+    return False
+
+
+def _require_arrow_name_counts_index(clusterer: Any, arrow_paths: Mapping[str, Any]) -> None:
+    if _clusterer_uses_name_count_features(clusterer) and not (
+        arrow_paths.get("name_counts_index") or arrow_paths.get("name_counts_index_dir")
+    ):
+        raise ValueError(
+            "Raw Arrow scoring with selected name_counts features requires name_counts_index. "
+            "Pass the S2AND name-count index directory in arrow_paths['name_counts_index']."
+        )
 
 
 @dataclass(frozen=True)
@@ -1504,6 +1525,19 @@ def _raw_plan_query_views(raw_candidate_plan: Mapping[str, Any], query_count: in
     return views
 
 
+def _validate_raw_plan_query_signature_ids(
+    raw_candidate_plan: Mapping[str, Any],
+    expected_query_signature_ids: Sequence[str],
+) -> None:
+    plan_query_ids = tuple(str(signature_id) for signature_id in raw_candidate_plan["query_signature_ids"])
+    expected_query_ids = tuple(str(signature_id) for signature_id in expected_query_signature_ids)
+    if plan_query_ids != expected_query_ids:
+        raise ValueError(
+            "raw candidate plan query_signature_ids must exactly match requested query_signature_ids: "
+            f"plan={list(plan_query_ids[:10])} requested={list(expected_query_ids[:10])}"
+        )
+
+
 def _max_retrieval_rank(candidate_batch: LinkerCandidateBatch) -> int:
     retrieval_ranks = candidate_batch.retrieval_ranks
     if retrieval_ranks is None:
@@ -1551,51 +1585,6 @@ def _raw_candidate_plan_telemetry_fields(raw_candidate_plan: Mapping[str, Any]) 
     return fields
 
 
-_RAW_CANDIDATE_PLAN_ROW_KEYS: tuple[str, ...] = (
-    "row_query_signature_indices",
-    "row_component_keys",
-    "retrieval_scores",
-    "retrieval_ranks",
-    "row_component_sizes",
-    "row_named_signature_counts",
-    "row_dominant_first_names",
-    "row_candidate_year_min",
-    "row_candidate_year_max",
-    "row_candidate_year_range_missing",
-    "row_query_first_tokens",
-    "row_query_years",
-    "row_query_year_missing",
-    "row_query_has_affiliations",
-    "row_query_has_coauthors",
-    "row_orcid_match",
-    "middle_initial_compatibility",
-    "affiliation_overlap",
-    "coauthor_overlap",
-    "venue_overlap",
-    "year_compatibility",
-    "title_overlap",
-    "specter_centroid_similarity",
-    "specter_exemplar_similarity",
-    "row_last_name_count_min_rarity",
-    "row_candidate_last_name_count_min_rarity",
-    "row_candidate_last_first_name_count_min_rarity",
-    "row_last_first_name_count_min_rarity",
-    "row_first_prefix_x_last_first_name_count_min_rarity",
-    "row_candidate_cluster_max_paper_author_count",
-    "row_paper_author_list_max_jaccard",
-    "row_paper_author_list_max_containment",
-    "row_paper_author_list_max_overlap_count",
-    "row_local_author_window10_jaccard_max",
-    "row_local_author_window10_overlap_count_max",
-    "row_best_author_count_log_absdiff",
-)
-_RAW_CANDIDATE_PLAN_PAIR_KEYS: tuple[str, ...] = (
-    "left_signature_indices",
-    "right_signature_indices",
-    "left_signature_ids",
-    "right_signature_ids",
-    "pair_row_indices",
-)
 _RAW_CANDIDATE_PLAN_WINDOW_REUSE_ZERO_TELEMETRY_KEYS: tuple[str, ...] = (
     "signature_count",
     "paper_count",
@@ -1672,16 +1661,13 @@ def subset_raw_candidate_plan_for_query_ids(
     }
     row_query_offsets = np.asarray(raw_candidate_plan["row_query_signature_indices"], dtype=np.uint32)
     pair_row_indices = np.asarray(raw_candidate_plan["pair_row_indices"], dtype=np.uint32)
-    contiguous_query_offsets = (
-        len(old_query_offsets) > 0
-        and np.array_equal(
-            old_query_offsets,
-            np.arange(
-                int(old_query_offsets[0]),
-                int(old_query_offsets[0]) + len(old_query_offsets),
-                dtype=old_query_offsets.dtype,
-            ),
-        )
+    contiguous_query_offsets = len(old_query_offsets) > 0 and np.array_equal(
+        old_query_offsets,
+        np.arange(
+            int(old_query_offsets[0]),
+            int(old_query_offsets[0]) + len(old_query_offsets),
+            dtype=old_query_offsets.dtype,
+        ),
     )
     sorted_row_offsets = len(row_query_offsets) < 2 or bool(np.all(row_query_offsets[:-1] <= row_query_offsets[1:]))
     sorted_pair_rows = len(pair_row_indices) < 2 or bool(np.all(pair_row_indices[:-1] <= pair_row_indices[1:]))
@@ -1705,7 +1691,7 @@ def subset_raw_candidate_plan_for_query_ids(
         out["row_count"] = int(row_stop - row_start)
         out["pair_count"] = int(pair_stop - pair_start)
 
-        for key in _RAW_CANDIDATE_PLAN_ROW_KEYS:
+        for key in RAW_CANDIDATE_PLAN_ROW_KEYS:
             if key not in raw_candidate_plan:
                 continue
             if key == "row_query_signature_indices":
@@ -1726,7 +1712,7 @@ def subset_raw_candidate_plan_for_query_ids(
                 remapped[~query_mask] = new_query_count + (raw_values[~query_mask] - old_query_count)
             return remapped
 
-        for key in _RAW_CANDIDATE_PLAN_PAIR_KEYS:
+        for key in RAW_CANDIDATE_PLAN_PAIR_KEYS:
             if key not in raw_candidate_plan:
                 continue
             if key in {"left_signature_indices", "right_signature_indices"}:
@@ -1771,7 +1757,7 @@ def subset_raw_candidate_plan_for_query_ids(
     out["row_count"] = int(len(old_row_indices))
     out["pair_count"] = int(np.count_nonzero(pair_mask))
 
-    for key in _RAW_CANDIDATE_PLAN_ROW_KEYS:
+    for key in RAW_CANDIDATE_PLAN_ROW_KEYS:
         if key not in raw_candidate_plan:
             continue
         if key == "row_query_signature_indices":
@@ -1796,7 +1782,7 @@ def subset_raw_candidate_plan_for_query_ids(
                 remapped[offset] = new_query_count + (index - old_query_count)
         return remapped
 
-    for key in _RAW_CANDIDATE_PLAN_PAIR_KEYS:
+    for key in RAW_CANDIDATE_PLAN_PAIR_KEYS:
         if key not in raw_candidate_plan:
             continue
         if key in {"left_signature_indices", "right_signature_indices"}:
@@ -2037,6 +2023,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
     top_k_resolved = int(artifact.metadata.retrieval_top_k if top_k is None else top_k)
     arrow_path_payload = {str(key): str(value) for key, value in arrow_paths.items()}
+    _require_arrow_name_counts_index(clusterer, arrow_path_payload)
     query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
 
     if raw_candidate_plan is None:
@@ -2055,6 +2042,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
         raw_arrow_retrieval_seconds = time.perf_counter() - stage_start
     else:
         raw_candidate_plan = dict(raw_candidate_plan)
+        _validate_raw_plan_query_signature_ids(raw_candidate_plan, query_signature_id_strings)
         raw_arrow_retrieval_seconds = 0.0
 
     stage_start = time.perf_counter()
@@ -2064,7 +2052,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
             arrow_path_payload,
             signature_ids=signature_order.signature_ids,
             name_tuples=name_tuples,
-            load_name_counts=bool(load_name_counts),
+            load_name_counts=bool(load_name_counts) or _clusterer_uses_name_count_features(clusterer),
             preprocess=True,
             compute_reference_features=False,
             num_threads=n_jobs_resolved,
@@ -2189,11 +2177,6 @@ def predict_incremental_link_or_abstain_from_raw_payloads(
         pairwise_model_result=result.pairwise_model_result,
         linked_signature_clusters=result.linked_signature_clusters,
     )
-
-
-_predict_incremental_link_or_abstain_raw_feature_block_private = (
-    predict_incremental_link_or_abstain_from_raw_feature_block
-)
 
 
 def naturalize_incremental_clusters(

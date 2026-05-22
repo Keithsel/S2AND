@@ -436,8 +436,20 @@ def test_make_distance_matrices_from_rust_featurizer_avoids_anddata_lookup(monke
     assert captured["feature_calls"] == 3
 
 
-def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch):
+def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, tmp_path):
+    import pyarrow as pa
+
     captured = {}
+    disallow_path = tmp_path / "cluster_seed_disallows.arrow"
+    disallow_table = pa.table(
+        {
+            "signature_id_1": pa.array(["0"], type=pa.string()),
+            "signature_id_2": pa.array(["2"], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(disallow_path), "wb") as sink:
+        with pa.ipc.new_file(sink, disallow_table.schema) as writer:
+            writer.write_table(disallow_table)
 
     class _FakeFeaturizer:
         def signature_ids(self):
@@ -453,6 +465,7 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch):
         captured["block_dict"] = block_dict
         captured["rust_featurizer"] = rust_featurizer
         captured["total_ram_bytes"] = kwargs["total_ram_bytes"]
+        captured["cluster_seeds_disallow"] = kwargs["cluster_seeds_disallow"]
         return {"block_0": ["0", "1", "2"]}, None
 
     monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", fake_build_from_arrow_paths)
@@ -461,7 +474,12 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch):
     clusterer = _dummy_clusterer(cluster_model=None)
     result, dists = clusterer.predict_from_arrow_paths(
         {"block": ["0", "1", "2"]},
-        {"signatures": "signatures.arrow", "papers": "papers.arrow", "paper_authors": "paper_authors.arrow"},
+        {
+            "signatures": "signatures.arrow",
+            "papers": "papers.arrow",
+            "paper_authors": "paper_authors.arrow",
+            "cluster_seed_disallows": str(disallow_path),
+        },
         load_name_counts=True,
         total_ram_bytes=123,
     )
@@ -471,6 +489,7 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch):
     assert captured["signature_ids"] == ("0", "1", "2")
     assert captured["load_name_counts"] is True
     assert captured["total_ram_bytes"] == 123
+    assert captured["cluster_seeds_disallow"] == {("0", "2")}
     telemetry = clusterer._last_arrow_predict_telemetry
     assert telemetry["signature_count"] == 3
     assert telemetry["block_count"] == 1
@@ -546,6 +565,65 @@ def test_predict_auto_routes_to_arrow_paths_when_dataset_advertises_them(tmp_pat
     assert captured["self"] is clusterer
     assert captured["block_dict"] == {"block": ["0", "1"]}
     assert captured["paths"] == arrow_paths
+    assert captured["runtime_context"] is runtime_context
+
+
+def test_predict_auto_declines_arrow_paths_missing_required_name_counts_index(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(model_module, "PROJECT_ROOT_PATH", str(tmp_path / "project"))
+    dataset = _dummy_dataset("dummy_predict_auto_arrow_missing_name_counts_index")
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
+    dataset.arrow_paths = arrow_paths
+    runtime_context = type(
+        "RuntimeContext",
+        (),
+        {
+            "operation": "cluster_predict",
+            "requested_backend": "rust",
+            "resolved_backend": "rust",
+            "use_rust": True,
+            "run_id": "test-auto-arrow-predict-missing-name-counts-index",
+            "source": "test",
+        },
+    )()
+
+    def fake_predict_helper(self, block_dict, dataset_arg, **kwargs):
+        captured["self"] = self
+        captured["block_dict"] = dict(block_dict)
+        captured["dataset"] = dataset_arg
+        captured["runtime_context"] = kwargs["runtime_context"]
+        return {"legacy": ["0", "1"]}, None
+
+    def fail_predict_from_arrow_paths(*_args, **_kwargs):
+        raise AssertionError("implicit Arrow routing should decline incomplete name-count artifacts")
+
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(Clusterer, "predict_helper", fake_predict_helper)
+    monkeypatch.setattr(Clusterer, "predict_from_arrow_paths", fail_predict_from_arrow_paths)
+
+    clusterer = Clusterer(
+        featurizer_info=FeaturizationInfo(features_to_use=["name_counts"]),
+        classifier=None,
+        cluster_model=None,
+        n_jobs=1,
+        use_cache=False,
+        batch_size=2,
+    )
+    result, dists = clusterer.predict({"block": ["0", "1"]}, dataset)
+
+    assert result == {"legacy": ["0", "1"]}
+    assert dists is None
+    assert captured["self"] is clusterer
+    assert captured["block_dict"] == {"block": ["0", "1"]}
+    assert captured["dataset"] is dataset
     assert captured["runtime_context"] is runtime_context
 
 

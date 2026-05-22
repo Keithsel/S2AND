@@ -11,7 +11,11 @@ from s2and.incremental_linking.feature_block import (
     write_name_counts_index,
     write_raw_arrow_batch_lookup_indexes,
 )
-from s2and.incremental_linking.retrieval import build_linker_retrieval_batch_from_raw_candidate_plan
+from s2and.incremental_linking.retrieval import (
+    RAW_CANDIDATE_PLAN_PAIR_KEYS,
+    RAW_CANDIDATE_PLAN_ROW_KEYS,
+    build_linker_retrieval_batch_from_raw_candidate_plan,
+)
 from s2and.incremental_linking.runtime import subset_raw_candidate_plan_for_query_ids
 from tests.helpers import build_cluster_summary, build_query_features
 
@@ -143,6 +147,17 @@ def _assert_retrieval_plan_equal(raw_plan: dict[str, object], direct_plan: dict[
         direct_plan["specter_centroid_similarity"],
         rtol=1e-6,
         atol=1e-6,
+    )
+
+
+def _raw_plan_for_base_paths(paths: dict[str, str]) -> dict[str, object]:
+    return s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
     )
 
 
@@ -331,6 +346,165 @@ def test_raw_arrow_candidate_plan_rejects_stale_batch_index(tmp_path: Path) -> N
             query_view="full",
             orcid_enabled=False,
             num_threads=1,
+        )
+
+
+def test_raw_arrow_candidate_plan_rejects_duplicate_signature_ids(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    duplicate_signatures = pa.table(
+        {
+            "signature_id": pa.array(["q1", "q1", "s1", "s2"], type=pa.string()),
+            "paper_id": pa.array(["p_q", "p_q", "p1", "p2"], type=pa.string()),
+            "author_first": pa.array(["Alice", "Alice", "Alice", "Bob"], type=pa.string()),
+            "author_middle": pa.array(["", "", "", ""], type=pa.string()),
+            "author_last": pa.array(["Wang", "Wang", "Wang", "Jones"], type=pa.string()),
+            "author_suffix": pa.array(["", "", "", ""], type=pa.string()),
+            "author_affiliations": pa.array(
+                [["AI Lab"], ["AI Lab"], ["AI Lab"], ["Other Lab"]],
+                type=pa.list_(pa.string()),
+            ),
+            "author_orcid": pa.array([None, None, None, None], type=pa.string()),
+            "author_position": pa.array([0, 0, 0, 0], type=pa.int64()),
+        }
+    )
+    _write_ipc(Path(paths["signatures"]), duplicate_signatures)
+
+    with pytest.raises(ValueError, match="duplicate signature_id"):
+        _raw_plan_for_base_paths(paths)
+
+
+def test_raw_arrow_candidate_plan_rejects_duplicate_paper_ids(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    duplicate_papers = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p_q", "p1", "p2"], type=pa.string()),
+            "title": pa.array(["Graph Models", "Graph Models", "Graph Models", "Different Topic"], type=pa.string()),
+            "venue": pa.array(["NeurIPS", "NeurIPS", "NeurIPS", "ICML"], type=pa.string()),
+            "journal_name": pa.array(["", "", "", ""], type=pa.string()),
+            "year": pa.array([2020, 2020, 2020, 2010], type=pa.int64()),
+        }
+    )
+    _write_ipc(Path(paths["papers"]), duplicate_papers)
+
+    with pytest.raises(ValueError, match="duplicate paper_id"):
+        _raw_plan_for_base_paths(paths)
+
+
+def test_raw_arrow_candidate_plan_rejects_duplicate_paper_author_positions(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    duplicate_authors = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p_q", "p1", "p2"], type=pa.string()),
+            "position": pa.array([0, 0, 0, 0], type=pa.int64()),
+            "author_name": pa.array(["Alice Wang", "A. Wang", "Alice Wang", "Bob Jones"], type=pa.string()),
+        }
+    )
+    _write_ipc(Path(paths["paper_authors"]), duplicate_authors)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        _raw_plan_for_base_paths(paths)
+
+
+def test_raw_arrow_candidate_plan_rejects_invalid_cluster_seed_rows(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    duplicate_seeds = pa.table(
+        {
+            "signature_id": pa.array(["s1", "s1", "s2"], type=pa.string()),
+            "cluster_id": pa.array(["c_match", "c_other", "c_other"], type=pa.string()),
+        }
+    )
+    _write_ipc(Path(paths["cluster_seeds"]), duplicate_seeds)
+    with pytest.raises(ValueError, match="duplicate signature_id"):
+        _raw_plan_for_base_paths(paths)
+
+    empty_cluster_id = pa.table(
+        {
+            "signature_id": pa.array(["s1", "s2"], type=pa.string()),
+            "cluster_id": pa.array(["", "c_other"], type=pa.string()),
+        }
+    )
+    _write_ipc(Path(paths["cluster_seeds"]), empty_cluster_id)
+    with pytest.raises(ValueError, match="empty cluster_id"):
+        _raw_plan_for_base_paths(paths)
+
+
+def test_raw_arrow_candidate_plan_rejects_duplicate_specter_paper_ids(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    specter = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p_q", "p1", "p2"], type=pa.string()),
+            "embedding": pa.FixedSizeListArray.from_arrays(
+                pa.array([1.0, 0.0, 1.0, 0.0, 0.8, 0.2, 0.0, 1.0], type=pa.float32()),
+                2,
+            ),
+        }
+    )
+    paths["specter"] = _write_ipc(tmp_path / "specter.arrow", specter)
+
+    with pytest.raises(ValueError, match="duplicate paper_id"):
+        _raw_plan_for_base_paths(paths)
+
+
+def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
+        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
+
+    full_scan = s2and_rust.RustFeaturizer.from_arrow_paths(
+        paths,
+        ["q1", "s1"],
+        set(),
+        None,
+        True,
+        False,
+        0.0,
+        10000.0,
+        1,
+    )
+    indexed = s2and_rust.RustFeaturizer.from_arrow_paths(
+        indexed_paths,
+        ["q1", "s1"],
+        set(),
+        None,
+        True,
+        False,
+        0.0,
+        10000.0,
+        1,
+    )
+
+    assert tuple(indexed.signature_ids()) == ("q1", "s1")
+    np.testing.assert_allclose(
+        indexed.featurize_pairs_matrix([("q1", "s1")], None, 1, np.nan),
+        full_scan.featurize_pairs_matrix([("q1", "s1")], None, 1, np.nan),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+    with Path(paths["signatures"]).open("ab") as outfile:
+        outfile.write(b"\0")
+    with pytest.raises(ValueError, match="stale"):
+        s2and_rust.RustFeaturizer.from_arrow_paths(
+            indexed_paths,
+            ["q1", "s1"],
+            set(),
+            None,
+            True,
+            False,
+            0.0,
+            10000.0,
+            1,
         )
 
 
@@ -605,6 +779,12 @@ def test_raw_arrow_candidate_plan_matches_multi_query_auto_views_and_specter(tmp
         "specter_centroid_similarity",
     ):
         np.testing.assert_array_equal(subset_plan[key], single_query_plan[key])
+    for key in RAW_CANDIDATE_PLAN_ROW_KEYS:
+        assert key in subset_plan
+        assert len(subset_plan[key]) == int(subset_plan["row_count"]), key
+    for key in RAW_CANDIDATE_PLAN_PAIR_KEYS:
+        assert key in subset_plan
+        assert len(subset_plan[key]) == int(subset_plan["pair_count"]), key
     assert subset_plan["telemetry"]["query_signature_count"] == 1
     assert subset_plan["telemetry"]["signature_count"] == 0
     assert subset_plan["telemetry"]["seed_signature_count"] == raw_plan["telemetry"]["seed_signature_count"]
@@ -672,6 +852,30 @@ def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metada
     assert plan["component_members"]["c_self"] == ["s1"]
     assert "q1" not in plan["right_signature_ids"]
     assert plan["query_views"] == ["full"]
+
+
+def test_raw_arrow_candidate_plan_rejects_null_paper_author_position(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paper_authors = pa.table(
+        {
+            "paper_id": pa.array(["p_q"], type=pa.string()),
+            "position": pa.array([None], type=pa.int64()),
+            "author_name": pa.array(["Alice Wang"], type=pa.string()),
+        }
+    )
+    paths["paper_authors"] = _write_ipc(tmp_path / "paper_authors.arrow", paper_authors)
+
+    with pytest.raises(ValueError, match="position is null"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
 
 
 def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tmp_path: Path) -> None:

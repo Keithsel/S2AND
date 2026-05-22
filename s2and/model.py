@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
-import tempfile
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -21,7 +21,7 @@ from sklearn.exceptions import EfficiencyWarning
 from tqdm import tqdm
 
 from s2and import memory_budget
-from s2and.consts import _PACKAGE_DATA_DIR, DEFAULT_CHUNK_SIZE, LARGE_DISTANCE, LARGE_INTEGER
+from s2and.consts import _PACKAGE_DATA_DIR, DEFAULT_CHUNK_SIZE, LARGE_DISTANCE, LARGE_INTEGER, PROJECT_ROOT_PATH
 from s2and.data import (
     NAME_COUNTS_LAST_FIRST_INITIAL_INITIAL_CHAR,
     NAME_COUNTS_LAST_FIRST_INITIAL_LEGACY,
@@ -34,7 +34,13 @@ from s2and.feature_port import (
     evict_rust_featurizer,
 )
 from s2and.featurizer import FeaturizationInfo, many_pairs_featurize, resolve_cache_policy
-from s2and.incremental_linking.feature_block import RAW_PLANNER_ARROW_BATCH_INDEX_KEYS
+from s2and.incremental_linking.feature_block import (
+    RAW_PLANNER_ARROW_BATCH_INDEX_KEYS,
+    TemporaryArrowPaths,
+    arrow_paths_with_temporary_cluster_seeds,
+    normalize_cluster_seed_disallow_pairs,
+    write_cluster_seeds_arrow,
+)
 from s2and.incremental_linking.production import (
     predict_incremental_promoted_linker,
     predict_incremental_promoted_linker_from_arrow_paths,
@@ -283,6 +289,33 @@ def _uses_embedding_features(clusterer: Any) -> bool:
     )
 
 
+def _uses_name_count_features(clusterer: Any) -> bool:
+    return _uses_feature(getattr(clusterer, "featurizer_info", None), "name_counts") or _uses_feature(
+        getattr(clusterer, "nameless_featurizer_info", None),
+        "name_counts",
+    )
+
+
+def _arrow_paths_have_name_counts_index(paths: Mapping[str, Any]) -> bool:
+    return _existing_name_counts_index_path(paths) is not None
+
+
+def _existing_name_counts_index_path(paths: Mapping[str, Any]) -> str | None:
+    for key in ("name_counts_index", "name_counts_index_dir"):
+        path_value = paths.get(key)
+        if path_value is not None and Path(str(path_value)).exists():
+            return str(path_value)
+    return None
+
+
+def _require_arrow_name_counts_index_for_clusterer(clusterer: Any, arrow_paths: Mapping[str, Any]) -> None:
+    if _uses_name_count_features(clusterer) and not _arrow_paths_have_name_counts_index(arrow_paths):
+        raise ValueError(
+            "Arrow prediction with selected name_counts features requires name_counts_index. "
+            "Pass the S2AND name-count index directory in arrow_paths['name_counts_index']."
+        )
+
+
 def _coerce_existing_arrow_paths(
     value: Any,
     *,
@@ -313,6 +346,11 @@ def _coerce_existing_arrow_paths(
             formatted = ", ".join(f"{key}={paths[key]}" for key in missing_files)
             raise FileNotFoundError(f"dataset Arrow paths point to missing files: {formatted}")
         return None
+    for key in ("name_counts_index", "name_counts_index_dir"):
+        if key in paths and not Path(paths[key]).exists():
+            if strict:
+                raise FileNotFoundError(f"dataset Arrow path {key}={paths[key]} does not exist")
+            return None
     return paths
 
 
@@ -332,6 +370,65 @@ def _add_raw_planner_batch_index_paths(paths: dict[str, str], arrow_dataset_dir:
                 break
 
 
+def _resolve_existing_arrow_manifest_path(path_value: Any, arrow_dataset_dir: Path) -> Path | None:
+    raw_path = Path(str(path_value))
+    candidates = [raw_path] if raw_path.is_absolute() else []
+    if not raw_path.is_absolute():
+        candidates.extend(
+            [
+                arrow_dataset_dir / raw_path,
+                Path(PROJECT_ROOT_PATH) / raw_path,
+                raw_path,
+            ]
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_name_counts_index_path(arrow_dataset_dir: Path) -> str | None:
+    manifest_path = arrow_dataset_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Arrow manifest is not valid JSON: {manifest_path}") from exc
+        manifest_paths = manifest.get("paths", {})
+        if isinstance(manifest_paths, Mapping):
+            path_value = manifest_paths.get("name_counts_index") or manifest_paths.get("name_counts_index_dir")
+            if path_value is not None:
+                resolved = _resolve_existing_arrow_manifest_path(path_value, arrow_dataset_dir)
+                if resolved is not None:
+                    return str(resolved)
+                raise FileNotFoundError(
+                    f"Arrow manifest {manifest_path} names missing name_counts_index path: {path_value}"
+                )
+    for candidate in (
+        arrow_dataset_dir / "name_counts_index",
+        arrow_dataset_dir.parent / "name_counts_index",
+        arrow_dataset_dir.parent.parent / "name_counts_index",
+        Path(PROJECT_ROOT_PATH) / "s2and" / "data" / "name_counts_index",
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _add_name_counts_index_path(paths: dict[str, str], arrow_dataset_dir: Path) -> None:
+    existing = _existing_name_counts_index_path(paths)
+    if existing is not None:
+        paths["name_counts_index"] = existing
+        paths.pop("name_counts_index_dir", None)
+        return
+    for key in ("name_counts_index", "name_counts_index_dir"):
+        if key in paths:
+            raise FileNotFoundError(f"dataset Arrow path {key}={paths[key]} does not exist")
+    resolved = _resolve_name_counts_index_path(arrow_dataset_dir)
+    if resolved is not None:
+        paths["name_counts_index"] = resolved
+
+
 def _specter_arrow_name_for_dataset(dataset: Any) -> str:
     specter_path = getattr(dataset, "specter_embeddings_path", None)
     specter_name = "" if specter_path is None else Path(str(specter_path)).name.lower()
@@ -343,6 +440,7 @@ def _resolve_dataset_arrow_paths(
     *,
     require_specter: bool,
     require_cluster_seeds: bool = False,
+    require_name_counts_index: bool = False,
 ) -> dict[str, str] | None:
     for attr_name in ("arrow_paths", "feature_block_arrow_paths", "rust_arrow_paths"):
         explicit_value = getattr(dataset, attr_name, None)
@@ -357,11 +455,16 @@ def _resolve_dataset_arrow_paths(
         if explicit is not None:
             signatures_path = explicit.get("signatures")
             if signatures_path is not None:
-                _add_raw_planner_batch_index_paths(explicit, Path(signatures_path).resolve().parent)
+                arrow_dataset_dir = Path(signatures_path).resolve().parent
+                _add_raw_planner_batch_index_paths(explicit, arrow_dataset_dir)
+                if require_name_counts_index:
+                    _add_name_counts_index_path(explicit, arrow_dataset_dir)
             if require_cluster_seeds:
                 cluster_seeds_path = explicit.get("cluster_seeds")
                 if cluster_seeds_path is None or not Path(cluster_seeds_path).exists():
                     return None
+            if require_name_counts_index and not _arrow_paths_have_name_counts_index(explicit):
+                return None
             return explicit
 
     signature_path_candidates = tuple(
@@ -404,31 +507,22 @@ def _resolve_dataset_arrow_paths(
             if altered_path.exists():
                 paths["altered_cluster_signatures"] = str(altered_path)
             _add_raw_planner_batch_index_paths(paths, arrow_dataset_dir)
+            if require_name_counts_index:
+                _add_name_counts_index_path(paths, arrow_dataset_dir)
             resolved = _coerce_existing_arrow_paths(
                 paths,
                 require_specter=require_specter,
                 require_cluster_seeds=require_cluster_seeds,
                 strict=False,
             )
+            if resolved is not None and require_name_counts_index and not _arrow_paths_have_name_counts_index(resolved):
+                resolved = None
             if resolved is not None:
                 return resolved
     return None
 
 
-def _write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, Any]) -> None:
-    import pyarrow as pa
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    items = [(str(signature_id), str(cluster_id)) for signature_id, cluster_id in cluster_seeds_require.items()]
-    table = pa.table(
-        {
-            "signature_id": pa.array([signature_id for signature_id, _cluster_id in items], type=pa.string()),
-            "cluster_id": pa.array([cluster_id for _signature_id, cluster_id in items], type=pa.string()),
-        }
-    )
-    with pa.OSFile(str(path), "wb") as sink:
-        with pa.ipc.new_file(sink, table.schema) as writer:
-            writer.write_table(table)
+_write_cluster_seeds_arrow = write_cluster_seeds_arrow
 
 
 def _read_cluster_seeds_arrow(path: Path) -> dict[str, int | str]:
@@ -454,9 +548,14 @@ def _read_cluster_seeds_arrow(path: Path) -> dict[str, int | str]:
         if signature_id is None or cluster_id is None:
             raise ValueError("cluster seeds Arrow cannot contain null signature_id or cluster_id values")
         signature_key = str(signature_id)
+        cluster_key = str(cluster_id)
+        if not signature_key:
+            raise ValueError("cluster seeds Arrow cannot contain empty signature_id values")
+        if not cluster_key:
+            raise ValueError(f"cluster seeds Arrow cannot contain empty cluster_id values: {signature_key!r}")
         if signature_key in cluster_seeds_require:
             raise ValueError(f"cluster seeds Arrow contains duplicate signature_id: {signature_key!r}")
-        cluster_seeds_require[signature_key] = str(cluster_id)
+        cluster_seeds_require[signature_key] = cluster_key
     _CLUSTER_SEEDS_ARROW_CACHE[cache_key] = tuple(cluster_seeds_require.items())
     _CLUSTER_SEEDS_ARROW_CACHE.move_to_end(cache_key)
     while len(_CLUSTER_SEEDS_ARROW_CACHE) > _CLUSTER_SEEDS_ARROW_CACHE_MAX_ENTRIES:
@@ -490,7 +589,7 @@ def _read_cluster_seed_disallows_arrow(path: Path) -> set[tuple[str, str]]:
     missing = sorted({"signature_id_1", "signature_id_2"}.difference(table.column_names))
     if missing:
         raise ValueError(f"cluster seed disallows Arrow is missing required columns: {missing}")
-    disallow_pairs: set[tuple[str, str]] = set()
+    disallow_rows: list[tuple[str, str]] = []
     for left, right in zip(
         table["signature_id_1"].to_pylist(),
         table["signature_id_2"].to_pylist(),
@@ -498,7 +597,8 @@ def _read_cluster_seed_disallows_arrow(path: Path) -> set[tuple[str, str]]:
     ):
         if left is None or right is None:
             raise ValueError("cluster seed disallows Arrow cannot contain null signature ids")
-        disallow_pairs.add((str(left), str(right)))
+        disallow_rows.append((str(left), str(right)))
+    disallow_pairs = set(normalize_cluster_seed_disallow_pairs(disallow_rows))
     _CLUSTER_SEED_DISALLOWS_ARROW_CACHE[cache_key] = tuple(disallow_pairs)
     _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.move_to_end(cache_key)
     while len(_CLUSTER_SEED_DISALLOWS_ARROW_CACHE) > _CLUSTER_SEED_DISALLOWS_ARROW_CACHE_MAX_ENTRIES:
@@ -522,45 +622,27 @@ def _cluster_seed_disallows_for_request(
     dataset: Any,
     arrow_paths: Mapping[str, Any] | None,
 ) -> set[tuple[str, str]]:
-    disallow_pairs = {
-        (str(left), str(right)) for left, right in getattr(dataset, "cluster_seeds_disallow", set()) or set()
-    }
+    disallow_pairs = set(
+        normalize_cluster_seed_disallow_pairs(getattr(dataset, "cluster_seeds_disallow", set()) or set())
+    )
     disallow_pairs.update(_cluster_seed_disallows_from_arrow_paths(arrow_paths))
     return disallow_pairs
 
 
-def _dataset_disables_arrow_cluster_seeds(dataset: Any) -> bool:
-    return bool(getattr(dataset, "_s2and_disable_arrow_cluster_seeds", False))
+def _temporary_arrow_paths_with_current_cluster_seeds(
+    dataset: Any,
+    arrow_paths: Mapping[str, Any],
+    *,
+    reuse_existing_cluster_seeds_when_empty: bool = True,
+) -> TemporaryArrowPaths:
+    """Return request-scoped Arrow paths whose seed table mirrors current dataset seeds."""
 
-
-def _arrow_paths_with_current_cluster_seeds(dataset: Any, arrow_paths: Mapping[str, Any]) -> dict[str, str]:
-    """Return Arrow paths whose cluster seed table mirrors current dataset seeds."""
-
-    paths = {str(key): str(value) for key, value in arrow_paths.items()}
-    if (
-        not getattr(dataset, "cluster_seeds_require", {})
-        and paths.get("cluster_seeds") is not None
-        and not _dataset_disables_arrow_cluster_seeds(dataset)
-    ):
-        return paths
-    current_seed_version = _cluster_seeds_version(dataset)
-
-    tmpdir = getattr(dataset, "_s2and_arrow_cluster_seeds_tmpdir", None)
-    if tmpdir is None:
-        tmpdir = tempfile.TemporaryDirectory(prefix="s2and_arrow_cluster_seeds_")
-        dataset._s2and_arrow_cluster_seeds_tmpdir = tmpdir
-    cached_version = getattr(dataset, "_s2and_arrow_cluster_seeds_version", None)
-    cached_path = getattr(dataset, "_s2and_arrow_cluster_seeds_path", None)
-    if cached_version == current_seed_version and cached_path is not None and Path(str(cached_path)).exists():
-        paths["cluster_seeds"] = str(cached_path)
-        return paths
-
-    output_path = Path(tmpdir.name) / f"cluster_seeds_v{current_seed_version}.arrow"
-    _write_cluster_seeds_arrow(output_path, getattr(dataset, "cluster_seeds_require", {}) or {})
-    dataset._s2and_arrow_cluster_seeds_version = current_seed_version
-    dataset._s2and_arrow_cluster_seeds_path = str(output_path)
-    paths["cluster_seeds"] = str(output_path)
-    return paths
+    return arrow_paths_with_temporary_cluster_seeds(
+        arrow_paths,
+        getattr(dataset, "cluster_seeds_require", {}) or {},
+        prefix="s2and_arrow_cluster_seeds_",
+        reuse_existing_cluster_seeds_when_empty=reuse_existing_cluster_seeds_when_empty,
+    )
 
 
 def _partial_supervision_with_cluster_seed_disallows(
@@ -596,7 +678,17 @@ def _read_altered_cluster_signatures_arrow(path: Path) -> list[str]:
         table = pa.ipc.open_file(source).read_all()
     if "signature_id" not in table.column_names:
         raise ValueError("altered cluster signatures Arrow is missing required column: signature_id")
-    return [str(value) for value in table["signature_id"].to_pylist() if str(value or "")]
+    values: list[str] = []
+    seen: set[str] = set()
+    for value in table["signature_id"].to_pylist():
+        if value is None or not str(value):
+            raise ValueError("altered cluster signatures Arrow cannot contain null or empty signature_id values")
+        signature_id = str(value)
+        if signature_id in seen:
+            raise ValueError(f"altered cluster signatures Arrow contains duplicate signature_id: {signature_id!r}")
+        seen.add(signature_id)
+        values.append(signature_id)
+    return values
 
 
 def _read_altered_cluster_signatures_file(path: Path) -> list[str]:
@@ -609,8 +701,6 @@ def _dataset_altered_cluster_signatures(
     dataset: Any,
     arrow_paths: Mapping[str, Any] | None = None,
 ) -> list[str]:
-    if bool(getattr(dataset, "_s2and_disable_altered_cluster_signatures", False)):
-        return []
     values = getattr(dataset, "altered_cluster_signatures", None)
     if values is not None:
         return [str(value) for value in values]
@@ -3042,6 +3132,7 @@ class Clusterer:
                 "use the ANDData predict path until Arrow reference-feature artifacts are available."
             )
 
+        _require_arrow_name_counts_index_for_clusterer(self, arrow_paths)
         signature_ids = list(
             dict.fromkeys(str(signature_id) for signatures in block_dict.values() for signature_id in signatures)
         )
@@ -3057,6 +3148,7 @@ class Clusterer:
             num_threads=self.n_jobs,
         )
         arrow_featurizer_seconds = time.perf_counter() - featurizer_start
+        cluster_seed_disallows = _cluster_seed_disallows_from_arrow_paths(arrow_paths)
         predict_start = time.perf_counter()
         result = self.predict_from_rust_featurizer(
             block_dict,
@@ -3067,6 +3159,7 @@ class Clusterer:
             incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
             runtime_context=runtime_context,
             total_ram_bytes=total_ram_bytes,
+            cluster_seeds_disallow=cluster_seed_disallows,
         )
         predict_seconds = time.perf_counter() - predict_start
         nested_telemetry = dict(getattr(self, "_last_rust_featurizer_predict_telemetry", {}) or {})
@@ -3360,17 +3453,11 @@ class Clusterer:
         logger.info("Running predict incremental on subblocks with single letter first names")
         cluster_seeds_require_original = copy.deepcopy(dataset.cluster_seeds_require)
         altered_cluster_signatures_original = getattr(dataset, "altered_cluster_signatures", None)
-        altered_cluster_signatures_disabled_original = bool(
-            getattr(dataset, "_s2and_disable_altered_cluster_signatures", False)
-        )
-        arrow_cluster_seeds_disabled_original = _dataset_disables_arrow_cluster_seeds(dataset)
         dataset.cluster_seeds_require = {}
         # This is bulk subblocking's synthetic incremental pass. The original altered-profile
         # list and Arrow seed path are keyed to production claimed-profile seeds, not to
         # these temporary clusters.
         dataset.altered_cluster_signatures = []
-        vars(dataset)["_s2and_disable_altered_cluster_signatures"] = True
-        vars(dataset)["_s2and_disable_arrow_cluster_seeds"] = True
         pred_clusters_intermediate: dict[str, list[str]] = pred_clusters
         try:
             synthetic_arrow_paths_available = (
@@ -3381,6 +3468,7 @@ class Clusterer:
                     dataset,
                     require_specter=_uses_embedding_features(self),
                     require_cluster_seeds=False,
+                    require_name_counts_index=_uses_name_count_features(self),
                 )
                 is not None
             )
@@ -3459,8 +3547,6 @@ class Clusterer:
         finally:
             dataset.cluster_seeds_require = cluster_seeds_require_original
             dataset.altered_cluster_signatures = altered_cluster_signatures_original
-            vars(dataset)["_s2and_disable_altered_cluster_signatures"] = altered_cluster_signatures_disabled_original
-            vars(dataset)["_s2and_disable_arrow_cluster_seeds"] = arrow_cluster_seeds_disabled_original
             _bump_cluster_seeds_version(dataset)
             _ensure_cluster_seed_version_tracking(dataset)
             if restore_rust_cluster_seeds_on_exit:
@@ -3495,6 +3581,7 @@ class Clusterer:
 
         cluster_seeds_require_original: dict[str, Any] | None = None
         arrow_paths_for_predict = arrow_paths
+        arrow_paths_for_predict_bundle: TemporaryArrowPaths | None = None
         subblocked_altered_telemetry: dict[str, int | float] = {
             "bulk_altered_presplit_applied": 0,
             "bulk_altered_presplit_seconds": 0.0,
@@ -3519,7 +3606,8 @@ class Clusterer:
                 )
                 dataset.cluster_seeds_require = dict(split_cluster_seeds_require)
                 _bump_cluster_seeds_version(dataset)
-                arrow_paths_for_predict = _arrow_paths_with_current_cluster_seeds(dataset, arrow_paths)
+                arrow_paths_for_predict_bundle = _temporary_arrow_paths_with_current_cluster_seeds(dataset, arrow_paths)
+                arrow_paths_for_predict = arrow_paths_for_predict_bundle.paths
                 setup_telemetry = dict(getattr(self, "_last_incremental_seed_setup_telemetry", {}) or {})
                 subblocked_altered_telemetry = {
                     "bulk_altered_presplit_applied": 1,
@@ -3570,6 +3658,7 @@ class Clusterer:
                 and len(block_dict_multiple_letter_first_names) > 0
                 and not use_s2_clusters
             ):
+                _require_arrow_name_counts_index_for_clusterer(self, arrow_paths_for_predict)
                 signature_ids = list(
                     dict.fromkeys(
                         str(signature_id)
@@ -3587,7 +3676,7 @@ class Clusterer:
                     {str(key): str(value) for key, value in arrow_paths_for_predict.items()},
                     signature_ids=signature_ids,
                     name_tuples="filtered",
-                    load_name_counts=False,
+                    load_name_counts=_uses_name_count_features(self),
                     preprocess=True,
                     compute_reference_features=False,
                     num_threads=self.n_jobs,
@@ -3624,6 +3713,8 @@ class Clusterer:
             self._last_subblocked_altered_presplit_telemetry = subblocked_altered_telemetry
             return dict(pred_clusters), None
         finally:
+            if arrow_paths_for_predict_bundle is not None:
+                arrow_paths_for_predict_bundle.close()
             if cluster_seeds_require_original is not None:
                 dataset.cluster_seeds_require = cluster_seeds_require_original
                 _bump_cluster_seeds_version(dataset)
@@ -3717,6 +3808,7 @@ class Clusterer:
                 dataset,
                 require_specter=_uses_embedding_features(self),
                 require_cluster_seeds=False,
+                require_name_counts_index=_uses_name_count_features(self),
             )
 
         if arrow_paths is not None and batching_threshold is None:
@@ -3731,7 +3823,7 @@ class Clusterer:
                 incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
                 runtime_context=runtime_context,
                 total_ram_bytes=total_ram_bytes,
-                load_name_counts=False,
+                load_name_counts=_uses_name_count_features(self),
                 name_tuples="filtered",
             )
             end = time.time()
@@ -4163,7 +4255,7 @@ class Clusterer:
         cluster_seeds_require: dict[str, int | str] = {}
         source_cluster_seeds_require = copy.deepcopy(getattr(dataset, "cluster_seeds_require", {}) or {})
         source_cluster_seeds_origin = "dataset" if source_cluster_seeds_require else "empty"
-        if not source_cluster_seeds_require and not _dataset_disables_arrow_cluster_seeds(dataset):
+        if not source_cluster_seeds_require:
             source_cluster_seeds_require = _cluster_seeds_require_from_arrow_paths(arrow_paths)
             if source_cluster_seeds_require:
                 source_cluster_seeds_origin = "arrow"
@@ -4184,15 +4276,22 @@ class Clusterer:
         # Claimed profiles from production can be "unnatural" with respect to S2AND constraints;
         # this pre-split step aligns them to natural-looking clusters before adding new signatures.
         if len(altered_cluster_signatures) > 0:
+            missing_altered_seeds = sorted(
+                str(signature_id)
+                for signature_id in altered_cluster_signatures
+                if str(signature_id) not in cluster_seeds_require
+            )
+            if missing_altered_seeds:
+                raise ValueError(
+                    "altered_cluster_signatures must all be present in cluster_seeds_require; "
+                    f"missing={missing_altered_seeds[:10]}"
+                )
             logger.info("Dealing with altered cluster signatures")
-            # It's possible an altered signature is not in cluster_seeds_require when
-            # a custom seed map is passed; skip those safely here.
             altered_cluster_nums: set[int | str] = set()
             for altered_signature_id in altered_cluster_signatures:
                 altered_signature_key = str(altered_signature_id)
-                if altered_signature_key in cluster_seeds_require:
-                    altered_cluster_num: int | str = cluster_seeds_require[altered_signature_key]
-                    altered_cluster_nums.add(altered_cluster_num)
+                altered_cluster_num: int | str = cluster_seeds_require[altered_signature_key]
+                altered_cluster_nums.add(altered_cluster_num)
             sorted_altered_cluster_nums = cast(list[int | str], sorted(altered_cluster_nums, key=str))
             altered_cluster_count = len(sorted_altered_cluster_nums)
             model_cache_fingerprint = _model_presplit_cache_fingerprint(self)
@@ -4264,7 +4363,7 @@ class Clusterer:
                         partial_supervision=presplit_partial_supervision,
                         runtime_context=runtime_context,
                         total_ram_bytes=total_ram_bytes,
-                        load_name_counts=False,
+                        load_name_counts=_uses_name_count_features(self),
                         name_tuples=getattr(dataset, "name_tuples", "filtered"),
                     )
                     altered_presplit_predict_seconds += time.perf_counter() - presplit_start
@@ -4514,7 +4613,7 @@ class Clusterer:
                             partial_supervision=residual_partial_supervision,
                             runtime_context=runtime_context,
                             total_ram_bytes=total_ram_bytes,
-                            load_name_counts=False,
+                            load_name_counts=_uses_name_count_features(self),
                             name_tuples=getattr(dataset, "name_tuples", "filtered"),
                         )
                 for new_cluster in reclustered_output.values():
@@ -4655,24 +4754,28 @@ class Clusterer:
                 dataset,
                 require_specter=_uses_embedding_features(self),
                 require_cluster_seeds=False,
+                require_name_counts_index=_uses_name_count_features(self),
             )
         if arrow_paths is not None:
-            arrow_paths = _arrow_paths_with_current_cluster_seeds(dataset, arrow_paths)
             logger.info("Running promoted incremental linker through Arrow/Rust paths")
-            return predict_incremental_promoted_linker_from_arrow_paths(
-                self,
-                block_signatures,
-                dataset,
-                arrow_paths=arrow_paths,
-                artifact_dir=artifact_dir,
-                prevent_new_incompatibilities=prevent_new_incompatibilities,
-                partial_supervision=partial_supervision,
-                runtime_context=runtime_context,
-                total_ram_bytes=total_ram_bytes,
-                batching_threshold=batching_threshold,
-                resolve_total_ram_bytes=_resolve_total_ram_bytes_for_incremental,
-                build_incremental_result=_build_incremental_result,
-            )
+            arrow_paths_bundle = _temporary_arrow_paths_with_current_cluster_seeds(dataset, arrow_paths)
+            try:
+                return predict_incremental_promoted_linker_from_arrow_paths(
+                    self,
+                    block_signatures,
+                    dataset,
+                    arrow_paths=arrow_paths_bundle.paths,
+                    artifact_dir=artifact_dir,
+                    prevent_new_incompatibilities=prevent_new_incompatibilities,
+                    partial_supervision=partial_supervision,
+                    runtime_context=runtime_context,
+                    total_ram_bytes=total_ram_bytes,
+                    batching_threshold=batching_threshold,
+                    resolve_total_ram_bytes=_resolve_total_ram_bytes_for_incremental,
+                    build_incremental_result=_build_incremental_result,
+                )
+            finally:
+                arrow_paths_bundle.close()
         return predict_incremental_promoted_linker(
             self,
             block_signatures,
@@ -4761,13 +4864,13 @@ class Clusterer:
                 dataset,
                 require_specter=_uses_embedding_features(self),
                 require_cluster_seeds=False,
+                require_name_counts_index=_uses_name_count_features(self),
             )
         arrow_paths_available = resolved_arrow_paths_for_incremental is not None
         arrow_cluster_seeds_available = (
             resolved_arrow_paths_for_incremental is not None
             and resolved_arrow_paths_for_incremental.get("cluster_seeds") is not None
             and Path(resolved_arrow_paths_for_incremental["cluster_seeds"]).exists()
-            and not _dataset_disables_arrow_cluster_seeds(dataset)
         )
         promoted_seed_inputs_available = bool(getattr(dataset, "cluster_seeds_require", {}) or {}) or bool(
             arrow_cluster_seeds_available

@@ -9,7 +9,6 @@ import pytest
 
 from s2and.data import ANDData, NameCounts
 from s2and.incremental_linking.feature_block import (
-    FEATURE_BLOCK_EXCLUDED_ANDDATA_RESPONSIBILITIES,
     RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS,
     FeatureBlockSignatureOrder,
     arrow_ipc_physical_layout,
@@ -221,12 +220,6 @@ def _write_feature_block_arrow_paths(tmp_path: Path) -> dict[str, str]:
     return write_feature_block_arrow_tables(feature_block, tmp_path, include_empty_cluster_seeds=True)
 
 
-def test_feature_block_contract_excludes_broad_anddata_responsibilities() -> None:
-    assert "train_eval_test_split_construction" in FEATURE_BLOCK_EXCLUDED_ANDDATA_RESPONSIBILITIES
-    assert "pair_sampling_policy" in FEATURE_BLOCK_EXCLUDED_ANDDATA_RESPONSIBILITIES
-    assert "general_anddata_mutation_lifecycle" in FEATURE_BLOCK_EXCLUDED_ANDDATA_RESPONSIBILITIES
-
-
 def test_feature_block_from_anddata_builds_requested_mini_contract() -> None:
     feature_block = feature_block_from_anddata(
         _tiny_anddata(),
@@ -346,6 +339,62 @@ def test_feature_block_from_arrow_paths_reads_cluster_seed_disallows(tmp_path: P
     assert feature_block.cluster_seeds_disallow == (("q", "s2"),)
 
 
+def test_feature_block_from_arrow_paths_rejects_invalid_cluster_seed_disallows(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    invalid = pa.table(
+        {
+            "signature_id_1": pa.array(["q", "s2"], type=pa.string()),
+            "signature_id_2": pa.array(["s2", "q"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(invalid, Path(arrow_paths["cluster_seed_disallows"]))
+
+    with pytest.raises(ValueError, match="duplicated"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_rejects_duplicate_signature_rows(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    duplicate_signatures = pa.table(
+        {
+            "signature_id": pa.array(["q", "q"], type=pa.string()),
+            "paper_id": pa.array(["p_q", "p_q"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(duplicate_signatures, Path(arrow_paths["signatures"]))
+
+    with pytest.raises(ValueError, match="duplicate signature_id"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_rejects_missing_signature_paper(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    incomplete_papers = pa.table({"paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string())})
+    write_arrow_ipc_table(incomplete_papers, Path(arrow_paths["papers"]))
+
+    with pytest.raises(ValueError, match="missing signature paper_ids"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_rejects_duplicate_paper_author_positions(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    duplicate_authors = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p_q"], type=pa.string()),
+            "position": pa.array([0, 0], type=pa.int64()),
+            "author_name": pa.array(["Ada Lovelace", "A. Lovelace"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(duplicate_authors, Path(arrow_paths["paper_authors"]))
+
+    with pytest.raises(ValueError, match="duplicate"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
 def test_write_arrow_ipc_table_writes_bounded_record_batches(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
 
@@ -392,6 +441,22 @@ def test_raw_planner_index_metadata_uses_stem_qualified_sidecar(tmp_path: Path) 
     assert layout["tables"]["signatures"]["batch_index_present"] is True
     assert layout["tables"]["signatures"]["max_record_batch_rows"] == 2
     assert RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS["signatures"] == 16_384
+
+
+def test_raw_planner_index_rejects_stale_python_reuse(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = write_arrow_ipc_table(
+        pa.table({"signature_id": pa.array(["s1", "s2"], type=pa.string())}),
+        tmp_path / "signatures.arrow",
+    )
+    write_raw_arrow_batch_lookup_indexes({"signatures": path}, tmp_path)
+    write_arrow_ipc_table(
+        pa.table({"signature_id": pa.array(["s1", "s2", "s3"], type=pa.string())}),
+        path,
+    )
+
+    with pytest.raises(ValueError, match="stale"):
+        write_raw_arrow_batch_lookup_indexes({"signatures": path}, tmp_path, overwrite=False)
 
 
 def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -889,6 +954,26 @@ def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
     assert captured["retrieval_right_indices"] == [1, 2, 3]
     assert result.telemetry["raw_arrow_featurizer_reused"] == 1
     assert result.telemetry["raw_arrow_featurizer_seconds"] >= 0.0
+
+
+def test_raw_arrow_scoring_wrapper_rejects_mismatched_raw_plan_query_ids() -> None:
+    class FakeFeaturizer:
+        def signature_ids(self) -> list[str]:
+            return ["q", "s1", "s2", "s3"]
+
+    with pytest.raises(ValueError, match="must exactly match requested query_signature_ids"):
+        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            type("Clusterer", (), {"n_jobs": 1})(),
+            type("Artifact", (), {"metadata": type("Metadata", (), {"retrieval_top_k": 25})()})(),
+            arrow_paths={},
+            query_signature_ids=["s1"],
+            raw_candidate_plan=_raw_plan(),
+            rust_featurizer=FakeFeaturizer(),
+            top_k=2,
+            n_jobs=1,
+            load_name_counts=False,
+            name_tuples=set(),
+        )
 
 
 def test_rust_featurizer_from_feature_block_matches_mini_anddata() -> None:

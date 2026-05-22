@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import math
-import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -16,6 +15,7 @@ import s2and.incremental_linking.query_adapter as query_adapter_module
 import s2and.incremental_linking.runtime as runtime_module
 from s2and import feature_port, memory_budget
 from s2and.data import ANDData
+from s2and.incremental_linking.feature_block import TemporaryArrowPaths, arrow_paths_with_temporary_cluster_seeds
 from s2and.runtime import RuntimeContext
 
 logger = logging.getLogger("s2and")
@@ -52,52 +52,26 @@ GetRustFeaturizerFn = Callable[..., Any]
 ResolveTotalRamBytesFn = Callable[[int | None], tuple[int, str]]
 
 
-def _write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, Any]) -> None:
-    import pyarrow as pa
+def _raw_window_plan_telemetry_fields(raw_candidate_plan: Mapping[str, Any]) -> dict[str, int | float | str]:
+    """Return raw Arrow planner telemetry under the window-plan prefix."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    items = [(str(signature_id), str(cluster_id)) for signature_id, cluster_id in cluster_seeds_require.items()]
-    table = pa.table(
-        {
-            "signature_id": pa.array([signature_id for signature_id, _cluster_id in items], type=pa.string()),
-            "cluster_id": pa.array([cluster_id for _signature_id, cluster_id in items], type=pa.string()),
-        }
-    )
-    with pa.OSFile(str(path), "wb") as sink:
-        with pa.ipc.new_file(sink, table.schema) as writer:
-            writer.write_table(table)
-
-
-def _arrow_paths_with_seed_assignments(
-    dataset: ANDData,
-    arrow_paths: Mapping[str, Any],
-    cluster_seeds_require: Mapping[str, int | str],
-) -> dict[str, str]:
-    """Return Arrow paths with a request-local cluster seed table."""
-
-    paths = {str(key): str(value) for key, value in arrow_paths.items()}
-    seed_fingerprint = tuple(
-        sorted((str(signature_id), str(cluster_id)) for signature_id, cluster_id in cluster_seeds_require.items())
-    )
-    tmpdir = getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_tmpdir", None)
-    if tmpdir is None:
-        tmpdir = tempfile.TemporaryDirectory(prefix="s2and_arrow_incremental_cluster_seeds_")
-        vars(dataset)["_s2and_arrow_incremental_cluster_seeds_tmpdir"] = tmpdir
-
-    cached_fingerprint = getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_fingerprint", None)
-    cached_path = getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_path", None)
-    if cached_fingerprint == seed_fingerprint and cached_path is not None and Path(str(cached_path)).exists():
-        paths["cluster_seeds"] = str(cached_path)
-        return paths
-
-    write_index = int(getattr(dataset, "_s2and_arrow_incremental_cluster_seeds_write_index", 0)) + 1
-    output_path = Path(tmpdir.name) / f"cluster_seeds_incremental_v{write_index}.arrow"
-    _write_cluster_seeds_arrow(output_path, cluster_seeds_require)
-    vars(dataset)["_s2and_arrow_incremental_cluster_seeds_write_index"] = write_index
-    vars(dataset)["_s2and_arrow_incremental_cluster_seeds_fingerprint"] = seed_fingerprint
-    vars(dataset)["_s2and_arrow_incremental_cluster_seeds_path"] = str(output_path)
-    paths["cluster_seeds"] = str(output_path)
-    return paths
+    telemetry = raw_candidate_plan.get("telemetry")
+    if not isinstance(telemetry, Mapping):
+        return {}
+    fields: dict[str, int | float | str] = {}
+    for key, value in telemetry.items():
+        if key == "timings":
+            continue
+        if isinstance(value, bool):
+            fields[f"raw_arrow_window_plan_{key}"] = int(value)
+        elif isinstance(value, int | float | str):
+            fields[f"raw_arrow_window_plan_{key}"] = value
+    timings = telemetry.get("timings")
+    if isinstance(timings, Mapping):
+        for key, value in timings.items():
+            if isinstance(value, int | float):
+                fields[f"raw_arrow_window_plan_{key}"] = float(value)
+    return fields
 
 
 def promoted_incremental_component_sizes(cluster_seeds_require: Mapping[str, int | str]) -> dict[str, int]:
@@ -756,6 +730,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
     artifact = artifact_module.load_incremental_linking_artifact(artifact_dir)
     resolved_total_ram_bytes, _ = resolve_total_ram_bytes(total_ram_bytes)
     base_arrow_path_payload = {str(key): str(value) for key, value in arrow_paths.items()}
+    runtime_module._require_arrow_name_counts_index(clusterer, base_arrow_path_payload)  # noqa: SLF001
     cluster_seeds_require, recluster_map, cluster_seeds_require_inverse = clusterer._build_incremental_seed_setup(
         dataset,
         partial_supervision,
@@ -784,143 +759,162 @@ def predict_incremental_promoted_linker_from_arrow_paths(
     )
     if seed_arrow_reused_source:
         arrow_path_payload = dict(base_arrow_path_payload)
+        arrow_path_bundle: TemporaryArrowPaths | None = None
     else:
-        arrow_path_payload = _arrow_paths_with_seed_assignments(dataset, base_arrow_path_payload, cluster_seeds_require)
+        arrow_path_bundle = arrow_paths_with_temporary_cluster_seeds(
+            base_arrow_path_payload,
+            cluster_seeds_require,
+            prefix="s2and_arrow_incremental_cluster_seeds_",
+        )
+        arrow_path_payload = arrow_path_bundle.paths
     seed_arrow_assignment_seconds = time.perf_counter() - seed_arrow_start
-    plan_window_multiplier = 8
-    plan_window_size = query_batch_size
-    if query_batch_size < len(unassigned_signature_ids):
-        plan_window_size = min(len(unassigned_signature_ids), query_batch_size * plan_window_multiplier)
-    use_windowed_raw_plan = plan_window_size > query_batch_size
-    raw_window_plan_count = 0
-    raw_window_plan_seconds = 0.0
-    raw_window_plan_query_count = 0
-    raw_window_featurizer_count = 0
-    raw_window_featurizer_seconds = 0.0
-    raw_window_featurizer_signature_count = 0
-    raw_window_subset_seconds = 0.0
+    try:
+        plan_window_multiplier = 8
+        plan_window_size = query_batch_size
+        if query_batch_size < len(unassigned_signature_ids):
+            plan_window_size = min(len(unassigned_signature_ids), query_batch_size * plan_window_multiplier)
+        use_windowed_raw_plan = plan_window_size > query_batch_size
+        raw_window_plan_count = 0
+        raw_window_plan_seconds = 0.0
+        raw_window_plan_query_count = 0
+        raw_window_featurizer_count = 0
+        raw_window_featurizer_seconds = 0.0
+        raw_window_featurizer_signature_count = 0
+        raw_window_subset_seconds = 0.0
+        raw_window_plan_telemetry: dict[str, int | float | str] = {}
 
-    rust_module = feature_port._require_rust_runtime() if use_windowed_raw_plan else None
-    for plan_start_index in range(0, len(unassigned_signature_ids), plan_window_size):
-        query_plan_window = unassigned_signature_ids[plan_start_index : plan_start_index + plan_window_size]
-        raw_candidate_plan: Mapping[str, Any] | None = None
-        raw_window_featurizer: Any | None = None
-        if use_windowed_raw_plan:
-            raw_window_start = time.perf_counter()
-            assert rust_module is not None
-            raw_candidate_plan = rust_module.raw_block_query_candidate_plan_arrow(
-                arrow_path_payload,
-                list(query_plan_window),
-                top_k=int(artifact.metadata.retrieval_top_k),
-                query_view="auto",
-                orcid_enabled=bool(orcid_enabled),
-                num_threads=clusterer.n_jobs,
-                max_exemplars=4,
-                include_seed_assignments=bool(partial_supervision),
-            )
-            raw_window_plan_seconds += time.perf_counter() - raw_window_start
-            raw_window_plan_count += 1
-            raw_window_plan_query_count += len(query_plan_window)
-            raw_window_featurizer_start = time.perf_counter()
-            signature_order = runtime_module.feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
-            raw_window_featurizer = feature_port.build_rust_featurizer_from_arrow_paths(
-                arrow_path_payload,
-                signature_ids=signature_order.signature_ids,
-                name_tuples=name_tuples,
-                load_name_counts=False,
-                preprocess=True,
-                compute_reference_features=False,
-                num_threads=clusterer.n_jobs,
-            )
-            raw_window_featurizer_seconds += time.perf_counter() - raw_window_featurizer_start
-            raw_window_featurizer_count += 1
-            raw_window_featurizer_signature_count += len(signature_order.signature_ids)
-
-        for local_start_index in range(0, len(query_plan_window), query_batch_size):
-            query_batch = query_plan_window[local_start_index : local_start_index + query_batch_size]
-            batch_raw_candidate_plan = None
-            batch_raw_window_featurizer = None
-            if raw_candidate_plan is not None:
-                raw_window_subset_start = time.perf_counter()
-                batch_raw_candidate_plan = runtime_module.subset_raw_candidate_plan_for_query_ids(
-                    raw_candidate_plan,
-                    query_batch,
-                    zero_plan_timings=True,
+        rust_module = feature_port._require_rust_runtime() if use_windowed_raw_plan else None
+        for plan_start_index in range(0, len(unassigned_signature_ids), plan_window_size):
+            query_plan_window = unassigned_signature_ids[plan_start_index : plan_start_index + plan_window_size]
+            raw_candidate_plan: Mapping[str, Any] | None = None
+            raw_window_featurizer: Any | None = None
+            if use_windowed_raw_plan:
+                raw_window_start = time.perf_counter()
+                assert rust_module is not None
+                raw_candidate_plan = rust_module.raw_block_query_candidate_plan_arrow(
+                    arrow_path_payload,
+                    list(query_plan_window),
+                    top_k=int(artifact.metadata.retrieval_top_k),
+                    query_view="auto",
+                    orcid_enabled=bool(orcid_enabled),
+                    num_threads=clusterer.n_jobs,
+                    max_exemplars=4,
+                    include_seed_assignments=bool(partial_supervision),
                 )
-                raw_window_subset_seconds += time.perf_counter() - raw_window_subset_start
-                batch_raw_window_featurizer = raw_window_featurizer
-            result = runtime_module.predict_incremental_link_or_abstain_from_raw_arrow_paths(
-                clusterer,
-                artifact,
-                arrow_paths=arrow_path_payload,
-                query_signature_ids=query_batch,
-                top_k=int(artifact.metadata.retrieval_top_k),
-                partial_supervision=partial_supervision,
-                runtime_context=runtime_context,
-                n_jobs=clusterer.n_jobs,
-                total_ram_bytes=resolved_total_ram_bytes,
-                load_name_counts=False,
-                name_tuples=name_tuples,
-                orcid_enabled=orcid_enabled,
-                raw_candidate_plan=batch_raw_candidate_plan,
-                rust_featurizer=batch_raw_window_featurizer,
-            )
-            linked_signature_clusters.update(dict(result.linked_signature_clusters))
-            batch_telemetries.append(dict(result.telemetry))
-            batch_sizes.append(len(query_batch))
+                raw_window_plan_seconds += time.perf_counter() - raw_window_start
+                raw_window_plan_count += 1
+                raw_window_plan_query_count += len(query_plan_window)
+                for key, value in _raw_window_plan_telemetry_fields(raw_candidate_plan).items():
+                    if isinstance(value, int | float) and not isinstance(value, bool):
+                        raw_window_plan_telemetry[key] = float(raw_window_plan_telemetry.get(key, 0.0)) + float(value)
+                    else:
+                        raw_window_plan_telemetry.setdefault(key, value)
+                raw_window_featurizer_start = time.perf_counter()
+                signature_order = runtime_module.feature_block_signature_order_from_raw_candidate_plan(
+                    raw_candidate_plan
+                )
+                raw_window_featurizer = feature_port.build_rust_featurizer_from_arrow_paths(
+                    arrow_path_payload,
+                    signature_ids=signature_order.signature_ids,
+                    name_tuples=name_tuples,
+                    load_name_counts=runtime_module._clusterer_uses_name_count_features(clusterer),  # noqa: SLF001
+                    preprocess=True,
+                    compute_reference_features=False,
+                    num_threads=clusterer.n_jobs,
+                )
+                raw_window_featurizer_seconds += time.perf_counter() - raw_window_featurizer_start
+                raw_window_featurizer_count += 1
+                raw_window_featurizer_signature_count += len(signature_order.signature_ids)
 
-    merged_telemetry = merge_promoted_incremental_batch_telemetry(
-        batch_telemetries,
-        batch_sizes=batch_sizes,
-        configured_batch_size=batching_threshold,
-    )
-    merged_telemetry.setdefault("seed_signature_count", int(len(cluster_seeds_require)))
-    merged_telemetry.setdefault("seed_component_count", int(len(cluster_seeds_require_inverse)))
-    merged_telemetry.setdefault("raw_arrow_seed_signature_count", int(len(cluster_seeds_require)))
-    merged_telemetry.setdefault("raw_arrow_seed_component_count", int(len(cluster_seeds_require_inverse)))
-    finish_start = time.perf_counter()
-    predicted_clusters = clusterer._finish_incremental_with_seed_links(
-        unassigned_signature_ids,
-        dataset,
-        linked_signature_clusters,
-        recluster_map,
-        cluster_seeds_require_inverse,
-        prevent_new_incompatibilities,
-        partial_supervision,
-        runtime_context,
-        total_ram_bytes=resolved_total_ram_bytes,
-        arrow_paths=arrow_path_payload,
-    )
-    finish_seconds = time.perf_counter() - finish_start
-    residual_phase_b_telemetry = dict(getattr(clusterer, "_last_incremental_residual_phase_b_telemetry", {}) or {})
-    residual_count = sum(
-        1 for signature_id in unassigned_signature_ids if signature_id not in linked_signature_clusters
-    )
-    phase_b_required_bytes = residual_count * (residual_count - 1) // 2 * 8
-    payload = build_incremental_result(
-        predicted_clusters,
-        phase_b_mode="exact",
-        phase_b_budget_bytes=phase_b_required_bytes,
-        phase_b_required_bytes=phase_b_required_bytes,
-        phase_b_residual_count=residual_count,
-    )
-    payload["incremental_linker_artifact_path"] = str(artifact_dir)
-    payload["incremental_linker_query_view"] = "raw_arrow"
-    payload["incremental_linker_telemetry"] = {
-        **seed_setup_telemetry,
-        **merged_telemetry,
-        **residual_phase_b_telemetry,
-        "incremental_finish_seconds": float(finish_seconds),
-        "seed_arrow_assignment_seconds": float(seed_arrow_assignment_seconds),
-        "seed_arrow_reused_source": int(bool(seed_arrow_reused_source)),
-        "arrow_promoted_incremental": 1,
-        "arrow_path_count": len(arrow_path_payload),
-        "raw_arrow_window_plan_count": int(raw_window_plan_count),
-        "raw_arrow_window_plan_query_count": int(raw_window_plan_query_count),
-        "raw_arrow_window_plan_seconds": float(raw_window_plan_seconds),
-        "raw_arrow_window_featurizer_count": int(raw_window_featurizer_count),
-        "raw_arrow_window_featurizer_signature_count": int(raw_window_featurizer_signature_count),
-        "raw_arrow_window_featurizer_seconds": float(raw_window_featurizer_seconds),
-        "raw_arrow_window_subset_seconds": float(raw_window_subset_seconds),
-    }
-    return payload
+            for local_start_index in range(0, len(query_plan_window), query_batch_size):
+                query_batch = query_plan_window[local_start_index : local_start_index + query_batch_size]
+                batch_raw_candidate_plan = None
+                batch_raw_window_featurizer = None
+                if raw_candidate_plan is not None:
+                    raw_window_subset_start = time.perf_counter()
+                    batch_raw_candidate_plan = runtime_module.subset_raw_candidate_plan_for_query_ids(
+                        raw_candidate_plan,
+                        query_batch,
+                        zero_plan_timings=True,
+                    )
+                    raw_window_subset_seconds += time.perf_counter() - raw_window_subset_start
+                    batch_raw_window_featurizer = raw_window_featurizer
+                result = runtime_module.predict_incremental_link_or_abstain_from_raw_arrow_paths(
+                    clusterer,
+                    artifact,
+                    arrow_paths=arrow_path_payload,
+                    query_signature_ids=query_batch,
+                    top_k=int(artifact.metadata.retrieval_top_k),
+                    partial_supervision=partial_supervision,
+                    runtime_context=runtime_context,
+                    n_jobs=clusterer.n_jobs,
+                    total_ram_bytes=resolved_total_ram_bytes,
+                    load_name_counts=runtime_module._clusterer_uses_name_count_features(clusterer),  # noqa: SLF001
+                    name_tuples=name_tuples,
+                    orcid_enabled=orcid_enabled,
+                    raw_candidate_plan=batch_raw_candidate_plan,
+                    rust_featurizer=batch_raw_window_featurizer,
+                )
+                linked_signature_clusters.update(dict(result.linked_signature_clusters))
+                batch_telemetries.append(dict(result.telemetry))
+                batch_sizes.append(len(query_batch))
+
+        merged_telemetry = merge_promoted_incremental_batch_telemetry(
+            batch_telemetries,
+            batch_sizes=batch_sizes,
+            configured_batch_size=batching_threshold,
+        )
+        merged_telemetry.setdefault("seed_signature_count", int(len(cluster_seeds_require)))
+        merged_telemetry.setdefault("seed_component_count", int(len(cluster_seeds_require_inverse)))
+        merged_telemetry.setdefault("raw_arrow_seed_signature_count", int(len(cluster_seeds_require)))
+        merged_telemetry.setdefault("raw_arrow_seed_component_count", int(len(cluster_seeds_require_inverse)))
+        finish_start = time.perf_counter()
+        predicted_clusters = clusterer._finish_incremental_with_seed_links(
+            unassigned_signature_ids,
+            dataset,
+            linked_signature_clusters,
+            recluster_map,
+            cluster_seeds_require_inverse,
+            prevent_new_incompatibilities,
+            partial_supervision,
+            runtime_context,
+            total_ram_bytes=resolved_total_ram_bytes,
+            arrow_paths=arrow_path_payload,
+        )
+        finish_seconds = time.perf_counter() - finish_start
+        residual_phase_b_telemetry = dict(getattr(clusterer, "_last_incremental_residual_phase_b_telemetry", {}) or {})
+        residual_count = sum(
+            1 for signature_id in unassigned_signature_ids if signature_id not in linked_signature_clusters
+        )
+        phase_b_required_bytes = residual_count * (residual_count - 1) // 2 * 8
+        payload = build_incremental_result(
+            predicted_clusters,
+            phase_b_mode="exact",
+            phase_b_budget_bytes=phase_b_required_bytes,
+            phase_b_required_bytes=phase_b_required_bytes,
+            phase_b_residual_count=residual_count,
+        )
+        payload["incremental_linker_artifact_path"] = str(artifact_dir)
+        payload["incremental_linker_query_view"] = "raw_arrow"
+        payload["incremental_linker_telemetry"] = {
+            **seed_setup_telemetry,
+            **merged_telemetry,
+            **residual_phase_b_telemetry,
+            **raw_window_plan_telemetry,
+            "incremental_finish_seconds": float(finish_seconds),
+            "seed_arrow_assignment_seconds": float(seed_arrow_assignment_seconds),
+            "seed_arrow_reused_source": int(bool(seed_arrow_reused_source)),
+            "arrow_promoted_incremental": 1,
+            "arrow_path_count": len(arrow_path_payload),
+            "raw_arrow_window_plan_count": int(raw_window_plan_count),
+            "raw_arrow_window_plan_query_count": int(raw_window_plan_query_count),
+            "raw_arrow_window_plan_seconds": float(raw_window_plan_seconds),
+            "raw_arrow_window_featurizer_count": int(raw_window_featurizer_count),
+            "raw_arrow_window_featurizer_signature_count": int(raw_window_featurizer_signature_count),
+            "raw_arrow_window_featurizer_seconds": float(raw_window_featurizer_seconds),
+            "raw_arrow_window_subset_seconds": float(raw_window_subset_seconds),
+        }
+        return payload
+    finally:
+        if arrow_path_bundle is not None:
+            arrow_path_bundle.close()

@@ -196,8 +196,10 @@ def run_rebuild_stress(
     if int(rss_sample_ms) <= 0:
         raise ValueError("rss_sample_ms must be positive")
 
-    os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
     os.environ.setdefault("S2AND_BACKEND", "rust")
+    from s2and.text import set_fasttext_loading_enabled
+
+    set_fasttext_loading_enabled(False)
     paths = _dataset_paths(dataset)
     _validate_paths(paths)
     s2and_rust_module = _import_rust_module()

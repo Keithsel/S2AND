@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from s2and import feature_port, memory_budget
+from s2and import feature_port, memory_budget, rust_calls
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.thread_config import resolve_n_jobs
@@ -337,6 +337,17 @@ def _chunk_plan_pairs(plan: memory_budget.RustBatchChunkPlan) -> int:
     return int(plan.chunk_pairs)
 
 
+def resolve_linker_pairwise_featurizer(
+    dataset: ANDData | None,
+    featurizer: Any | None,
+    *,
+    runtime_context: Any | None = None,
+) -> Any:
+    """Return the Rust featurizer used for linker pairwise array APIs."""
+
+    return rust_calls._resolve_featurizer(dataset, featurizer, runtime_context)  # noqa: SLF001
+
+
 def iter_candidate_batch_pair_feature_chunks_rust(
     dataset: ANDData | None,
     candidate_batch: LinkerCandidateBatch,
@@ -371,13 +382,7 @@ def iter_candidate_batch_pair_feature_chunks_rust(
             total_ram_bytes=total_ram_bytes,
         )
     chunk_pairs = _chunk_plan_pairs(plan)
-    if featurizer is None:
-        if dataset is None:
-            raise ValueError("dataset is required when featurizer is not provided")
-        featurizer = feature_port._get_rust_featurizer(  # noqa: SLF001
-            dataset,
-            runtime_context=runtime_context,
-        )
+    featurizer = resolve_linker_pairwise_featurizer(dataset, featurizer, runtime_context=runtime_context)
 
     for start in range(0, candidate_batch.pair_count, chunk_pairs):
         stop = min(candidate_batch.pair_count, start + chunk_pairs)

@@ -68,18 +68,6 @@ Operational behavior:
   process do not re-read SQLite; large cache-enabled runs can therefore still consume substantial
   RAM
 
-### Legacy JSON Compatibility
-
-Older S2AND versions wrote pair features to:
-
-```text
-<S2AND_CACHE>/<dataset>/<featurizer_version>/all_features.json
-```
-
-Current code still reads that file for compatibility. If a legacy JSON cache is loaded and the
-cache is later written, S2AND migrates those entries into `pair_features.sqlite3`. After that, the
-SQLite database is the authoritative persistent cache.
-
 ## Rust Featurizer Caches
 
 The Rust featurizer has two distinct reuse mechanisms.
@@ -107,9 +95,8 @@ Implications:
 
 This cache is separate from `use_cache`. It is an input-artifact cache, not a featurization cache.
 
-Remote artifacts are keyed by URL plus the server validator. Current releases namespace validators as
-`etag:<value>` or `last-modified:<value>` before hashing. For compatibility, S2AND still probes the
-pre-0.50 raw-ETag filename before downloading.
+Remote artifacts are keyed by URL plus the server validator. Validators are namespaced as
+`etag:<value>` or `last-modified:<value>` before hashing.
 
 ## Interaction with Rust Batch Featurization
 

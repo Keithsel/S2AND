@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
 import pytest
 
-from s2and import feature_port, memory_budget
+from s2and import feature_port, memory_budget, rust_calls
 from s2and.feature_port import build_pair_feature_matrix_rust
 from s2and.incremental_linking import linker_pairwise
 from tests.helpers import build_dummy_dataset, import_s2and_rust
@@ -63,6 +65,45 @@ def _candidate_batch_from_index_arrays(
     )
 
 
+def test_pairwise_featurizer_resolver_prefers_explicit_featurizer() -> None:
+    featurizer = object()
+
+    resolved = linker_pairwise.resolve_linker_pairwise_featurizer(None, featurizer)
+
+    assert resolved is featurizer
+
+
+def test_pairwise_featurizer_resolver_delegates_to_shared_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    dataset = object()
+    runtime_context = object()
+    featurizer = object()
+    captured: dict[str, object | None] = {}
+
+    def fake_resolve_featurizer(
+        dataset_arg: object | None,
+        featurizer_arg: object | None,
+        runtime_context_arg: object | None,
+    ) -> object:
+        captured["dataset"] = dataset_arg
+        captured["featurizer"] = featurizer_arg
+        captured["runtime_context"] = runtime_context_arg
+        return featurizer
+
+    monkeypatch.setattr(rust_calls, "_resolve_featurizer", fake_resolve_featurizer)
+
+    resolved = linker_pairwise.resolve_linker_pairwise_featurizer(
+        cast(Any, dataset), None, runtime_context=runtime_context
+    )
+
+    assert resolved is featurizer
+    assert captured == {"dataset": dataset, "featurizer": None, "runtime_context": runtime_context}
+
+
+def test_pairwise_featurizer_resolver_requires_dataset_without_featurizer() -> None:
+    with pytest.raises(ValueError, match="dataset is required"):
+        linker_pairwise.resolve_linker_pairwise_featurizer(None, None)
+
+
 def test_combined_array_feature_wrapper_passes_separate_nan_policies() -> None:
     calls: list[tuple[float, float]] = []
 
@@ -93,7 +134,7 @@ def test_combined_array_feature_wrapper_passes_separate_nan_policies() -> None:
 
     matrix, counts, valid_counts, sums, mins, maxs = (
         feature_port.build_linker_pair_features_and_aggregate_stats_arrays_rust(
-            object(),
+            cast(Any, object()),
             np.asarray([0, 1], dtype=np.uint32),
             np.asarray([1, 2], dtype=np.uint32),
             np.asarray([0, 0], dtype=np.uint32),
@@ -130,7 +171,7 @@ def test_combined_array_feature_wrapper_rejects_outdated_aggregate_contract() ->
 
     with pytest.raises(RuntimeError, match="outdated aggregate contract"):
         feature_port.build_linker_pair_features_and_aggregate_stats_arrays_rust(
-            object(),
+            cast(Any, object()),
             np.asarray([0], dtype=np.uint32),
             np.asarray([1], dtype=np.uint32),
             np.asarray([0], dtype=np.uint32),
@@ -149,7 +190,7 @@ def test_combined_array_feature_wrapper_rejects_non_tuple_aggregate_contract() -
 
     with pytest.raises(RuntimeError, match="outdated aggregate contract"):
         feature_port.build_linker_pair_features_and_aggregate_stats_arrays_rust(
-            object(),
+            cast(Any, object()),
             np.asarray([0], dtype=np.uint32),
             np.asarray([1], dtype=np.uint32),
             np.asarray([0], dtype=np.uint32),
@@ -168,7 +209,7 @@ def test_combined_array_feature_wrapper_raises_rust_errors() -> None:
 
     with pytest.raises(ValueError, match="bad rows"):
         feature_port.build_linker_pair_features_and_aggregate_stats_arrays_rust(
-            object(),
+            cast(Any, object()),
             np.asarray([0], dtype=np.uint32),
             np.asarray([1], dtype=np.uint32),
             np.asarray([0], dtype=np.uint32),
@@ -194,7 +235,7 @@ def test_combined_array_feature_wrapper_passes_result_arrays_through() -> None:
 
     matrix, counts, valid_counts, sums, mins, maxs = (
         feature_port.build_linker_pair_features_and_aggregate_stats_arrays_rust(
-            object(),
+            cast(Any, object()),
             np.asarray([0], dtype=np.uint32),
             np.asarray([1], dtype=np.uint32),
             np.asarray([0], dtype=np.uint32),
@@ -484,7 +525,7 @@ def test_candidate_batch_aggregates_use_array_api(monkeypatch: pytest.MonkeyPatc
 
     assert call_sizes == [2, 1]
     assert stats.counts.tolist() == [2, 1]
-    assert candidate_batch.labels.tolist() == [1, 0]
+    assert cast(Any, candidate_batch.labels).tolist() == [1, 0]
     assert candidate_batch.row_component_keys == ("c0", "c1")
 
 

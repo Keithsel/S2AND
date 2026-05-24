@@ -101,6 +101,7 @@ def test_build_rust_json_ingest_contract_accepts_service_shaped_dataset():
         clusters_path = None
         cluster_seeds_path = None
         specter_embeddings_path = None
+        specter_embeddings: dict[str, list[float]] | None = None
         preprocess = True
         compute_reference_features = False
 

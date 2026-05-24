@@ -5,7 +5,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 import scripts.convert_to_arrow as convert_to_arrow
+from s2and.incremental_linking.feature_block import write_arrow_ipc_table
 from scripts.convert_to_arrow import RuntimeDatasetSources
 
 
@@ -17,6 +20,42 @@ def _fake_sources(tmp_path: Path, dataset: str) -> RuntimeDatasetSources:
         signatures_path=source_dir / f"{dataset}_signatures.json",
         papers_path=source_dir / f"{dataset}_papers.json",
     )
+
+
+def test_benchmark_parser_requires_explicit_dataset_selection(tmp_path: Path) -> None:
+    parser = convert_to_arrow._build_parser()
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(
+            [
+                "benchmark",
+                "--source-root",
+                str(tmp_path / "source"),
+                "--output-root",
+                str(tmp_path / "out"),
+            ]
+        )
+
+    assert excinfo.value.code == 2
+
+
+def test_linker_replay_parser_requires_explicit_dataset_selection(tmp_path: Path) -> None:
+    parser = convert_to_arrow._build_parser()
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(
+            [
+                "linker-replay",
+                "--raw-root",
+                str(tmp_path / "raw"),
+                "--embeddings-root",
+                str(tmp_path / "embeddings"),
+                "--output-root",
+                str(tmp_path / "out"),
+            ]
+        )
+
+    assert excinfo.value.code == 2
 
 
 def test_benchmark_main_overwrite_name_counts_index_rebuilds_shared_index_once(
@@ -100,30 +139,80 @@ def test_benchmark_main_overwrite_does_not_force_name_counts_index_rebuild(
     assert [call["overwrite_name_counts_index"] for call in calls] == [False, False]
 
 
-def test_root_manifest_normalizes_existing_benchmark_reports(
+def test_benchmark_main_run_full_discovers_datasets_only_when_explicit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_convert_runtime_dataset_to_arrow(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {"dataset": kwargs["sources"].dataset}
+
+    monkeypatch.setattr(convert_to_arrow, "discover_benchmark_datasets", lambda _source_root: ["first", "second"])
+    monkeypatch.setattr(
+        convert_to_arrow, "benchmark_dataset_sources", lambda _source_root, dataset: _fake_sources(tmp_path, dataset)
+    )
+    monkeypatch.setattr(convert_to_arrow, "convert_runtime_dataset_to_arrow", fake_convert_runtime_dataset_to_arrow)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "convert_to_arrow.py",
+            "benchmark",
+            "--source-root",
+            str(tmp_path / "source"),
+            "--output-root",
+            str(tmp_path / "out"),
+            "--run-full",
+            "--skip-validation",
+        ],
+    )
+
+    convert_to_arrow.main()
+
+    assert [call["sources"].dataset for call in calls] == ["first", "second"]
+
+
+def test_root_manifest_rejects_existing_benchmark_reports(
     tmp_path: Path,
 ) -> None:
     output_root = tmp_path / "out"
     output_root.mkdir()
+    legacy_manifest = {
+        "output_root": str(output_root),
+        "reports": [{"dataset": "existing", "paths": {"manifest": "existing/manifest.json"}}],
+    }
     (output_root / "manifest.json").write_text(
-        json.dumps(
-            {
-                "output_root": str(output_root),
-                "reports": [{"dataset": "existing", "paths": {"manifest": "existing/manifest.json"}}],
-            }
-        ),
+        json.dumps(legacy_manifest),
         encoding="utf-8",
     )
 
     dataset_dir = output_root / "new"
     dataset_dir.mkdir()
-    convert_to_arrow._upsert_root_manifest(output_root, dataset_name="new", dataset_dir=dataset_dir)
+
+    with pytest.raises(ValueError, match="unsupported schema"):
+        convert_to_arrow._upsert_root_manifest(output_root, dataset_name="new", dataset_dir=dataset_dir)
 
     root_manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
-    assert root_manifest["schema"] == "inference_arrow_bundle_v1"
-    assert "reports" not in root_manifest
-    assert root_manifest["datasets"] == ["existing", "new"]
-    assert [entry["dataset"] for entry in root_manifest["dataset_manifests"]] == ["existing", "new"]
+    assert root_manifest == legacy_manifest
+
+
+def test_root_manifest_upsert_keeps_dataset_order_stable(tmp_path: Path) -> None:
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    for dataset_name in ("b", "a"):
+        dataset_dir = output_root / dataset_name
+        dataset_dir.mkdir()
+        (dataset_dir / "manifest.json").write_text("{}", encoding="utf-8")
+        convert_to_arrow._upsert_root_manifest(output_root, dataset_name=dataset_name, dataset_dir=dataset_dir)
+
+    dataset_dir = output_root / "a"
+    convert_to_arrow._upsert_root_manifest(output_root, dataset_name="a", dataset_dir=dataset_dir)
+
+    root_manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
+    assert root_manifest["datasets"] == ["a", "b"]
+    assert [entry["dataset"] for entry in root_manifest["dataset_manifests"]] == ["a", "b"]
 
 
 def test_linker_replay_main_writes_datasets_under_release_root(
@@ -170,3 +259,208 @@ def test_linker_replay_main_writes_datasets_under_release_root(
     assert calls[0]["output_dir"] == tmp_path / "linker_replay_20260513" / "datasets" / "pubmed"
     assert calls[0]["root_manifest_dir"] == tmp_path / "linker_replay_20260513"
     assert calls[0]["selected_embedding"] == "specter2"
+
+
+def test_linker_replay_main_run_full_discovers_datasets_only_when_explicit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_linker_sources(_raw_root: Path, _embeddings_root: Path, dataset: str) -> RuntimeDatasetSources:
+        return RuntimeDatasetSources(
+            dataset=dataset,
+            source_dir=tmp_path / "raw" / dataset,
+            signatures_path=tmp_path / "raw" / dataset / "signatures.json",
+            papers_path=tmp_path / "raw" / dataset / "papers.json",
+            specter2_path=tmp_path / "embeddings" / dataset / "specter2.pkl",
+        )
+
+    def fake_convert_runtime_dataset_to_arrow(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {"dataset": kwargs["sources"].dataset}
+
+    monkeypatch.setattr(
+        convert_to_arrow, "discover_linker_replay_datasets", lambda _raw_root, _embeddings_root: ["pubmed"]
+    )
+    monkeypatch.setattr(convert_to_arrow, "linker_replay_dataset_sources", fake_linker_sources)
+    monkeypatch.setattr(convert_to_arrow, "convert_runtime_dataset_to_arrow", fake_convert_runtime_dataset_to_arrow)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "convert_to_arrow.py",
+            "linker-replay",
+            "--raw-root",
+            str(tmp_path / "raw"),
+            "--embeddings-root",
+            str(tmp_path / "embeddings"),
+            "--output-root",
+            str(tmp_path / "linker_replay_20260513"),
+            "--run-full",
+            "--skip-validation",
+        ],
+    )
+
+    convert_to_arrow.main()
+
+    assert [call["sources"].dataset for call in calls] == ["pubmed"]
+
+
+def test_validate_manifest_require_embeddings_rejects_missing_specter_rows(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signatures_path = tmp_path / "signatures.arrow"
+    papers_path = tmp_path / "papers.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter_path = tmp_path / "specter.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1", "s2"], type=pa.string()),
+                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1", "p2"], type=pa.string())}), papers_path)
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+                "position": pa.array([0, 0], type=pa.int64()),
+            }
+        ),
+        paper_authors_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([0.1, 0.2], type=pa.float32()), 2),
+            }
+        ),
+        specter_path,
+    )
+
+    manifest = {
+        "paths": {
+            "signatures": str(signatures_path),
+            "papers": str(papers_path),
+            "paper_authors": str(paper_authors_path),
+            "specter": str(specter_path),
+        },
+        "signature_count": 2,
+        "paper_count": 2,
+    }
+
+    with pytest.raises(ValueError, match="require_embeddings=True.*p2"):
+        convert_to_arrow.validate_arrow_dataset_manifest(
+            manifest,
+            require_embeddings=True,
+            require_name_counts_index=False,
+        )
+
+
+def test_validate_arrow_dataset_dir_resolves_relative_manifest_paths() -> None:
+    pytest.importorskip("pyarrow")
+    fixture = Path("tests/fixtures/arrow/pubmed_specter2/pubmed")
+
+    metrics = convert_to_arrow.validate_arrow_dataset_dir(
+        fixture,
+        require_embeddings=True,
+        require_name_counts_index=True,
+    )
+
+    assert metrics["signature_count"] == 2871
+    assert metrics["name_counts_index_present"] is True
+
+
+def test_validate_arrow_dataset_manifest_rejects_integer_id_columns(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    signatures_path = tmp_path / "signatures.arrow"
+    papers_path = tmp_path / "papers.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array([1], type=pa.int64()),
+                "paper_id": pa.array(["p1"], type=pa.string()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), papers_path)
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "position": pa.array([0], type=pa.int64()),
+            }
+        ),
+        paper_authors_path,
+    )
+
+    with pytest.raises(ValueError, match="expected string"):
+        convert_to_arrow.validate_arrow_dataset_manifest(
+            {
+                "paths": {
+                    "signatures": str(signatures_path),
+                    "papers": str(papers_path),
+                    "paper_authors": str(paper_authors_path),
+                }
+            },
+            require_embeddings=False,
+            require_name_counts_index=False,
+        )
+
+
+def test_validate_arrow_dataset_manifest_requires_batch_index_sidecar(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    signatures_path = tmp_path / "signatures.arrow"
+    papers_path = tmp_path / "papers.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1"], type=pa.string()),
+                "paper_id": pa.array(["p1"], type=pa.string()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), papers_path)
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "position": pa.array([0], type=pa.int64()),
+            }
+        ),
+        paper_authors_path,
+    )
+    manifest = {
+        "paths": {
+            "signatures": str(signatures_path),
+            "papers": str(papers_path),
+            "paper_authors": str(paper_authors_path),
+        },
+        "physical_layout": {
+            "tables": {
+                "signatures": {
+                    "key": "signature_id",
+                    "batch_index_path_key": "signatures_batch_index",
+                    "batch_index_present": True,
+                    "max_record_batch_rows": 16384,
+                    "actual_max_batch_rows": 1,
+                }
+            }
+        },
+    }
+
+    with pytest.raises(FileNotFoundError, match="signatures_batch_index"):
+        convert_to_arrow.validate_arrow_dataset_manifest(
+            manifest,
+            require_embeddings=False,
+            require_name_counts_index=False,
+        )

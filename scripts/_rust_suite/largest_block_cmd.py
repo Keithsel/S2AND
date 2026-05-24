@@ -261,11 +261,13 @@ def _run_single(
 
     os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
     os.environ["S2AND_BACKEND"] = backend
-    os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
 
     import s2and.model as model_module
     from s2and.data import ANDData
     from s2and.production_model import load_production_model
+    from s2and.text import set_fasttext_loading_enabled
+
+    set_fasttext_loading_enabled(False)
 
     resolved_model_path = _resolve_path(model_path)
     resolved_data_root = _resolve_path(data_root)

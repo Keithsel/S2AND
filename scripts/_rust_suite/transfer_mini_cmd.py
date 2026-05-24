@@ -355,7 +355,6 @@ def _single_run(
 ) -> dict[str, Any]:
     os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
     os.environ["S2AND_BACKEND"] = backend
-    os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
 
     rust_extension_identity: dict[str, Any] | None = None
     if backend == "rust":
@@ -368,6 +367,9 @@ def _single_run(
     from hyperopt import hp
 
     from s2and.consts import DEFAULT_CHUNK_SIZE, FEATURIZER_VERSION, NAME_COUNTS_PATH
+    from s2and.text import set_fasttext_loading_enabled
+
+    set_fasttext_loading_enabled(False)
     from s2and.data import ANDData
     from s2and.eval import cluster_eval
     from s2and.featurizer import FeaturizationInfo, featurize

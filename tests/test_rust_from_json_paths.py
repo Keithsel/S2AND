@@ -40,7 +40,6 @@ def _load_stress_module():
 def _force_python_backend(monkeypatch):
     """Ensure all tests run with the Python backend and skip fastText."""
     monkeypatch.setenv("S2AND_BACKEND", "python")
-    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
 
 
 def _load_dataset_from_dir(data_dir: str, name: str, *, compute_reference_features: bool) -> ANDData:

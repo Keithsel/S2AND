@@ -8,8 +8,9 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 # When this module is executed directly (including via the compare-mode subprocess
 # path), ensure `scripts/` is importable so `import _rust_suite.*` works.
@@ -298,8 +299,10 @@ def _load_truth_bundle_inputs(args: argparse.Namespace) -> dict[str, Any]:
     retrieval_rank = pd.to_numeric(labels["retrieval_rank"], errors="coerce")
     bad_retrieval_rank = retrieval_rank.isna()
     if bool(bad_retrieval_rank.any()):
-        examples = labels.loc[bad_retrieval_rank, ["query_group_id", "source_key", "retrieval_rank"]].head(5).to_dict(
-            "records"
+        examples = (
+            labels.loc[bad_retrieval_rank, ["query_group_id", "source_key", "retrieval_rank"]]
+            .head(5)
+            .to_dict("records")
         )
         raise ValueError(
             "Truth labels contain invalid retrieval_rank values: "
@@ -347,9 +350,11 @@ def _load_truth_bundle_inputs(args: argparse.Namespace) -> dict[str, Any]:
     member_index = pd.to_numeric(members["member_index"], errors="coerce")
     bad_member_index = member_index.isna()
     if bool(bad_member_index.any()):
-        examples = members.loc[bad_member_index, ["candidate_component_key", "member_index", "signature_id"]].head(
-            5
-        ).to_dict("records")
+        examples = (
+            members.loc[bad_member_index, ["candidate_component_key", "member_index", "signature_id"]]
+            .head(5)
+            .to_dict("records")
+        )
         raise ValueError(
             "Truth component members contain invalid member_index values: "
             f"invalid={int(bad_member_index.sum())} examples={examples}"
@@ -624,26 +629,32 @@ def _set_runtime_env(
     *,
     backend: str,
     n_jobs: int,
-) -> dict[str, str | None]:
+) -> tuple[dict[str, str | None], bool]:
     if backend not in {"python", "rust", "auto"}:
         raise ValueError(f"Unsupported backend={backend}")
+    from s2and import text as s2and_text
+
     prior_values = {
         "S2AND_BACKEND": os.environ.get("S2AND_BACKEND"),
-        "S2AND_SKIP_FASTTEXT": os.environ.get("S2AND_SKIP_FASTTEXT"),
         "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
     }
+    prior_fasttext_loading_enabled = s2and_text.fasttext_loading_enabled()
     os.environ["S2AND_BACKEND"] = backend
-    os.environ["S2AND_SKIP_FASTTEXT"] = "1"
     os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
-    return prior_values
+    s2and_text.set_fasttext_loading_enabled(False)
+    return prior_values, prior_fasttext_loading_enabled
 
 
-def _restore_runtime_env(prior_values: dict[str, str | None]) -> None:
+def _restore_runtime_env(prior_state: tuple[dict[str, str | None], bool]) -> None:
+    prior_values, prior_fasttext_loading_enabled = prior_state
     for name, prior_value in prior_values.items():
         if prior_value is None:
             os.environ.pop(name, None)
         else:
             os.environ[name] = prior_value
+    from s2and import text as s2and_text
+
+    s2and_text.set_fasttext_loading_enabled(prior_fasttext_loading_enabled)
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -873,14 +884,17 @@ def _run_single_impl(args: argparse.Namespace) -> dict[str, Any]:
         clusterer.n_jobs = int(args.n_jobs)
 
         predict_start = time.perf_counter()
-        incremental_result = clusterer.predict_incremental(
-            selected_signature_ids,
-            anddata,
-            batching_threshold=int(args.batching_threshold),
-            total_ram_bytes=int(args.total_ram_bytes),
+        incremental_result = cast(
+            dict[str, Any],
+            clusterer.predict_incremental(
+                selected_signature_ids,
+                anddata,
+                batching_threshold=int(args.batching_threshold),
+                total_ram_bytes=int(args.total_ram_bytes),
+            ),
         )
-        pred_clusters = incremental_result["clusters"]
-        promoted_telemetry = dict(incremental_result.get("incremental_linker_telemetry", {}))
+        pred_clusters = cast(dict[str, list[str]], incremental_result["clusters"])
+        promoted_telemetry = dict(cast(Mapping[str, Any], incremental_result.get("incremental_linker_telemetry", {})))
         predict_seconds = time.perf_counter() - predict_start
 
     truth_quality = _evaluate_truth_link_quality(pred_clusters, truth_context) if truth_context is not None else None
@@ -1129,11 +1143,15 @@ def _run_compare_promoted(args: argparse.Namespace) -> dict[str, Any]:
 
     partition_diff = _partition_diff_summary(legacy_python_result, promoted_rust_result)
     runtime_delta = _runtime_delta_summary(legacy_python_result, promoted_rust_result)
-    legacy_quality = legacy_python_result.get("truth_quality")
-    promoted_quality = promoted_rust_result.get("truth_quality")
-    quality_evidence_available = isinstance(legacy_quality, dict) and isinstance(promoted_quality, dict)
+    legacy_quality_raw = legacy_python_result.get("truth_quality")
+    promoted_quality_raw = promoted_rust_result.get("truth_quality")
+    legacy_quality = legacy_quality_raw if isinstance(legacy_quality_raw, dict) else None
+    promoted_quality = promoted_quality_raw if isinstance(promoted_quality_raw, dict) else None
+    quality_evidence_available = legacy_quality is not None and promoted_quality is not None
     quality_delta: dict[str, Any] | None = None
     if quality_evidence_available:
+        assert legacy_quality is not None
+        assert promoted_quality is not None
         quality_delta = {
             "link_precision_delta": (
                 None
@@ -1226,6 +1244,8 @@ def _run_compare_promoted(args: argparse.Namespace) -> dict[str, Any]:
         f"{summary['signature_partition_denominator']}"
     )
     if quality_evidence_available:
+        assert legacy_quality is not None
+        assert promoted_quality is not None
         print(
             "7. Truth-bundle quality (legacy -> promoted): "
             f"F1={legacy_quality.get('link_f1')} -> {promoted_quality.get('link_f1')} | "

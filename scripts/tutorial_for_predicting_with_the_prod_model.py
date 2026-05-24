@@ -145,7 +145,10 @@ def main() -> None:
         type=int,
         choices=[0, 1],
         default=0,
-        help="Set 1 to enable pair-feature/Rust featurizer cache during prediction.",
+        help=(
+            "Set 1 to enable the persistent pair-feature SQLite cache during cache-aware prediction paths. "
+            "Same-process Rust featurizer reuse is independent of this flag."
+        ),
     )
     parser.add_argument(
         "--warm-rust-featurizer-before-predict",

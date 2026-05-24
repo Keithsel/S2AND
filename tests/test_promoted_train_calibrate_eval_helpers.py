@@ -982,6 +982,7 @@ def test_minimal_raw_materialization_skips_tables_empty_after_dataset_filter(
         max_top_k=1,
         reuse_existing_features=False,
         rust_build_path=None,
+        name_counts_path=None,
         allow_normalization_version_mismatch=False,
         pairwise_model_nan_value=float("nan"),
         pairwise_aggregate_nan_value=0.0,

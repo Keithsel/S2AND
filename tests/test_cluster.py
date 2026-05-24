@@ -75,6 +75,11 @@ class TestClusterer(unittest.TestCase):
         )
         self.assertIsNone(constraint)
 
+    def test_cluster_one_block_empty_returns_no_labels(self):
+        labels = self.dummy_clusterer._cluster_one_block([], np.zeros((0, 0)), None, self.dummy_dataset, set())
+
+        self.assertEqual(labels, [])
+
     def test_make_distance_matrix_fastcluster(self):
         block = {
             "a sattar": ["0", "1", "2"],
@@ -154,7 +159,7 @@ class TestClusterer(unittest.TestCase):
             "a sattar": ["0", "1"],
         }
 
-        with pytest.raises(ValueError, match="cluster_seeds_disallow cannot be enforced"):
+        with pytest.raises(ValueError, match="cluster_seeds_disallow.*precomputed dists"):
             self.dummy_clusterer.predict_from_rust_featurizer(
                 block,
                 object(),

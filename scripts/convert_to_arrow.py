@@ -1,4 +1,8 @@
-"""Convert S2AND runtime inputs into direct-Rust Arrow artifacts."""
+"""Convert S2AND runtime inputs into direct-Rust Arrow artifacts.
+
+The runtime bundle writer emits bounded Arrow IPC file-format tables plus the
+current S2AND raw-planner batch-index sidecars (S2ABI001).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +14,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,6 +75,25 @@ def _replace_json(path: Path, payload: Any) -> None:
         raise
 
 
+def _resolve_manifest_path(path_value: Any, base_dir: Path | None) -> Path:
+    path = Path(str(path_value))
+    if path.is_absolute() or base_dir is None:
+        return path
+    return base_dir / path
+
+
+def _manifest_relative_path(path_value: Any, manifest_dir: Path) -> str:
+    path = Path(str(path_value))
+    try:
+        return os.path.relpath(str(path.resolve()), str(manifest_dir.resolve()))
+    except ValueError:
+        return str(path)
+
+
+def _portable_manifest_paths(paths: Mapping[str, Any], manifest_dir: Path) -> dict[str, str]:
+    return {str(key): _manifest_relative_path(value, manifest_dir) for key, value in paths.items()}
+
+
 class _RootManifestLock:
     """Small same-directory lock for root manifest read-modify-write."""
 
@@ -79,43 +102,66 @@ class _RootManifestLock:
         self.attempts = attempts
         self.sleep_seconds = sleep_seconds
         self._fd: int | None = None
+        self._payload: str | None = None
+
+    def _try_create_lock_file(self) -> bool:
+        payload = f"{os.getpid()}\n"
+        fd: int | None = None
+        try:
+            fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, payload.encode("ascii"))
+        except FileExistsError:
+            return False
+        except Exception:
+            self.path.unlink(missing_ok=True)
+            raise
+        finally:
+            if fd is not None:
+                os.close(fd)
+        self._payload = payload
+        return True
 
     def __enter__(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
         for attempt in range(1, self.attempts + 1):
-            try:
-                self._fd = os.open(str(self.path), flags)
-                os.write(self._fd, str(os.getpid()).encode("ascii"))
+            if self._try_create_lock_file():
+                self._fd = None
                 return
-            except FileExistsError as exc:
-                if _remove_dead_pid_lock(self.path):
-                    try:
-                        self._fd = os.open(str(self.path), flags)
-                        os.write(self._fd, str(os.getpid()).encode("ascii"))
-                        return
-                    except FileExistsError:
-                        pass
-                if attempt == self.attempts:
-                    lock_pid = _lock_pid(self.path)
-                    pid_context = f" held by pid {lock_pid}" if lock_pid is not None else ""
-                    raise TimeoutError(
-                        f"timed out waiting for root manifest lock {self.path}{pid_context} "
-                        f"after {self.attempts} attempts; remove the lock file if no converter is running"
-                    ) from exc
-                time.sleep(self.sleep_seconds)
+            if _remove_dead_pid_lock(self.path) and self._try_create_lock_file():
+                self._fd = None
+                return
+            if attempt == self.attempts:
+                lock_pid = _lock_pid(self.path)
+                pid_context = f" held by pid {lock_pid}" if lock_pid is not None else ""
+                raise TimeoutError(
+                    f"timed out waiting for root manifest lock {self.path}{pid_context} "
+                    f"after {self.attempts} attempts; remove the lock file if no converter is running"
+                )
+            time.sleep(self.sleep_seconds)
 
     def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
-        self.path.unlink(missing_ok=True)
+        if self._payload is None:
+            return
+        try:
+            current_payload = self.path.read_text(encoding="ascii")
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        if current_payload == self._payload:
+            self.path.unlink(missing_ok=True)
+        self._payload = None
 
 
 def _lock_pid(path: Path) -> int | None:
     try:
-        raw_pid = path.read_text(encoding="ascii").strip()
+        raw_pid = path.read_text(encoding="ascii").splitlines()[0].strip()
     except OSError:
+        return None
+    except IndexError:
         return None
     if not raw_pid:
         return None
@@ -150,8 +196,20 @@ def _pid_is_running(pid: int) -> bool:
 
 
 def _remove_dead_pid_lock(path: Path) -> bool:
-    pid = _lock_pid(path)
-    if pid is not None and _pid_is_running(pid):
+    try:
+        raw_pid = path.read_text(encoding="ascii").splitlines()[0].strip()
+    except OSError:
+        return False
+    except IndexError:
+        raw_pid = ""
+    if raw_pid:
+        try:
+            pid = int(raw_pid)
+        except ValueError:
+            pid = None
+    else:
+        pid = None
+    if pid is not None and pid > 0 and _pid_is_running(pid):
         return False
     try:
         path.unlink()
@@ -197,12 +255,11 @@ def _root_manifest_entries_from_manifest(
         if not isinstance(raw_entries, Sequence) or isinstance(raw_entries, str | bytes):
             raise ValueError(f"existing root manifest dataset_manifests must be a list: {root_manifest_path}")
         entries = _validated_root_manifest_entries(raw_entries, root_manifest_path)
-    elif "reports" in root_manifest:
-        if "source_path" in root_manifest:
-            raise ValueError(f"existing root manifest uses legacy source_path/reports fields: {root_manifest_path}")
-        entries = _legacy_report_entries(root_manifest, root_manifest_path)
     else:
-        raise ValueError(f"existing root manifest has unsupported schema: {root_manifest_path}")
+        raise ValueError(
+            "existing root manifest has unsupported schema "
+            f"{root_manifest.get('schema')!r}; expected {ROOT_MANIFEST_SCHEMA!r}: {root_manifest_path}"
+        )
     return entries
 
 
@@ -231,31 +288,6 @@ def _validated_root_manifest_entries(raw_entries: Any, root_manifest_path: Path)
     return entries
 
 
-def _legacy_report_entries(root_manifest: Mapping[str, Any], root_manifest_path: Path) -> list[dict[str, str]]:
-    raw_reports = root_manifest.get("reports")
-    if not isinstance(raw_reports, Sequence) or isinstance(raw_reports, str | bytes):
-        raise ValueError(f"legacy root manifest reports must be a list: {root_manifest_path}")
-    output_root = Path(str(root_manifest.get("output_root") or root_manifest_path.parent))
-    entries: list[dict[str, str]] = []
-    for index, raw_report in enumerate(raw_reports):
-        if not isinstance(raw_report, Mapping):
-            raise ValueError(f"legacy root manifest reports[{index}] must be an object: {root_manifest_path}")
-        if raw_report.get("dataset") is None:
-            raise ValueError(f"legacy root manifest reports[{index}] is missing dataset: {root_manifest_path}")
-        dataset = str(raw_report["dataset"])
-        dataset_dir = output_root / dataset
-        paths = raw_report.get("paths") if isinstance(raw_report.get("paths"), Mapping) else {}
-        manifest_path = paths.get("manifest") if isinstance(paths, Mapping) else None
-        entries.append(
-            {
-                "dataset": dataset,
-                "dataset_dir": str(dataset_dir),
-                "manifest_path": str(manifest_path or dataset_dir / "manifest.json"),
-            }
-        )
-    return entries
-
-
 def _upsert_root_manifest(output_root: Path, *, dataset_name: str, dataset_dir: Path) -> None:
     root_manifest_path = output_root / "manifest.json"
     lock_path = root_manifest_path.with_suffix(root_manifest_path.suffix + ".lock")
@@ -264,10 +296,11 @@ def _upsert_root_manifest(output_root: Path, *, dataset_name: str, dataset_dir: 
         dataset_manifests.append(
             {
                 "dataset": dataset_name,
-                "dataset_dir": str(dataset_dir),
-                "manifest_path": str(dataset_dir / "manifest.json"),
+                "dataset_dir": _manifest_relative_path(dataset_dir, output_root),
+                "manifest_path": _manifest_relative_path(dataset_dir / "manifest.json", output_root),
             }
         )
+        dataset_manifests.sort(key=lambda entry: entry["dataset"])
         _replace_json(
             root_manifest_path,
             {
@@ -693,6 +726,7 @@ def convert_service_json_to_arrow(
         write_name_counts_index_seconds = time.perf_counter() - start
         paths["name_counts_index"] = name_counts_index_path
 
+    manifest_paths = _portable_manifest_paths(paths, output_dir)
     manifest = {
         "schema": FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION,
         "dataset": dataset_name,
@@ -705,7 +739,7 @@ def convert_service_json_to_arrow(
         "cluster_seeds_disallow_count": len(dataset.cluster_seeds_disallow),
         "altered_cluster_signature_count": len(altered),
         "altered_cluster_signatures": altered,
-        "paths": paths,
+        "paths": manifest_paths,
         "physical_layout": physical_layout,
         "raw_planner_batch_indexes": raw_planner_index_metrics,
         "name_counts_index": name_counts_index_metrics,
@@ -723,6 +757,7 @@ def convert_service_json_to_arrow(
             manifest,
             require_embeddings=specter_embeddings is not None,
             require_name_counts_index=not skip_name_counts_index,
+            base_dir=output_dir,
         )
     _write_json(output_dir / "manifest.json", manifest)
     _upsert_root_manifest(output_root, dataset_name=dataset_name, dataset_dir=output_dir)
@@ -858,6 +893,7 @@ def convert_runtime_dataset_to_arrow(
         write_name_counts_index_seconds = time.perf_counter() - start
         paths["name_counts_index"] = name_counts_index_path
 
+    manifest_paths = _portable_manifest_paths(paths, output_dir)
     manifest = {
         "schema": FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION,
         "dataset": dataset_name,
@@ -866,7 +902,7 @@ def convert_runtime_dataset_to_arrow(
         "signature_count": len(dataset.signatures),
         "paper_count": len(dataset.papers),
         "cluster_count": len(dataset.clusters or {}),
-        "paths": paths,
+        "paths": manifest_paths,
         "specter": specter_reports,
         "physical_layout": physical_layout,
         "raw_planner_batch_indexes": raw_planner_index_metrics,
@@ -884,6 +920,7 @@ def convert_runtime_dataset_to_arrow(
             manifest,
             require_embeddings=sources.specter_path is not None or sources.specter2_path is not None,
             require_name_counts_index=not skip_name_counts_index,
+            base_dir=output_dir,
         )
     _write_json(output_dir / "manifest.json", manifest)
     _upsert_root_manifest(root_manifest_dir, dataset_name=dataset_name, dataset_dir=output_dir)
@@ -895,6 +932,38 @@ def _read_arrow_table(path: str | Path) -> Any:
 
     with pa.memory_map(str(path), "r") as source:
         return pa.ipc.open_file(source).read_all()
+
+
+def _ensure_arrow_column_type(table: Any, column: str, predicate: Callable[[Any], bool], expected: str) -> None:
+    field_index = table.schema.get_field_index(column)
+    if field_index < 0:
+        raise KeyError(f"Arrow table is missing required column {column!r}")
+    field_type = table.schema.field(field_index).type
+    if not predicate(field_type):
+        raise ValueError(f"Arrow column {column!r} expected {expected}, got {field_type}")
+
+
+def _ensure_string_column(table: Any, column: str) -> None:
+    import pyarrow as pa
+
+    _ensure_arrow_column_type(table, column, pa.types.is_string, "string")
+
+
+def _ensure_integer_column(table: Any, column: str) -> None:
+    import pyarrow as pa
+
+    _ensure_arrow_column_type(table, column, pa.types.is_integer, "integer")
+
+
+def _ensure_specter_embedding_column(table: Any) -> None:
+    import pyarrow as pa
+
+    field_index = table.schema.get_field_index("embedding")
+    if field_index < 0:
+        raise KeyError("Arrow table is missing required column 'embedding'")
+    field_type = table.schema.field(field_index).type
+    if not (pa.types.is_fixed_size_list(field_type) and pa.types.is_float32(field_type.value_type)):
+        raise ValueError(f"Arrow column 'embedding' expected fixed_size_list<float32>, got {field_type}")
 
 
 def _table_values(table: Any, column: str) -> list[Any]:
@@ -931,12 +1000,13 @@ def validate_arrow_dataset_manifest(
     *,
     require_embeddings: bool,
     require_name_counts_index: bool,
+    base_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Validate the generated Arrow tables and return compact audit metrics."""
 
     if not isinstance(manifest.get("paths"), Mapping):
         raise ValueError("manifest is missing paths")
-    paths = {str(key): str(value) for key, value in manifest["paths"].items()}
+    paths = {str(key): str(_resolve_manifest_path(value, base_dir)) for key, value in manifest["paths"].items()}
     required_paths = ["signatures", "papers", "paper_authors"]
     if require_embeddings:
         required_paths.append("specter")
@@ -949,6 +1019,11 @@ def validate_arrow_dataset_manifest(
     signatures = _read_arrow_table(paths["signatures"])
     papers = _read_arrow_table(paths["papers"])
     paper_authors = _read_arrow_table(paths["paper_authors"])
+    _ensure_string_column(signatures, "signature_id")
+    _ensure_string_column(signatures, "paper_id")
+    _ensure_string_column(papers, "paper_id")
+    _ensure_string_column(paper_authors, "paper_id")
+    _ensure_integer_column(paper_authors, "position")
     signature_ids = [str(value) for value in _table_values(signatures, "signature_id")]
     signature_paper_ids = [str(value) for value in _table_values(signatures, "paper_id")]
     paper_ids = [str(value) for value in _table_values(papers, "paper_id")]
@@ -981,16 +1056,25 @@ def validate_arrow_dataset_manifest(
 
     if require_embeddings:
         specter = _read_arrow_table(paths["specter"])
+        _ensure_string_column(specter, "paper_id")
+        _ensure_specter_embedding_column(specter)
         specter_paper_ids = [str(value) for value in _table_values(specter, "paper_id")]
         _ensure_unique(specter_paper_ids, label="specter.paper_id")
         missing_embeddings = sorted(set(signature_paper_ids) - set(specter_paper_ids))
-        if missing_embeddings:
-            raise ValueError(f"specter is missing embeddings for referenced paper ids: {missing_embeddings[:10]}")
         metrics["specter_count"] = int(specter.num_rows)
+        metrics["missing_specter_paper_count"] = int(len(missing_embeddings))
+        metrics["missing_specter_paper_examples"] = missing_embeddings[:10]
+        if missing_embeddings:
+            raise ValueError(
+                "require_embeddings=True but specter Arrow is missing embeddings for referenced "
+                f"paper ids: {missing_embeddings[:10]}"
+            )
 
     cluster_seed_path = paths.get("cluster_seeds")
     if cluster_seed_path is not None and Path(cluster_seed_path).exists():
         cluster_seeds = _read_arrow_table(cluster_seed_path)
+        _ensure_string_column(cluster_seeds, "signature_id")
+        _ensure_string_column(cluster_seeds, "cluster_id")
         seed_signature_ids = [str(value) for value in _table_values(cluster_seeds, "signature_id")]
         seed_cluster_ids = [str(value) for value in _table_values(cluster_seeds, "cluster_id")]
         _ensure_unique(seed_signature_ids, label="cluster_seeds.signature_id")
@@ -1005,6 +1089,8 @@ def validate_arrow_dataset_manifest(
     disallow_path = paths.get("cluster_seed_disallows")
     if disallow_path is not None and Path(disallow_path).exists():
         disallows = _read_arrow_table(disallow_path)
+        _ensure_string_column(disallows, "signature_id_1")
+        _ensure_string_column(disallows, "signature_id_2")
         left_ids = [str(value) for value in _table_values(disallows, "signature_id_1")]
         right_ids = [str(value) for value in _table_values(disallows, "signature_id_2")]
         _ensure_subset(left_ids, signature_id_set, label="cluster_seed_disallows.signature_id_1")
@@ -1022,6 +1108,7 @@ def validate_arrow_dataset_manifest(
     altered_path = paths.get("altered_cluster_signatures")
     if altered_path is not None and Path(altered_path).exists():
         altered = _read_arrow_table(altered_path)
+        _ensure_string_column(altered, "signature_id")
         altered_signature_ids = [str(value) for value in _table_values(altered, "signature_id")]
         _ensure_unique(altered_signature_ids, label="altered_cluster_signatures.signature_id")
         _ensure_subset(altered_signature_ids, signature_id_set, label="altered_cluster_signatures.signature_id")
@@ -1041,17 +1128,50 @@ def validate_arrow_dataset_manifest(
 
     physical_layout = manifest.get("physical_layout")
     if isinstance(physical_layout, Mapping):
+        from s2and.incremental_linking.feature_block import (
+            RAW_PLANNER_ARROW_KEY_COLUMNS,
+            write_arrow_batch_lookup_index,
+        )
+
         tables = physical_layout.get("tables", {})
         if isinstance(tables, Mapping):
             for table_name, raw_layout in tables.items():
                 if not isinstance(raw_layout, Mapping):
                     raise ValueError(f"physical_layout.tables.{table_name} must be an object")
+                table_key = str(table_name)
                 max_rows = int(raw_layout.get("max_record_batch_rows", 0))
                 actual_max_rows = int(raw_layout.get("actual_max_batch_rows", 0))
                 if max_rows > 0 and actual_max_rows > max_rows:
                     raise ValueError(
                         f"physical_layout.tables.{table_name} exceeds max batch rows: "
                         f"{actual_max_rows} > {max_rows}"
+                    )
+                if bool(raw_layout.get("batch_index_present", False)):
+                    if table_key not in paths:
+                        raise FileNotFoundError(
+                            f"physical_layout.tables.{table_name} has batch_index_present but manifest.paths "
+                            f"is missing {table_key!r}"
+                        )
+                    index_key = str(raw_layout.get("batch_index_path_key") or f"{table_key}_batch_index")
+                    if index_key not in paths:
+                        raise FileNotFoundError(
+                            f"physical_layout.tables.{table_name} has batch_index_present but manifest.paths "
+                            f"is missing {index_key!r}"
+                        )
+                    if not Path(paths[index_key]).exists():
+                        raise FileNotFoundError(
+                            f"physical_layout.tables.{table_name} batch index is missing: {paths[index_key]}"
+                        )
+                    key_column = str(raw_layout.get("key") or RAW_PLANNER_ARROW_KEY_COLUMNS.get(table_key, ""))
+                    if not key_column:
+                        raise ValueError(f"physical_layout.tables.{table_name} is missing key for batch index")
+                    write_arrow_batch_lookup_index(
+                        paths[table_key],
+                        paths[index_key],
+                        key_column=key_column,
+                        table_name=table_key,
+                        max_record_batch_rows=max_rows if max_rows > 0 else None,
+                        overwrite=False,
                     )
     return metrics
 
@@ -1069,6 +1189,7 @@ def validate_arrow_dataset_dir(
         manifest,
         require_embeddings=require_embeddings,
         require_name_counts_index=require_name_counts_index,
+        base_dir=dataset_dir,
     )
 
 
@@ -1105,10 +1226,29 @@ def _run_service_json(args: argparse.Namespace) -> None:
     _print_report(report)
 
 
+def _selected_runtime_dataset_names(
+    *,
+    datasets: Sequence[str] | None,
+    run_full: bool,
+    discover: Callable[[], Sequence[str]],
+    command: str,
+) -> list[str]:
+    if datasets is not None:
+        return [str(dataset) for dataset in datasets]
+    if run_full:
+        return [str(dataset) for dataset in discover()]
+    raise ValueError(f"{command} requires --datasets DATASET... for a bounded run or --run-full for full discovery")
+
+
 def _run_benchmark(args: argparse.Namespace) -> None:
     output_root = args.output_root
     output_root.mkdir(parents=True, exist_ok=True)
-    dataset_names = [str(dataset) for dataset in (args.datasets or discover_benchmark_datasets(args.source_root))]
+    dataset_names = _selected_runtime_dataset_names(
+        datasets=getattr(args, "datasets", None),
+        run_full=bool(getattr(args, "run_full", False)),
+        discover=lambda: discover_benchmark_datasets(args.source_root),
+        command="benchmark",
+    )
     if not dataset_names:
         raise ValueError(f"No benchmark datasets found under {args.source_root}")
     name_counts_index_overwritten = False
@@ -1140,10 +1280,12 @@ def _run_linker_replay(args: argparse.Namespace) -> None:
     output_root = args.output_root
     datasets_root = output_root / "datasets"
     datasets_root.mkdir(parents=True, exist_ok=True)
-    dataset_names = [
-        str(dataset)
-        for dataset in (args.datasets or discover_linker_replay_datasets(args.raw_root, args.embeddings_root))
-    ]
+    dataset_names = _selected_runtime_dataset_names(
+        datasets=getattr(args, "datasets", None),
+        run_full=bool(getattr(args, "run_full", False)),
+        discover=lambda: discover_linker_replay_datasets(args.raw_root, args.embeddings_root),
+        command="linker-replay",
+    )
     if not dataset_names:
         raise ValueError(f"No linker replay datasets found under {args.raw_root}")
     name_counts_index_overwritten = False
@@ -1200,6 +1342,21 @@ def _add_common_runtime_args(parser: argparse.ArgumentParser, *, default_n_jobs:
     parser.add_argument("--skip-validation", action="store_true")
 
 
+def _add_runtime_dataset_selection_args(parser: argparse.ArgumentParser) -> None:
+    dataset_selection = parser.add_mutually_exclusive_group(required=True)
+    dataset_selection.add_argument(
+        "--datasets",
+        nargs="+",
+        default=None,
+        help="Convert only the named datasets.",
+    )
+    dataset_selection.add_argument(
+        "--run-full",
+        action="store_true",
+        help="Discover and convert every eligible dataset under the configured roots.",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1215,7 +1372,7 @@ def _build_parser() -> argparse.ArgumentParser:
     benchmark = subparsers.add_parser("benchmark", help="Convert benchmark dataset JSON/pickle files.")
     benchmark.add_argument("--source-root", type=Path, default=Path("s2and/data/s2and_mini"))
     benchmark.add_argument("--output-root", type=Path, default=Path("s2and/data/s2and_mini_arrow"))
-    benchmark.add_argument("--datasets", nargs="*", default=None)
+    _add_runtime_dataset_selection_args(benchmark)
     _add_common_runtime_args(benchmark, default_n_jobs=20)
     benchmark.set_defaults(func=_run_benchmark)
 
@@ -1223,7 +1380,7 @@ def _build_parser() -> argparse.ArgumentParser:
     linker_replay.add_argument("--raw-root", type=Path, required=True)
     linker_replay.add_argument("--embeddings-root", type=Path, required=True)
     linker_replay.add_argument("--output-root", type=Path, required=True)
-    linker_replay.add_argument("--datasets", nargs="*", default=None)
+    _add_runtime_dataset_selection_args(linker_replay)
     _add_common_runtime_args(linker_replay, default_n_jobs=20)
     linker_replay.set_defaults(func=_run_linker_replay)
 

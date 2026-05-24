@@ -2,14 +2,20 @@ import json
 import logging
 import os
 import random
+import time
 from collections import Counter, defaultdict
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from itertools import combinations
+from types import SimpleNamespace
+from typing import Any
 
 import genieclust
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import MultiLabelBinarizer
 
 from s2and.consts import _PACKAGE_DATA_DIR, SPECTER_DIM
@@ -28,6 +34,98 @@ with open(os.path.join(_PACKAGE_DATA_DIR, "first_k_letter_counts_from_orcid.json
     FIRST_K_LETTER_COUNTS = json.load(f)
 
 
+def normalize_orcid_for_subblocking(value: Any) -> str | None:
+    """Return the canonical ORCID key used by Rust Arrow subblocking inputs.
+
+    This mirrors Rust's `normalize_orcid_owned(...)`: keep digits and `X`/`x`,
+    require exactly 16 ORCID characters, uppercase the check digit, and format
+    the result with hyphens.
+    """
+
+    if value is None:
+        return None
+    compact = []
+    for char in str(value).strip():
+        if char.isascii() and char.isdigit():
+            compact.append(char)
+        elif char in {"X", "x"}:
+            compact.append("X")
+    if len(compact) != 16:
+        return None
+    if any(not char.isdigit() for char in compact[:15]):
+        return None
+    if not (compact[15].isdigit() or compact[15] == "X"):
+        return None
+    normalized = "".join(compact)
+    return f"{normalized[0:4]}-{normalized[4:8]}-{normalized[8:12]}-{normalized[12:16]}"
+
+
+@dataclass(frozen=True)
+class GraphSubblockingConfig:
+    """Configuration for the experimental graph fallback used by subblocking."""
+
+    neighbor_mode: str = "projection"
+    neighbors: int = 16
+    min_edge_score: float = 0.30
+    specter_weight: float = 1.0
+    coauthor_weight: float = 0.35
+    affiliation_weight: float = 0.20
+    max_exact_knn_group_size: int = 25_000
+    projection_count: int = 12
+    projection_window: int = 12
+    max_candidate_edges: int = 5_000_000
+    pack_components: bool = True
+    component_pack_strategy: str = "edge-greedy"
+    sparse_evidence_edges: bool = False
+    sparse_evidence_max_posting_size: int = 64
+    sparse_evidence_neighbors: int = 4
+    sparse_evidence_min_weight: float = 0.20
+    sparse_evidence_include_coauthors: bool = True
+    sparse_evidence_include_affiliations: bool = True
+    component_pack_top_k: int = 8
+    local_move_passes: int = 0
+    adaptive_projection: bool = False
+    adaptive_projection_max_group_size: int = 5_000
+    adaptive_projection_count: int = 24
+    adaptive_projection_window: int = 24
+
+
+class _UnionFind:
+    """Capacity-constrained union find for graph components."""
+
+    def __init__(self, size: int) -> None:
+        self.parent = list(range(size))
+        self.component_size = [1] * size
+
+    def find(self, item: int) -> int:
+        parent = self.parent[item]
+        if parent != item:
+            self.parent[item] = self.find(parent)
+        return self.parent[item]
+
+    def union_if_capacity(self, left: int, right: int, maximum_size: int) -> bool:
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root == right_root:
+            return False
+        merged_size = self.component_size[left_root] + self.component_size[right_root]
+        if merged_size > maximum_size:
+            return False
+        if self.component_size[left_root] < self.component_size[right_root]:
+            left_root, right_root = right_root, left_root
+        self.parent[right_root] = left_root
+        self.component_size[left_root] = merged_size
+        return True
+
+
+@dataclass(frozen=True)
+class _SignatureEvidence:
+    """Metadata evidence used while scoring candidate graph edges."""
+
+    coauthor_blocks: frozenset[str]
+    affiliation_keys: frozenset[str]
+
+
 def signature_affiliation_feature_keys(signature) -> list[str]:
     if signature.author_info_affiliations_n_grams is not None:
         return list(signature.author_info_affiliations_n_grams.keys())
@@ -39,6 +137,1299 @@ def signature_affiliation_feature_keys(signature) -> list[str]:
         return []
     ngrams = get_text_ngrams_words(" ".join(tokens), stopwords=set())
     return list(ngrams.keys())
+
+
+def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _signature_evidence(
+    signature, anddata=None, compute_block_fn: Callable[[str], str] = compute_block
+) -> _SignatureEvidence:
+    if anddata is None:
+        coauthor_blocks = signature.author_info_coauthor_blocks or ()
+    else:
+        coauthor_blocks = _signature_coauthor_blocks_for_specter(signature, anddata, compute_block_fn)
+    return _SignatureEvidence(
+        coauthor_blocks=frozenset(str(value) for value in coauthor_blocks if value),
+        affiliation_keys=frozenset(signature_affiliation_feature_keys(signature)),
+    )
+
+
+def _embedding_matrix(signature_ids: Sequence[str], anddata, *, dimension: int = SPECTER_DIM) -> np.ndarray:
+    first_embedding = next(iter(getattr(anddata, "specter_embeddings", {}).values()), None)
+    if first_embedding is not None:
+        dimension = int(np.asarray(first_embedding).shape[0])
+    matrix = np.zeros((len(signature_ids), int(dimension)), dtype=np.float32)
+    for row_index, signature_id in enumerate(signature_ids):
+        signature = anddata.signatures[str(signature_id)]
+        embedding = getattr(anddata, "specter_embeddings", {}).get(str(signature.paper_id))
+        if embedding is not None:
+            matrix[row_index, :] = np.asarray(embedding, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1)
+    nonzero = norms > 0
+    matrix[nonzero] /= norms[nonzero, None]
+    return matrix
+
+
+def _weighted_edge_score(
+    cosine_similarity: float,
+    left_evidence: _SignatureEvidence,
+    right_evidence: _SignatureEvidence,
+    config: GraphSubblockingConfig,
+) -> float:
+    return (
+        config.specter_weight * cosine_similarity
+        + config.coauthor_weight * _jaccard(left_evidence.coauthor_blocks, right_evidence.coauthor_blocks)
+        + config.affiliation_weight * _jaccard(left_evidence.affiliation_keys, right_evidence.affiliation_keys)
+    )
+
+
+def _prune_edge_scores(edge_scores: dict[tuple[int, int], float], max_candidate_edges: int) -> None:
+    if max_candidate_edges <= 0 or len(edge_scores) <= max_candidate_edges:
+        return
+    strongest = sorted(edge_scores.items(), key=lambda item: item[1], reverse=True)[:max_candidate_edges]
+    edge_scores.clear()
+    edge_scores.update(strongest)
+
+
+def _score_candidate_edge(
+    edge_scores: dict[tuple[int, int], float],
+    *,
+    left_index: int,
+    right_index: int,
+    matrix: np.ndarray,
+    evidences: Sequence[_SignatureEvidence],
+    config: GraphSubblockingConfig,
+) -> None:
+    if left_index == right_index:
+        return
+    left = min(left_index, right_index)
+    right = max(left_index, right_index)
+    cosine_similarity = max(0.0, float(np.dot(matrix[left], matrix[right])))
+    score = _weighted_edge_score(cosine_similarity, evidences[left], evidences[right], config)
+    if score < config.min_edge_score:
+        return
+    current = edge_scores.get((left, right))
+    if current is None or score > current:
+        edge_scores[(left, right)] = score
+
+
+def _score_candidate_edge_from_cosine(
+    edge_scores: dict[tuple[int, int], float],
+    *,
+    left_index: int,
+    right_index: int,
+    cosine_similarity: float,
+    evidences: Sequence[_SignatureEvidence],
+    config: GraphSubblockingConfig,
+) -> None:
+    score = _weighted_edge_score(max(0.0, cosine_similarity), evidences[left_index], evidences[right_index], config)
+    if score < config.min_edge_score:
+        return
+    current = edge_scores.get((left_index, right_index))
+    if current is None or score > current:
+        edge_scores[(left_index, right_index)] = score
+
+
+def _exact_neighbor_edge_scores(
+    matrix: np.ndarray,
+    evidences: Sequence[_SignatureEvidence],
+    config: GraphSubblockingConfig,
+) -> dict[tuple[int, int], float]:
+    neighbor_count = min(matrix.shape[0], max(2, int(config.neighbors) + 1))
+    nearest = NearestNeighbors(n_neighbors=neighbor_count, metric="cosine", algorithm="brute")
+    distances, indices = nearest.fit(matrix).kneighbors(matrix)
+    edge_scores: dict[tuple[int, int], float] = {}
+    for left_index in range(matrix.shape[0]):
+        for distance, right_index_raw in zip(distances[left_index], indices[left_index], strict=True):
+            right_index = int(right_index_raw)
+            if right_index == left_index:
+                continue
+            left = min(left_index, right_index)
+            right = max(left_index, right_index)
+            cosine_similarity = max(0.0, 1.0 - float(distance))
+            score = _weighted_edge_score(cosine_similarity, evidences[left], evidences[right], config)
+            if score < config.min_edge_score:
+                continue
+            current = edge_scores.get((left, right))
+            if current is None or score > current:
+                edge_scores[(left, right)] = score
+    return edge_scores
+
+
+def _projection_neighbor_edge_scores(
+    matrix: np.ndarray,
+    evidences: Sequence[_SignatureEvidence],
+    config: GraphSubblockingConfig,
+    *,
+    seed: int,
+) -> dict[tuple[int, int], float]:
+    if config.projection_count <= 0:
+        raise ValueError("Graph subblocking projection_count must be positive")
+    if config.projection_window <= 0:
+        raise ValueError("Graph subblocking projection_window must be positive")
+    rng = np.random.default_rng(seed)
+    projection_vectors = rng.standard_normal(
+        (matrix.shape[1], int(config.projection_count)),
+        dtype=np.float32,
+    )
+    projection_norms = np.linalg.norm(projection_vectors, axis=0)
+    nonzero = projection_norms > 0
+    projection_vectors[:, nonzero] /= projection_norms[nonzero]
+    projection_scores = matrix @ projection_vectors
+    edge_scores: dict[tuple[int, int], float] = {}
+    window = int(config.projection_window)
+    score_chunk_size = 8192
+    pending_left = np.empty(score_chunk_size, dtype=np.int64)
+    pending_right = np.empty(score_chunk_size, dtype=np.int64)
+
+    def flush_pending(pending_size: int) -> int:
+        if pending_size == 0:
+            return 0
+        left_chunk = pending_left[:pending_size]
+        right_chunk = pending_right[:pending_size]
+        cosine_similarities = np.einsum("ij,ij->i", matrix[left_chunk], matrix[right_chunk])
+        for row_index, cosine_similarity in enumerate(cosine_similarities):
+            _score_candidate_edge_from_cosine(
+                edge_scores,
+                left_index=int(left_chunk[row_index]),
+                right_index=int(right_chunk[row_index]),
+                cosine_similarity=float(cosine_similarity),
+                evidences=evidences,
+                config=config,
+            )
+        return 0
+
+    for projection_index in range(projection_scores.shape[1]):
+        order = np.argsort(projection_scores[:, projection_index], kind="mergesort")
+        pending_size = 0
+        for position, left_index_raw in enumerate(order):
+            left_index = int(left_index_raw)
+            stop = min(len(order), position + window + 1)
+            for right_index_raw in order[position + 1 : stop]:
+                right_index = int(right_index_raw)
+                left = min(left_index, right_index)
+                right = max(left_index, right_index)
+                if (left, right) in edge_scores:
+                    continue
+                pending_left[pending_size] = left
+                pending_right[pending_size] = right
+                pending_size += 1
+                if pending_size == score_chunk_size:
+                    pending_size = flush_pending(pending_size)
+        flush_pending(pending_size)
+        _prune_edge_scores(edge_scores, int(config.max_candidate_edges))
+    return edge_scores
+
+
+def _add_sparse_evidence_edge_scores(
+    edge_scores: dict[tuple[int, int], float],
+    matrix: np.ndarray,
+    evidences: Sequence[_SignatureEvidence],
+    config: GraphSubblockingConfig,
+) -> dict[str, int]:
+    """Add bounded edges from rare shared coauthor/affiliation evidence."""
+
+    max_posting_size = int(config.sparse_evidence_max_posting_size)
+    if max_posting_size <= 1:
+        raise ValueError("Graph subblocking sparse_evidence_max_posting_size must be greater than 1")
+    neighbor_limit = int(config.sparse_evidence_neighbors)
+    if neighbor_limit < 0:
+        raise ValueError("Graph subblocking sparse_evidence_neighbors must be non-negative")
+    postings: dict[str, list[int]] = defaultdict(list)
+    for index, evidence in enumerate(evidences):
+        if config.sparse_evidence_include_coauthors:
+            for value in evidence.coauthor_blocks:
+                if value:
+                    postings[f"coauthor:{value}"].append(index)
+        if config.sparse_evidence_include_affiliations:
+            for value in evidence.affiliation_keys:
+                if value:
+                    postings[f"affiliation:{value}"].append(index)
+
+    features_considered = 0
+    features_skipped = 0
+    edge_count_before = len(edge_scores)
+    score_threshold = float(config.sparse_evidence_min_weight)
+    for indices in postings.values():
+        posting_size = len(indices)
+        if posting_size <= 1:
+            continue
+        if posting_size > max_posting_size:
+            features_skipped += 1
+            continue
+        features_considered += 1
+        sorted_indices = sorted(indices)
+        for left_offset, left_index in enumerate(sorted_indices):
+            right_indices = (
+                sorted_indices[left_offset + 1 :]
+                if neighbor_limit == 0
+                else sorted_indices[left_offset + 1 : left_offset + neighbor_limit + 1]
+            )
+            for right_index in right_indices:
+                left_evidence = evidences[left_index]
+                right_evidence = evidences[right_index]
+                cosine_similarity = max(0.0, float(np.dot(matrix[left_index], matrix[right_index])))
+                score = _weighted_edge_score(cosine_similarity, left_evidence, right_evidence, config)
+                if score < score_threshold:
+                    continue
+                left = min(left_index, right_index)
+                right = max(left_index, right_index)
+                current = edge_scores.get((left, right))
+                if current is None or score > current:
+                    edge_scores[(left, right)] = score
+        if int(config.max_candidate_edges) > 0 and len(edge_scores) > int(config.max_candidate_edges) * 2:
+            _prune_edge_scores(edge_scores, int(config.max_candidate_edges))
+    _prune_edge_scores(edge_scores, int(config.max_candidate_edges))
+    return {
+        "sparse_evidence_feature_count": int(features_considered),
+        "sparse_evidence_skipped_feature_count": int(features_skipped),
+        "sparse_evidence_added_edge_count": int(len(edge_scores) - edge_count_before),
+        "sparse_evidence_neighbors": int(config.sparse_evidence_neighbors),
+    }
+
+
+def _ordered_components_from_union(
+    signature_ids: Sequence[str],
+    uf: _UnionFind,
+) -> tuple[list[list[str]], list[int], dict[int, int]]:
+    root_by_index = [uf.find(index) for index in range(len(signature_ids))]
+    components_by_root: dict[int, list[str]] = defaultdict(list)
+    for index, signature_id in enumerate(signature_ids):
+        components_by_root[root_by_index[index]].append(str(signature_id))
+    roots = sorted(
+        components_by_root,
+        key=lambda root: (-len(components_by_root[root]), sorted(components_by_root[root])[0]),
+    )
+    component_id_by_root = {root: component_id for component_id, root in enumerate(roots)}
+    components = [sorted(components_by_root[root]) for root in roots]
+    return components, root_by_index, component_id_by_root
+
+
+def _pack_components_by_size(components: Sequence[Sequence[str]], target_subblock_size: int) -> list[list[str]]:
+    bins: list[list[str]] = []
+    bin_sizes: list[int] = []
+    for component in components:
+        component_size = len(component)
+        if component_size > target_subblock_size:
+            raise ValueError(
+                f"Graph component size {component_size} exceeds target_subblock_size={target_subblock_size}"
+            )
+        best_bin = None
+        best_remaining = None
+        for bin_index, bin_size in enumerate(bin_sizes):
+            remaining = target_subblock_size - bin_size
+            if component_size <= remaining and (best_remaining is None or remaining < best_remaining):
+                best_bin = bin_index
+                best_remaining = remaining
+        if best_bin is None:
+            bins.append(list(component))
+            bin_sizes.append(component_size)
+        else:
+            bins[best_bin].extend(component)
+            bin_sizes[best_bin] += component_size
+    return [sorted(values) for values in bins]
+
+
+def _component_adjacency(
+    edge_scores: Mapping[tuple[int, int], float],
+    root_by_index: Sequence[int],
+    component_id_by_root: Mapping[int, int],
+    *,
+    aggregate: bool = False,
+) -> dict[int, dict[int, float]]:
+    adjacency: dict[int, dict[int, float]] = defaultdict(dict)
+    for (left_index, right_index), score in edge_scores.items():
+        left_component = component_id_by_root[root_by_index[left_index]]
+        right_component = component_id_by_root[root_by_index[right_index]]
+        if left_component == right_component:
+            continue
+        current = adjacency[left_component].get(right_component)
+        if aggregate:
+            adjacency[left_component][right_component] = (current or 0.0) + score
+            adjacency[right_component][left_component] = adjacency[right_component].get(left_component, 0.0) + score
+        elif current is None or score > current:
+            adjacency[left_component][right_component] = score
+            adjacency[right_component][left_component] = score
+    return adjacency
+
+
+def _component_bin_affinity(
+    component_id: int,
+    bin_component_ids: Sequence[int],
+    adjacency: Mapping[int, Mapping[int, float]],
+    *,
+    top_k: int,
+) -> float:
+    scores = [
+        float(score)
+        for neighbor_component_id, score in adjacency.get(component_id, {}).items()
+        if neighbor_component_id in bin_component_ids
+    ]
+    if not scores:
+        return 0.0
+    if top_k > 0 and len(scores) > top_k:
+        scores = sorted(scores, reverse=True)[:top_k]
+    return float(sum(scores))
+
+
+def _component_affinities_to_bins(
+    component_id: int,
+    component_to_bin: Mapping[int, int],
+    adjacency: Mapping[int, Mapping[int, float]],
+    *,
+    top_k: int,
+) -> dict[int, float]:
+    scores_by_bin: dict[int, list[float]] = defaultdict(list)
+    for neighbor_component_id, score in adjacency.get(component_id, {}).items():
+        bin_index = component_to_bin.get(neighbor_component_id)
+        if bin_index is not None:
+            scores_by_bin[bin_index].append(float(score))
+    out: dict[int, float] = {}
+    for bin_index, scores in scores_by_bin.items():
+        if top_k > 0 and len(scores) > top_k:
+            scores = sorted(scores, reverse=True)[:top_k]
+        out[bin_index] = float(sum(scores))
+    return out
+
+
+def _pack_component_ids_greedy(
+    components: Sequence[Sequence[str]],
+    edge_scores: Mapping[tuple[int, int], float],
+    root_by_index: Sequence[int],
+    component_id_by_root: Mapping[int, int],
+    target_subblock_size: int,
+    config: GraphSubblockingConfig,
+) -> list[list[int]]:
+    use_aggregate = config.component_pack_strategy == "aggregate-greedy"
+    adjacency = _component_adjacency(edge_scores, root_by_index, component_id_by_root, aggregate=use_aggregate)
+    component_order = sorted(range(len(components)), key=lambda index: (-len(components[index]), components[index][0]))
+    bins: list[list[int]] = []
+    bin_sizes: list[int] = []
+    component_to_bin: dict[int, int] = {}
+    for component_id in component_order:
+        component = components[component_id]
+        component_size = len(component)
+        if component_size > target_subblock_size:
+            raise ValueError(
+                f"Graph component size {component_size} exceeds target_subblock_size={target_subblock_size}"
+            )
+
+        candidate_bins: dict[int, float] = {}
+        if use_aggregate:
+            affinities = _component_affinities_to_bins(
+                component_id,
+                component_to_bin,
+                adjacency,
+                top_k=int(config.component_pack_top_k),
+            )
+            for bin_index, affinity in affinities.items():
+                if bin_index >= len(bins) or bin_sizes[bin_index] + component_size > target_subblock_size:
+                    continue
+                if affinity > 0.0:
+                    candidate_bins[bin_index] = affinity
+        else:
+            for neighbor_component, score in adjacency.get(component_id, {}).items():
+                bin_index = component_to_bin.get(neighbor_component)
+                if bin_index is None or bin_sizes[bin_index] + component_size > target_subblock_size:
+                    continue
+                current = candidate_bins.get(bin_index)
+                if current is None or score > current:
+                    candidate_bins[bin_index] = score
+
+        if candidate_bins:
+            selected_bin = min(
+                candidate_bins,
+                key=lambda bin_index: (
+                    -candidate_bins[bin_index],
+                    target_subblock_size - (bin_sizes[bin_index] + component_size),
+                    bin_index,
+                ),
+            )
+        else:
+            selected_bin = None
+            selected_remaining = None
+            for bin_index, bin_size in enumerate(bin_sizes):
+                remaining = target_subblock_size - bin_size
+                if component_size <= remaining and (selected_remaining is None or remaining < selected_remaining):
+                    selected_bin = bin_index
+                    selected_remaining = remaining
+
+        if selected_bin is None:
+            selected_bin = len(bins)
+            bins.append([])
+            bin_sizes.append(0)
+        bins[selected_bin].append(component_id)
+        bin_sizes[selected_bin] += component_size
+        component_to_bin[component_id] = selected_bin
+
+    if int(config.local_move_passes) > 0:
+        bins = _local_move_component_bins(
+            components,
+            bins,
+            adjacency,
+            target_subblock_size,
+            passes=int(config.local_move_passes),
+            top_k=int(config.component_pack_top_k),
+        )
+    return bins
+
+
+def _component_ids_to_subblocks(
+    components: Sequence[Sequence[str]],
+    bins: Sequence[Sequence[int]],
+) -> list[list[str]]:
+    packed: list[list[str]] = []
+    for component_ids in bins:
+        values: list[str] = []
+        for component_id in sorted(component_ids, key=lambda index: components[index][0]):
+            values.extend(components[component_id])
+        packed.append(sorted(values))
+    return packed
+
+
+def _local_move_component_bins(
+    components: Sequence[Sequence[str]],
+    bins: Sequence[Sequence[int]],
+    adjacency: Mapping[int, Mapping[int, float]],
+    target_subblock_size: int,
+    *,
+    passes: int,
+    top_k: int,
+) -> list[list[int]]:
+    """Move raw components between bins when aggregate graph affinity improves."""
+
+    working_bins = [list(component_ids) for component_ids in bins]
+    bin_sizes = [sum(len(components[component_id]) for component_id in component_ids) for component_ids in working_bins]
+    for _pass_index in range(max(0, passes)):
+        moved = False
+        component_to_bin = {
+            component_id: bin_index
+            for bin_index, component_ids in enumerate(working_bins)
+            for component_id in component_ids
+        }
+        component_order = sorted(
+            component_to_bin,
+            key=lambda component_id: (len(components[component_id]), components[component_id][0]),
+        )
+        for component_id in component_order:
+            source_bin = component_to_bin.get(component_id)
+            if source_bin is None:
+                continue
+            component_size = len(components[component_id])
+            affinities = _component_affinities_to_bins(
+                component_id,
+                component_to_bin,
+                adjacency,
+                top_k=top_k,
+            )
+            current_affinity = affinities.get(source_bin, 0.0)
+            best_bin = None
+            best_gain = 0.0
+            for target_bin, candidate_affinity in affinities.items():
+                if target_bin >= len(working_bins):
+                    continue
+                if target_bin == source_bin:
+                    continue
+                if bin_sizes[target_bin] + component_size > target_subblock_size:
+                    continue
+                gain = candidate_affinity - current_affinity
+                if gain > best_gain:
+                    best_gain = gain
+                    best_bin = target_bin
+            if best_bin is None:
+                continue
+            working_bins[source_bin].remove(component_id)
+            working_bins[best_bin].append(component_id)
+            bin_sizes[source_bin] -= component_size
+            bin_sizes[best_bin] += component_size
+            component_to_bin[component_id] = best_bin
+            moved = True
+        if not moved:
+            break
+        nonempty_bins = []
+        nonempty_sizes = []
+        for component_ids, bin_size in zip(working_bins, bin_sizes, strict=True):
+            if component_ids:
+                nonempty_bins.append(component_ids)
+                nonempty_sizes.append(bin_size)
+        working_bins = nonempty_bins
+        bin_sizes = nonempty_sizes
+    return working_bins
+
+
+def _pack_graph_components(
+    components: Sequence[Sequence[str]],
+    edge_scores: Mapping[tuple[int, int], float],
+    root_by_index: Sequence[int],
+    component_id_by_root: Mapping[int, int],
+    target_subblock_size: int,
+    config: GraphSubblockingConfig,
+) -> list[list[str]]:
+    if not config.pack_components:
+        return [list(component) for component in components]
+    if config.component_pack_strategy == "size":
+        return _pack_components_by_size(components, target_subblock_size)
+    if config.component_pack_strategy in {"edge-greedy", "aggregate-greedy"}:
+        return _component_ids_to_subblocks(
+            components,
+            _pack_component_ids_greedy(
+                components,
+                edge_scores,
+                root_by_index,
+                component_id_by_root,
+                target_subblock_size,
+                config,
+            ),
+        )
+    raise ValueError(f"Unsupported component_pack_strategy={config.component_pack_strategy!r}")
+
+
+def _effective_graph_config(config: GraphSubblockingConfig, group_size: int) -> GraphSubblockingConfig:
+    if (
+        not config.adaptive_projection
+        or config.neighbor_mode != "projection"
+        or group_size > int(config.adaptive_projection_max_group_size)
+    ):
+        return config
+    return replace(
+        config,
+        projection_count=max(int(config.projection_count), int(config.adaptive_projection_count)),
+        projection_window=max(int(config.projection_window), int(config.adaptive_projection_window)),
+    )
+
+
+def cluster_with_graph_fallback(
+    signature_ids: Iterable[str],
+    anddata,
+    target_subblock_size: int = 10000,
+    compute_block_fn: Callable[[str], str] = compute_block,
+    *,
+    config: GraphSubblockingConfig | None = None,
+) -> dict[str, list[str]]:
+    """Cluster an oversized fallback group with a capacity-constrained graph."""
+
+    config = config or GraphSubblockingConfig()
+    if config.neighbor_mode not in {"projection", "exact"}:
+        raise ValueError("Graph subblocking neighbor_mode must be 'projection' or 'exact'")
+    if config.component_pack_strategy not in {"edge-greedy", "aggregate-greedy", "size"}:
+        raise ValueError(
+            "Graph subblocking component_pack_strategy must be 'edge-greedy', 'aggregate-greedy', or 'size'"
+        )
+    fallback_start = time.perf_counter()
+    signature_ids = [str(signature_id) for signature_id in signature_ids]
+    if len(signature_ids) == 0:
+        return {}
+    if len(signature_ids) <= target_subblock_size:
+        return {"0": signature_ids}
+    config = _effective_graph_config(config, len(signature_ids))
+    if config.neighbor_mode == "exact" and len(signature_ids) > config.max_exact_knn_group_size:
+        raise ValueError(
+            "Exact graph subblocking fallback group exceeds max_exact_knn_group_size: "
+            f"group_size={len(signature_ids)} max_exact_knn_group_size={config.max_exact_knn_group_size}"
+        )
+
+    missing_signature_ids = [signature_id for signature_id in signature_ids if signature_id not in anddata.signatures]
+    if missing_signature_ids:
+        raise ValueError(f"Graph subblocking evidence is missing signatures: {missing_signature_ids[:10]}")
+
+    matrix = _embedding_matrix(signature_ids, anddata)
+    evidences = [
+        _signature_evidence(anddata.signatures[signature_id], anddata, compute_block_fn)
+        for signature_id in signature_ids
+    ]
+    edge_start = time.perf_counter()
+    if config.neighbor_mode == "exact":
+        edge_scores = _exact_neighbor_edge_scores(matrix, evidences, config)
+    else:
+        seed = int(getattr(anddata, "random_seed", 0) or 0) + len(signature_ids)
+        edge_scores = _projection_neighbor_edge_scores(matrix, evidences, config, seed=seed)
+    sparse_evidence_stats: dict[str, int] = {
+        "sparse_evidence_feature_count": 0,
+        "sparse_evidence_skipped_feature_count": 0,
+        "sparse_evidence_added_edge_count": 0,
+        "sparse_evidence_neighbors": int(config.sparse_evidence_neighbors),
+    }
+    if config.sparse_evidence_edges:
+        sparse_evidence_stats = _add_sparse_evidence_edge_scores(edge_scores, matrix, evidences, config)
+    edge_seconds = time.perf_counter() - edge_start
+
+    uf = _UnionFind(len(signature_ids))
+    sorted_edges = sorted(
+        ((score, left, right) for (left, right), score in edge_scores.items()),
+        key=lambda item: (-item[0], signature_ids[item[1]], signature_ids[item[2]]),
+    )
+    for _score, left, right in sorted_edges:
+        uf.union_if_capacity(left, right, int(target_subblock_size))
+
+    raw_components, root_by_index, component_id_by_root = _ordered_components_from_union(signature_ids, uf)
+    ordered_components = sorted(
+        _pack_graph_components(
+            raw_components,
+            edge_scores,
+            root_by_index,
+            component_id_by_root,
+            int(target_subblock_size),
+            config,
+        ),
+        key=lambda values: (-len(values), values[0]),
+    )
+    stats = getattr(anddata, "_graph_subblocking_stats", None)
+    if isinstance(stats, list):
+        raw_sizes = [len(values) for values in raw_components]
+        sizes = [len(values) for values in ordered_components]
+        stats.append(
+            {
+                "input_signature_count": int(len(signature_ids)),
+                "neighbor_mode": config.neighbor_mode,
+                "projection_count": int(config.projection_count),
+                "projection_window": int(config.projection_window),
+                "candidate_edge_count": int(len(edge_scores)),
+                **sparse_evidence_stats,
+                "raw_component_count": int(len(raw_components)),
+                "raw_max_component_size": int(max(raw_sizes)) if raw_sizes else 0,
+                "raw_median_component_size": float(np.median(raw_sizes)) if raw_sizes else 0.0,
+                "packed_component_count": int(len(ordered_components)),
+                "max_component_size": int(max(sizes)) if sizes else 0,
+                "median_component_size": float(np.median(sizes)) if sizes else 0.0,
+                "pack_components": bool(config.pack_components),
+                "component_pack_strategy": config.component_pack_strategy,
+                "component_pack_top_k": int(config.component_pack_top_k),
+                "local_move_passes": int(config.local_move_passes),
+                "edge_build_seconds": float(edge_seconds),
+                "total_seconds": float(time.perf_counter() - fallback_start),
+            }
+        )
+    return {str(index): values for index, values in enumerate(ordered_components)}
+
+
+def _read_arrow_rows_by_values(
+    path: Any,
+    key_column: str,
+    values: Sequence[str],
+    *,
+    required_columns: set[str],
+    table_name: str,
+    load_metrics: dict[str, int] | None = None,
+) -> list[Mapping[str, Any]]:
+    pa = __import__("pyarrow")
+    keep_values = {str(value) for value in values}
+    if not keep_values:
+        return []
+    rows: list[Mapping[str, Any]] = []
+    record_batches_scanned = 0
+    rows_scanned = 0
+    with pa.memory_map(str(path), "r") as source:
+        reader = pa.ipc.open_file(source)
+        required_columns = set(required_columns)
+        required_columns.add(key_column)
+        missing = sorted(required_columns.difference(reader.schema.names))
+        if missing:
+            raise ValueError(f"{table_name} Arrow is missing required columns for graph subblocking: {missing}")
+        key_column_index = reader.schema.get_field_index(key_column)
+        if key_column_index < 0:
+            raise ValueError(f"{table_name} Arrow is missing key column for graph subblocking: {key_column!r}")
+        selected_column_names = [name for name in reader.schema.names if name in required_columns]
+        selected_column_indices = [reader.schema.get_field_index(name) for name in selected_column_names]
+        for batch_index in range(reader.num_record_batches):
+            batch = reader.get_batch(batch_index)
+            keys = batch.column(key_column_index).to_pylist()
+            record_batches_scanned += 1
+            rows_scanned += len(keys)
+            selected_indices = [
+                row_index for row_index, key in enumerate(keys) if key is not None and str(key) in keep_values
+            ]
+            if not selected_indices:
+                continue
+            row_batch = pa.record_batch(
+                [batch.column(index) for index in selected_column_indices],
+                names=selected_column_names,
+            )
+            selected = (
+                row_batch
+                if len(selected_indices) == len(keys)
+                else row_batch.take(pa.array(selected_indices, type=pa.int64()))
+            )
+            rows.extend(selected.to_pylist())
+    if load_metrics is not None:
+        _add_load_metric(load_metrics, f"{table_name}_record_batches_scanned", record_batches_scanned)
+        _add_load_metric(load_metrics, f"{table_name}_rows_scanned", rows_scanned)
+        _add_load_metric(load_metrics, f"{table_name}_rows_loaded", len(rows))
+    return rows
+
+
+def _add_load_metric(load_metrics: dict[str, int], key: str, value: int) -> None:
+    load_metrics[key] = int(load_metrics.get(key, 0)) + int(value)
+
+
+def _unique_rows_by_key(
+    rows_in: Iterable[Mapping[str, Any]],
+    *,
+    table_name: str,
+    key_column: str,
+) -> dict[str, Mapping[str, Any]]:
+    rows: dict[str, Mapping[str, Any]] = {}
+    for row in rows_in:
+        key_value = row.get(key_column)
+        if key_value is None:
+            raise ValueError(f"{table_name} Arrow cannot contain null {key_column} values")
+        key = str(key_value)
+        if not key:
+            raise ValueError(f"{table_name} Arrow cannot contain empty {key_column} values")
+        if key in rows:
+            raise ValueError(f"{table_name} Arrow contains duplicate {key_column}: {key!r}")
+        rows[key] = row
+    return rows
+
+
+def _optional_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str | bytes):
+        raise ValueError("Arrow list field unexpectedly decoded as a scalar string")
+    return tuple(str(item) for item in value if item is not None)
+
+
+def _coauthor_blocks_by_paper_from_arrow(
+    paths: Mapping[str, Any],
+    paper_ids: Sequence[str],
+    *,
+    load_metrics: dict[str, int],
+) -> dict[str, list[tuple[int, str]]]:
+    pa = __import__("pyarrow")
+    paper_authors_path = paths.get("paper_authors")
+    if paper_authors_path is None:
+        return {}
+    keep_values = {str(value) for value in paper_ids}
+    out: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    record_batches_scanned = 0
+    rows_scanned = 0
+    rows_loaded = 0
+    with pa.memory_map(str(paper_authors_path), "r") as source:
+        reader = pa.ipc.open_file(source)
+        required_columns = {"paper_id", "position", "author_name"}
+        missing = sorted(required_columns.difference(reader.schema.names))
+        if missing:
+            raise ValueError(f"paper_authors Arrow is missing required columns for graph subblocking: {missing}")
+        paper_id_index = reader.schema.get_field_index("paper_id")
+        position_index = reader.schema.get_field_index("position")
+        author_name_index = reader.schema.get_field_index("author_name")
+        for batch_index in range(reader.num_record_batches):
+            batch = reader.get_batch(batch_index)
+            paper_values = batch.column(paper_id_index).to_pylist()
+            record_batches_scanned += 1
+            rows_scanned += len(paper_values)
+            selected_indices = [
+                row_index
+                for row_index, paper_id in enumerate(paper_values)
+                if paper_id is not None and str(paper_id) in keep_values
+            ]
+            if not selected_indices:
+                continue
+            if len(selected_indices) == len(paper_values):
+                selected_paper_values = paper_values
+                selected_positions = batch.column(position_index).to_pylist()
+                selected_author_names = batch.column(author_name_index).to_pylist()
+            else:
+                take_indices = pa.array(selected_indices, type=pa.int64())
+                selected_paper_values = batch.column(paper_id_index).take(take_indices).to_pylist()
+                selected_positions = batch.column(position_index).take(take_indices).to_pylist()
+                selected_author_names = batch.column(author_name_index).take(take_indices).to_pylist()
+            rows_loaded += len(selected_paper_values)
+            for paper_id_value, position, author_name_value in zip(
+                selected_paper_values,
+                selected_positions,
+                selected_author_names,
+                strict=True,
+            ):
+                if position is None:
+                    raise ValueError("paper_authors Arrow cannot contain null position values")
+                paper_id = str(paper_id_value)
+                author_name = str(author_name_value or "").strip()
+                if not author_name:
+                    continue
+                block = compute_block(author_name)
+                if block:
+                    out[paper_id].append((int(position), block))
+    _add_load_metric(load_metrics, "paper_authors_record_batches_scanned", record_batches_scanned)
+    _add_load_metric(load_metrics, "paper_authors_rows_scanned", rows_scanned)
+    _add_load_metric(load_metrics, "paper_authors_rows_loaded", rows_loaded)
+    return out
+
+
+def _specter_embeddings_from_arrow(
+    paths: Mapping[str, Any],
+    paper_ids: Sequence[str],
+    *,
+    load_metrics: dict[str, int],
+) -> dict[str, np.ndarray]:
+    pa = __import__("pyarrow")
+    specter_path = paths.get("specter") or paths.get("specter2")
+    if specter_path is None:
+        raise ValueError("Graph subblocking requires a 'specter' or 'specter2' Arrow path")
+    keep_values = {str(value) for value in paper_ids}
+    embeddings: dict[str, np.ndarray] = {}
+    record_batches_scanned = 0
+    rows_scanned = 0
+    rows_loaded = 0
+    with pa.memory_map(str(specter_path), "r") as source:
+        reader = pa.ipc.open_file(source)
+        required_columns = {"paper_id", "embedding"}
+        missing = sorted(required_columns.difference(reader.schema.names))
+        if missing:
+            raise ValueError(f"specter Arrow is missing required columns for graph subblocking: {missing}")
+        paper_id_index = reader.schema.get_field_index("paper_id")
+        embedding_index = reader.schema.get_field_index("embedding")
+        for batch_index in range(reader.num_record_batches):
+            batch = reader.get_batch(batch_index)
+            paper_values = batch.column(paper_id_index).to_pylist()
+            record_batches_scanned += 1
+            rows_scanned += len(paper_values)
+            selected_indices = [
+                row_index
+                for row_index, paper_id in enumerate(paper_values)
+                if paper_id is not None and str(paper_id) in keep_values
+            ]
+            if not selected_indices:
+                continue
+            if len(selected_indices) == len(paper_values):
+                selected_paper_values = paper_values
+                selected_embeddings = batch.column(embedding_index).to_pylist()
+            else:
+                take_indices = pa.array(selected_indices, type=pa.int64())
+                selected_paper_values = batch.column(paper_id_index).take(take_indices).to_pylist()
+                selected_embeddings = batch.column(embedding_index).take(take_indices).to_pylist()
+            rows_loaded += len(selected_paper_values)
+            for paper_id_value, embedding in zip(selected_paper_values, selected_embeddings, strict=True):
+                paper_id = str(paper_id_value)
+                if not paper_id:
+                    raise ValueError("specter Arrow cannot contain empty paper_id values")
+                if paper_id in embeddings:
+                    raise ValueError(f"specter Arrow contains duplicate paper_id: {paper_id!r}")
+                if embedding is None:
+                    raise ValueError("specter Arrow cannot contain null embedding values")
+                embeddings[paper_id] = np.asarray(embedding, dtype=np.float32)
+    _add_load_metric(load_metrics, "specter_record_batches_scanned", record_batches_scanned)
+    _add_load_metric(load_metrics, "specter_rows_scanned", rows_scanned)
+    _add_load_metric(load_metrics, "specter_rows_loaded", rows_loaded)
+    return embeddings
+
+
+def _load_arrow_graph_subblocking_dataset(
+    paths: Mapping[str, Any],
+    signature_ids: Sequence[str],
+    *,
+    random_seed: int,
+    stats: list[dict[str, Any]],
+    load_metrics: dict[str, int],
+) -> SimpleNamespace:
+    signature_ids = tuple(dict.fromkeys(str(signature_id) for signature_id in signature_ids))
+    signature_rows = _read_arrow_rows_by_values(
+        paths["signatures"],
+        "signature_id",
+        signature_ids,
+        required_columns={
+            "signature_id",
+            "paper_id",
+            "author_first",
+            "author_middle",
+            "author_affiliations",
+            "author_orcid",
+            "author_position",
+        },
+        table_name="signatures",
+        load_metrics=load_metrics,
+    )
+    signatures_by_id = _unique_rows_by_key(signature_rows, table_name="signatures", key_column="signature_id")
+    missing_signature_ids = [signature_id for signature_id in signature_ids if signature_id not in signatures_by_id]
+    if missing_signature_ids:
+        raise ValueError(f"signatures Arrow is missing graph-subblocking signature ids: {missing_signature_ids[:10]}")
+
+    paper_ids = tuple(dict.fromkeys(str(row["paper_id"]) for row in signatures_by_id.values()))
+    coauthors_by_paper = _coauthor_blocks_by_paper_from_arrow(paths, paper_ids, load_metrics=load_metrics)
+    specter_embeddings = _specter_embeddings_from_arrow(paths, paper_ids, load_metrics=load_metrics)
+
+    signature_objects: dict[str, SimpleNamespace] = {}
+    for signature_id in signature_ids:
+        row = signatures_by_id[signature_id]
+        paper_id = str(row["paper_id"])
+        position = None if row.get("author_position") is None else int(row["author_position"])
+        coauthor_blocks = tuple(
+            block
+            for author_position, block in coauthors_by_paper.get(paper_id, ())
+            if position is None or int(author_position) != position
+        )
+        signature_objects[signature_id] = SimpleNamespace(
+            signature_id=signature_id,
+            paper_id=paper_id,
+            author_info_first=_optional_str(row.get("author_first")),
+            author_info_middle=_optional_str(row.get("author_middle")),
+            author_info_first_normalized_without_apostrophe=_optional_str(row.get("author_first")),
+            author_info_middle_normalized_without_apostrophe=_optional_str(row.get("author_middle")),
+            author_info_affiliations=_string_tuple(row.get("author_affiliations")),
+            author_info_affiliations_n_grams=None,
+            author_info_coauthor_blocks=coauthor_blocks,
+            author_info_coauthors=None,
+            author_info_orcid=_optional_str(row.get("author_orcid")),
+            author_info_position=position,
+        )
+
+    return SimpleNamespace(
+        signatures=signature_objects,
+        papers={},
+        specter_embeddings=specter_embeddings,
+        random_seed=int(random_seed),
+        _graph_subblocking_stats=stats,
+    )
+
+
+def _read_full_arrow_table(path: Any, *, required_columns: set[str], table_name: str, load_metrics: dict[str, int]):
+    pa = __import__("pyarrow")
+    with pa.memory_map(str(path), "r") as source:
+        reader = pa.ipc.open_file(source)
+        missing = sorted(required_columns.difference(reader.schema.names))
+        if missing:
+            raise ValueError(f"{table_name} Arrow is missing required columns for graph subblocking: {missing}")
+        record_batch_count = int(reader.num_record_batches)
+        table = reader.read_all()
+    load_metrics[f"{table_name}_record_batches_scanned"] = record_batch_count
+    load_metrics[f"{table_name}_rows_scanned"] = int(table.num_rows)
+    load_metrics[f"{table_name}_rows_loaded"] = int(table.num_rows)
+    return table.select([name for name in table.column_names if name in required_columns])
+
+
+def _filter_arrow_table_by_values(table, key_column: str, values: Sequence[str]):
+    pa = __import__("pyarrow")
+    pc = __import__("pyarrow.compute").compute
+    keep_values = list(dict.fromkeys(str(value) for value in values))
+    if not keep_values:
+        return table.slice(0, 0)
+    key_type = table.schema.field(key_column).type
+    return table.filter(pc.is_in(table[key_column], value_set=pa.array(keep_values, type=key_type)))
+
+
+def _coauthor_blocks_by_paper_from_full_arrow(
+    paths: Mapping[str, Any],
+    paper_ids: Sequence[str],
+    load_metrics: dict[str, int],
+):
+    paper_authors_path = paths.get("paper_authors")
+    if paper_authors_path is None:
+        return {}
+    table = _read_full_arrow_table(
+        paper_authors_path,
+        required_columns={"paper_id", "position", "author_name"},
+        table_name="paper_authors",
+        load_metrics=load_metrics,
+    )
+    table = _filter_arrow_table_by_values(table, "paper_id", paper_ids)
+    load_metrics["paper_authors_rows_loaded"] = int(table.num_rows)
+    paper_values = table["paper_id"].to_pylist()
+    positions = table["position"].to_pylist()
+    author_names = table["author_name"].to_pylist()
+    out: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for paper_id_value, position, author_name_value in zip(paper_values, positions, author_names, strict=True):
+        if paper_id_value is None:
+            raise ValueError("paper_authors Arrow cannot contain null paper_id values")
+        paper_id = str(paper_id_value)
+        if position is None:
+            raise ValueError("paper_authors Arrow cannot contain null position values")
+        author_name = str(author_name_value or "").strip()
+        if not author_name:
+            continue
+        name_parts = author_name.split()
+        block = name_parts[0] if len(name_parts) == 1 else name_parts[0][0] + " " + name_parts[-1]
+        if block:
+            out[paper_id].append((int(position), block))
+    return out
+
+
+def _specter_embeddings_from_full_arrow(
+    paths: Mapping[str, Any],
+    paper_ids: Sequence[str],
+    load_metrics: dict[str, int],
+):
+    specter_path = paths.get("specter") or paths.get("specter2")
+    if specter_path is None:
+        raise ValueError("Graph subblocking requires a 'specter' or 'specter2' Arrow path")
+    table = _read_full_arrow_table(
+        specter_path,
+        required_columns={"paper_id", "embedding"},
+        table_name="specter",
+        load_metrics=load_metrics,
+    )
+    table = _filter_arrow_table_by_values(table, "paper_id", paper_ids)
+    load_metrics["specter_rows_loaded"] = int(table.num_rows)
+    embeddings: dict[str, np.ndarray] = {}
+    backing_matrices: list[np.ndarray] = []
+    paper_values = table["paper_id"].to_pylist()
+    embedding_values = table["embedding"].combine_chunks()
+    if embedding_values.null_count:
+        raise ValueError("specter Arrow cannot contain null embedding values")
+    if not hasattr(embedding_values.type, "list_size"):
+        raise ValueError("specter Arrow embedding column must be a fixed-size list")
+    dimension = int(embedding_values.type.list_size)
+    matrix = np.asarray(embedding_values.values.to_numpy(zero_copy_only=False), dtype=np.float32).reshape(
+        int(table.num_rows),
+        dimension,
+    )
+    backing_matrices.append(matrix)
+    for row_index, paper_id_value in enumerate(paper_values):
+        if paper_id_value is None:
+            raise ValueError("specter Arrow cannot contain null paper_id values")
+        paper_id = str(paper_id_value)
+        if not paper_id:
+            raise ValueError("specter Arrow cannot contain empty paper_id values")
+        if paper_id in embeddings:
+            raise ValueError(f"specter Arrow contains duplicate paper_id: {paper_id!r}")
+        embeddings[paper_id] = matrix[row_index]
+    return embeddings, backing_matrices
+
+
+def _load_columnar_arrow_graph_subblocking_dataset(
+    paths: Mapping[str, Any],
+    signature_ids: Sequence[str],
+    *,
+    random_seed: int,
+    stats: list[dict[str, Any]],
+    load_metrics: dict[str, int],
+) -> SimpleNamespace:
+    target_signature_ids = tuple(dict.fromkeys(str(signature_id) for signature_id in signature_ids))
+    keep_signature_ids = set(target_signature_ids)
+    signatures_table = _read_full_arrow_table(
+        paths["signatures"],
+        required_columns={
+            "signature_id",
+            "paper_id",
+            "author_first",
+            "author_middle",
+            "author_affiliations",
+            "author_orcid",
+            "author_position",
+        },
+        table_name="signatures",
+        load_metrics=load_metrics,
+    )
+    signatures_table = _filter_arrow_table_by_values(signatures_table, "signature_id", target_signature_ids)
+    load_metrics["signatures_rows_loaded"] = int(signatures_table.num_rows)
+    table_signature_ids = signatures_table["signature_id"].to_pylist()
+    paper_ids = signatures_table["paper_id"].to_pylist()
+    first_names = signatures_table["author_first"].to_pylist()
+    middle_names = signatures_table["author_middle"].to_pylist()
+    affiliations = signatures_table["author_affiliations"].to_pylist()
+    orcids = signatures_table["author_orcid"].to_pylist()
+    positions = signatures_table["author_position"].to_pylist()
+    signature_rows: dict[str, tuple[str, Any, Any, Any, Any, Any]] = {}
+    for row in zip(
+        table_signature_ids,
+        paper_ids,
+        first_names,
+        middle_names,
+        affiliations,
+        orcids,
+        positions,
+        strict=True,
+    ):
+        signature_id_value, paper_id_value, first_name, middle_name, affiliation_values, orcid, position_value = row
+        if signature_id_value is None:
+            raise ValueError("signatures Arrow cannot contain null signature_id values")
+        if paper_id_value is None:
+            raise ValueError("signatures Arrow cannot contain null paper_id values")
+        signature_id = str(signature_id_value)
+        if signature_id not in keep_signature_ids:
+            continue
+        if not signature_id:
+            raise ValueError("signatures Arrow cannot contain empty signature_id values")
+        if signature_id in signature_rows:
+            raise ValueError(f"signatures Arrow contains duplicate signature_id: {signature_id!r}")
+        paper_id = str(paper_id_value)
+        signature_rows[signature_id] = (paper_id, first_name, middle_name, affiliation_values, orcid, position_value)
+    missing_signature_ids = [
+        signature_id for signature_id in target_signature_ids if signature_id not in signature_rows
+    ]
+    if missing_signature_ids:
+        raise ValueError(f"signatures Arrow is missing graph-subblocking signature ids: {missing_signature_ids[:10]}")
+    selected_paper_ids = tuple(dict.fromkeys(row[0] for row in signature_rows.values()))
+    coauthors_by_paper = _coauthor_blocks_by_paper_from_full_arrow(paths, selected_paper_ids, load_metrics)
+    specter_embeddings, specter_backing_matrices = _specter_embeddings_from_full_arrow(
+        paths,
+        selected_paper_ids,
+        load_metrics,
+    )
+
+    signature_objects: dict[str, SimpleNamespace] = {}
+    for signature_id in target_signature_ids:
+        paper_id, first_name, middle_name, affiliation_values, orcid, position_value = signature_rows[signature_id]
+        position = None if position_value is None else int(position_value)
+        coauthor_blocks = tuple(
+            block
+            for author_position, block in coauthors_by_paper.get(paper_id, ())
+            if position is None or int(author_position) != position
+        )
+        signature_objects[signature_id] = SimpleNamespace(
+            signature_id=signature_id,
+            paper_id=paper_id,
+            author_info_first=_optional_str(first_name),
+            author_info_middle=_optional_str(middle_name),
+            author_info_first_normalized_without_apostrophe=_optional_str(first_name),
+            author_info_middle_normalized_without_apostrophe=_optional_str(middle_name),
+            author_info_affiliations=_string_tuple(affiliation_values),
+            author_info_affiliations_n_grams=None,
+            author_info_coauthor_blocks=coauthor_blocks,
+            author_info_coauthors=None,
+            author_info_orcid=_optional_str(orcid),
+            author_info_position=position,
+        )
+    return SimpleNamespace(
+        signatures=signature_objects,
+        papers={},
+        specter_embeddings=specter_embeddings,
+        _specter_backing_matrices=specter_backing_matrices,
+        random_seed=int(random_seed),
+        _graph_subblocking_stats=stats,
+    )
+
+
+class ArrowGraphSubblockingFallback:
+    """Lazy Arrow-backed callable for graph subblocking fallback."""
+
+    def __init__(
+        self,
+        paths: Mapping[str, Any],
+        signature_ids: Sequence[str],
+        *,
+        config: GraphSubblockingConfig | None = None,
+        random_seed: int = 0,
+    ) -> None:
+        self.paths = dict(paths)
+        self.signature_ids = tuple(dict.fromkeys(str(signature_id) for signature_id in signature_ids))
+        self.config = config or GraphSubblockingConfig()
+        self.random_seed = int(random_seed)
+        self.stats: list[dict[str, Any]] = []
+        self.load_metrics: dict[str, int] = {}
+        self.load_seconds = 0.0
+        self._dataset: SimpleNamespace | None = None
+
+    def _load_signature_ids(self, signature_ids: Sequence[str]) -> None:
+        signature_ids = tuple(dict.fromkeys(str(signature_id) for signature_id in signature_ids))
+        start = time.perf_counter()
+        self._dataset = _load_arrow_graph_subblocking_dataset(
+            self.paths,
+            signature_ids,
+            random_seed=self.random_seed,
+            stats=self.stats,
+            load_metrics=self.load_metrics,
+        )
+        self.load_seconds = float(time.perf_counter() - start)
+
+    def prepare(self, signature_groups: Iterable[Iterable[str]]) -> None:
+        """Preload the memory-resident Arrow evidence store once."""
+
+        groups = [tuple(dict.fromkeys(str(signature_id) for signature_id in group)) for group in signature_groups]
+        signature_ids = tuple(dict.fromkeys(signature_id for group in groups for signature_id in group))
+        self.load_metrics["prepared_group_count"] = len(groups)
+        self.load_metrics["prepared_signature_count"] = len(signature_ids)
+        if self._dataset is None:
+            self._load_signature_ids(signature_ids)
+
+    def _dataset_or_load(self, signature_ids: Sequence[str]) -> SimpleNamespace:
+        if self._dataset is None:
+            self._load_signature_ids(signature_ids)
+        dataset = self._dataset
+        if dataset is None:
+            raise RuntimeError("Arrow graph subblocking dataset did not load")
+        missing_signature_ids = [
+            str(signature_id) for signature_id in signature_ids if str(signature_id) not in dataset.signatures
+        ]
+        if missing_signature_ids:
+            raise ValueError(
+                "Arrow graph subblocking evidence is missing required signatures: " f"{missing_signature_ids[:10]}"
+            )
+        return dataset
+
+    def __call__(
+        self,
+        signature_ids: Iterable[str],
+        anddata,
+        target_subblock_size: int = 10000,
+        compute_block_fn: Callable[[str], str] = compute_block,
+    ) -> dict[str, list[str]]:
+        del anddata
+        signature_id_tuple = tuple(str(signature_id) for signature_id in signature_ids)
+        return cluster_with_graph_fallback(
+            signature_id_tuple,
+            self._dataset_or_load(signature_id_tuple),
+            target_subblock_size=target_subblock_size,
+            compute_block_fn=compute_block_fn,
+            config=self.config,
+        )
+
+
+def make_arrow_graph_subblocking_cluster_fn(
+    paths: Mapping[str, Any],
+    signature_ids: Sequence[str],
+    *,
+    config: GraphSubblockingConfig | None = None,
+    random_seed: int = 0,
+) -> ArrowGraphSubblockingFallback:
+    """Return a lazy Arrow-backed graph fallback callable for subblocking."""
+
+    return ArrowGraphSubblockingFallback(
+        paths,
+        signature_ids,
+        config=config,
+        random_seed=random_seed,
+    )
+
+
+class DatasetGraphSubblockingFallback:
+    """ANDData-backed callable for graph subblocking fallback."""
+
+    load_seconds = 0.0
+
+    def __init__(self, *, config: GraphSubblockingConfig | None = None) -> None:
+        self.config = config or GraphSubblockingConfig()
+        self.stats: list[dict[str, Any]] = []
+
+    def __call__(
+        self,
+        signature_ids: Iterable[str],
+        anddata,
+        target_subblock_size: int = 10000,
+        compute_block_fn: Callable[[str], str] = compute_block,
+    ) -> dict[str, list[str]]:
+        had_prior_stats = hasattr(anddata, "_graph_subblocking_stats")
+        prior_stats = getattr(anddata, "_graph_subblocking_stats", None)
+        anddata._graph_subblocking_stats = self.stats
+        try:
+            return cluster_with_graph_fallback(
+                signature_ids,
+                anddata,
+                target_subblock_size=target_subblock_size,
+                compute_block_fn=compute_block_fn,
+                config=self.config,
+            )
+        finally:
+            if had_prior_stats:
+                anddata._graph_subblocking_stats = prior_stats
+            else:
+                delattr(anddata, "_graph_subblocking_stats")
+
+
+def make_dataset_graph_subblocking_cluster_fn(
+    *,
+    config: GraphSubblockingConfig | None = None,
+) -> DatasetGraphSubblockingFallback:
+    """Return an ANDData-backed graph fallback callable for subblocking."""
+
+    return DatasetGraphSubblockingFallback(config=config)
 
 
 def signature_name_parts_for_subblocking(signature) -> tuple[str, str]:
@@ -59,11 +1450,13 @@ def _signature_coauthor_blocks_for_specter(signature, anddata, compute_block_fn=
     if coauthors is None:
         paper = anddata.papers.get(str(signature.paper_id))
         if paper is None:
+            paper = anddata.papers.get(signature.paper_id)
+        if paper is None:
             return []
         coauthors = [
             author.author_name for author in paper.authors if author.position != signature.author_info_position
         ]
-    return [compute_block_fn(author) for author in coauthors]
+    return [block for author in coauthors if (block := compute_block_fn(str(author or "")))]
 
 
 def cluster_with_specter(signature_ids, anddata, target_subblock_size=10000, compute_block_fn=compute_block):
@@ -181,7 +1574,7 @@ def subdivide_helper(names, signature_ids, maximum_size, starting_k=2):
         # use Series.value_counts to avoid the deprecated pd.value_counts API
         counts_up_to_k = pd.Series(names_up_to_k).value_counts()
         # find the ones that are a good size, and then take the rest and subdivide further
-        good_size_flag = counts_up_to_k < maximum_size
+        good_size_flag = counts_up_to_k <= maximum_size
         counts_up_to_k_good_size = counts_up_to_k[good_size_flag]
         # the case where at this point *all* the newly made subblocks are too big
         # so it is a dead-end
@@ -276,7 +1669,7 @@ def _sorted_subblock_merge_candidates(
         if name_for_splits_1 == name_for_splits_2:
             if middle_name_1 is not None and middle_name_2 is not None:
                 score = 0
-                for i in range(1, len(middle_name_1)):
+                for i in range(1, min(len(middle_name_1), len(middle_name_2)) + 1):
                     if middle_name_1[:i] == middle_name_2[:i]:
                         score = i
             else:
@@ -295,12 +1688,86 @@ def _sorted_subblock_merge_candidates(
     return sorted(candidates, key=lambda x: (x[1], x[0][0], x[0][1]), reverse=True)
 
 
+def _rust_arrow_subblocking_callable():
+    from s2and.rust_capabilities import load_s2and_rust_extension
+
+    rust_module = load_s2and_rust_extension()
+    return None if rust_module is None else getattr(rust_module, "make_subblocks_with_telemetry_arrow", None)
+
+
+def rust_arrow_subblocking_available() -> bool:
+    """Return whether the loaded Rust extension can run Arrow-backed subblocking."""
+
+    return callable(_rust_arrow_subblocking_callable())
+
+
+def _make_subblocks_with_telemetry_arrow_rust(
+    arrow_paths: Mapping[str, Any],
+    signature_ids,
+    anddata,
+    maximum_size=15000,
+    first_k_letter_counts_sorted=FIRST_K_LETTER_COUNTS,
+    compute_block_fn=compute_block,
+    specter_cluster_fn=None,
+    use_orcid_subblocking: bool = True,
+):
+    """Run experimental Rust subblocking with signature rows loaded from Arrow."""
+
+    rust_make_subblocks = _rust_arrow_subblocking_callable()
+    if not callable(rust_make_subblocks):
+        raise RuntimeError(
+            "Rust Arrow subblocking requires an s2and_rust extension with "
+            "make_subblocks_with_telemetry_arrow; rebuild with "
+            "`uv run maturin develop -m s2and_rust/Cargo.toml`."
+        )
+
+    fallback_cluster_fn = specter_cluster_fn or cluster_with_specter
+    subblocks, telemetry = rust_make_subblocks(
+        dict(arrow_paths),
+        [str(signature_id) for signature_id in signature_ids],
+        int(maximum_size),
+        first_k_letter_counts_sorted,
+        fallback_cluster_fn,
+        anddata,
+        compute_block_fn,
+        bool(use_orcid_subblocking),
+    )
+    return {str(key): list(values) for key, values in dict(subblocks).items()}, dict(telemetry)
+
+
+def make_subblocks_arrow_rust(
+    arrow_paths: Mapping[str, Any],
+    signature_ids,
+    anddata,
+    maximum_size=15000,
+    first_k_letter_counts_sorted=FIRST_K_LETTER_COUNTS,
+    compute_block_fn=compute_block,
+    specter_cluster_fn=None,
+    use_orcid_subblocking: bool = True,
+):
+    """Return Rust Arrow-backed subblocks without telemetry."""
+
+    output, _ = _make_subblocks_with_telemetry_arrow_rust(
+        arrow_paths,
+        signature_ids,
+        anddata,
+        maximum_size=maximum_size,
+        first_k_letter_counts_sorted=first_k_letter_counts_sorted,
+        compute_block_fn=compute_block_fn,
+        specter_cluster_fn=specter_cluster_fn,
+        use_orcid_subblocking=use_orcid_subblocking,
+    )
+    return output
+
+
 def make_subblocks_with_telemetry(
     signature_ids,
     anddata,
     maximum_size=15000,
     first_k_letter_counts_sorted=FIRST_K_LETTER_COUNTS,
     compute_block_fn=compute_block,
+    specter_cluster_fn=None,
+    use_orcid_subblocking: bool = True,
 ):
     """Split signature IDs into subblocks and report how the partition was built.
 
@@ -309,8 +1776,9 @@ def make_subblocks_with_telemetry(
     maximum_size using middle names and the SPECTER clustering algorithm. Finally, it merges any subblocks
     smaller than maximum_size that share name attributes.
 
-    There is a special case for ORCIDs: we make sure that signatures with the same ORCID end up
-    in the same subblock.
+    There is an optional ORCID repair pass: when `use_orcid_subblocking` is true, signatures with
+    the same normalized ORCID are co-located when one existing subblock can absorb the full ORCID
+    group without exceeding `maximum_size`.
 
     Args:
         signature_ids (list[str/int]): List of signature IDs.
@@ -319,6 +1787,7 @@ def make_subblocks_with_telemetry(
         first_k_letter_counts_sorted (dict): Dictionary of name letter counts, used for merging subblocks.
             Already included in the package. Default is FIRST_K_LETTER_COUNTS, which is imported
             in this file.
+        use_orcid_subblocking (bool): Whether to run the final same-ORCID co-location pass.
 
     Returns:
         tuple[dict, dict]: `(subblocks, telemetry)` where `subblocks` is the final partition and
@@ -349,6 +1818,7 @@ def make_subblocks_with_telemetry(
         "pre_merge_subblock_count": 0,
         "pre_merge_specter_labeled_subblock_count": 0,
         "pre_merge_specter_labeled_signature_count": 0,
+        "orcid_subblocking_enabled": bool(use_orcid_subblocking),
         "orcid_merge_skipped_due_to_capacity_count": 0,
         "orcid_merge_skipped_due_to_capacity_signature_count": 0,
         "final_subblock_count": 0,
@@ -429,6 +1899,15 @@ def make_subblocks_with_telemetry(
             "Subdividing the subblocks that could not be subdivided via middle names using SPECTER "
             "(and random subblocking)"
         )
+    fallback_cluster_fn = specter_cluster_fn or cluster_with_specter
+    fallback_signature_groups = [
+        tuple(str(signature_id) for signature_id in sig_ids_loop)
+        for sig_ids_loop in output_for_specter.values()
+        if len(sig_ids_loop) > maximum_size
+    ]
+    prepare_fallback = getattr(fallback_cluster_fn, "prepare", None)
+    if callable(prepare_fallback) and fallback_signature_groups:
+        prepare_fallback(fallback_signature_groups)
     for key, sig_ids_loop in output_for_specter.items():
         output_loop = {}
         if len(sig_ids_loop) <= maximum_size:
@@ -439,7 +1918,7 @@ def make_subblocks_with_telemetry(
         else:
             telemetry["specter_invocation_count"] += 1
             telemetry["specter_input_signature_count"] += int(len(sig_ids_loop))
-            specter_clustering = cluster_with_specter(
+            specter_clustering = fallback_cluster_fn(
                 sig_ids_loop,
                 anddata,
                 target_subblock_size=maximum_size,
@@ -551,73 +2030,66 @@ def make_subblocks_with_telemetry(
     for k in list(output.keys()):
         output[k] = list(output[k])
 
-    # final step: we need to make sure that sets of signature_ids with the same ORCID are in the same subblock
-    # approach: find all the signature_ids with ORCIDs that appear more than once
-    # AND are in different subblocks
-    # then move around the individual signatures so that they are in the same subblock
-    # 1: get a mapping from orcid -> signature_ids, plus a live index of current subblock membership
-    orcid_to_sig_ids = defaultdict(list)
     sig_id_to_subblock_id = {}
     for subblock_id, sig_ids in output.items():
         for sig_id in sig_ids:
             sig_id_to_subblock_id[sig_id] = subblock_id
-            orcid = anddata.signatures[sig_id].author_info_orcid
+
+    if use_orcid_subblocking:
+        # Final ORCID repair pass. It is intentionally cap-preserving: if no existing target
+        # subblock can absorb the full same-ORCID group, leave the split in place and report it.
+        orcid_to_sig_ids = defaultdict(list)
+        for sig_id in sig_id_to_subblock_id:
+            orcid = normalize_orcid_for_subblocking(getattr(anddata.signatures[sig_id], "author_info_orcid", None))
             if orcid is not None:
                 orcid_to_sig_ids[orcid].append(sig_id)
-    # 2: for each orcid, if there is more than one unique subblock_id, then we need to move signature_ids around
-    for orcid, orcid_sig_ids in orcid_to_sig_ids.items():
-        current_subblock_counts = Counter(sig_id_to_subblock_id[sig_id] for sig_id in orcid_sig_ids)
-        unique_subblock_ids = sorted(current_subblock_counts)
-        if len(unique_subblock_ids) > 1:
-            # 3: pick a subblock that can absorb the full ORCID group without exceeding maximum_size
-            # try to move into subblocks that
-            # (a) are not SPECTER subblocks
-            # (b) have more than 1 letter
-            unique_subblock_ids = sorted(
-                unique_subblock_ids,
-                key=lambda x: (x.count("specter") * 10 + x.count("|"), x),
-            )
-            total_orcid_sig_count = len(orcid_sig_ids)
-            feasible_subblock_ids = [
-                subblock_id
-                for subblock_id in unique_subblock_ids
-                if len(output[subblock_id]) + (total_orcid_sig_count - current_subblock_counts[subblock_id])
-                <= maximum_size
-            ]
-            if not feasible_subblock_ids:
-                telemetry["orcid_merge_skipped_due_to_capacity_count"] += 1
-                telemetry["orcid_merge_skipped_due_to_capacity_signature_count"] += int(total_orcid_sig_count)
-                logger.warning(
-                    "Skipping ORCID merge for %s across %d subblocks; no target fits within maximum_size=%d",
-                    orcid,
-                    len(unique_subblock_ids),
-                    maximum_size,
+        for orcid, orcid_sig_ids in orcid_to_sig_ids.items():
+            current_subblock_counts = Counter(sig_id_to_subblock_id[sig_id] for sig_id in orcid_sig_ids)
+            unique_subblock_ids = sorted(current_subblock_counts)
+            if len(unique_subblock_ids) > 1:
+                unique_subblock_ids = sorted(
+                    unique_subblock_ids,
+                    key=lambda x: (x.count("specter") * 10 + x.count("|"), x),
                 )
-                continue
-            subblock_id_to_move_to = feasible_subblock_ids[0]
-            # 4: move the signature_ids around so that they are all in the same subblock
-            # we take ONLY the signature ids that are not in the chosen subblock_id
-            # and move them there, then batch-remove via set membership to avoid repeated list.remove().
-            sig_ids_to_move = []
-            moved_sig_ids_by_source = defaultdict(set)
-            for sig_id in orcid_sig_ids:
-                original_subblock_id = sig_id_to_subblock_id[sig_id]
-                if original_subblock_id != subblock_id_to_move_to:
-                    sig_ids_to_move.append(sig_id)
-                    moved_sig_ids_by_source[original_subblock_id].add(sig_id)
-
-            output[subblock_id_to_move_to].extend(sig_ids_to_move)
-            for sig_id in sig_ids_to_move:
-                sig_id_to_subblock_id[sig_id] = subblock_id_to_move_to
-            for original_subblock_id, moved_sig_ids in moved_sig_ids_by_source.items():
-                if original_subblock_id not in output:
+                total_orcid_sig_count = len(orcid_sig_ids)
+                feasible_subblock_ids = [
+                    subblock_id
+                    for subblock_id in unique_subblock_ids
+                    if len(output[subblock_id]) + (total_orcid_sig_count - current_subblock_counts[subblock_id])
+                    <= maximum_size
+                ]
+                if not feasible_subblock_ids:
+                    telemetry["orcid_merge_skipped_due_to_capacity_count"] += 1
+                    telemetry["orcid_merge_skipped_due_to_capacity_signature_count"] += int(total_orcid_sig_count)
+                    logger.warning(
+                        "Skipping ORCID merge for %s across %d subblocks; no target fits within maximum_size=%d",
+                        orcid,
+                        len(unique_subblock_ids),
+                        maximum_size,
+                    )
                     continue
-                remaining_sig_ids = [sig_id for sig_id in output[original_subblock_id] if sig_id not in moved_sig_ids]
-                if remaining_sig_ids:
-                    output[original_subblock_id] = remaining_sig_ids
-                else:
-                    # unlikely, but if we emptied out the original subblock, then delete it
-                    del output[original_subblock_id]
+                subblock_id_to_move_to = feasible_subblock_ids[0]
+                sig_ids_to_move = []
+                moved_sig_ids_by_source = defaultdict(set)
+                for sig_id in orcid_sig_ids:
+                    original_subblock_id = sig_id_to_subblock_id[sig_id]
+                    if original_subblock_id != subblock_id_to_move_to:
+                        sig_ids_to_move.append(sig_id)
+                        moved_sig_ids_by_source[original_subblock_id].add(sig_id)
+
+                output[subblock_id_to_move_to].extend(sig_ids_to_move)
+                for sig_id in sig_ids_to_move:
+                    sig_id_to_subblock_id[sig_id] = subblock_id_to_move_to
+                for original_subblock_id, moved_sig_ids in moved_sig_ids_by_source.items():
+                    if original_subblock_id not in output:
+                        continue
+                    remaining_sig_ids = [
+                        sig_id for sig_id in output[original_subblock_id] if sig_id not in moved_sig_ids
+                    ]
+                    if remaining_sig_ids:
+                        output[original_subblock_id] = remaining_sig_ids
+                    else:
+                        del output[original_subblock_id]
 
     # let's assert that we have done a complete partition
     assert set(np.hstack([output[k] for k in output])) == set(signature_ids)
@@ -644,6 +2116,8 @@ def make_subblocks(
     maximum_size=15000,
     first_k_letter_counts_sorted=FIRST_K_LETTER_COUNTS,
     compute_block_fn=compute_block,
+    specter_cluster_fn=None,
+    use_orcid_subblocking: bool = True,
 ):
     """Split signature IDs into subblocks based on name attributes.
 
@@ -655,6 +2129,7 @@ def make_subblocks(
         anddata (s2and.data.ANDData): Contains name attribute data for the signatures.
         maximum_size (int): Maximum size of any subblock. Default is 15000.
         first_k_letter_counts_sorted (dict): Prefix-count priors used when merging small subblocks.
+        use_orcid_subblocking (bool): Whether to run the final same-ORCID co-location pass.
 
     Returns:
         dict: Dictionary of subblock keys mapped to lists of signature IDs.
@@ -665,5 +2140,7 @@ def make_subblocks(
         maximum_size=maximum_size,
         first_k_letter_counts_sorted=first_k_letter_counts_sorted,
         compute_block_fn=compute_block_fn,
+        specter_cluster_fn=specter_cluster_fn,
+        use_orcid_subblocking=use_orcid_subblocking,
     )
     return output

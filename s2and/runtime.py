@@ -14,7 +14,7 @@ logger = logging.getLogger("s2and")
 
 Backend = Literal["python", "rust"]
 RequestedBackend = Literal["python", "rust", "auto"]
-RuntimeSource = Literal["S2AND_BACKEND", "default"]
+RuntimeSource = Literal["S2AND_BACKEND", "argument", "default"]
 
 _STARTUP_WARNING_EMITTED = False
 _STARTUP_WARNING_LOCK = threading.Lock()
@@ -341,10 +341,11 @@ def _resolve_explicit_rust_backend(*, source: RuntimeSource) -> BackendResolutio
     capabilities = detect_rust_runtime_capabilities()
     if not capabilities.core_runtime_available:
         min_version = min_supported_rust_extension_version_string()
+        request_label = "backend='rust'" if source == "argument" else "S2AND_BACKEND='rust'"
         raise RuntimeError(
-            "S2AND_BACKEND='rust' requested but Rust runtime is unavailable or unsupported "
+            f"{request_label} requested but Rust runtime is unavailable or unsupported "
             f"(reason={capabilities.reason}). Install/upgrade s2and_rust (>= {min_version}) "
-            "or set S2AND_BACKEND=python/auto."
+            "or use backend='python'/'auto'."
         )
     return BackendResolution(
         requested_backend="rust",
@@ -355,6 +356,36 @@ def _resolve_explicit_rust_backend(*, source: RuntimeSource) -> BackendResolutio
 
 
 def resolve_backend(*, emit_startup_warning: bool = True) -> BackendResolution:
+    return resolve_backend_for_request(backend=None, emit_startup_warning=emit_startup_warning)
+
+
+def resolve_backend_for_request(
+    *,
+    backend: RequestedBackend | None = None,
+    emit_startup_warning: bool = True,
+) -> BackendResolution:
+    if backend is not None:
+        requested = _normalize_backend_value(backend)
+        if requested not in {"python", "rust", "auto"}:
+            raise ValueError(f"Invalid backend={backend!r}; expected 'python', 'rust', or 'auto'")
+        if requested == "auto":
+            resolution = _resolve_auto_backend(
+                requested_backend="auto",
+                source="argument",
+            )
+        elif requested == "rust":
+            resolution = _resolve_explicit_rust_backend(source="argument")
+        else:
+            resolution = BackendResolution(
+                requested_backend="python",
+                resolved_backend="python",
+                source="argument",
+                capability_reason="explicit_python",
+            )
+        if emit_startup_warning:
+            _emit_startup_runtime_warning_once(resolution)
+        return resolution
+
     requested_raw = os.environ.get("S2AND_BACKEND")
     if requested_raw is not None:
         requested = _normalize_backend_value(requested_raw)
@@ -390,10 +421,11 @@ def resolve_backend(*, emit_startup_warning: bool = True) -> BackendResolution:
 def build_runtime_context(
     operation: str,
     *,
+    backend: RequestedBackend | None = None,
     run_id: str | None = None,
     emit_startup_warning: bool = True,
 ) -> RuntimeContext:
-    resolution = resolve_backend(emit_startup_warning=emit_startup_warning)
+    resolution = resolve_backend_for_request(backend=backend, emit_startup_warning=emit_startup_warning)
     if not operation:
         raise ValueError("operation must be a non-empty string")
     effective_run_id = run_id or f"{operation}-{uuid.uuid4().hex[:12]}"

@@ -80,45 +80,65 @@
     }
   },
   "raw_planner_batch_indexes": {
-    "paper_authors_batch_index": {
-      "actual_max_batch_rows": 12361,
-      "magic": "S2ABI001",
-      "max_record_batch_rows": 16384,
-      "record_batch_count": 1,
-      "record_count": 12361,
+    "signatures_batch_index": {
       "reused": false,
-      "row_count": 12361,
-      "schema_version": "arrow_batch_lookup_index_v1"
+      "schema_version": "arrow_batch_lookup_index",
+      "magic": "S2ABI001",
+      "row_count": 2871,
+      "record_count": 2871,
+      "key_column_hash": 607743565014278955,
+      "source_fingerprint": 1123841135725622699,
+      "record_batch_count": 1,
+      "actual_max_batch_rows": 2871,
+      "max_record_batch_rows": 16384
     },
     "papers_batch_index": {
-      "actual_max_batch_rows": 2871,
-      "magic": "S2ABI001",
-      "max_record_batch_rows": 16384,
-      "record_batch_count": 1,
-      "record_count": 2871,
       "reused": false,
+      "schema_version": "arrow_batch_lookup_index",
+      "magic": "S2ABI001",
       "row_count": 2871,
-      "schema_version": "arrow_batch_lookup_index_v1"
+      "record_count": 2871,
+      "key_column_hash": 17948583095397703583,
+      "source_fingerprint": 5282088373386211127,
+      "record_batch_count": 1,
+      "actual_max_batch_rows": 2871,
+      "max_record_batch_rows": 16384
     },
-    "signatures_batch_index": {
-      "actual_max_batch_rows": 2871,
-      "magic": "S2ABI001",
-      "max_record_batch_rows": 16384,
-      "record_batch_count": 1,
-      "record_count": 2871,
+    "paper_authors_batch_index": {
       "reused": false,
+      "schema_version": "arrow_batch_lookup_index",
+      "magic": "S2ABI001",
+      "row_count": 12361,
+      "record_count": 12361,
+      "key_column_hash": 17948583095397703583,
+      "source_fingerprint": 4243736360547859004,
+      "record_batch_count": 1,
+      "actual_max_batch_rows": 12361,
+      "max_record_batch_rows": 16384
+    },
+    "specter_batch_index": {
+      "reused": false,
+      "schema_version": "arrow_batch_lookup_index",
+      "magic": "S2ABI001",
       "row_count": 2871,
-      "schema_version": "arrow_batch_lookup_index_v1"
+      "record_count": 2871,
+      "key_column_hash": 17948583095397703583,
+      "source_fingerprint": 1442493885799096514,
+      "record_batch_count": 2,
+      "actual_max_batch_rows": 2048,
+      "max_record_batch_rows": 2048
     },
     "specter2_batch_index": {
-      "actual_max_batch_rows": 2048,
-      "magic": "S2ABI001",
-      "max_record_batch_rows": 2048,
-      "record_batch_count": 2,
-      "record_count": 2871,
       "reused": false,
+      "schema_version": "arrow_batch_lookup_index",
+      "magic": "S2ABI001",
       "row_count": 2871,
-      "schema_version": "arrow_batch_lookup_index_v1"
+      "record_count": 2871,
+      "key_column_hash": 17948583095397703583,
+      "source_fingerprint": 1442493885799096514,
+      "record_batch_count": 2,
+      "actual_max_batch_rows": 2048,
+      "max_record_batch_rows": 2048
     }
   },
   "schema": "feature_block_arrow_v2",

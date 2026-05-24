@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import orjson
 from tqdm import tqdm
 
 from s2and import feature_port, memory_budget
@@ -817,24 +816,6 @@ class FeaturizationInfo:
         """
         return os.path.join(CACHE_ROOT, dataset_name, str(self.featurizer_version))
 
-    def cache_file_path(self, dataset_name: str) -> str:
-        """
-        returns the legacy JSON file path for the features cache
-
-        Parameters
-        ----------
-        dataset_name: string
-            the name of the dataset
-
-        Returns
-        -------
-        string: the full file path for the features cache file
-        """
-        return os.path.join(
-            self.cache_directory(dataset_name),
-            "all_features.json",
-        )
-
     def cache_db_path(self, dataset_name: str) -> str:
         """
         returns the SQLite database path for the features cache
@@ -905,28 +886,6 @@ class FeaturizationInfo:
             """
         )
 
-    def _load_legacy_json_cache(self, legacy_path: str) -> dict[str, Any]:
-        cached_features = self._fresh_cache_payload()
-        try:
-            with open(legacy_path, "rb") as cache_file:
-                payload = orjson.loads(cache_file.read())
-        except ValueError:
-            with open(legacy_path, encoding="utf-8") as cache_file:
-                payload = json.load(cache_file)
-
-        if not isinstance(payload, dict):
-            raise ValueError(f"Invalid legacy pair-feature cache at {legacy_path}: expected object payload")
-        features = payload.get("features")
-        if not isinstance(features, dict):
-            raise ValueError(f"Invalid legacy pair-feature cache at {legacy_path}: missing features object")
-        cached_features["features"] = features
-        stored_features_to_use = payload.get("features_to_use")
-        if isinstance(stored_features_to_use, list) and all(isinstance(value, str) for value in stored_features_to_use):
-            cached_features["features_to_use"] = list(stored_features_to_use)
-        cached_features["__cache_backend__"] = "legacy_json"
-        cached_features["__legacy_cache_path__"] = legacy_path
-        return cached_features
-
     def _load_sqlite_cache(self, db_path: str) -> dict[str, Any]:
         cached_features = self._fresh_cache_payload()
         with sqlite3.connect(db_path, timeout=PAIR_FEATURE_CACHE_BUSY_TIMEOUT_SECONDS) as connection:
@@ -959,11 +918,8 @@ class FeaturizationInfo:
     def load_cache(self, dataset_name: str) -> dict[str, Any]:
         """Load the persisted pair-feature cache for a dataset."""
         db_path = self.cache_db_path(dataset_name)
-        legacy_path = self.cache_file_path(dataset_name)
         if os.path.exists(db_path):
             return self._load_sqlite_cache(db_path)
-        if os.path.exists(legacy_path):
-            return self._load_legacy_json_cache(legacy_path)
         cached_features = self._fresh_cache_payload()
         cached_features["__cache_backend__"] = "empty"
         return cached_features
@@ -996,12 +952,8 @@ class FeaturizationInfo:
         if not isinstance(new_features, dict):
             raise ValueError("cached_features['__new_features__'] must be a dictionary")
 
-        migrating_legacy_cache = cached_features.get("__cache_backend__") == "legacy_json"
         replace_existing_rows = not incremental
-        if incremental:
-            features_to_persist = full_features if migrating_legacy_cache else new_features
-        else:
-            features_to_persist = full_features
+        features_to_persist = new_features if incremental else full_features
         if len(features_to_persist) <= 0:
             return
 
@@ -1840,9 +1792,7 @@ def many_pairs_featurize(
         if not os.path.exists(featurizer_info.cache_directory(dataset.name)):
             os.makedirs(featurizer_info.cache_directory(dataset.name))
         cache_storage_key = featurizer_info.cache_storage_key(dataset.name)
-        if os.path.exists(featurizer_info.cache_db_path(dataset.name)) or os.path.exists(
-            featurizer_info.cache_file_path(dataset.name)
-        ):
+        if os.path.exists(featurizer_info.cache_db_path(dataset.name)):
             with _CACHED_FEATURES_LOCK:
                 in_memory = CACHED_FEATURES.get(cache_storage_key)
             if in_memory is not None:

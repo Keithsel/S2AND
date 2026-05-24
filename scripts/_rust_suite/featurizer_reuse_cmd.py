@@ -66,7 +66,6 @@ def run_reuse_profile(
         raise ValueError("repeats must be >= 1")
 
     os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
-    os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
     os.environ["S2AND_BACKEND"] = "rust"
     rust_extension_identity = collect_rust_extension_identity(
         require_release=bool(require_rust_release),
@@ -78,6 +77,9 @@ def run_reuse_profile(
     from s2and.eval import cluster_eval
     from s2and.feature_port import _rust_featurizer_build_count, clear_rust_featurizer_cache
     from s2and.production_model import load_production_model
+    from s2and.text import set_fasttext_loading_enabled
+
+    set_fasttext_loading_enabled(False)
 
     paths = _build_data_paths(PROJECT_ROOT_PATH, dataset_name)
     for key, path in paths.items():

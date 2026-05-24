@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
@@ -8,7 +9,7 @@ from lightgbm import LGBMClassifier
 
 import s2and.incremental_linking.production as production_module
 import s2and.model as model_module
-from s2and.consts import LARGE_INTEGER
+from s2and.consts import LARGE_DISTANCE
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.feature_block import write_cluster_seeds_arrow
@@ -54,15 +55,15 @@ def test_finish_incremental_uses_split_inverse_for_altered_incompatibility_check
     )
 
     clusters = Clusterer._finish_incremental_with_seed_links(
-        clusterer,
+        cast(Any, clusterer),
         ["new_donald"],
-        dataset,
+        cast(Any, dataset),
         {"new_donald": "0_1"},
         {"0_0": "0", "0_1": "0"},
         {"0": ["seed_david", "seed_initial"]},
         prevent_new_incompatibilities=True,
         partial_supervision={},
-        runtime_context=SimpleNamespace(),
+        runtime_context=cast(Any, SimpleNamespace()),
         split_cluster_seeds_require_inverse={
             "0_0": ["seed_david"],
             "0_1": ["seed_initial"],
@@ -99,6 +100,47 @@ def test_finish_incremental_wrapper_forwards_split_inverse_to_kwargs_method() ->
     assert result == {"0": ["seed_david"]}
     assert captured["kwargs"]["split_cluster_seeds_require_inverse"] is split_inverse
     assert captured["kwargs"]["total_ram_bytes"] == 123
+
+
+def test_subblocked_altered_presplit_failure_refreshes_telemetry(monkeypatch) -> None:
+    clusterer = Clusterer(
+        featurizer_info=FeaturizationInfo(features_to_use=[]),
+        classifier=None,
+        cluster_model=None,
+        n_jobs=1,
+    )
+    clusterer._last_subblocked_altered_presplit_telemetry = {"stale": 1}
+    dataset = SimpleNamespace(cluster_seeds_require={"s1": "c1"})
+
+    monkeypatch.setattr(model_module, "_dataset_altered_cluster_signatures", lambda _dataset, _paths: ["s1"])
+
+    def fail_seed_setup(self, *_args, **_kwargs):
+        del self
+        raise RuntimeError("seed setup failed")
+
+    monkeypatch.setattr(Clusterer, "_build_incremental_seed_setup", fail_seed_setup)
+
+    with pytest.raises(RuntimeError, match="seed setup failed"):
+        clusterer._predict_subblocked(
+            {"block": ["s1"]},
+            cast(ANDData, dataset),
+            cluster_model_params=None,
+            partial_supervision={},
+            use_s2_clusters=False,
+            incremental_dont_use_cluster_seeds=False,
+            batching_threshold=10,
+            desired_memory_use=None,
+            runtime_context=cast(Any, SimpleNamespace(run_id="test")),
+            dists=None,
+            total_ram_bytes=None,
+            restore_rust_cluster_seeds_on_exit=True,
+            arrow_paths={"signatures": "signatures.arrow"},
+        )
+
+    assert clusterer._last_subblocked_altered_presplit_telemetry == {
+        "bulk_altered_presplit_applied": 0,
+        "bulk_altered_presplit_seconds": 0.0,
+    }
 
 
 def test_model_presplit_cache_fingerprint_drops_cluster_model_identity() -> None:
@@ -145,7 +187,7 @@ def test_predict_from_rust_featurizer_proxy_exposes_signature_rule_metadata() ->
             ]
 
     clusterer = DummyClusterer()
-    clusterer.predict_from_rust_featurizer(
+    cast(Any, clusterer).predict_from_rust_featurizer(
         {"block": ["s_alice", "s_bob", "s_alicia"]},
         FakeRustFeaturizer(),
         dists={"block": np.asarray([0.1, 0.2, 0.3], dtype=np.float64)},
@@ -329,7 +371,7 @@ def test_predict_incremental_rust_promoted_linker_uses_seed_link_seam(clusterer_
         "_resolve_total_ram_bytes_for_incremental",
         lambda _total=None: (1_000_000_000, "test"),
     )
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module.memory_budget, "current_rss_bytes_best_effort", lambda _total: (1_000, "rss:test"))
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
     monkeypatch.setattr(model_module, "_get_rust_featurizer", lambda *args, **kwargs: object())
@@ -439,7 +481,7 @@ def test_predict_incremental_promoted_linker_respects_suppress_orcid(
         "_resolve_total_ram_bytes_for_incremental",
         lambda _total=None: (1_000_000_000, "test"),
     )
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module.memory_budget, "current_rss_bytes_best_effort", lambda _total: (1_000, "rss:test"))
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
     monkeypatch.setattr(model_module, "_get_rust_featurizer", lambda *args, **kwargs: object())
@@ -522,7 +564,7 @@ def test_predict_incremental_promoted_linker_passes_orcid_fanout_floor_to_limits
         "_resolve_total_ram_bytes_for_incremental",
         lambda _total=None: (1_000_000_000, "test"),
     )
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module.memory_budget, "current_rss_bytes_best_effort", lambda _total: (1_000, "rss:test"))
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
     monkeypatch.setattr(model_module, "_get_rust_featurizer", lambda *args, **kwargs: object())
@@ -624,7 +666,7 @@ def test_predict_incremental_explicit_rust_backend_uses_promoted_linker_by_defau
         "phase_b_required_bytes": 0,
     }
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
 
     def fake_promoted_mode(self, block_signatures, dataset_arg, **kwargs):
@@ -666,7 +708,7 @@ def test_predict_incremental_auto_backend_uses_promoted_linker_when_auto_resolve
         "phase_b_required_bytes": 0,
     }
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         Clusterer,
@@ -745,8 +787,10 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
         runtime_context_arg,
         total_ram_bytes=None,
         arrow_paths=None,
+        split_cluster_seeds_require_inverse=None,
     ):
         del self, recluster_map, cluster_seeds_require_inverse, prevent_new_incompatibilities, partial_supervision
+        del split_cluster_seeds_require_inverse
         captured["finish_unassigned"] = list(unassigned_signature_ids)
         captured["finish_dataset"] = dataset_arg
         captured["finish_linked"] = dict(linked_signature_clusters)
@@ -755,7 +799,7 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
         captured["finish_arrow_paths"] = None if arrow_paths is None else dict(arrow_paths)
         return {"finished": list(unassigned_signature_ids)}
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: sync_calls.append(args))
     monkeypatch.setattr(
         production_module.artifact_module,
@@ -800,7 +844,7 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
     assert captured["finish_arrow_paths"] == captured["arrow_paths"]
 
 
-def test_predict_incremental_arrow_promoted_linker_closes_temp_seed_bundle_on_failure(
+def test_predict_incremental_arrow_promoted_linker_cleans_up_temp_seed_context_on_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -809,15 +853,16 @@ def test_predict_incremental_arrow_promoted_linker_closes_temp_seed_bundle_on_fa
     class FakeArtifact:
         metadata = SimpleNamespace(retrieval_top_k=25)
 
-    class FakeArrowPathBundle:
-        paths = {
-            "signatures": "signatures.arrow",
-            "papers": "papers.arrow",
-            "paper_authors": "paper_authors.arrow",
-            "cluster_seeds": "temp_cluster_seeds.arrow",
-        }
-
-        def close(self) -> None:
+    @contextmanager
+    def fake_temporary_arrow_paths_with_cluster_seeds(*_args: object, **_kwargs: object):
+        try:
+            yield {
+                "signatures": "signatures.arrow",
+                "papers": "papers.arrow",
+                "paper_authors": "paper_authors.arrow",
+                "cluster_seeds": "temp_cluster_seeds.arrow",
+            }
+        finally:
             closed.append(True)
 
     class FakeClusterer:
@@ -850,8 +895,8 @@ def test_predict_incremental_arrow_promoted_linker_closes_temp_seed_bundle_on_fa
     )
     monkeypatch.setattr(
         production_module,
-        "arrow_paths_with_temporary_cluster_seeds",
-        lambda *_args, **_kwargs: FakeArrowPathBundle(),
+        "temporary_arrow_paths_with_cluster_seeds",
+        fake_temporary_arrow_paths_with_cluster_seeds,
     )
 
     with pytest.raises(RuntimeError, match="raw Arrow linker failed"):
@@ -964,7 +1009,7 @@ def test_predict_incremental_arrow_promoted_linker_uses_budget_batch_size(
         limit_calls.append(dict(kwargs))
         return _mock_promoted_limits(query_count=int(kwargs["query_count"]), query_batch_size=1)
 
-    def fake_raw_arrow_linker(*_args: object, **kwargs: object):
+    def fake_raw_arrow_linker(*_args: object, **kwargs: Any):
         query_ids = tuple(str(signature_id) for signature_id in kwargs["query_signature_ids"])
         raw_batches.append(query_ids)
         return SimpleNamespace(
@@ -1044,6 +1089,8 @@ def test_resolve_dataset_arrow_paths_discovers_raw_planner_batch_indexes(tmp_pat
         "paper_authors.paper_authors_batch_index.bin",
     ):
         (tmp_path / filename).touch()
+    (tmp_path / "cluster_seed_disallows.arrow").touch()
+    (tmp_path / "altered_cluster_signatures.arrow").touch()
 
     dataset = SimpleNamespace(arrow_paths=arrow_paths)
     resolved = model_module._resolve_dataset_arrow_paths(
@@ -1056,6 +1103,57 @@ def test_resolve_dataset_arrow_paths_discovers_raw_planner_batch_indexes(tmp_pat
     assert Path(resolved["signatures_batch_index"]).name == "signatures.signatures_batch_index.bin"
     assert Path(resolved["papers_batch_index"]).name == "papers.papers_batch_index.bin"
     assert Path(resolved["paper_authors_batch_index"]).name == "paper_authors.paper_authors_batch_index.bin"
+    assert Path(resolved["cluster_seed_disallows"]).name == "cluster_seed_disallows.arrow"
+    assert Path(resolved["altered_cluster_signatures"]).name == "altered_cluster_signatures.arrow"
+
+
+def test_cluster_seeds_arrow_matches_surfaces_arrow_invalid_by_type(tmp_path: Path, monkeypatch) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "cluster_seeds.arrow"
+    path.write_bytes(b"not-arrow")
+
+    def raise_arrow_invalid(_path):
+        raise pa.lib.ArrowInvalid("invalid arrow")
+
+    monkeypatch.setattr(production_module, "read_cluster_seeds_arrow", raise_arrow_invalid)
+
+    with pytest.raises(pa.lib.ArrowInvalid, match="invalid arrow"):
+        production_module._cluster_seeds_arrow_matches(path, {"s1": "c1"})
+
+
+def test_cluster_seeds_arrow_matches_surfaces_arrow_invalid_by_name(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "cluster_seeds.arrow"
+    path.write_bytes(b"not-arrow")
+    arrow_invalid = type("ArrowInvalid", (Exception,), {})
+
+    def raise_arrow_invalid(_path):
+        raise arrow_invalid("invalid arrow")
+
+    monkeypatch.setattr(production_module, "read_cluster_seeds_arrow", raise_arrow_invalid)
+
+    with pytest.raises(arrow_invalid, match="invalid arrow"):
+        production_module._cluster_seeds_arrow_matches(path, {"s1": "c1"})
+
+
+def test_specter_arrow_name_uses_declared_suffix_not_substring() -> None:
+    specter2_paths = [
+        "/tmp/pubmed_specter2.pkl",
+        "/tmp/specter2.tar.gz",
+        "/tmp/specter2.embeddings.pkl",
+        "/tmp/pubmed_specter2.pkl.gz",
+    ]
+    for specter_path in specter2_paths:
+        assert (
+            model_module._specter_arrow_name_for_dataset(SimpleNamespace(specter_embeddings_path=specter_path))
+            == "specter2.arrow"
+        )
+
+    assert (
+        model_module._specter_arrow_name_for_dataset(
+            SimpleNamespace(specter_embeddings_path="/tmp/specter2backup.json")
+        )
+        == "specter.arrow"
+    )
 
 
 def test_resolve_dataset_arrow_paths_discovers_name_counts_index_from_manifest(tmp_path: Path) -> None:
@@ -1256,16 +1354,17 @@ def test_predict_incremental_arrow_promoted_linker_uses_seed_arrow_without_pytho
         runtime_context_arg,
         total_ram_bytes=None,
         arrow_paths=None,
+        split_cluster_seeds_require_inverse=None,
     ):
         del self, dataset_arg, linked_signature_clusters, recluster_map, prevent_new_incompatibilities
-        del partial_supervision, runtime_context_arg, total_ram_bytes, arrow_paths
+        del partial_supervision, runtime_context_arg, total_ram_bytes, arrow_paths, split_cluster_seeds_require_inverse
         captured["finish_unassigned"] = list(unassigned_signature_ids)
         captured["finish_seed_inverse"] = {
             str(cluster_id): list(signature_ids) for cluster_id, signature_ids in cluster_seeds_require_inverse.items()
         }
         return {"finished": list(unassigned_signature_ids)}
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: sync_calls.append(args))
     monkeypatch.setattr(Clusterer, "_predict_incremental_helper", fail_python_incremental)
     monkeypatch.setattr(
@@ -1337,16 +1436,14 @@ def test_predict_incremental_arrow_promoted_linker_rewrites_stale_seed_arrow(
             del args, kwargs
             return {"new": ["seed", "query"]}
 
-    class FakeArrowPathBundle:
-        paths = {**arrow_paths, "cluster_seeds": "rewritten_cluster_seeds.arrow"}
-
-        def close(self) -> None:
-            captured["closed"] = True
-
-    def fake_arrow_paths_with_temporary_cluster_seeds(paths_arg, cluster_seeds_require, **_kwargs):
+    @contextmanager
+    def fake_temporary_arrow_paths_with_cluster_seeds(paths_arg, cluster_seeds_require, **_kwargs):
         captured["rewritten_paths_input"] = dict(paths_arg)
         captured["rewritten_seed_map"] = dict(cluster_seeds_require)
-        return FakeArrowPathBundle()
+        try:
+            yield {**arrow_paths, "cluster_seeds": "rewritten_cluster_seeds.arrow"}
+        finally:
+            captured["closed"] = True
 
     def fake_raw_arrow_linker(_clusterer, _artifact, **kwargs):
         captured["raw_arrow_paths"] = dict(kwargs["arrow_paths"])
@@ -1370,8 +1467,8 @@ def test_predict_incremental_arrow_promoted_linker_rewrites_stale_seed_arrow(
     )
     monkeypatch.setattr(
         production_module,
-        "arrow_paths_with_temporary_cluster_seeds",
-        fake_arrow_paths_with_temporary_cluster_seeds,
+        "temporary_arrow_paths_with_cluster_seeds",
+        fake_temporary_arrow_paths_with_cluster_seeds,
     )
     monkeypatch.setattr(
         production_module.runtime_module,
@@ -1439,7 +1536,7 @@ def test_predict_incremental_arrow_promoted_linker_rejects_none_arrow_path(
         )
 
 
-def test_predict_incremental_arrow_promoted_linker_reuses_window_featurizer(
+def test_predict_incremental_arrow_promoted_linker_keeps_raw_plan_within_batch_budget(
     clusterer_dataset_factory,
     monkeypatch,
     tmp_path,
@@ -1479,7 +1576,7 @@ def test_predict_incremental_arrow_promoted_linker_reuses_window_featurizer(
             writer.write_table(seed_table)
     arrow_paths["cluster_seeds"] = str(cluster_seeds_path)
     dataset.arrow_paths = arrow_paths
-    captured: dict[str, Any] = {"runtime_featurizers": [], "runtime_batches": []}
+    captured: dict[str, Any] = {"runtime_featurizers": [], "runtime_batches": [], "runtime_raw_plans": []}
 
     class FakeArtifact:
         metadata = SimpleNamespace(retrieval_top_k=25)
@@ -1494,43 +1591,19 @@ def test_predict_incremental_arrow_promoted_linker_reuses_window_featurizer(
     class FakeRustModule:
         @staticmethod
         def raw_block_query_candidate_plan_arrow(paths_arg, query_signature_ids, **kwargs):
-            captured["raw_plan_paths"] = dict(paths_arg)
-            captured["raw_plan_query_signature_ids"] = tuple(query_signature_ids)
-            captured["raw_plan_kwargs"] = dict(kwargs)
-            query_count = len(query_signature_ids)
-            return {
-                "query_signature_ids": list(query_signature_ids),
-                "query_views": ["full"] * query_count,
-                "query_authors": ["author"] * query_count,
-                "row_count": 0,
-                "pair_count": 0,
-                "row_query_signature_indices": np.asarray([], dtype=np.uint32),
-                "pair_row_indices": np.asarray([], dtype=np.uint32),
-                "left_signature_indices": np.asarray([], dtype=np.uint32),
-                "right_signature_indices": np.asarray([], dtype=np.uint32),
-                "left_signature_ids": [],
-                "right_signature_ids": [],
-                "row_component_keys": [],
-                "component_members": {},
-                "telemetry": {
-                    "query_signature_count": query_count,
-                    "signature_count": query_count,
-                    "seed_signature_count": 4,
-                    "cluster_count": 2,
-                    "timings": {"read_signatures_secs": 0.05, "total_secs": 0.25},
-                },
-            }
+            del paths_arg, query_signature_ids, kwargs
+            raise AssertionError("promoted raw Arrow path must not preplan windows larger than the runtime batch")
 
     def fake_build_rust_featurizer_from_arrow_paths(paths_arg, **kwargs):
-        captured["featurizer_paths"] = dict(paths_arg)
-        captured["featurizer_signature_ids"] = tuple(kwargs["signature_ids"])
-        return FakeFeaturizer(kwargs["signature_ids"])
+        del paths_arg, kwargs
+        raise AssertionError("window featurizer should not be built when window planning is disabled")
 
     def fake_raw_arrow_linker(clusterer_arg, artifact_arg, **kwargs):
         del clusterer_arg, artifact_arg
         query_batch = tuple(kwargs["query_signature_ids"])
         captured["runtime_batches"].append(query_batch)
         captured["runtime_featurizers"].append(kwargs["rust_featurizer"])
+        captured["runtime_raw_plans"].append(kwargs["raw_candidate_plan"])
         return SimpleNamespace(
             linked_signature_clusters={str(signature_id): "0" for signature_id in query_batch},
             telemetry={
@@ -1545,7 +1618,7 @@ def test_predict_incremental_arrow_promoted_linker_reuses_window_featurizer(
             },
         )
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         production_module.artifact_module,
@@ -1567,22 +1640,23 @@ def test_predict_incremental_arrow_promoted_linker_reuses_window_featurizer(
     result = clusterer.predict_incremental(block, dataset, batching_threshold=1)
 
     assert result["clusters"] == {"0": ["6", "7", "5", "8"], "1": ["3", "4"]}
-    assert captured["raw_plan_query_signature_ids"] == ("5", "8")
-    assert captured["featurizer_signature_ids"] == ("5", "8")
+    assert "raw_plan_query_signature_ids" not in captured
+    assert "featurizer_signature_ids" not in captured
     assert captured["runtime_batches"] == [("5",), ("8",)]
-    assert len({id(featurizer) for featurizer in captured["runtime_featurizers"]}) == 1
-    assert captured["runtime_featurizers"][0] is not None
+    assert captured["runtime_featurizers"] == [None, None]
+    assert captured["runtime_raw_plans"] == [None, None]
     telemetry = result["incremental_linker_telemetry"]
-    assert telemetry["raw_arrow_window_plan_count"] == 1
-    assert telemetry["raw_arrow_window_featurizer_count"] == 1
-    assert telemetry["raw_arrow_window_featurizer_signature_count"] == 2
+    assert telemetry["raw_arrow_window_plan_count"] == 0
+    assert telemetry["raw_arrow_window_plan_enabled"] == 0
+    assert telemetry["raw_arrow_window_plan_size"] == 1
+    assert telemetry["raw_arrow_window_plan_multiplier"] == 1
+    assert telemetry["raw_arrow_window_plan_query_count"] == 0
+    assert telemetry["raw_arrow_window_featurizer_count"] == 0
+    assert telemetry["raw_arrow_window_featurizer_signature_count"] == 0
     assert "raw_arrow_window_subset_seconds" in telemetry
-    assert telemetry["raw_arrow_window_plan_signature_count"] == 2
-    assert telemetry["raw_arrow_window_plan_seed_signature_count"] == 4
-    assert telemetry["raw_arrow_window_plan_cluster_count"] == 2
-    assert telemetry["raw_arrow_window_plan_read_signatures_secs"] == 0.05
-    assert telemetry["raw_arrow_window_plan_total_secs"] == 0.25
-    assert telemetry["raw_arrow_featurizer_reused"] == 2
+    assert "raw_arrow_window_plan_signature_count" not in telemetry
+    assert "raw_arrow_window_plan_seed_signature_count" not in telemetry
+    assert telemetry["raw_arrow_featurizer_reused"] == 0
     assert telemetry["seed_signature_count"] == 4
     assert telemetry["seed_component_count"] == 2
     assert telemetry["raw_arrow_seed_signature_count"] == 4
@@ -1648,7 +1722,7 @@ def test_predict_incremental_arrow_promoted_linker_transforms_altered_seed_arrow
             telemetry={"candidate_row_count": 2, "pair_count": 2, "query_count": len(kwargs["query_signature_ids"])},
         )
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: sync_calls.append(args))
     monkeypatch.setattr(
         model_module,
@@ -1717,7 +1791,7 @@ def test_predict_incremental_rust_empty_seeds_uses_monolithic_fallback(clusterer
         "phase_b_required_bytes": 0,
     }
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
 
     def fake_helper(self, block_signatures, dataset_arg, **kwargs):
@@ -1749,7 +1823,7 @@ def test_predict_incremental_rust_empty_seeds_rejects_batching_threshold(cluster
         source="S2AND_BACKEND",
     )
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         Clusterer,
@@ -1776,7 +1850,7 @@ def test_predict_incremental_promoted_linker_batches_queries(
         run_id="test-rust-promoted-incremental-batch",
         source="S2AND_BACKEND",
     )
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
     monkeypatch.setattr(model_module, "_get_rust_featurizer", lambda *args, **kwargs: object())
     monkeypatch.setattr(
@@ -1890,7 +1964,7 @@ def test_predict_incremental_promoted_linker_recalibrates_query_batch_size(
         run_id="test-rust-promoted-incremental-calibration",
         source="S2AND_BACKEND",
     )
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
     monkeypatch.setattr(model_module, "_get_rust_featurizer", lambda *args, **kwargs: object())
     monkeypatch.setattr(
@@ -2068,7 +2142,7 @@ def test_predict_incremental_promoted_linker_fails_closed_when_single_query_exce
         run_id="test-rust-promoted-incremental-budget-fail",
         source="S2AND_BACKEND",
     )
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         model_module,
@@ -2291,8 +2365,8 @@ def test_predict_subblocked_processes_subblocks_in_sorted_key_order(clusterer_da
     block_signatures = ["3", "4", "5", "6"]
     observed_order: list[str] = []
 
-    def _fake_make_subblocks(signatures, anddata, maximum_size=7500, first_k_letter_counts_sorted=None):
-        del signatures, anddata, maximum_size, first_k_letter_counts_sorted
+    def _fake_make_subblocks(signatures, anddata, maximum_size=7500, first_k_letter_counts_sorted=None, **kwargs):
+        del signatures, anddata, maximum_size, first_k_letter_counts_sorted, kwargs
         # Intentionally unsorted insertion order to verify deterministic processing order in predict().
         return {"zeta": ["3", "4"], "alpha": ["5", "6"]}
 
@@ -2320,6 +2394,500 @@ def test_predict_subblocked_processes_subblocks_in_sorted_key_order(clusterer_da
 
     clusterer.predict({"block": block_signatures}, dataset, batching_threshold=3)
     assert observed_order == ["block|subblock=alpha", "block|subblock=zeta"]
+
+
+def test_predict_subblocked_arrow_path_wires_graph_fallback(clusterer_dataset_factory, monkeypatch):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_arrow_graph_subblocking")
+    fake_arrow_paths = {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+        "specter": "specter.arrow",
+    }
+    captured: dict[str, Any] = {}
+
+    class FakeFallback:
+        load_seconds = 1.25
+        stats = [{"input_signature_count": 4, "packed_component_count": 2}]
+
+        def __call__(self, *_args: object, **_kwargs: object) -> dict[str, list[str]]:
+            raise AssertionError("make_subblocks fake should only receive the callback")
+
+    fake_fallback = FakeFallback()
+
+    def fake_factory(paths, signature_ids, *, config, random_seed):
+        captured["factory_paths"] = dict(paths)
+        captured["factory_signature_ids"] = list(signature_ids)
+        captured["factory_config"] = config
+        captured["factory_random_seed"] = random_seed
+        return fake_fallback
+
+    def fake_make_subblocks(signatures, anddata, maximum_size=7500, first_k_letter_counts_sorted=None, **kwargs):
+        del anddata, first_k_letter_counts_sorted
+        captured["make_subblocks_signatures"] = list(signatures)
+        captured["make_subblocks_maximum_size"] = maximum_size
+        captured["specter_cluster_fn"] = kwargs.get("specter_cluster_fn")
+        return {"zeta": ["3", "4"], "alpha": ["5", "6"]}
+
+    def fake_partition(self, block_dict_subblocked, dataset):
+        del self, dataset
+        captured["subblocked_keys"] = sorted(block_dict_subblocked)
+        return {}, {}, False
+
+    def fake_predict_multiple(self, block_dict_multiple_letter, **kwargs):
+        del self, block_dict_multiple_letter, kwargs
+        return {"cluster": ["3", "4", "5", "6"]}
+
+    def fake_predict_single(self, block_dict_single_letter, *, pred_clusters, **kwargs):
+        del self, block_dict_single_letter, kwargs
+        return pred_clusters
+
+    monkeypatch.setattr(model_module, "make_arrow_graph_subblocking_cluster_fn", fake_factory)
+    monkeypatch.setattr(model_module, "make_subblocks", fake_make_subblocks)
+    monkeypatch.setattr(Clusterer, "_partition_subblocked_first_name_groups", fake_partition)
+    monkeypatch.setattr(Clusterer, "_predict_subblocked_multiple_letter_groups", fake_predict_multiple)
+    monkeypatch.setattr(Clusterer, "_predict_subblocked_single_letter_incremental_groups", fake_predict_single)
+
+    pred_clusters, dists = clusterer._predict_subblocked(
+        {"block": ["3", "4", "5", "6"]},
+        dataset,
+        cluster_model_params={},
+        partial_supervision={},
+        use_s2_clusters=False,
+        incremental_dont_use_cluster_seeds=False,
+        batching_threshold=3,
+        desired_memory_use=None,
+        runtime_context=cast(Any, SimpleNamespace(run_id="test", use_rust=True)),
+        dists=None,
+        total_ram_bytes=None,
+        restore_rust_cluster_seeds_on_exit=True,
+        arrow_paths=fake_arrow_paths,
+    )
+
+    assert pred_clusters == {"cluster": ["3", "4", "5", "6"]}
+    assert dists is None
+    assert captured["factory_paths"] == fake_arrow_paths
+    assert captured["factory_signature_ids"] == ["3", "4", "5", "6"]
+    assert captured["factory_random_seed"] == clusterer.random_state
+    assert captured["specter_cluster_fn"].graph_fallback is fake_fallback
+    assert captured["subblocked_keys"] == ["block|subblock=alpha", "block|subblock=zeta"]
+    assert clusterer._last_arrow_graph_subblocking_telemetry == {
+        "enabled": 1,
+        "mode": "graph",
+        "source": "arrow",
+        "candidate_signature_count": 4,
+        "arrow_load_seconds": 1.25,
+        "arrow_load_metrics": {},
+        "fallback_invocation_count": 1,
+        "fallback_stats": [{"input_signature_count": 4, "packed_component_count": 2}],
+        "legacy_fallback_invocation_count": 0,
+        "graph_prepare_failed": 0,
+        "graph_prepare_error": None,
+        "graph_fallback_errors": [],
+    }
+
+
+def test_build_subblocked_block_dict_uses_indexed_arrow_rust_subblocking_when_enabled(
+    clusterer_dataset_factory, monkeypatch
+):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_arrow_rust_subblocking")
+    fake_arrow_paths = {"signatures": "signatures.arrow", "signatures_batch_index": "signatures.index"}
+    captured: dict[str, Any] = {}
+
+    def fake_make_subblocks_arrow_rust(arrow_paths, signatures, anddata, **kwargs):
+        captured["arrow_paths"] = dict(arrow_paths)
+        captured["signatures"] = list(signatures)
+        captured["anddata"] = anddata
+        captured["kwargs"] = dict(kwargs)
+        return {"beta": ["3", "4"], "alpha": ["5", "6"]}
+
+    def fail_make_subblocks(*_args, **_kwargs):
+        raise AssertionError("Python make_subblocks should not run when Arrow Rust subblocking is enabled")
+
+    fallback = object()
+    monkeypatch.setattr(model_module, "make_subblocks_arrow_rust", fake_make_subblocks_arrow_rust)
+    monkeypatch.setattr(model_module, "make_subblocks", fail_make_subblocks)
+    monkeypatch.setattr(model_module, "rust_arrow_subblocking_available", lambda: True)
+
+    output = clusterer._build_subblocked_block_dict(
+        {"block": ["3", "4", "5", "6"]},
+        dataset,
+        batching_threshold=3,
+        specter_cluster_fn=cast(Any, fallback),
+        subblocking_arrow_paths=fake_arrow_paths,
+        use_rust_subblocking=True,
+    )
+
+    assert output == {
+        "block|subblock=alpha": ["5", "6"],
+        "block|subblock=beta": ["3", "4"],
+    }
+    assert captured["arrow_paths"] == fake_arrow_paths
+    assert captured["signatures"] == ["3", "4", "5", "6"]
+    assert captured["anddata"] is dataset
+    assert captured["kwargs"]["maximum_size"] == 3
+    assert captured["kwargs"]["specter_cluster_fn"] is fallback
+
+
+def test_build_subblocked_block_dict_falls_back_when_arrow_rust_subblocking_unavailable(
+    clusterer_dataset_factory, monkeypatch
+):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_arrow_rust_subblocking_unavailable")
+    fake_arrow_paths = {"signatures": "signatures.arrow", "signatures_batch_index": "signatures.index"}
+    captured: dict[str, Any] = {}
+
+    def fail_make_subblocks_arrow_rust(*_args, **_kwargs):
+        raise AssertionError("Rust Arrow subblocking should not run when the capability is missing")
+
+    def fake_make_subblocks(signatures, anddata, **kwargs):
+        captured["signatures"] = list(signatures)
+        captured["anddata"] = anddata
+        captured["kwargs"] = dict(kwargs)
+        return {"alpha": ["3", "4"], "beta": ["5", "6"]}
+
+    fallback = object()
+    monkeypatch.setattr(model_module, "make_subblocks_arrow_rust", fail_make_subblocks_arrow_rust)
+    monkeypatch.setattr(model_module, "make_subblocks", fake_make_subblocks)
+    monkeypatch.setattr(model_module, "rust_arrow_subblocking_available", lambda: False)
+
+    output = clusterer._build_subblocked_block_dict(
+        {"block": ["3", "4", "5", "6"]},
+        dataset,
+        batching_threshold=3,
+        specter_cluster_fn=cast(Any, fallback),
+        subblocking_arrow_paths=fake_arrow_paths,
+        use_rust_subblocking=True,
+    )
+
+    assert output == {
+        "block|subblock=alpha": ["3", "4"],
+        "block|subblock=beta": ["5", "6"],
+    }
+    assert captured["signatures"] == ["3", "4", "5", "6"]
+    assert captured["anddata"] is dataset
+    assert captured["kwargs"]["maximum_size"] == 3
+    assert captured["kwargs"]["specter_cluster_fn"] is fallback
+
+
+def test_predict_accepts_backend_argument(clusterer_dataset_factory, monkeypatch):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_predict_backend_argument")
+    captured: dict[str, Any] = {}
+    runtime_context = SimpleNamespace(
+        operation="cluster_predict",
+        requested_backend="python",
+        resolved_backend="python",
+        use_rust=False,
+        run_id="test",
+        source="argument",
+    )
+
+    def fake_build_runtime_context(operation, *, backend=None, **kwargs):
+        del kwargs
+        captured["operation"] = operation
+        captured["backend"] = backend
+        return runtime_context
+
+    def fake_predict_subblocked(self, block_dict, dataset, **kwargs):
+        del self, dataset
+        captured["block_dict"] = dict(block_dict)
+        captured["runtime_context"] = kwargs["runtime_context"]
+        return {"cluster": ["3", "4"]}, None
+
+    monkeypatch.setattr(model_module, "build_runtime_context", fake_build_runtime_context)
+    monkeypatch.setattr(Clusterer, "_predict_subblocked", fake_predict_subblocked)
+
+    pred_clusters, dists = clusterer.predict(
+        {"block": ["3", "4", "5", "6"]},
+        dataset,
+        batching_threshold=3,
+        backend="python",
+    )
+
+    assert pred_clusters == {"cluster": ["3", "4"]}
+    assert dists is None
+    assert captured["operation"] == "cluster_predict"
+    assert captured["backend"] == "python"
+    assert captured["runtime_context"] is runtime_context
+
+
+def test_predict_rejects_backend_with_runtime_context(clusterer_dataset_factory):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_predict_backend_conflict")
+    runtime_context = SimpleNamespace(
+        operation="cluster_predict",
+        requested_backend="python",
+        resolved_backend="python",
+        use_rust=False,
+        run_id="test",
+        source="argument",
+    )
+
+    with pytest.raises(ValueError, match="Pass either runtime_context or backend"):
+        clusterer.predict(
+            {"block": ["3", "4"]},
+            dataset,
+            runtime_context=cast(Any, runtime_context),
+            backend="python",
+        )
+
+
+def test_predict_subblocked_python_path_wires_graph_fallback(clusterer_dataset_factory, monkeypatch):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_python_graph_subblocking")
+    captured: dict[str, Any] = {}
+
+    class FakeFallback:
+        load_seconds = 0.0
+        stats = [{"input_signature_count": 4, "packed_component_count": 2}]
+
+    fake_fallback = FakeFallback()
+
+    def fake_factory(*, config):
+        captured["factory_config"] = config
+        return fake_fallback
+
+    def fake_make_subblocks(signatures, anddata, maximum_size=7500, first_k_letter_counts_sorted=None, **kwargs):
+        del anddata, first_k_letter_counts_sorted
+        captured["make_subblocks_signatures"] = list(signatures)
+        captured["make_subblocks_maximum_size"] = maximum_size
+        captured["specter_cluster_fn"] = kwargs.get("specter_cluster_fn")
+        return {"zeta": ["3", "4"], "alpha": ["5", "6"]}
+
+    def fake_partition(self, block_dict_subblocked, dataset):
+        del self, dataset
+        captured["subblocked_keys"] = sorted(block_dict_subblocked)
+        return {}, {}, False
+
+    def fake_predict_multiple(self, block_dict_multiple_letter, **kwargs):
+        del self, block_dict_multiple_letter, kwargs
+        return {"cluster": ["3", "4", "5", "6"]}
+
+    def fake_predict_single(self, block_dict_single_letter, *, pred_clusters, **kwargs):
+        del self, block_dict_single_letter, kwargs
+        return pred_clusters
+
+    monkeypatch.setattr(model_module, "make_dataset_graph_subblocking_cluster_fn", fake_factory)
+    monkeypatch.setattr(model_module, "make_subblocks", fake_make_subblocks)
+    monkeypatch.setattr(Clusterer, "_partition_subblocked_first_name_groups", fake_partition)
+    monkeypatch.setattr(Clusterer, "_predict_subblocked_multiple_letter_groups", fake_predict_multiple)
+    monkeypatch.setattr(Clusterer, "_predict_subblocked_single_letter_incremental_groups", fake_predict_single)
+
+    pred_clusters, dists = clusterer._predict_subblocked(
+        {"block": ["3", "4", "5", "6"]},
+        dataset,
+        cluster_model_params={},
+        partial_supervision={},
+        use_s2_clusters=False,
+        incremental_dont_use_cluster_seeds=False,
+        batching_threshold=3,
+        desired_memory_use=None,
+        runtime_context=cast(Any, SimpleNamespace(run_id="test", use_rust=False)),
+        dists=None,
+        total_ram_bytes=None,
+        restore_rust_cluster_seeds_on_exit=True,
+        arrow_paths=None,
+    )
+
+    assert pred_clusters == {"cluster": ["3", "4", "5", "6"]}
+    assert dists is None
+    assert captured["specter_cluster_fn"].graph_fallback is fake_fallback
+    assert captured["subblocked_keys"] == ["block|subblock=alpha", "block|subblock=zeta"]
+    assert clusterer._last_graph_subblocking_telemetry == {
+        "enabled": 1,
+        "mode": "graph",
+        "source": "anddata",
+        "candidate_signature_count": 4,
+        "arrow_load_seconds": 0.0,
+        "arrow_load_metrics": {},
+        "fallback_invocation_count": 1,
+        "fallback_stats": [{"input_signature_count": 4, "packed_component_count": 2}],
+        "legacy_fallback_invocation_count": 0,
+        "graph_prepare_failed": 0,
+        "graph_prepare_error": None,
+        "graph_fallback_errors": [],
+    }
+
+
+def test_graph_subblocking_is_default(clusterer_dataset_factory):
+    clusterer, _dataset = clusterer_dataset_factory(name="dummy_default_graph_subblocking")
+
+    assert clusterer.subblocking_fallback_mode == "graph"
+
+
+def test_legacy_subblocking_telemetry_has_graph_contract_keys(clusterer_dataset_factory):
+    clusterer, _dataset = clusterer_dataset_factory(name="dummy_legacy_graph_subblocking_telemetry")
+    clusterer.subblocking_fallback_mode = "legacy"
+
+    fallback = clusterer._subblocking_specter_cluster_fn(None, ["3", "4", "3"])
+
+    assert fallback is None
+    assert clusterer._last_graph_subblocking_telemetry == {
+        "enabled": 0,
+        "mode": "legacy",
+        "source": "legacy",
+        "candidate_signature_count": 2,
+        "arrow_load_seconds": 0.0,
+        "arrow_load_metrics": {},
+        "fallback_invocation_count": 0,
+        "fallback_stats": [],
+        "legacy_fallback_invocation_count": 0,
+        "graph_prepare_failed": 0,
+        "graph_prepare_error": None,
+        "graph_fallback_errors": [],
+    }
+    assert clusterer._last_arrow_graph_subblocking_telemetry is clusterer._last_graph_subblocking_telemetry
+
+
+def test_graph_subblocking_falls_back_to_legacy_specter(clusterer_dataset_factory, monkeypatch):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_graph_legacy_fallback")
+    captured: dict[str, Any] = {}
+
+    class FailingFallback:
+        load_seconds = 0.0
+        load_metrics = {}
+        stats: list[dict[str, Any]] = []
+
+        def __call__(self, *_args: object, **_kwargs: object) -> dict[str, list[str]]:
+            raise ValueError("graph failed")
+
+    def fake_factory(*, config):
+        captured["factory_config"] = config
+        return FailingFallback()
+
+    def fake_legacy(signature_ids, anddata, target_subblock_size=10000, **kwargs):
+        captured["legacy_signature_ids"] = list(signature_ids)
+        captured["legacy_anddata"] = anddata
+        captured["legacy_target_subblock_size"] = target_subblock_size
+        captured["legacy_kwargs"] = dict(kwargs)
+        return {"legacy": list(signature_ids)}
+
+    monkeypatch.setattr(model_module, "make_dataset_graph_subblocking_cluster_fn", fake_factory)
+    monkeypatch.setattr(model_module, "cluster_with_specter", fake_legacy)
+
+    fallback = clusterer._subblocking_specter_cluster_fn(None, ["3", "4", "5"])
+    assert fallback is not None
+
+    output = fallback(["3", "4", "5"], dataset, target_subblock_size=2, compute_block_fn=str)
+
+    assert output == {"legacy": ["3", "4", "5"]}
+    assert captured["legacy_signature_ids"] == ["3", "4", "5"]
+    assert captured["legacy_anddata"] is dataset
+    assert captured["legacy_target_subblock_size"] == 2
+    assert captured["legacy_kwargs"]["compute_block_fn"] is str
+    assert fallback.legacy_fallback_invocation_count == 1
+    assert fallback.graph_fallback_errors == [
+        {
+            "stage": "call",
+            "type": "ValueError",
+            "message": "graph failed",
+            "signature_count": 3,
+        }
+    ]
+
+
+def test_graph_subblocking_falls_back_to_legacy_specter_for_io_errors(clusterer_dataset_factory, monkeypatch):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_graph_io_legacy_fallback")
+    captured: dict[str, Any] = {}
+
+    class FailingFallback:
+        load_seconds = 0.0
+        load_metrics = {}
+        stats: list[dict[str, Any]] = []
+
+        def __call__(self, *_args: object, **_kwargs: object) -> dict[str, list[str]]:
+            raise OSError("arrow mmap failed")
+
+    def fake_factory(*, config):
+        del config
+        return FailingFallback()
+
+    def fake_legacy(signature_ids, anddata, target_subblock_size=10000, **kwargs):
+        del anddata, target_subblock_size, kwargs
+        captured["legacy_signature_ids"] = list(signature_ids)
+        return {"legacy": list(signature_ids)}
+
+    monkeypatch.setattr(model_module, "make_dataset_graph_subblocking_cluster_fn", fake_factory)
+    monkeypatch.setattr(model_module, "cluster_with_specter", fake_legacy)
+
+    fallback = clusterer._subblocking_specter_cluster_fn(None, ["3", "4", "5"])
+    assert fallback is not None
+
+    output = fallback(["3", "4", "5"], dataset, target_subblock_size=2)
+
+    assert output == {"legacy": ["3", "4", "5"]}
+    assert captured["legacy_signature_ids"] == ["3", "4", "5"]
+    assert fallback.legacy_fallback_invocation_count == 1
+    assert fallback.graph_fallback_errors == [
+        {
+            "stage": "call",
+            "type": "OSError",
+            "message": "arrow mmap failed",
+            "signature_count": 3,
+        }
+    ]
+
+
+def test_graph_subblocking_prepare_io_errors_switch_to_legacy_specter(clusterer_dataset_factory, monkeypatch):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_graph_prepare_io_legacy_fallback")
+    captured: dict[str, Any] = {}
+
+    class FailingPrepareFallback:
+        load_seconds = 0.0
+        load_metrics = {}
+        stats: list[dict[str, Any]] = []
+
+        def prepare(self, _signature_groups):
+            raise OSError("arrow footer is invalid")
+
+        def __call__(self, *_args: object, **_kwargs: object) -> dict[str, list[str]]:
+            raise AssertionError("graph fallback should not be called after prepare failure")
+
+    def fake_factory(*, config):
+        del config
+        return FailingPrepareFallback()
+
+    def fake_legacy(signature_ids, anddata, target_subblock_size=10000, **kwargs):
+        del anddata, target_subblock_size, kwargs
+        captured["legacy_signature_ids"] = list(signature_ids)
+        return {"legacy": list(signature_ids)}
+
+    monkeypatch.setattr(model_module, "make_dataset_graph_subblocking_cluster_fn", fake_factory)
+    monkeypatch.setattr(model_module, "cluster_with_specter", fake_legacy)
+
+    fallback = clusterer._subblocking_specter_cluster_fn(None, ["3", "4", "5"])
+    assert fallback is not None
+    fallback.prepare([["3", "4"], ["5"]])
+
+    output = fallback(["3", "4", "5"], dataset, target_subblock_size=2)
+
+    assert output == {"legacy": ["3", "4", "5"]}
+    assert captured["legacy_signature_ids"] == ["3", "4", "5"]
+    assert fallback.graph_prepare_failed is True
+    assert fallback.graph_prepare_error == {
+        "stage": "prepare",
+        "type": "OSError",
+        "message": "arrow footer is invalid",
+        "signature_count": 3,
+        "group_count": 2,
+    }
+
+
+def test_graph_subblocking_unexpected_errors_propagate(clusterer_dataset_factory, monkeypatch):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_graph_unexpected_failure")
+
+    class FailingFallback:
+        def __call__(self, *_args: object, **_kwargs: object) -> dict[str, list[str]]:
+            raise RuntimeError("graph bug")
+
+    def fake_factory(*, config):
+        del config
+        return FailingFallback()
+
+    monkeypatch.setattr(model_module, "make_dataset_graph_subblocking_cluster_fn", fake_factory)
+
+    fallback = clusterer._subblocking_specter_cluster_fn(None, ["3", "4", "5"])
+    assert fallback is not None
+
+    with pytest.raises(RuntimeError, match="graph bug"):
+        fallback(["3", "4", "5"], dataset, target_subblock_size=2)
 
 
 def test_best_incremental_cluster_respects_seed_score_mode():
@@ -2478,7 +3046,7 @@ def test_finish_incremental_with_seed_links_reclusters_abstains_from_arrow_paths
     assert result == {"7": ["seed0", "u1"], "8": ["seed1"], "9": ["u2", "u3"]}
     assert captured["block_dict"] == {"block": ["u2", "u3"]}
     assert captured["arrow_paths"] == arrow_paths
-    assert captured["partial_supervision"] == {("u2", "u3"): LARGE_INTEGER}
+    assert captured["partial_supervision"] == {("u2", "u3"): LARGE_DISTANCE}
     assert captured["runtime_context"] is runtime_context
     assert captured["total_ram_bytes"] == 123_456
 
@@ -2660,6 +3228,7 @@ def test_build_incremental_seed_setup_passes_total_ram_to_altered_profile_reclus
     clusterer = _build_minimal_incremental_clusterer()
     recluster_blocks: list[list[str]] = []
     recluster_total_ram_bytes: list[int | None] = []
+    recluster_partial_supervision: list[dict[tuple[str, str], int | float]] = []
 
     def fake_predict_helper(
         block_dict,
@@ -2670,10 +3239,11 @@ def test_build_incremental_seed_setup_passes_total_ram_to_altered_profile_reclus
         runtime_context,
         total_ram_bytes=None,
     ):
-        del dataset, partial_supervision, runtime_context
+        del dataset, runtime_context
         assert incremental_dont_use_cluster_seeds is True
         recluster_blocks.append(list(block_dict["block"]))
         recluster_total_ram_bytes.append(total_ram_bytes)
+        recluster_partial_supervision.append(dict(partial_supervision))
         return {"split0": ["seed0"], "split1": ["seed1"]}, None
 
     clusterer.predict_helper = cast(Any, fake_predict_helper)
@@ -2684,6 +3254,7 @@ def test_build_incremental_seed_setup_passes_total_ram_to_altered_profile_reclus
             (),
             {
                 "cluster_seeds_require": {"seed0": "7", "seed1": "7", "seed2": "8"},
+                "cluster_seeds_disallow": {("seed0", "seed1")},
                 "altered_cluster_signatures": ["seed0"],
             },
         )(),
@@ -2700,6 +3271,7 @@ def test_build_incremental_seed_setup_passes_total_ram_to_altered_profile_reclus
 
     assert recluster_blocks == [["seed0", "seed1"]]
     assert recluster_total_ram_bytes == [123_456]
+    assert recluster_partial_supervision == [{("seed0", "seed1"): LARGE_DISTANCE}]
     assert cluster_seeds_require == {"seed0": "7_0", "seed1": "7_1", "seed2": "8"}
     assert recluster_map == {"7_0": "7", "7_1": "7"}
     assert cluster_seeds_require_inverse == {"7": ["seed0", "seed1"], "8": ["seed2"]}
@@ -2765,8 +3337,8 @@ def test_build_incremental_seed_setup_uses_arrow_paths_for_altered_profile_reclu
         "paper_authors": "paper_authors.arrow",
     }
     assert captured["partial_supervision"] == {
-        ("seed0", "seed1"): LARGE_INTEGER,
-        ("seed2", "seed3"): LARGE_INTEGER,
+        ("seed0", "seed1"): LARGE_DISTANCE,
+        ("seed2", "seed3"): LARGE_DISTANCE,
     }
     assert captured["incremental_dont_use_cluster_seeds"] is True
     assert captured["runtime_context"] is runtime_context
@@ -2780,6 +3352,111 @@ def test_build_incremental_seed_setup_uses_arrow_paths_for_altered_profile_reclu
     }
     assert recluster_map == {"7_0": "7", "7_1": "7", "8_0": "8", "8_1": "8"}
     assert cluster_seeds_require_inverse == {"7": ["seed0", "seed1"], "8": ["seed2", "seed3"], "9": ["seed4"]}
+
+
+def test_predict_subblocked_restores_seed_state_when_presplit_setup_raises(monkeypatch):
+    clusterer = _build_minimal_incremental_clusterer()
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed0": "7"},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=["seed0"],
+            name_tuples="filtered",
+        ),
+    )
+
+    def fake_seed_setup(*_args, **_kwargs):
+        return {"seed0": "7_0"}, {}, {"7": ["seed0"]}, {"7_0": ["seed0"]}
+
+    def fail_temporary_arrow_paths(current_dataset, _arrow_paths):
+        assert current_dataset.cluster_seeds_require == {"seed0": "7_0"}
+        raise RuntimeError("temporary arrow path setup failed")
+
+    monkeypatch.setattr(clusterer, "_build_incremental_seed_setup", fake_seed_setup)
+    monkeypatch.setattr(model_module, "_temporary_arrow_paths_with_current_cluster_seeds", fail_temporary_arrow_paths)
+
+    with pytest.raises(RuntimeError, match="temporary arrow path setup failed"):
+        clusterer._predict_subblocked(
+            {"block": ["seed0"]},
+            dataset,
+            cluster_model_params=None,
+            partial_supervision={},
+            use_s2_clusters=False,
+            incremental_dont_use_cluster_seeds=False,
+            batching_threshold=2,
+            desired_memory_use=None,
+            runtime_context=cast(Any, object()),
+            dists=None,
+            total_ram_bytes=None,
+            restore_rust_cluster_seeds_on_exit=False,
+            arrow_paths={
+                "signatures": "signatures.arrow",
+                "papers": "papers.arrow",
+                "paper_authors": "paper_authors.arrow",
+            },
+        )
+
+    assert dataset.cluster_seeds_require == {"seed0": "7"}
+
+
+def test_predict_subblocked_arrow_forwards_disallows_to_multiple_letter_rust_path(monkeypatch):
+    clusterer = _build_minimal_incremental_clusterer()
+    clusterer.subblocking_fallback_mode = "legacy"
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={},
+            cluster_seeds_disallow={("s1", "s2")},
+            altered_cluster_signatures=[],
+            name_tuples="filtered",
+            signatures={
+                "s1": SimpleNamespace(
+                    author_info_first="Alice",
+                    author_info_first_normalized_without_apostrophe="Alice",
+                ),
+                "s2": SimpleNamespace(
+                    author_info_first="Alicia",
+                    author_info_first_normalized_without_apostrophe="Alicia",
+                ),
+            },
+        ),
+    )
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", lambda *_args, **_kwargs: object())
+
+    def fake_predict_from_rust_featurizer(_block_dict, _rust_featurizer, **kwargs):
+        captured["partial_supervision"] = dict(kwargs["partial_supervision"])
+        captured["cluster_seeds_disallow"] = set(kwargs["cluster_seeds_disallow"])
+        return {"block_0": ["s1"], "block_1": ["s2"]}, None
+
+    clusterer.predict_from_rust_featurizer = cast(Any, fake_predict_from_rust_featurizer)
+
+    result, dists = clusterer._predict_subblocked(
+        {"block": ["s1", "s2"]},
+        dataset,
+        cluster_model_params=None,
+        partial_supervision={},
+        use_s2_clusters=False,
+        incremental_dont_use_cluster_seeds=False,
+        batching_threshold=10,
+        desired_memory_use=None,
+        runtime_context=cast(Any, SimpleNamespace(use_rust=False)),
+        dists=None,
+        total_ram_bytes=None,
+        restore_rust_cluster_seeds_on_exit=False,
+        arrow_paths={
+            "signatures": "signatures.arrow",
+            "papers": "papers.arrow",
+            "paper_authors": "paper_authors.arrow",
+        },
+    )
+
+    assert result == {"block_0": ["s1"], "block_1": ["s2"]}
+    assert dists is None
+    assert captured["partial_supervision"] == {("s1", "s2"): LARGE_DISTANCE}
+    assert captured["cluster_seeds_disallow"] == {("s1", "s2")}
 
 
 def test_build_incremental_seed_setup_caches_arrow_altered_profile_reclustering():
@@ -2874,7 +3551,7 @@ def test_build_incremental_seed_setup_cache_includes_partial_supervision():
     )
     clusterer._build_incremental_seed_setup(
         dataset,
-        {("seed0", "seed1"): LARGE_INTEGER},
+        {("seed0", "seed1"): LARGE_DISTANCE},
         runtime_context=cast(Any, object()),
         arrow_paths=arrow_paths,
     )
@@ -3070,7 +3747,7 @@ def test_build_incremental_seed_setup_loads_seed_and_altered_signatures_from_arr
     )
 
     assert captured["block_dict"] == {"altered_profile_0": ["seed0", "seed1"]}
-    assert captured["partial_supervision"] == {("seed0", "seed1"): LARGE_INTEGER}
+    assert captured["partial_supervision"] == {("seed0", "seed1"): LARGE_DISTANCE}
     assert cluster_seeds_require == {"seed0": "7_0", "seed1": "7_1", "seed2": "8"}
     assert recluster_map == {"7_0": "7", "7_1": "7"}
     assert cluster_seeds_require_inverse == {"7": ["seed0", "seed1"], "8": ["seed2"]}

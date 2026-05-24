@@ -8,6 +8,7 @@ import math
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +18,9 @@ import s2and.incremental_linking.runtime as runtime_module
 from s2and import feature_port, memory_budget
 from s2and.data import ANDData
 from s2and.incremental_linking.feature_block import (
-    TemporaryArrowPaths,
-    arrow_paths_with_temporary_cluster_seeds,
     cluster_seed_disallows_from_arrow_paths,
     read_cluster_seeds_arrow,
+    temporary_arrow_paths_with_cluster_seeds,
 )
 from s2and.incremental_linking.policy import (
     clusterer_uses_name_count_features,
@@ -30,6 +30,8 @@ from s2and.incremental_linking.policy import (
 from s2and.runtime import RuntimeContext
 
 logger = logging.getLogger("s2and")
+
+_RAW_ARROW_PLAN_WINDOW_MULTIPLIER = 4
 
 _PROMOTED_INCREMENTAL_TELEMETRY_MERGE_POLICY = {
     "retrieval_top_k": "constant",
@@ -55,6 +57,19 @@ BuildIncrementalResultFn = Callable[..., dict[str, Any]]
 BuildIncrementalConstraintBackendFn = Callable[..., Any]
 GetRustFeaturizerFn = Callable[..., Any]
 ResolveTotalRamBytesFn = Callable[[int | None], tuple[int, str]]
+
+
+def _raw_arrow_plan_window_size(
+    *,
+    query_count: int,
+    query_batch_size: int,
+    plan_window_multiplier: int,
+) -> int:
+    """Return the query count covered by each raw Arrow planner call."""
+
+    resolved_query_count = max(0, int(query_count))
+    resolved_query_batch_size = max(1, int(query_batch_size))
+    return min(resolved_query_count, resolved_query_batch_size * max(1, int(plan_window_multiplier)))
 
 
 def _raw_window_plan_telemetry_fields(raw_candidate_plan: Mapping[str, Any]) -> dict[str, int | float | str]:
@@ -123,14 +138,9 @@ def _cluster_seeds_arrow_matches(path_value: Any, cluster_seeds_require: Mapping
     path = Path(str(path_value))
     if not path.exists():
         return False
-    try:
-        arrow_cluster_seeds = read_cluster_seeds_arrow(path)
-    except (OSError, ValueError):
+    if path.stat().st_size == 0:
         return False
-    except Exception as exc:
-        if exc.__class__.__name__ == "ArrowInvalid":
-            return False
-        raise
+    arrow_cluster_seeds = read_cluster_seeds_arrow(path)
     return _cluster_seed_map_fingerprint(arrow_cluster_seeds) == _cluster_seed_map_fingerprint(cluster_seeds_require)
 
 
@@ -936,23 +946,28 @@ def predict_incremental_promoted_linker_from_arrow_paths(
         and seed_arrow_matches_cluster_seeds_require
         and request_disallows == arrow_disallows
     )
+    arrow_path_context: AbstractContextManager[Mapping[str, Any]]
     if seed_arrow_reused_source:
-        arrow_path_payload = dict(base_arrow_path_payload)
-        arrow_path_bundle: TemporaryArrowPaths | None = None
+        arrow_path_context = nullcontext(dict(base_arrow_path_payload))
     else:
-        arrow_path_bundle = arrow_paths_with_temporary_cluster_seeds(
+        arrow_path_context = temporary_arrow_paths_with_cluster_seeds(
             base_arrow_path_payload,
             cluster_seeds_require,
             prefix="s2and_arrow_incremental_cluster_seeds_",
             cluster_seeds_disallow=request_disallows,
         )
-        arrow_path_payload = arrow_path_bundle.paths
-    seed_arrow_assignment_seconds = time.perf_counter() - seed_arrow_start
-    try:
-        plan_window_multiplier = 8
-        plan_window_size = query_batch_size
-        if query_batch_size < len(unassigned_signature_ids):
-            plan_window_size = min(len(unassigned_signature_ids), query_batch_size * plan_window_multiplier)
+    with arrow_path_context as arrow_path_payload:
+        seed_arrow_assignment_seconds = time.perf_counter() - seed_arrow_start
+        # Explicit caller batching thresholds are hard runtime caps. When the
+        # memory model chooses the batch size, preplan a slightly larger raw
+        # Arrow window to amortize retrieval/featurizer setup while still
+        # scoring in budget-sized batches.
+        plan_window_multiplier = 1 if batching_threshold is not None else _RAW_ARROW_PLAN_WINDOW_MULTIPLIER
+        plan_window_size = _raw_arrow_plan_window_size(
+            query_count=len(unassigned_signature_ids),
+            query_batch_size=query_batch_size,
+            plan_window_multiplier=plan_window_multiplier,
+        )
         use_windowed_raw_plan = plan_window_size > query_batch_size
         raw_window_plan_count = 0
         raw_window_plan_seconds = 0.0
@@ -1045,10 +1060,10 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             initial_limits=initial_limits,
             final_limits=initial_limits,
         )
-        merged_telemetry.setdefault("seed_signature_count", int(len(cluster_seeds_require)))
-        merged_telemetry.setdefault("seed_component_count", int(len(cluster_seeds_require_inverse)))
-        merged_telemetry.setdefault("raw_arrow_seed_signature_count", int(len(cluster_seeds_require)))
-        merged_telemetry.setdefault("raw_arrow_seed_component_count", int(len(cluster_seeds_require_inverse)))
+        merged_telemetry["seed_signature_count"] = int(len(cluster_seeds_require))
+        merged_telemetry["seed_component_count"] = int(len(cluster_seeds_require_inverse))
+        merged_telemetry["raw_arrow_seed_signature_count"] = int(len(cluster_seeds_require))
+        merged_telemetry["raw_arrow_seed_component_count"] = int(len(cluster_seeds_require_inverse))
         finish_start = time.perf_counter()
         predicted_clusters = _finish_incremental_with_optional_split_inverse(
             clusterer,
@@ -1093,6 +1108,9 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             "arrow_path_count": len(arrow_path_payload),
             "raw_arrow_window_plan_count": int(raw_window_plan_count),
             "raw_arrow_window_plan_query_count": int(raw_window_plan_query_count),
+            "raw_arrow_window_plan_enabled": int(bool(use_windowed_raw_plan)),
+            "raw_arrow_window_plan_size": int(plan_window_size),
+            "raw_arrow_window_plan_multiplier": int(plan_window_multiplier),
             "raw_arrow_window_plan_seconds": float(raw_window_plan_seconds),
             "raw_arrow_window_featurizer_count": int(raw_window_featurizer_count),
             "raw_arrow_window_featurizer_signature_count": int(raw_window_featurizer_signature_count),
@@ -1100,6 +1118,3 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             "raw_arrow_window_subset_seconds": float(raw_window_subset_seconds),
         }
         return payload
-    finally:
-        if arrow_path_bundle is not None:
-            arrow_path_bundle.close()

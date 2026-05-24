@@ -18,6 +18,33 @@ def _get_rust_featurizer(*args: Any, **kwargs: Any) -> Any:
     return feature_port._get_rust_featurizer(*args, **kwargs)  # noqa: SLF001
 
 
+def _get_rust_featurizer_for_cluster_seed_update(
+    dataset: ANDData,
+    runtime_context: Any | None,
+) -> Any:
+    from s2and import feature_port
+
+    return feature_port._get_cached_rust_featurizer_for_cluster_seed_update(  # noqa: SLF001
+        dataset,
+        runtime_context=runtime_context,
+    )
+
+
+def _promote_rust_featurizer_cluster_seed_version(
+    dataset: ANDData,
+    featurizer: Any,
+    *,
+    target_seed_version: int,
+) -> None:
+    from s2and import feature_port
+
+    feature_port._promote_cached_rust_featurizer_cluster_seed_version(  # noqa: SLF001
+        dataset,
+        featurizer,
+        target_seed_version=target_seed_version,
+    )
+
+
 def _resolve_featurizer(
     dataset: ANDData | None,
     featurizer: Any | None,
@@ -33,9 +60,19 @@ def _resolve_featurizer(
 def update_rust_cluster_seeds(
     dataset: ANDData,
     runtime_context: Any | None = None,
+    *,
+    bump_version: bool = True,
 ) -> None:
-    featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
+    featurizer = _get_rust_featurizer_for_cluster_seed_update(dataset, runtime_context=runtime_context)
+    if bump_version:
+        dataset._cluster_seeds_version = int(getattr(dataset, "_cluster_seeds_version", 0)) + 1
+    target_seed_version = int(getattr(dataset, "_cluster_seeds_version", 0))
     featurizer.update_cluster_seeds(dataset.cluster_seeds_require, dataset.cluster_seeds_disallow)
+    _promote_rust_featurizer_cluster_seed_version(
+        dataset,
+        featurizer,
+        target_seed_version=target_seed_version,
+    )
 
 
 def get_constraint_rust(

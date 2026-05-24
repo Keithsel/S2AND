@@ -180,6 +180,15 @@ these indexes before a later rewrite or deployment copy that changes the source
 Arrow file metadata; regenerate the indexes from the final files in their
 serving location.
 
+Every script that produces S2AND runtime Arrow artifacts should use the shared
+writers instead of open-coding the table or sidecar formats:
+
+- `write_feature_block_arrow_from_anddata(...)` or
+  `write_feature_block_arrow_tables(...)` for semantic Arrow IPC tables.
+- `write_raw_arrow_batch_lookup_indexes(...)` after the final table write for
+  raw-planner sidecars.
+- `raw_planner_arrow_physical_layout(...)` for manifest/report layout metrics.
+
 Recommended sidecar filenames are stem-qualified:
 
 ```text
@@ -198,12 +207,12 @@ index per file. At runtime, the selected embedding file is passed under the
 `specter` path key, and S2AND uses the adjacent
 `<embedding-stem>.specter_batch_index.bin` sidecar when present.
 
-The batch-index format is S2AND-owned. Current writers emit
-`arrow_batch_lookup_index_v2` / `S2ABI002`, which records the key-column hash and
-source fingerprint in addition to key-to-batch records. Rust still accepts
-legacy v1 indexes. Each record maps a 64-bit FNV-1a hash of the lookup key to an
-IPC record-batch index; the Rust reader verifies exact ids after loading the
-selected batches, so hash collisions do not change results.
+The batch-index format is S2AND-owned. Current writers and readers require
+`arrow_batch_lookup_index` / `S2ABI001`, which records the key-column hash and
+source fingerprint in addition to key-to-batch records. Each record maps a
+64-bit FNV-1a hash of the lookup key to an IPC record-batch index; the Rust
+reader verifies exact ids after loading the selected batches, so hash collisions
+do not change results.
 
 ---
 
@@ -225,9 +234,12 @@ values and Arrow physical layout:
 `s2and.incremental_linking.feature_block.write_feature_block_arrow_from_anddata`.
 That writer returns table paths and does not write `manifest.json`; manifests
 are producer-owned. `scripts/convert_to_arrow.py` is the reference producer for
-manifest shape. An independent assembly pipeline is
-fine, but it must produce the same table values as the writer and the same
-manifest contract as this document.
+deployable manifest shape and current batch-index sidecars.
+`scripts/verification/compare_full_predict_arrow_parity.py` is the reference
+bounded parity producer and also writes current batch-index sidecars for its
+temporary Arrow bundle. An independent assembly pipeline is fine, but it must
+produce the same table values as the writer and the same manifest contract as
+this document.
 
 Important parity details:
 
@@ -549,10 +561,9 @@ Recommended additional fields:
 Root-level `manifest.json` should use schema `inference_arrow_bundle_v1` and
 list dataset directories and their manifest paths in `dataset_manifests` when an
 artifact bundle contains multiple datasets. Keep per-input `source_path` values
-in dataset manifests; do not write a root-level `source_path`. Older mini Arrow
-artifacts may still have the legacy `reports` root shape; `scripts/convert_to_arrow.py`
-can read that shape when updating a bundle, but new writes should use
-`dataset_manifests`.
+in dataset manifests; do not write a root-level `source_path`. Existing root
+manifests without `schema: "inference_arrow_bundle_v1"` are rejected instead of
+migrated in place.
 
 ---
 
@@ -616,6 +627,7 @@ PowerShell:
 uv run python scripts/convert_to_arrow.py benchmark `
   --source-root s2and/data/s2and_mini `
   --output-root s2and/data/s2and_mini_arrow `
+  --datasets pubmed `
   --n-jobs 20 `
   --overwrite
 ```
@@ -631,6 +643,7 @@ Bash:
 uv run python scripts/convert_to_arrow.py benchmark \
   --source-root s2and/data/s2and_mini \
   --output-root s2and/data/s2and_mini_arrow \
+  --datasets pubmed \
   --n-jobs 20 \
   --overwrite
 

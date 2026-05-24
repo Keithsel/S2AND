@@ -248,9 +248,10 @@ Runtime controls:
 
 Cache behavior:
 
-- `use_cache=False` skips persistent pair-feature caching and Rust featurizer disk-cache reads and writes.
-- `use_cache=True` enables the SQLite-backed pair-feature cache and Rust featurizer disk cache under `S2AND_CACHE`.
-- Same-process Rust featurizer reuse remains available even when `use_cache=False`.
+- `use_cache=False` skips persistent pair-feature SQLite cache reads and writes.
+- `use_cache=True` enables the SQLite-backed pair-feature cache under `S2AND_CACHE` for cache-aware pair-featurization paths.
+- Same-process Rust featurizer reuse is independent of `use_cache` and remains available even when `use_cache=False`.
+- Rust featurizers are not serialized to disk; direct Arrow/Rust production prediction paths bypass the persistent pair-feature cache.
 
 Large blocks:
 

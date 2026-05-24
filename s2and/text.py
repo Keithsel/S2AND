@@ -23,26 +23,45 @@ from s2and.file_cache import cached_path
 # Lazily-loaded fastText model to avoid heavy import-time cost
 _FASTTEXT_MODEL = None
 _FASTTEXT_MODEL_INITIALIZED = False
+_FASTTEXT_LOADING_ENABLED = True
 _FASTTEXT_MODEL_LOCK = threading.Lock()
 
 
-def _get_fasttext_model():
-    """Return a cached fastText model instance, loading on first use.
+def set_fasttext_loading_enabled(enabled: bool) -> None:
+    """Configure whether language detection may load the fastText model."""
 
-    Honors test/benchmark env var `S2AND_SKIP_FASTTEXT` to skip loading.
-    """
-    import os
+    global _FASTTEXT_LOADING_ENABLED
+    global _FASTTEXT_MODEL
+    global _FASTTEXT_MODEL_INITIALIZED
+    with _FASTTEXT_MODEL_LOCK:
+        resolved_enabled = bool(enabled)
+        if _FASTTEXT_LOADING_ENABLED == resolved_enabled:
+            if not resolved_enabled:
+                _FASTTEXT_MODEL = None
+                _FASTTEXT_MODEL_INITIALIZED = True
+            return
+        _FASTTEXT_LOADING_ENABLED = resolved_enabled
+        if resolved_enabled:
+            _FASTTEXT_MODEL_INITIALIZED = False
+            return
+        _FASTTEXT_MODEL = None
+        _FASTTEXT_MODEL_INITIALIZED = True
+
+
+def fasttext_loading_enabled() -> bool:
+    """Return whether language detection may load the fastText model."""
+
+    with _FASTTEXT_MODEL_LOCK:
+        return bool(_FASTTEXT_LOADING_ENABLED)
+
+
+def _get_fasttext_model():
+    """Return a cached fastText model instance, loading on first use."""
 
     global _FASTTEXT_MODEL
     global _FASTTEXT_MODEL_INITIALIZED
-    if os.environ.get("S2AND_SKIP_FASTTEXT", "").lower() in {"1", "true", "yes"}:
-        _FASTTEXT_MODEL = None
-        _FASTTEXT_MODEL_INITIALIZED = True
-        return None
-    if _FASTTEXT_MODEL_INITIALIZED:
-        return _FASTTEXT_MODEL
     with _FASTTEXT_MODEL_LOCK:
-        if os.environ.get("S2AND_SKIP_FASTTEXT", "").lower() in {"1", "true", "yes"}:
+        if not _FASTTEXT_LOADING_ENABLED:
             _FASTTEXT_MODEL = None
             _FASTTEXT_MODEL_INITIALIZED = True
             return None

@@ -100,12 +100,13 @@ def test_get_from_cache_hit_checks_remote_validator_but_does_not_download(monkey
     assert head_response.closed is True
 
 
-def test_get_from_cache_hits_legacy_raw_etag_filename(monkeypatch, tmp_path):
+def test_get_from_cache_ignores_raw_etag_filename(monkeypatch, tmp_path):
     url = "https://example.org/model.bin"
     etag = "etag-123"
-    legacy_cache_path = tmp_path / file_cache.url_to_filename(url, etag)
-    legacy_cache_path.write_bytes(b"legacy cached")
+    raw_validator_cache_path = tmp_path / file_cache.url_to_filename(url, etag)
+    raw_validator_cache_path.write_bytes(b"raw validator cached")
     head_response = _HeadResponse(headers={"ETag": etag})
+    get_response = _GetResponse([b"validator namespaced"])
 
     monkeypatch.setattr(
         file_cache.requests,
@@ -115,10 +116,14 @@ def test_get_from_cache_hits_legacy_raw_etag_filename(monkeypatch, tmp_path):
     monkeypatch.setattr(
         file_cache.requests,
         "get",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy cache hit should not download")),
+        lambda request_url, *, stream=False, timeout=None: get_response,
     )
 
-    assert file_cache.get_from_cache(url, str(tmp_path)) == str(legacy_cache_path)
+    cache_path = file_cache.get_from_cache(url, str(tmp_path))
+
+    assert Path(cache_path).name == file_cache.url_to_filename(url, f"etag:{etag}")
+    assert Path(cache_path).read_bytes() == b"validator namespaced"
+    assert raw_validator_cache_path.read_bytes() == b"raw validator cached"
     assert head_response.closed is True
 
 

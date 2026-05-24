@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 
 from s2and import feature_port
@@ -10,12 +12,12 @@ if not feature_port.rust_featurizer_available():
 import numpy as np
 
 import s2and.model as model_module
-from s2and.consts import LARGE_INTEGER
+from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.model import Clusterer
 
-s2and_rust = feature_port.s2and_rust
+s2and_rust = cast(Any, feature_port.s2and_rust)
 
 
 def _dummy_dataset(name: str) -> ANDData:
@@ -29,7 +31,7 @@ def _dummy_dataset(name: str) -> ANDData:
     )
 
 
-def _specter_dataset(name: str, specter_embeddings: object) -> ANDData:
+def _specter_dataset(name: str, specter_embeddings: Any) -> ANDData:
     signatures = {
         "s1": {
             "signature_id": "s1",
@@ -436,6 +438,168 @@ def test_make_distance_matrices_from_rust_featurizer_avoids_anddata_lookup(monke
     assert captured["feature_calls"] == 3
 
 
+def test_make_distance_matrices_from_rust_featurizer_skips_fastcluster_indices_without_constraints(monkeypatch):
+    monkeypatch.setattr(
+        model_module,
+        "_upper_triangle_indices_for_range",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("FastCluster vector writes do not need upper-triangle index arrays")
+        ),
+    )
+    monkeypatch.setattr(
+        model_module,
+        "get_constraints_block_upper_triangle_indexed_rust",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("constraints are disabled")),
+    )
+
+    captured = {"feature_calls": 0}
+
+    class _FakeFeaturizer:
+        def signature_ids(self):
+            return ["0", "1", "2", "3"]
+
+        def featurize_block_upper_triangle_matrix_indexed(
+            self,
+            _block_signature_indices,
+            start_offset=0,
+            max_pairs=None,
+            selected_indices=None,
+            *_args,
+            **_kwargs,
+        ):
+            captured["feature_calls"] += 1
+            assert max_pairs is not None
+            out_cols = len(selected_indices) if selected_indices is not None else 1
+            out = np.zeros((int(max_pairs), out_cols), dtype=np.float64)
+            out[:, 0] = np.arange(start_offset, start_offset + int(max_pairs), dtype=np.float64)
+            return out
+
+    def fake_predict_and_combine(
+        _classifier,
+        _nameless_classifier,
+        features,
+        labels,
+        _nameless_features,
+        _batch_label,
+        runtime_context=None,
+        **_kwargs,
+    ):
+        del _classifier, _nameless_classifier, _nameless_features, _batch_label, runtime_context, _kwargs
+        assert np.isnan(labels).all()
+        return np.asarray(features[:, 0], dtype=np.float64), 0.0
+
+    monkeypatch.setattr(model_module, "_predict_and_combine", fake_predict_and_combine)
+
+    clusterer = _dummy_clusterer(
+        cluster_model=model_module.FastCluster(linkage="average"),
+        use_default_constraints_as_supervision=False,
+    )
+    output = clusterer.make_distance_matrices_from_rust_featurizer(
+        {"block": ["0", "1", "2", "3"]},
+        _FakeFeaturizer(),
+    )
+
+    np.testing.assert_allclose(output["block"], np.arange(6, dtype=np.float64), rtol=0, atol=0)
+    assert captured["feature_calls"] == 3
+    telemetry = clusterer._last_rust_featurizer_make_dists_telemetry
+    assert telemetry["chunk_count"] == 3
+    assert telemetry["upper_triangle_index_seconds"] == 0.0
+
+
+def test_make_distance_matrices_from_rust_featurizer_skips_fastcluster_constraint_index_conversion(monkeypatch):
+    class _IndexValuesThatShouldNotBeConverted:
+        def __array__(self, *_args, **_kwargs):
+            raise AssertionError("FastCluster vector writes do not need converted constraint index arrays")
+
+    class _FakeFeaturizer:
+        def signature_ids(self):
+            return ["0", "1", "2", "3"]
+
+        def featurize_block_upper_triangle_matrix_indexed(
+            self,
+            _block_signature_indices,
+            start_offset=0,
+            max_pairs=None,
+            selected_indices=None,
+            *_args,
+            **_kwargs,
+        ):
+            assert max_pairs is not None
+            out_cols = len(selected_indices) if selected_indices is not None else 1
+            out = np.zeros((int(max_pairs), out_cols), dtype=np.float64)
+            out[:, 0] = np.arange(start_offset, start_offset + int(max_pairs), dtype=np.float64)
+            return out
+
+    def fake_predict_and_combine(
+        _classifier,
+        _nameless_classifier,
+        features,
+        labels,
+        _nameless_features,
+        _batch_label,
+        runtime_context=None,
+        **_kwargs,
+    ):
+        del _classifier, _nameless_classifier, _nameless_features, _batch_label, runtime_context, _kwargs
+        assert np.isnan(labels).all()
+        return np.asarray(features[:, 0], dtype=np.float64), 0.0
+
+    monkeypatch.setattr(model_module, "_predict_and_combine", fake_predict_and_combine)
+    monkeypatch.setattr(
+        model_module,
+        "get_constraints_block_upper_triangle_indexed_rust",
+        lambda _dataset, _block_signature_indices, *, max_pairs, **_kwargs: (
+            _IndexValuesThatShouldNotBeConverted(),
+            _IndexValuesThatShouldNotBeConverted(),
+            [None] * int(max_pairs),
+        ),
+    )
+
+    clusterer = _dummy_clusterer(
+        cluster_model=model_module.FastCluster(linkage="average"),
+        use_default_constraints_as_supervision=True,
+    )
+    output = clusterer.make_distance_matrices_from_rust_featurizer(
+        {"block": ["0", "1", "2", "3"]},
+        _FakeFeaturizer(),
+    )
+
+    np.testing.assert_allclose(output["block"], np.arange(6, dtype=np.float64), rtol=0, atol=0)
+    telemetry = clusterer._last_rust_featurizer_make_dists_telemetry
+    assert telemetry["chunk_count"] == 3
+    assert telemetry["upper_triangle_index_seconds"] == 0.0
+
+
+def test_make_distance_matrices_from_rust_featurizer_checks_fastcluster_constraint_count(monkeypatch):
+    class _FakeFeaturizer:
+        def signature_ids(self):
+            return ["0", "1", "2"]
+
+        def featurize_block_upper_triangle_matrix_indexed(self, *_args, **_kwargs):
+            raise AssertionError("feature rows should not be built after a constraint count mismatch")
+
+    monkeypatch.setattr(
+        model_module,
+        "get_constraints_block_upper_triangle_indexed_rust",
+        lambda _dataset, _block_signature_indices, *, max_pairs, **_kwargs: (
+            [],
+            [],
+            [None] * (int(max_pairs) - 1),
+        ),
+    )
+
+    clusterer = _dummy_clusterer(
+        cluster_model=model_module.FastCluster(linkage="average"),
+        use_default_constraints_as_supervision=True,
+    )
+
+    with pytest.raises(RuntimeError, match="Rust constraint row count mismatch"):
+        clusterer.make_distance_matrices_from_rust_featurizer(
+            {"block": ["0", "1", "2"]},
+            _FakeFeaturizer(),
+        )
+
+
 def test_predict_from_rust_featurizer_builds_and_clusters_one_block_at_a_time(monkeypatch):
     make_calls = []
     cluster_calls = []
@@ -494,10 +658,27 @@ def test_predict_from_rust_featurizer_builds_and_clusters_one_block_at_a_time(mo
     assert cluster_calls == [("a", ("0", "1")), ("b", ("2", "3"))]
     assert result == {"a_0": ["0", "1"], "b_0": ["2", "3"]}
     telemetry = clusterer._last_rust_featurizer_predict_telemetry
-    assert telemetry["make_dists_total_seconds"] >= 0.0
+    assert float(telemetry["make_dists_total_seconds"]) >= 0.0
     assert telemetry["make_dists_constraint_seconds"] == 0.2
     assert telemetry["make_dists_block_count"] == 2
     assert telemetry["make_dists_pair_count"] == 2
+
+
+def test_predict_from_rust_featurizer_rejects_disallows_with_precomputed_dists() -> None:
+    class _FakeFeaturizer:
+        def signature_rule_metadata(self):
+            return [("0", "First0", None), ("1", "First1", None)]
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+
+    with pytest.raises(ValueError, match="precomputed dists"):
+        clusterer.predict_from_rust_featurizer(
+            {"block": ["0", "1"]},
+            _FakeFeaturizer(),
+            dists={"block": np.zeros((2, 2), dtype=np.float64)},
+            cluster_seeds_require={},
+            cluster_seeds_disallow={("0", "1")},
+        )
 
 
 def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, tmp_path):
@@ -554,8 +735,8 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, 
     assert captured["signature_ids"] == ("0", "1", "2")
     assert captured["load_name_counts"] is True
     assert captured["total_ram_bytes"] == 123
-    assert captured["partial_supervision"] == {("0", "2"): LARGE_INTEGER}
-    assert captured["cluster_seeds_disallow"] is None
+    assert captured["partial_supervision"] == {("0", "2"): LARGE_DISTANCE}
+    assert captured["cluster_seeds_disallow"] == {("0", "2")}
     telemetry = clusterer._last_arrow_predict_telemetry
     assert telemetry["signature_count"] == 3
     assert telemetry["block_count"] == 1
@@ -613,9 +794,9 @@ def test_predict_from_arrow_paths_merges_explicit_disallows(monkeypatch):
     assert captured["partial_supervision"] == {
         ("0", "1"): 0,
         ("0", "2"): 0,
-        ("1", "2"): LARGE_INTEGER,
+        ("1", "2"): LARGE_DISTANCE,
     }
-    assert captured["cluster_seeds_disallow"] is None
+    assert captured["cluster_seeds_disallow"] == {("0", "1"), ("1", "2")}
 
 
 def test_predict_auto_routes_to_arrow_paths_when_dataset_advertises_them(tmp_path, monkeypatch):
@@ -632,7 +813,7 @@ def test_predict_auto_routes_to_arrow_paths_when_dataset_advertises_them(tmp_pat
         path = tmp_path / filename
         path.touch()
         arrow_paths[key] = str(path)
-    dataset.arrow_paths = arrow_paths
+    cast(Any, dataset).arrow_paths = arrow_paths
     runtime_context = type(
         "RuntimeContext",
         (),
@@ -658,7 +839,7 @@ def test_predict_auto_routes_to_arrow_paths_when_dataset_advertises_them(tmp_pat
         captured["cluster_seeds_disallow"] = set(kwargs["cluster_seeds_disallow"])
         return {"arrow": ["0", "1"]}, None
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(Clusterer, "predict_helper", fail_predict_helper)
     monkeypatch.setattr(Clusterer, "predict_from_arrow_paths", fake_predict_from_arrow_paths)
 
@@ -688,7 +869,7 @@ def test_predict_auto_declines_arrow_paths_missing_required_name_counts_index(tm
         path = tmp_path / filename
         path.touch()
         arrow_paths[key] = str(path)
-    dataset.arrow_paths = arrow_paths
+    cast(Any, dataset).arrow_paths = arrow_paths
     runtime_context = type(
         "RuntimeContext",
         (),
@@ -712,7 +893,7 @@ def test_predict_auto_declines_arrow_paths_missing_required_name_counts_index(tm
     def fail_predict_from_arrow_paths(*_args, **_kwargs):
         raise AssertionError("implicit Arrow routing should decline incomplete name-count artifacts")
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(Clusterer, "predict_helper", fake_predict_helper)
     monkeypatch.setattr(Clusterer, "predict_from_arrow_paths", fail_predict_from_arrow_paths)
 
@@ -746,7 +927,7 @@ def test_predict_subblocked_uses_arrow_featurizer_for_multiple_letter_groups(tmp
         path = tmp_path / filename
         path.touch()
         arrow_paths[key] = str(path)
-    dataset.arrow_paths = arrow_paths
+    cast(Any, dataset).arrow_paths = arrow_paths
     runtime_context = type(
         "RuntimeContext",
         (),
@@ -776,7 +957,7 @@ def test_predict_subblocked_uses_arrow_featurizer_for_multiple_letter_groups(tmp
         captured["predict_calls"].append(dict(block_dict))
         return {f"{next(iter(block_dict))}_0": list(next(iter(block_dict.values())))}, None
 
-    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation: runtime_context)
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
     monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", fake_build_from_arrow_paths)
     monkeypatch.setattr(Clusterer, "predict_helper", fail_predict_helper)
     monkeypatch.setattr(Clusterer, "predict_from_rust_featurizer", fake_predict_from_rust_featurizer)

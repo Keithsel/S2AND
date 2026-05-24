@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
 import pytest
 
@@ -52,12 +54,12 @@ def test_load_s2and_rust_extension_prefers_versioned_candidate_on_tie(monkeypatc
     class ShimModule:
         __version__ = None
 
-    ShimModule.RustFeaturizer = RustFeaturizer
+    cast(Any, ShimModule).RustFeaturizer = RustFeaturizer
 
     class NativeModule:
         __version__ = "0.50.0"
 
-    NativeModule.RustFeaturizer = RustFeaturizer
+    cast(Any, NativeModule).RustFeaturizer = RustFeaturizer
 
     def _fake_import_module(name: str):
         if name == "s2and_rust":
@@ -107,7 +109,7 @@ def test_load_s2and_rust_extension_reraises_nested_missing_dependency(monkeypatc
     class ShimModule:
         __version__ = "0.50.0"
 
-    ShimModule.RustFeaturizer = RustFeaturizer
+    cast(Any, ShimModule).RustFeaturizer = RustFeaturizer
 
     def _fake_import_module(name: str):
         if name == "s2and_rust":
@@ -136,7 +138,7 @@ def test_detect_rust_runtime_capabilities_requires_core_markers():
     class Module:
         __version__ = "0.49.0"
 
-    Module.RustFeaturizer = MissingMarkerRustFeaturizer
+    cast(Any, Module).RustFeaturizer = MissingMarkerRustFeaturizer
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
     assert capabilities.extension_importable is True
@@ -150,7 +152,7 @@ def test_detect_rust_runtime_capabilities_rejects_old_version():
     class Module:
         __version__ = "0.49.9"
 
-    Module.RustFeaturizer = RustFeaturizer
+    cast(Any, Module).RustFeaturizer = RustFeaturizer
 
     blocked = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
     assert blocked.core_runtime_available is False
@@ -163,7 +165,7 @@ def test_detect_rust_runtime_capabilities_rejects_unparseable_version():
     class Module:
         __version__ = "dev-local"
 
-    Module.RustFeaturizer = RustFeaturizer
+    cast(Any, Module).RustFeaturizer = RustFeaturizer
 
     blocked = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
     assert blocked.core_runtime_available is False
@@ -176,7 +178,7 @@ def test_detect_rust_runtime_capabilities_reads_from_dataset_paper_preprocess_ma
     class Module:
         __version__ = "0.50.0"
 
-    Module.RustFeaturizer = RustFeaturizer
+    cast(Any, Module).RustFeaturizer = RustFeaturizer
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
     assert capabilities.core_runtime_available is True
@@ -334,7 +336,7 @@ def test_rust_get_build_info_contract():
 
     get_build_info = getattr(s2and_rust, "get_build_info", None)
     if not callable(get_build_info):
-        pytest.skip("s2and_rust.get_build_info unavailable")
+        raise pytest.skip.Exception("s2and_rust.get_build_info unavailable")
 
     info = get_build_info()
     assert isinstance(info, dict)

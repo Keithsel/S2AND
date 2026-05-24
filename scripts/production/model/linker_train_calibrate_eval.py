@@ -770,8 +770,7 @@ def _component_member_details_by_key(
 
 def _enable_fasttext_language_detection() -> None:
     os.environ["S2AND_SKIP_FASTTEXT"] = "0"
-    s2and_text._FASTTEXT_MODEL = None  # noqa: SLF001
-    s2and_text._FASTTEXT_MODEL_INITIALIZED = False  # noqa: SLF001
+    s2and_text.set_fasttext_loading_enabled(True)
 
 
 def _signature_id_to_index(featurizer: Any) -> dict[str, int]:
@@ -791,8 +790,9 @@ def _candidate_batch_from_rows(
     query_indices = np.empty(len(rows), dtype=np.uint32)
     member_arrays: list[np.ndarray] = []
     for row_offset, row in enumerate(rows.itertuples(index=False)):
-        query_signature_id = str(row.query_signature_id)
-        component_key = str(row.candidate_component_key)
+        row_any = cast(Any, row)
+        query_signature_id = str(row_any.query_signature_id)
+        component_key = str(row_any.candidate_component_key)
         try:
             query_index = int(signature_id_to_index[query_signature_id])
         except KeyError as exc:
@@ -942,6 +942,7 @@ def _build_minimal_raw_dataset_context(
     clusterer: Any,
     n_jobs: int,
     rust_build_path: str | None,
+    name_counts_path: str | None,
     allow_normalization_version_mismatch: bool,
     max_exemplars: int,
 ) -> MinimalRawDatasetContext:
@@ -962,6 +963,7 @@ def _build_minimal_raw_dataset_context(
         runtime_context=runtime_context,
         rust_build_path=cast(Any, rust_build_path),
         allow_normalization_version_mismatch=allow_normalization_version_mismatch,
+        name_counts_path=name_counts_path,
     )
     constraint_backend = _build_incremental_constraint_backend(
         dataset,
@@ -2093,13 +2095,15 @@ def _materialize_minimal_raw_dataset_rows(
         retrieval_ranks: dict[str, int] = {}
         rows_by_component: dict[str, list[int]] = {}
         for row in sorted_group.itertuples():
-            component_key = str(row.candidate_component_key)
+            row_any = cast(Any, row)
+            row_index = int(row_any.Index)
+            component_key = str(row_any.candidate_component_key)
             summary, _active_member_ids = summary_for(component_key, query_signature_id)
             summaries[component_key] = summary
-            retrieval_ranks[component_key] = int(row.retrieval_rank)
-            rows_by_component.setdefault(component_key, []).append(int(row.Index))
+            retrieval_ranks[component_key] = int(row_any.retrieval_rank)
+            rows_by_component.setdefault(component_key, []).append(row_index)
             if _row_label_is_positive(row):
-                row_ignore_disallow[int(row.Index)] = True
+                row_ignore_disallow[row_index] = True
             if (
                 seed_constraint_signature_ids
                 and _row_allows_seed_constraint_bypass(
@@ -2113,7 +2117,7 @@ def _materialize_minimal_raw_dataset_rows(
                     candidate_signature_ids=_active_member_ids,
                 )
             ):
-                row_seed_bypass[int(row.Index)] = True
+                row_seed_bypass[row_index] = True
         retrieval_scores = _score_candidate_summaries_with_frozen_rust_policy(
             query=query,
             summaries=summaries,
@@ -2363,6 +2367,7 @@ def _materialize_minimal_raw_feature_bundle(
     max_top_k: int,
     reuse_existing_features: bool,
     rust_build_path: str | None,
+    name_counts_path: str | None,
     allow_normalization_version_mismatch: bool,
     pairwise_model_nan_value: float,
     pairwise_aggregate_nan_value: float,
@@ -2531,6 +2536,7 @@ def _materialize_minimal_raw_feature_bundle(
             clusterer=clusterer,
             n_jobs=n_jobs,
             rust_build_path=rust_build_path,
+            name_counts_path=name_counts_path,
             allow_normalization_version_mismatch=allow_normalization_version_mismatch,
             max_exemplars=max_exemplars,
         )
@@ -2959,6 +2965,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             max_top_k=int(args.max_top_k),
             reuse_existing_features=bool(args.reuse_existing_features),
             rust_build_path=args.minimal_raw_rust_build_path,
+            name_counts_path=args.minimal_raw_name_counts_path,
             allow_normalization_version_mismatch=bool(args.allow_normalization_version_mismatch),
             pairwise_model_nan_value=pairwise_model_nan_value,
             pairwise_aggregate_nan_value=pairwise_aggregate_nan_value,
@@ -3061,6 +3068,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             holdout_importance_weight=float(args.prod_holdout_importance_weight),
         )
     if production_bundle_dir is not None:
+        if save_artifact_to is None:
+            raise RuntimeError("production bundle finalization requires an incremental linker artifact path")
         production_bundle_summary = finalize_production_bundle(
             pairwise_bundle_dir=Path(args.pairwise_model_path),
             output_bundle_dir=production_bundle_dir,
@@ -3226,6 +3235,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Optional RustFeaturizer constructor override for minimal-raw-rust materialization. "
             "Defaults to the normal dataset lifecycle policy."
         ),
+    )
+    parser.add_argument(
+        "--minimal-raw-name-counts-path",
+        default=None,
+        help="Optional Rust JSON ingest name-count artifact path for minimal-raw-rust materialization.",
     )
     parser.add_argument(
         "--allow-normalization-version-mismatch",

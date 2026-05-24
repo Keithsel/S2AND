@@ -113,7 +113,6 @@ def _single_run(
 
     os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
     os.environ["S2AND_BACKEND"] = backend
-    os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
     rust_extension_identity: dict[str, Any] | None = None
     if backend == "rust":
         rust_extension_identity = collect_rust_extension_identity(
@@ -125,6 +124,9 @@ def _single_run(
     from s2and.data import ANDData
     from s2and.eval import cluster_eval
     from s2and.production_model import load_production_model
+    from s2and.text import set_fasttext_loading_enabled
+
+    set_fasttext_loading_enabled(False)
 
     resolved_model_path = _resolve_path(PROJECT_ROOT_PATH, model_path)
     clusterer = load_production_model(resolved_model_path)

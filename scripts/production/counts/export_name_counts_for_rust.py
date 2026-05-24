@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--normalization-version",
         type=str,
-        default=os.environ.get("S2AND_NORMALIZATION_VERSION", "legacy_compat"),
+        default="legacy_compat",
         help="Normalization policy version tag stored in artifact metadata.",
     )
     return parser.parse_args()

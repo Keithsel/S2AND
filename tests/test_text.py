@@ -35,6 +35,7 @@ class TestClusterer(unittest.TestCase):
         assert "text" == normalize_text("TeXt")
         assert "te han zi xt" == normalize_text("te'漢字xt")
         assert "text" == normalize_text("te'xt", True)
+        assert "a b" == normalize_text("A1 B-2")
 
     def test_name_similarity_features(self):
         assert [NUMPY_NAN] * 4 == name_text_features("", cast(Any, None))
@@ -192,7 +193,7 @@ def test_fasttext_model_lazy_load_is_thread_safe(monkeypatch):
     monkeypatch.setattr(text_module.fasttext, "load_model", _fake_load_model)
     monkeypatch.setattr(text_module, "cached_path", lambda path: path)
     monkeypatch.setattr(text_module, "FASTTEXT_PATH", "dummy_model_path.bin")
-    monkeypatch.delenv("S2AND_SKIP_FASTTEXT", raising=False)
+    text_module.set_fasttext_loading_enabled(True)
     text_module._FASTTEXT_MODEL = None
     text_module._FASTTEXT_MODEL_INITIALIZED = False
 
@@ -208,12 +209,38 @@ def test_fasttext_model_lazy_load_is_thread_safe(monkeypatch):
     assert all(model is fake_model for model in outputs)
 
 
-def test_fasttext_skip_overrides_cached_model(monkeypatch):
+def test_fasttext_skip_overrides_cached_model():
     import s2and.text as text_module
 
-    text_module._FASTTEXT_MODEL = object()
-    text_module._FASTTEXT_MODEL_INITIALIZED = True
-    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+    text_module_any = cast(Any, text_module)
+    text_module_any.set_fasttext_loading_enabled(True)
+    text_module_any._FASTTEXT_MODEL = object()
+    text_module_any._FASTTEXT_MODEL_INITIALIZED = True
+    text_module_any.set_fasttext_loading_enabled(False)
 
-    assert text_module._get_fasttext_model() is None
-    assert text_module._FASTTEXT_MODEL is None
+    assert text_module_any._get_fasttext_model() is None
+    assert text_module_any._FASTTEXT_MODEL is None
+
+
+def test_fasttext_enable_preserves_loaded_model(monkeypatch):
+    import s2and.text as text_module
+
+    fake_model = object()
+    load_calls = {"count": 0}
+
+    def _fake_load_model(_path: str):
+        load_calls["count"] += 1
+        return fake_model
+
+    monkeypatch.setattr(text_module.fasttext, "load_model", _fake_load_model)
+    monkeypatch.setattr(text_module, "cached_path", lambda path: path)
+    monkeypatch.setattr(text_module, "FASTTEXT_PATH", "dummy_model_path.bin")
+    text_module.set_fasttext_loading_enabled(True)
+    text_module._FASTTEXT_MODEL = None
+    text_module._FASTTEXT_MODEL_INITIALIZED = False
+
+    assert text_module._get_fasttext_model() is fake_model
+    text_module.set_fasttext_loading_enabled(True)
+
+    assert text_module._get_fasttext_model() is fake_model
+    assert load_calls["count"] == 1

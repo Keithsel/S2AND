@@ -44,7 +44,7 @@
 | `make_inventors_split_and_histograms.py` | Split inventors data and generate histograms (defaults to a local ignored output path) |
 | `make_inventors_hf_specter_embeddings.py` | Generate SPECTER embeddings for inventors dataset (defaults to a local ignored output path) |
 | `extract_big_block_dataset.py` | Convert a monolithic big-block export into `ANDData`-friendly `signatures.json`, `papers.json`, and `specter.pickle` files; supports both pretty-printed and minified JSON exports |
-| `convert_to_arrow.py` | Convert service JSON, benchmark datasets, linker replay raw inputs, and shared name-counts into Arrow runtime artifacts; subcommands are `service-json`, `benchmark`, `linker-replay`, `name-counts-index`, and `validate` |
+| `convert_to_arrow.py` | Convert service JSON, benchmark datasets, linker replay raw inputs, and shared name-counts into bounded Arrow runtime artifacts with current raw-planner batch-index sidecars (`S2ABI001`); subcommands are `service-json`, `benchmark`, `linker-replay`, `name-counts-index`, and `validate` |
 | `analyze_giant_block_subblocking.py` | Sweep subblocking thresholds on an extracted giant block and write preservation metrics, plots, and tables |
 | `bench_preprocess_phases.py` | Benchmark preprocessing phases (papers, signatures) across serial / threads / processes |
 
@@ -53,6 +53,7 @@
 | Script | What it does |
 |---|---|
 | `eval_prod_models.py` | Evaluate production models (SPECTER1 vs SPECTER2) on full, inventors_s2and, or mini datasets |
+| `verification/compare_full_predict_arrow_parity.py` | Build a bounded Arrow parity artifact, including current raw-planner batch-index sidecars, and compare incumbent full predict against direct Arrow/Rust full predict |
 
 ### CI & release
 

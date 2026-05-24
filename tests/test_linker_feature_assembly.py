@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -28,6 +29,10 @@ class StaticPairwiseStats:
     def feature_matrix(self) -> np.ndarray:
         self.feature_matrix_call_count += 1
         return self._matrix
+
+
+def _static_pairwise_stats(matrix: np.ndarray, columns: tuple[str, ...]) -> Any:
+    return StaticPairwiseStats(matrix, columns)
 
 
 def _row_feature_fixture(row_count: int) -> dict[str, np.ndarray]:
@@ -66,7 +71,7 @@ def test_assemble_linker_feature_matrix_places_row_and_pairwise_columns() -> Non
     assembled = features.assemble_linker_feature_matrix(
         candidate_batch,
         _row_feature_fixture(row_count),
-        pairwise_stats=StaticPairwiseStats(pairwise_matrix, pairwise_columns),
+        pairwise_stats=_static_pairwise_stats(pairwise_matrix, pairwise_columns),
     )
 
     assert assembled.matrix.dtype == np.float32
@@ -98,7 +103,7 @@ def test_assemble_linker_feature_matrix_rejects_pairwise_nans() -> None:
         features.assemble_linker_feature_matrix(
             candidate_batch,
             _row_feature_fixture(row_count),
-            pairwise_stats=StaticPairwiseStats(pairwise_matrix, pairwise_columns),
+            pairwise_stats=_static_pairwise_stats(pairwise_matrix, pairwise_columns),
         )
 
 
@@ -118,7 +123,7 @@ def test_assemble_linker_feature_matrix_rejects_pairwise_infinities() -> None:
         features.assemble_linker_feature_matrix(
             candidate_batch,
             _row_feature_fixture(row_count),
-            pairwise_stats=StaticPairwiseStats(pairwise_matrix, pairwise_columns),
+            pairwise_stats=_static_pairwise_stats(pairwise_matrix, pairwise_columns),
         )
 
 
@@ -150,7 +155,7 @@ def test_assemble_linker_feature_matrix_matches_tracked_target_order() -> None:
     assembled = features.assemble_linker_feature_matrix(
         candidate_batch,
         frame,
-        pairwise_stats=StaticPairwiseStats(
+        pairwise_stats=_static_pairwise_stats(
             pairwise_frame.loc[:, list(pairwise_columns)].to_numpy(np.float32),
             pairwise_columns,
         ),
@@ -176,10 +181,11 @@ def test_feature_values_from_runtime_reuses_assembled_pairwise_columns() -> None
         row_count, len(pairwise_columns)
     )
     pairwise_stats = StaticPairwiseStats(pairwise_matrix, pairwise_columns)
+    pairwise_stats_for_call: Any = pairwise_stats
     assembled = features.assemble_linker_feature_matrix(
         candidate_batch,
         _row_feature_fixture(row_count),
-        pairwise_stats=pairwise_stats,
+        pairwise_stats=cast(Any, pairwise_stats_for_call),
     )
 
     assert pairwise_stats.feature_matrix_call_count == 1

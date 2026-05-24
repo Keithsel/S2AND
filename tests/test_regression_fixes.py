@@ -30,6 +30,10 @@ def _subblocking_signature(first_name: str, *, middle_name: str = "", orcid: str
     )
 
 
+VALID_ORCID_1 = "0000-0001-2345-6789"
+VALID_ORCID_2 = "0000-0001-2345-679X"
+
+
 def test_model_predict_class0_does_not_require_num_threads_keyword_support():
     class RejectsNumThreads:
         def predict_proba(self, features):
@@ -245,22 +249,11 @@ def test_fused_constraint_fallback_resumes_at_failed_offset(monkeypatch):
     assert [chunk.start_offset for chunk in chunks] == [0, 2, 4]
 
 
-def test_predict_from_arrow_paths_merges_disallows_without_forwarding_to_precomputed_dists(monkeypatch):
-    captured: dict[str, Any] = {}
-
+def test_predict_from_arrow_paths_rejects_disallows_with_precomputed_dists_before_build(monkeypatch):
     def fake_build_from_arrow_paths(*_args, **_kwargs):
-        return object()
-
-    def fake_predict_from_rust_featurizer(self, block_dict, rust_featurizer, **kwargs):
-        del self, rust_featurizer
-        captured["block_dict"] = block_dict
-        captured["dists"] = kwargs["dists"]
-        captured["partial_supervision"] = dict(kwargs["partial_supervision"])
-        captured["cluster_seeds_disallow"] = kwargs.get("cluster_seeds_disallow")
-        return {"block": ["s0", "s1"]}, kwargs["dists"]
+        raise AssertionError("precomputed dists with disallows should be rejected before Rust featurizer build")
 
     monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", fake_build_from_arrow_paths)
-    monkeypatch.setattr(Clusterer, "predict_from_rust_featurizer", fake_predict_from_rust_featurizer)
 
     clusterer = Clusterer(
         featurizer_info=FeaturizationInfo(features_to_use=["year_diff", "misc_features"]),
@@ -269,17 +262,13 @@ def test_predict_from_arrow_paths_merges_disallows_without_forwarding_to_precomp
         use_cache=False,
     )
     dists = {"block": np.asarray([0.5], dtype=np.float64)}
-    result, returned_dists = clusterer.predict_from_arrow_paths(
-        {"block": ["s0", "s1"]},
-        {"signatures": "signatures.arrow", "papers": "papers.arrow", "paper_authors": "paper_authors.arrow"},
-        dists=dists,
-        cluster_seeds_disallow={("s0", "s1")},
-    )
-
-    assert result == {"block": ["s0", "s1"]}
-    assert returned_dists is dists
-    assert captured["partial_supervision"] == {("s0", "s1"): model_module.LARGE_INTEGER}
-    assert captured["cluster_seeds_disallow"] is None
+    with pytest.raises(ValueError, match="cluster_seeds_disallow cannot be used with precomputed dists"):
+        clusterer.predict_from_arrow_paths(
+            {"block": ["s0", "s1"]},
+            {"signatures": "signatures.arrow", "papers": "papers.arrow", "paper_authors": "paper_authors.arrow"},
+            dists=dists,
+            cluster_seeds_disallow={("s0", "s1")},
+        )
 
 
 def test_predict_from_arrow_paths_rejects_none_path_before_rust_builder(monkeypatch):
@@ -299,6 +288,27 @@ def test_predict_from_arrow_paths_rejects_none_path_before_rust_builder(monkeypa
         clusterer.predict_from_arrow_paths(
             {"block": ["s0", "s1"]},
             {"signatures": None, "papers": "papers.arrow", "paper_authors": "paper_authors.arrow"},
+        )
+
+
+@pytest.mark.parametrize("bad_path", ["", "   ", Path()])
+def test_predict_from_arrow_paths_rejects_empty_path_before_rust_builder(monkeypatch, bad_path):
+    def fail_build_from_arrow_paths(*_args, **_kwargs):
+        raise AssertionError("invalid Arrow paths should be rejected before Rust featurizer build")
+
+    monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", fail_build_from_arrow_paths)
+
+    clusterer = Clusterer(
+        featurizer_info=FeaturizationInfo(features_to_use=["year_diff", "misc_features"]),
+        classifier=None,
+        n_jobs=1,
+        use_cache=False,
+    )
+
+    with pytest.raises(ValueError, match="signatures"):
+        clusterer.predict_from_arrow_paths(
+            {"block": ["s0", "s1"]},
+            {"signatures": bad_path, "papers": "papers.arrow", "paper_authors": "paper_authors.arrow"},
         )
 
 
@@ -540,11 +550,11 @@ def test_make_subblocks_handles_specter_edge_case_without_unbound_local(monkeypa
 
 def test_make_subblocks_skips_orcid_merge_when_all_targets_are_full(monkeypatch):
     signatures = {
-        "s1": _subblocking_signature("aa", orcid="O1"),
-        "s2": _subblocking_signature("aa", orcid="O2"),
-        "s3": _subblocking_signature("bb", orcid="O1"),
+        "s1": _subblocking_signature("aa", orcid=VALID_ORCID_1),
+        "s2": _subblocking_signature("aa", orcid=VALID_ORCID_2),
+        "s3": _subblocking_signature("bb", orcid=VALID_ORCID_1),
         "s4": _subblocking_signature("bb"),
-        "s5": _subblocking_signature("cc", orcid="O2"),
+        "s5": _subblocking_signature("cc", orcid=VALID_ORCID_2),
         "s6": _subblocking_signature("cc"),
     }
 
@@ -569,11 +579,11 @@ def test_make_subblocks_skips_orcid_merge_when_all_targets_are_full(monkeypatch)
 
 def test_make_subblocks_skips_orcid_merge_without_enough_capacity(monkeypatch):
     signatures = {
-        "s1": _subblocking_signature("aa", orcid="O1"),
+        "s1": _subblocking_signature("aa", orcid=VALID_ORCID_1),
         "x1": _subblocking_signature("aa"),
-        "s2": _subblocking_signature("bb", orcid="O1"),
+        "s2": _subblocking_signature("bb", orcid=VALID_ORCID_1),
         "x2": _subblocking_signature("bb"),
-        "s3": _subblocking_signature("cc", orcid="O1"),
+        "s3": _subblocking_signature("cc", orcid=VALID_ORCID_1),
         "x3": _subblocking_signature("cc"),
     }
 
@@ -598,10 +608,10 @@ def test_make_subblocks_skips_orcid_merge_without_enough_capacity(monkeypatch):
 
 def test_make_subblocks_merges_orcid_when_target_has_capacity(monkeypatch):
     signatures = {
-        "s1": _subblocking_signature("aa", orcid="O1"),
+        "s1": _subblocking_signature("aa", orcid=VALID_ORCID_1),
         "x1": _subblocking_signature("aa"),
-        "s2": _subblocking_signature("bb", orcid="O1"),
-        "s3": _subblocking_signature("cc", orcid="O1"),
+        "s2": _subblocking_signature("bb", orcid=VALID_ORCID_1),
+        "s3": _subblocking_signature("cc", orcid=VALID_ORCID_1),
     }
 
     output = _run_make_subblocks_with_fixed_first_pass(
@@ -652,7 +662,7 @@ def test_clusterer_predict_uses_minimum_one_for_incremental_batch_threshold(monk
     monkeypatch.setattr(
         model_module,
         "make_subblocks",
-        lambda block_signatures, _dataset, maximum_size: {
+        lambda block_signatures, _dataset, maximum_size, **_kwargs: {
             "multi_1": ["m1", "m2"],
             "multi_2": ["m3", "m4"],
             "multi_3": ["m5", "m6"],
@@ -740,7 +750,7 @@ def test_clusterer_predict_optionally_skips_final_rust_seed_restore(
     monkeypatch.setattr(
         model_module,
         "make_subblocks",
-        lambda block_signatures, _dataset, maximum_size: {
+        lambda block_signatures, _dataset, maximum_size, **_kwargs: {
             "multi_1": ["m1", "m2"],
             "single_1": ["s1", "s2"],
         },
@@ -817,7 +827,7 @@ def test_clusterer_predict_subblocked_single_letter_ignores_original_altered_pro
     monkeypatch.setattr(
         model_module,
         "make_subblocks",
-        lambda block_signatures, _dataset, maximum_size: {
+        lambda block_signatures, _dataset, maximum_size, **_kwargs: {
             "multi": ["m1", "m2"],
             "single": ["s1", "s2"],
         },
@@ -862,6 +872,44 @@ def test_clusterer_predict_subblocked_single_letter_ignores_original_altered_pro
     assert dataset.altered_cluster_signatures == original_altered
 
 
+def test_clusterer_predict_subblocked_single_letter_restores_absent_altered_attr(monkeypatch):
+    dataset = _as_anddata(SimpleNamespace(cluster_seeds_require={}, cluster_seeds_disallow=set()))
+    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
+    clusterer = Clusterer(featurizer_info=featurizer_info, classifier=None, n_jobs=1, use_cache=False)
+    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda _dataset, runtime_context=None: None)
+
+    def fake_predict_incremental(self, block_signatures, dataset_arg, *args, **kwargs):
+        del self, dataset_arg, args, kwargs
+        return {
+            "clusters": {"merged": list(block_signatures)},
+            "phase_b_mode": "exact",
+            "phase_b_budget_bytes": 0,
+            "phase_b_required_bytes": 0,
+        }
+
+    monkeypatch.setattr(Clusterer, "predict_incremental", fake_predict_incremental)
+    runtime_context = RuntimeContext(
+        operation="cluster_predict",
+        requested_backend="python",
+        resolved_backend="python",
+        use_rust=False,
+        run_id="test-absent-altered-restore",
+        source="default",
+    )
+
+    clusterer._predict_subblocked_single_letter_incremental_groups(
+        {"single": ["s1"]},
+        pred_clusters={"seed_cluster": ["seed"]},
+        desired_memory_use=100,
+        dataset=dataset,
+        partial_supervision={},
+        runtime_context=runtime_context,
+        restore_rust_cluster_seeds_on_exit=True,
+    )
+
+    assert not hasattr(dataset, "altered_cluster_signatures")
+
+
 def test_clusterer_predict_subblocked_single_letter_suppresses_altered_arrow_path(monkeypatch, tmp_path):
     import pyarrow as pa
 
@@ -902,7 +950,7 @@ def test_clusterer_predict_subblocked_single_letter_suppresses_altered_arrow_pat
     monkeypatch.setattr(
         model_module,
         "make_subblocks",
-        lambda block_signatures, _dataset, maximum_size: {
+        lambda block_signatures, _dataset, maximum_size, **_kwargs: {
             "multi": ["m1", "m2"],
             "single": ["s1", "s2"],
         },
@@ -1062,7 +1110,7 @@ def test_clusterer_predict_subblocked_single_letter_restores_state_after_increme
     monkeypatch.setattr(
         model_module,
         "make_subblocks",
-        lambda block_signatures, _dataset, maximum_size: {
+        lambda block_signatures, _dataset, maximum_size, **_kwargs: {
             "multi": ["m1", "m2"],
             "single": ["s1", "s2"],
         },
@@ -1133,6 +1181,7 @@ def test_clusterer_predict_subblocked_arrow_presplits_altered_profile_seeds(
         del kwargs
         seed_path = Path(paths["cluster_seeds"])
         assert seed_path != Path(arrow_paths["cluster_seeds"])
+        captured["cluster_seeds_path"] = seed_path
         with pa.memory_map(str(seed_path), "r") as source:
             table = pa.ipc.open_file(source).read_all()
         captured["cluster_seeds_arrow"] = {
@@ -1207,6 +1256,7 @@ def test_clusterer_predict_subblocked_arrow_presplits_altered_profile_seeds(
     assert clusters == {"cluster0": ["seed0"], "cluster1": ["seed1"], "cluster2": ["seed2"]}
     assert dists is None
     assert captured["cluster_seeds_arrow"] == {"seed0": "7_0", "seed1": "7_1", "seed2": "8"}
+    assert not captured["cluster_seeds_path"].exists()
     assert dict(dataset.cluster_seeds_require) == original_seeds
     assert sync_snapshots[-1] == original_seeds
     assert clusterer._last_subblocked_altered_presplit_telemetry["bulk_altered_presplit_applied"] == 1
@@ -1216,7 +1266,7 @@ def test_clusterer_predict_subblocked_arrow_presplits_altered_profile_seeds(
 def test_sync_rust_cluster_seeds_skips_when_unchanged(monkeypatch):
     calls = {"count": 0}
 
-    def fake_update(_dataset, runtime_context=None):
+    def fake_update(_dataset, runtime_context=None, **_kwargs):
         del runtime_context
         calls["count"] += 1
 
@@ -1262,7 +1312,7 @@ def test_sync_rust_cluster_seeds_skips_when_unchanged(monkeypatch):
 def test_sync_rust_cluster_seeds_detects_in_place_seed_mutation(monkeypatch):
     calls = {"count": 0}
 
-    def fake_update(_dataset, runtime_context=None):
+    def fake_update(_dataset, runtime_context=None, **_kwargs):
         del runtime_context
         calls["count"] += 1
 

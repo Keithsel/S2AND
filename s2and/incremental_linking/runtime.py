@@ -11,7 +11,6 @@ from typing import Any, Literal
 
 import numpy as np
 
-import s2and.incremental_linking.query_adapter as query_adapter_module
 from s2and import feature_port
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
@@ -33,6 +32,7 @@ from s2and.incremental_linking.linker_pairwise import (
     compute_candidate_batch_pairwise_aggregate_stats_rust,
     compute_linker_pair_chunk_plan,
     iter_candidate_batch_pair_feature_chunks_rust,
+    resolve_linker_pairwise_featurizer,
 )
 from s2and.incremental_linking.logistic_gate import (
     NumpyLogisticGate,
@@ -648,13 +648,7 @@ def compute_candidate_batch_pairwise_model_and_aggregate_stats(
     distance_mins = np.full(row_count, np.inf, dtype=np.float64)
     top_distances = np.full((row_count, 5), np.inf, dtype=np.float64)
     hard_disallow_distance_pair_count = 0
-    if featurizer is None:
-        if dataset is None:
-            raise ValueError("dataset is required when featurizer is not provided")
-        featurizer = feature_port._get_rust_featurizer(  # noqa: SLF001
-            dataset,
-            runtime_context=runtime_context,
-        )
+    featurizer = resolve_linker_pairwise_featurizer(dataset, featurizer, runtime_context=runtime_context)
 
     chunk_count = 0
     feature_seconds = 0.0
@@ -1116,6 +1110,13 @@ def _validate_partial_supervision_window(
             seed_signature_id = left
 
         if query_signature_id is None or seed_signature_id is None:
+            if kind == "require" and (left_is_query or right_is_query):
+                unknown_signature_id = right if left_is_query else left
+                raise ValueError(
+                    "partial_supervision_require_unknown_seed_signature: "
+                    f"query_signature_id={(left if left_is_query else right)!r} "
+                    f"seed_signature_id={unknown_signature_id!r}"
+                )
             telemetry["partial_supervision_ignored_outside_window"] += 1
             continue
         seed_component = seed_signature_to_component[seed_signature_id]
@@ -1355,6 +1356,7 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
         (str(left), str(right)): value for (left, right), value in (partial_supervision or {}).items()
     }
     n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
+    retrieval_top_k_resolved = int(artifact.metadata.retrieval_top_k if retrieval_top_k is None else retrieval_top_k)
     if seed_setup is None:
         build_seed_setup = getattr(clusterer, "_build_incremental_seed_setup", None)
         if not callable(build_seed_setup):
@@ -1507,9 +1509,7 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
         "query_count": int(len(query_signature_id_strings)),
         "seed_signature_count": int(len(cluster_seeds_require)),
         "seed_component_count": int(len({str(value) for value in cluster_seeds_require.values()})),
-        "retrieval_top_k": int(
-            retrieval_top_k if retrieval_top_k is not None else _max_retrieval_rank(candidate_batch)
-        ),
+        "retrieval_top_k": retrieval_top_k_resolved,
         "retrieved_component_count": int(len(retrieved_component_keys)),
     }
     return LinkOrAbstainProductionResult(
@@ -1537,15 +1537,6 @@ def _raw_plan_query_views(raw_candidate_plan: Mapping[str, Any], query_count: in
     return views
 
 
-def _validate_raw_plan_query_view_lengths(raw_candidate_plan: Mapping[str, Any], query_count: int) -> None:
-    """Validate raw-plan query view cardinality without returning the view tuple."""
-
-    raw_views = _raw_plan_query_view_values(raw_candidate_plan)
-    view_count = len(tuple(raw_views))
-    if view_count != int(query_count):
-        raise ValueError(f"raw candidate plan query_views length must match query count: {view_count} != {query_count}")
-
-
 def _validate_raw_plan_query_signature_ids(
     raw_candidate_plan: Mapping[str, Any],
     expected_query_signature_ids: Sequence[str],
@@ -1557,13 +1548,6 @@ def _validate_raw_plan_query_signature_ids(
             "raw candidate plan query_signature_ids must exactly match requested query_signature_ids: "
             f"plan={list(plan_query_ids[:10])} requested={list(expected_query_ids[:10])}"
         )
-
-
-def _max_retrieval_rank(candidate_batch: LinkerCandidateBatch) -> int:
-    retrieval_ranks = candidate_batch.retrieval_ranks
-    if retrieval_ranks is None:
-        return 0
-    return max((int(rank) for rank in retrieval_ranks), default=0)
 
 
 def _identity_seed_setup(
@@ -1611,8 +1595,6 @@ _RAW_CANDIDATE_PLAN_WINDOW_REUSE_ZERO_TELEMETRY_KEYS: tuple[str, ...] = (
     "paper_count",
     "paper_author_paper_count",
     "specter_count",
-    "seed_signature_count",
-    "cluster_count",
     "unidecode_char_count",
     "excluded_query_seed_count",
     "indexed_arrow_candidate_plan",
@@ -1645,8 +1627,6 @@ def _zero_raw_plan_timings(telemetry: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(timings, Mapping):
         out["timings"] = {str(key): 0.0 for key in timings}
     for key in _RAW_CANDIDATE_PLAN_WINDOW_REUSE_ZERO_TELEMETRY_KEYS:
-        if key in {"seed_signature_count", "cluster_count"}:
-            continue
         value = out.get(key)
         if isinstance(value, int | float) and not isinstance(value, bool):
             out[key] = 0
@@ -1670,6 +1650,22 @@ def subset_raw_candidate_plan_for_query_ids(
 
     requested_query_ids = tuple(str(signature_id) for signature_id in query_signature_ids)
     plan_query_ids = tuple(str(signature_id) for signature_id in raw_candidate_plan["query_signature_ids"])
+
+    def duplicate_ids(values: Sequence[str]) -> list[str]:
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for value in values:
+            if value in seen:
+                duplicates.add(value)
+            seen.add(value)
+        return sorted(duplicates)
+
+    duplicate_plan_query_ids = duplicate_ids(plan_query_ids)
+    if duplicate_plan_query_ids:
+        raise ValueError(f"raw candidate plan query_signature_ids must be unique: {duplicate_plan_query_ids[:10]}")
+    duplicate_requested_query_ids = duplicate_ids(requested_query_ids)
+    if duplicate_requested_query_ids:
+        raise ValueError(f"requested query_signature_ids must be unique: {duplicate_requested_query_ids[:10]}")
     query_offset_by_id = {signature_id: offset for offset, signature_id in enumerate(plan_query_ids)}
     missing = [signature_id for signature_id in requested_query_ids if signature_id not in query_offset_by_id]
     if missing:
@@ -1751,13 +1747,10 @@ def subset_raw_candidate_plan_for_query_ids(
             else:
                 out[key] = _slice_sequence_or_array(raw_candidate_plan[key], pair_start, pair_stop)
 
-        retrieved_component_keys = set(out.get("row_component_keys", ()))
         component_members = raw_candidate_plan.get("component_members")
         if isinstance(component_members, Mapping):
             out["component_members"] = {
-                str(component_key): list(members)
-                for component_key, members in component_members.items()
-                if str(component_key) in retrieved_component_keys
+                str(component_key): list(members) for component_key, members in component_members.items()
             }
 
         telemetry = raw_candidate_plan.get("telemetry")
@@ -1834,13 +1827,10 @@ def subset_raw_candidate_plan_for_query_ids(
         else:
             out[key] = _subset_sequence_or_array(raw_candidate_plan[key], pair_mask)
 
-    retrieved_component_keys = set(out.get("row_component_keys", ()))
     component_members = raw_candidate_plan.get("component_members")
     if isinstance(component_members, Mapping):
         out["component_members"] = {
-            str(component_key): list(members)
-            for component_key, members in component_members.items()
-            if str(component_key) in retrieved_component_keys
+            str(component_key): list(members) for component_key, members in component_members.items()
         }
 
     telemetry = raw_candidate_plan.get("telemetry")
@@ -1913,7 +1903,6 @@ def predict_incremental_link_or_abstain_from_raw_feature_block(
     resolved_runtime_context = runtime_context or build_runtime_context("incremental_link_or_abstain_raw_feature_block")
     n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
     stage_start = time.perf_counter()
-    orcid_enabled = not bool(getattr(clusterer, "suppress_orcid", False))
     signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
     mini_feature_block = feature_block_for_signature_order(feature_block, signature_order)
     order_seconds = time.perf_counter() - stage_start
@@ -1947,57 +1936,10 @@ def predict_incremental_link_or_abstain_from_raw_feature_block(
         signature_id_to_index=featurizer_signature_id_to_index,
     )
     query_signature_ids = tuple(signature_order.query_signature_ids)
-    query_views = _raw_plan_query_views(raw_candidate_plan, len(query_signature_ids))
 
-    stage_start = time.perf_counter()
-    feature_cache: dict[str, query_adapter_module.QueryFeatures] = {}
-    query_context = query_adapter_module.build_feature_block_query_context(
-        mini_feature_block,
-        feature_cache=feature_cache,
-    )
-    base_query_by_signature_id = {
-        query_signature_id: query_adapter_module.extract_query_features_from_feature_block(
-            mini_feature_block,
-            query_signature_id,
-            query_context=query_context,
-            orcid_enabled=orcid_enabled,
-        )
-        for query_signature_id in query_signature_ids
-    }
-    query_by_signature_id = {
-        query_signature_id: query_adapter_module.mask_query_features(
-            base_query_by_signature_id[query_signature_id],
-            query_view,
-            orcid_enabled=orcid_enabled,
-        )
-        for query_signature_id, query_view in zip(query_signature_ids, query_views, strict=True)
-    }
-
+    query_placeholders = _raw_candidate_plan_query_placeholders(raw_candidate_plan, query_signature_ids)
     component_members = mini_feature_block.seed_component_members
-    summary_by_component = {
-        component_key: query_adapter_module.build_cluster_summary_from_feature_block(
-            mini_feature_block,
-            cluster_id=component_key,
-            component_key=component_key,
-            signature_ids=member_signature_ids,
-            max_exemplars=max_exemplars,
-            query_context=query_context,
-            orcid_enabled=orcid_enabled,
-        )
-        for component_key, member_signature_ids in component_members.items()
-    }
-    feature_block_signal_seconds = time.perf_counter() - stage_start
-
-    def extra_row_signal_builder(
-        current_retrieval_batch: LinkerRetrievalBatch,
-        query_signature_id_by_index: Mapping[int, str],
-    ) -> Mapping[str, Any]:
-        return query_adapter_module.build_name_count_rarity_row_signals(
-            current_retrieval_batch,
-            query_signature_id_by_index=query_signature_id_by_index,
-            query_by_signature_id=query_by_signature_id,
-            summary_by_component=summary_by_component,
-        )
+    feature_block_signal_seconds = 0.0
 
     result = _predict_incremental_link_or_abstain_production_from_retrieval_private(
         clusterer,
@@ -2005,11 +1947,11 @@ def predict_incremental_link_or_abstain_from_raw_feature_block(
         dataset=None,
         featurizer=featurizer,
         retrieval_batch=retrieval_batch,
-        queries=tuple(query_by_signature_id[query_signature_id] for query_signature_id in query_signature_ids),
+        queries=query_placeholders,
         query_signature_ids=query_signature_ids,
         partial_supervision=partial_supervision,
         constraint_backend=None,
-        extra_row_signal_builder=extra_row_signal_builder,
+        extra_row_signal_builder=None,
         seed_setup=_identity_seed_setup(dict(mini_feature_block.cluster_seeds_require)),
         runtime_context=resolved_runtime_context,
         n_jobs=n_jobs_resolved,
@@ -2052,7 +1994,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     max_exemplars: int = 4,
     load_name_counts: bool | None | dict[str, Any] = None,
     name_tuples: set[tuple[str, str]] | str | None = "filtered",
-    orcid_enabled: bool = True,
+    orcid_enabled: bool | None = None,
     raw_candidate_plan: Mapping[str, Any] | None = None,
     rust_featurizer: Any | None = None,
     partial_supervision_seed_signature_to_component: Mapping[str, Any] | None = None,
@@ -2065,6 +2007,9 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     arrow_path_payload = feature_port.normalize_arrow_paths(arrow_paths)
     require_arrow_name_counts_index_for_clusterer(clusterer, arrow_path_payload, context="Raw Arrow scoring")
     query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
+    resolved_orcid_enabled = (
+        not bool(getattr(clusterer, "suppress_orcid", False)) if orcid_enabled is None else bool(orcid_enabled)
+    )
 
     if raw_candidate_plan is None:
         stage_start = time.perf_counter()
@@ -2074,7 +2019,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
             list(query_signature_id_strings),
             top_k=top_k_resolved,
             query_view=str(query_view),
-            orcid_enabled=bool(orcid_enabled),
+            orcid_enabled=resolved_orcid_enabled,
             num_threads=n_jobs_resolved,
             max_exemplars=int(max_exemplars),
         )
@@ -2084,6 +2029,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
         _validate_raw_plan_query_signature_ids(raw_candidate_plan, query_signature_id_strings)
         raw_arrow_retrieval_seconds = 0.0
 
+    _raw_plan_query_views(raw_candidate_plan, len(query_signature_id_strings))
     stage_start = time.perf_counter()
     signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
     resolved_load_name_counts = _resolve_load_name_counts_policy(
@@ -2113,7 +2059,6 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
         raw_candidate_plan,
         signature_id_to_index=featurizer_signature_id_to_index,
     )
-    _validate_raw_plan_query_view_lengths(raw_candidate_plan, len(query_signature_id_strings))
     stage_start = time.perf_counter()
     query_placeholders = _raw_candidate_plan_query_placeholders(raw_candidate_plan, query_signature_id_strings)
     seed_setup = _raw_candidate_plan_seed_setup(raw_candidate_plan)

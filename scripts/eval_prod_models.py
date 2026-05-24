@@ -131,6 +131,26 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_requested_datasets(
+    default_datasets: list[str],
+    requested_datasets: list[str] | None,
+    dataset_label: str,
+) -> list[str]:
+    if not requested_datasets:
+        return list(default_datasets)
+    requested = [str(dataset_name) for dataset_name in requested_datasets]
+    unknown_datasets = sorted(set(requested) - set(default_datasets))
+    if unknown_datasets:
+        raise ValueError(f"Unknown dataset(s) for --dataset {dataset_label}: {unknown_datasets}")
+    return requested
+
+
+def _resolve_requested_specter_suffixes(default_suffixes: list[str], requested_suffixes: list[str] | None) -> list[str]:
+    if not requested_suffixes:
+        return list(default_suffixes)
+    return [str(suffix) for suffix in requested_suffixes]
+
+
 # specter suffix -> production model artifact
 # v1.1 was trained on specter1 features; v1.21 bundles the v1.2 SPECTER2 pairwise model.
 MODELS = {
@@ -153,7 +173,6 @@ def resolve_dataset_file(data_root: str, dataset_name: str, preferred_name: str,
 
 def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suffix: str) -> dict[str, str]:
     from s2and.incremental_linking.feature_block import RAW_PLANNER_ARROW_BATCH_INDEX_KEYS
-    from s2and.model import _resolve_name_counts_index_path
 
     dataset_root = os.path.join(arrow_root, dataset_name)
     specter_name = "specter2.arrow" if specter_suffix == "_specter2.pkl" else "specter.arrow"
@@ -165,7 +184,7 @@ def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suff
         "specter": os.path.join(dataset_root, specter_name),
         "clusters": os.path.join(dataset_root, f"{dataset_name}_clusters.json"),
     }
-    name_counts_index_path = _resolve_name_counts_index_path(Path(dataset_root))
+    name_counts_index_path = _resolve_eval_name_counts_index_path(Path(dataset_root))
     if name_counts_index_path is not None:
         paths["name_counts_index"] = name_counts_index_path
     missing = {key: path for key, path in paths.items() if not os.path.exists(path)}
@@ -190,6 +209,35 @@ def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suff
                 paths[index_key] = candidate
                 break
     return paths
+
+
+def _resolve_eval_name_counts_index_path(dataset_root: Path) -> str | None:
+    manifest_path = dataset_root / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Arrow manifest is not valid JSON: {manifest_path}") from exc
+        manifest_paths = manifest.get("paths", {})
+        if isinstance(manifest_paths, dict):
+            path_value = manifest_paths.get("name_counts_index")
+            if path_value is not None:
+                resolved = Path(str(path_value))
+                if not resolved.is_absolute():
+                    resolved = dataset_root / resolved
+                if resolved.exists():
+                    return str(resolved)
+                raise FileNotFoundError(
+                    f"Arrow manifest {manifest_path} names missing name_counts_index path: {path_value}"
+                )
+    for candidate in (
+        dataset_root / "name_counts_index",
+        dataset_root.parent / "name_counts_index",
+        dataset_root.parent.parent / "name_counts_index",
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 def arrow_datasets_available(arrow_root: str | None, datasets: list[str], specter_suffixes: list[str]) -> bool:
@@ -241,9 +289,12 @@ def split_blocks_like_anddata(
 
     block_ids = []
     block_sizes = []
-    for block_id, signatures in blocks_dict.items():
+    for block_id in sorted(blocks_dict):
+        signatures = blocks_dict[block_id]
         block_ids.append(block_id)
         block_sizes.append(len(signatures))
+    if len(block_ids) == 0:
+        return {}, {}, {}
     y_group = (
         KMeans(n_clusters=num_clusters_for_block_size, random_state=random_seed, n_init=10)
         .fit(np.array(block_sizes).reshape(-1, 1))
@@ -284,9 +335,20 @@ def construct_cluster_to_signatures(
     block_dict: dict[str, list[str]],
 ) -> dict[str, list[str]]:
     cluster_to_signatures: dict[str, list[str]] = defaultdict(list)
+    missing_signature_ids: list[str] = []
     for signatures in block_dict.values():
         for signature_id in signatures:
-            cluster_to_signatures[signature_to_cluster_id[str(signature_id)]].append(str(signature_id))
+            signature_key = str(signature_id)
+            cluster_id = signature_to_cluster_id.get(signature_key)
+            if cluster_id is None:
+                missing_signature_ids.append(signature_key)
+                continue
+            cluster_to_signatures[cluster_id].append(signature_key)
+    if missing_signature_ids:
+        raise ValueError(
+            "clusters.json is missing cluster assignments for "
+            f"{len(missing_signature_ids)} evaluated signature(s): {missing_signature_ids[:10]}"
+        )
     return dict(cluster_to_signatures)
 
 
@@ -403,13 +465,8 @@ def main() -> None:
         if args.use_arrow:
             raise ValueError("--use-arrow currently supports --dataset mini only")
         datasets = ["inventors_s2and"]
-    if args.datasets is not None:
-        requested_datasets = [str(dataset_name) for dataset_name in args.datasets]
-        unknown_datasets = sorted(set(requested_datasets) - set(datasets))
-        if unknown_datasets:
-            raise ValueError(f"Unknown dataset(s) for --dataset {args.dataset}: {unknown_datasets}")
-        datasets = requested_datasets
-    active_specter_suffixes = [str(suffix) for suffix in (args.specter_suffixes or specter_suffixes)]
+    datasets = _resolve_requested_datasets(datasets, args.datasets, args.dataset)
+    active_specter_suffixes = _resolve_requested_specter_suffixes(specter_suffixes, args.specter_suffixes)
     missing_arrow_error = (
         first_missing_arrow_dataset_error(arrow_data_root, datasets, active_specter_suffixes)
         if args.dataset == "mini" and not train_flag

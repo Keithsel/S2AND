@@ -32,11 +32,14 @@ def test_resolve_total_ram_arg_overrides_autodetect():
     assert source == "arg"
 
 
-def test_emit_memory_telemetry_writes_jsonl(monkeypatch, tmp_path):
+def test_emit_memory_telemetry_writes_jsonl(tmp_path):
     output_path = tmp_path / "memory_telemetry.jsonl"
-    monkeypatch.setenv(memory_budget.MEMORY_TELEMETRY_JSONL_ENV, str(output_path))
-
-    memory_budget.emit_memory_telemetry({"stage": "test_stage", "value": 7})
+    previous_path = memory_budget.memory_telemetry_jsonl_path()
+    try:
+        memory_budget.configure_memory_telemetry_jsonl(output_path)
+        memory_budget.emit_memory_telemetry({"stage": "test_stage", "value": 7})
+    finally:
+        memory_budget.configure_memory_telemetry_jsonl(previous_path)
 
     record = json.loads(output_path.read_text(encoding="utf-8"))
     assert record["schema_version"] == 1

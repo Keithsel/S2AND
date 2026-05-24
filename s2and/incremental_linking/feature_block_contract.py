@@ -42,6 +42,40 @@ def normalize_cluster_seed_disallow_pairs(
     return tuple(normalized)
 
 
+def filter_cluster_seed_disallows_for_signature_set(
+    pairs: Iterable[tuple[Any, Any]],
+    signature_ids: Iterable[str],
+    *,
+    context: str,
+) -> tuple[tuple[str, str], ...]:
+    """Keep only disallow pairs whose endpoints are both in the selected signatures."""
+
+    signature_id_set = {str(signature_id) for signature_id in signature_ids}
+    filtered: list[tuple[str, str]] = []
+    for left, right in pairs:
+        left_id = str(left)
+        right_id = str(right)
+        if left_id in signature_id_set and right_id in signature_id_set:
+            filtered.append((left_id, right_id))
+    return normalize_cluster_seed_disallow_pairs(filtered)
+
+
+def filter_cluster_seed_disallows_for_signature_subset(
+    pairs: Iterable[tuple[Any, Any]],
+    signature_ids: Iterable[str],
+) -> tuple[tuple[str, str], ...]:
+    """Keep only disallow pairs whose endpoints are both inside a sliced signature set."""
+
+    signature_id_set = {str(signature_id) for signature_id in signature_ids}
+    filtered: list[tuple[str, str]] = []
+    for left, right in pairs:
+        left_id = str(left)
+        right_id = str(right)
+        if left_id in signature_id_set and right_id in signature_id_set:
+            filtered.append((left_id, right_id))
+    return normalize_cluster_seed_disallow_pairs(filtered)
+
+
 def _strict_string_tuple(value: Any, *, field_name: str, skip_none: bool = False) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -187,6 +221,12 @@ class FeatureBlock:
         paper_ids = tuple(paper.paper_id for paper in self.papers)
         if len(set(paper_ids)) != len(paper_ids):
             raise ValueError("FeatureBlock papers must have unique paper_id values")
+        seen_paper_author_positions: set[tuple[str, int]] = set()
+        for author in self.paper_authors:
+            key = (str(author.paper_id), int(author.position))
+            if key in seen_paper_author_positions:
+                raise ValueError(f"FeatureBlock paper_authors contains duplicate (paper_id, position): {key!r}")
+            seen_paper_author_positions.add(key)
 
         signature_id_set = set(signature_ids)
         query_signature_ids = tuple(str(value) for value in self.query_signature_ids)
@@ -404,10 +444,9 @@ def feature_block_for_signature_order(
         for signature_id, component_id in feature_block.cluster_seeds_require
         if signature_id in signature_id_set
     )
-    disallow_pairs = tuple(
-        (left, right)
-        for left, right in feature_block.cluster_seeds_disallow
-        if left in signature_id_set and right in signature_id_set
+    disallow_pairs = filter_cluster_seed_disallows_for_signature_subset(
+        feature_block.cluster_seeds_disallow,
+        signature_id_set,
     )
     specter_paper_ids: list[str] = []
     specter_rows: list[np.ndarray] = []

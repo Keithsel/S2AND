@@ -99,7 +99,6 @@ def _write_truth_bundle(
 
 def test_run_single_uses_synthetic_cluster_seeds_when_no_path_is_supplied(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("S2AND_BACKEND", "python")
-    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "0")
     monkeypatch.setenv("OMP_NUM_THREADS", "3")
 
     subset_dir = tmp_path / "subset"
@@ -233,13 +232,11 @@ def test_run_single_uses_synthetic_cluster_seeds_when_no_path_is_supplied(monkey
     assert result["promoted_memory_predicted_peak_delta_bytes_max"] == 444
     assert result["promoted_memory_observed_peak_delta_bytes_max"] == 555
     assert os.environ["S2AND_BACKEND"] == "python"
-    assert os.environ["S2AND_SKIP_FASTTEXT"] == "0"
     assert os.environ["OMP_NUM_THREADS"] == "3"
 
 
 def test_run_single_rejects_external_seed_signatures_outside_selected_subset(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("S2AND_BACKEND", "python")
-    monkeypatch.delenv("S2AND_SKIP_FASTTEXT", raising=False)
     monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
 
     subset_dir = tmp_path / "subset"
@@ -320,7 +317,6 @@ def test_run_single_rejects_external_seed_signatures_outside_selected_subset(mon
             )
         )
     assert os.environ["S2AND_BACKEND"] == "python"
-    assert "S2AND_SKIP_FASTTEXT" not in os.environ
     assert "OMP_NUM_THREADS" not in os.environ
 
 

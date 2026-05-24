@@ -118,7 +118,7 @@ def _build_labeled_pairs(sig_ids, count=20, seed=123):
 
 @pytest.fixture(scope="session")
 def dataset():
-    with _temporary_env(S2AND_SKIP_FASTTEXT="1", S2AND_BACKEND="python"):
+    with _temporary_env(S2AND_BACKEND="python"):
         # Avoid reusing stale process-level env caches between parity fixtures.
         _reset_featurizer_env_caches()
 
@@ -380,8 +380,6 @@ def test_featurize_pair_rust_parity(dataset, sample_pairs):
 
 
 def test_many_pairs_end_to_end_parity_python_vs_rust(monkeypatch):
-    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
-
     data_dir = os.path.join(PROJECT_ROOT_PATH, "tests", "dummy")
 
     monkeypatch.setenv("S2AND_BACKEND", "python")
@@ -572,18 +570,18 @@ def test_get_constraints_matrix_indexed_rust_parity(dataset, constraint_pairs):
         indexed_values,
         strict=True,
     ):
-        assert ref_val == string_val, (
-            f"Batch string constraint mismatch for pair {pair}: ref={ref_val}, got={string_val}"
-        )
-        assert string_val == indexed_val, (
-            f"Batch indexed constraint mismatch for pair {pair}: string={string_val}, indexed={indexed_val}"
-        )
+        assert (
+            ref_val == string_val
+        ), f"Batch string constraint mismatch for pair {pair}: ref={ref_val}, got={string_val}"
+        assert (
+            string_val == indexed_val
+        ), f"Batch indexed constraint mismatch for pair {pair}: string={string_val}, indexed={indexed_val}"
 
 
 def test_linker_constraint_labels_index_arrays_match_indexed_constraints_large(dataset, constraint_pairs):
     rust_featurizer = _get_rust_featurizer(dataset)
     if not hasattr(rust_featurizer, "linker_pair_index_arrays_constraint_labels"):
-        pytest.skip("linker_pair_index_arrays_constraint_labels is unavailable")
+        raise pytest.skip.Exception("linker_pair_index_arrays_constraint_labels is unavailable")
 
     signature_ids = list(rust_featurizer.signature_ids())
     signature_index = {sig_id: idx for idx, sig_id in enumerate(signature_ids)}
@@ -616,7 +614,7 @@ def test_linker_constraint_labels_index_arrays_match_indexed_constraints_large(d
 def test_linker_pair_distance_accumulators_match_python_large(dataset):
     rust_featurizer = _get_rust_featurizer(dataset)
     if not hasattr(rust_featurizer, "linker_pair_distance_accumulators"):
-        pytest.skip("linker_pair_distance_accumulators is unavailable")
+        raise pytest.skip.Exception("linker_pair_distance_accumulators is unavailable")
 
     rng = np.random.default_rng(20260509)
     row_count = 503

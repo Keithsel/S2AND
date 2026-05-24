@@ -374,6 +374,11 @@ Full cache details: [caching.md](caching.md)
 - `rust`: strict Rust mode
 - `python`: Python-only mode
 
+Python callers can also pass `backend="python"`, `backend="rust"`, or `backend="auto"` to
+`Clusterer.predict(...)` for a single-call override. Subblocking follows the resolved backend:
+direct `make_subblocks(...)` calls remain Python, while indexed Arrow subblocking in
+`Clusterer.predict(...)` can run in Rust when the resolved backend is Rust.
+
 Install contract:
 
 - `uv pip install s2and`: Python-only runtime

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
 import pytest
 
@@ -59,6 +61,33 @@ def test_resolve_backend_prefers_explicit_s2and_backend(monkeypatch: pytest.Monk
     assert resolution.source == "S2AND_BACKEND"
 
 
+def test_resolve_backend_argument_overrides_env(monkeypatch: pytest.MonkeyPatch):
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("S2AND_BACKEND", "python")
+    monkeypatch.setattr(
+        runtime,
+        "detect_rust_runtime_capabilities",
+        lambda: _runtime_capabilities(core_available=True, reason="rust_core_available"),
+    )
+
+    resolution = runtime.resolve_backend_for_request(backend="rust", emit_startup_warning=False)
+
+    assert resolution.requested_backend == "rust"
+    assert resolution.resolved_backend == "rust"
+    assert resolution.source == "argument"
+
+
+def test_build_runtime_context_accepts_backend_argument(monkeypatch: pytest.MonkeyPatch):
+    _clear_runtime_env(monkeypatch)
+
+    context = runtime.build_runtime_context("unit_test", backend="python", emit_startup_warning=False)
+
+    assert context.requested_backend == "python"
+    assert context.resolved_backend == "python"
+    assert context.source == "argument"
+    assert context.use_rust is False
+
+
 def test_resolve_backend_explicit_rust_raises_when_runtime_unavailable(monkeypatch: pytest.MonkeyPatch):
     _clear_runtime_env(monkeypatch)
     monkeypatch.setenv("S2AND_BACKEND", "rust")
@@ -104,7 +133,7 @@ def test_rust_calls_missing_matrix_reports_runtime_minimum() -> None:
 
     with pytest.raises(RuntimeError) as exc_info:
         rust_calls.get_constraints_matrix_rust(
-            dataset=object(),
+            dataset=cast(Any, object()),
             pairs=[],
             featurizer=MissingMatrixFeaturizer(),
         )

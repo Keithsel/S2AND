@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 import warnings
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -504,8 +505,8 @@ def test_write_claims_eval_shap_plots_requires_nameless_features(monkeypatch):
         _write_claims_eval_shap_plots(
             id1="p1___0",
             id2="p2___0",
-            dataset=object(),
-            clusterer=DummyClusterer(),
+            dataset=cast(Any, object()),
+            clusterer=cast(Any, DummyClusterer()),
             directory_for_caching=".",
         )
 

@@ -52,6 +52,7 @@ def test_native_production_bundle_loads_as_mutable_clusterer() -> None:
 
     assert isinstance(clusterer.classifier, NativeLightGBMBinaryClassifier)
     assert isinstance(clusterer.nameless_classifier, NativeLightGBMBinaryClassifier)
+    assert clusterer.incremental_linker_artifact_dir is not None
     assert Path(clusterer.incremental_linker_artifact_dir).name == "incremental_linker"
     assert clusterer.production_model_bundle_version == "1.21"
 
@@ -103,6 +104,8 @@ def test_native_pairwise_models_match_v12_pickle_fixture() -> None:
         rtol=1e-10,
         atol=1e-10,
     )
+    assert native_clusterer.nameless_classifier is not None
+    assert legacy_clusterer.nameless_classifier is not None
     np.testing.assert_allclose(
         native_clusterer.nameless_classifier.predict_proba(nameless_features),
         legacy_clusterer.nameless_classifier.predict_proba(nameless_features),
@@ -116,7 +119,7 @@ def test_native_clusterer_predict_matches_v12_pickle(monkeypatch: pytest.MonkeyP
     if backend == "rust":
         rust_available, rust_error = import_s2and_rust(required_method="from_dataset")
         if not rust_available:
-            pytest.skip(f"Rust runtime unavailable: {rust_error!r}")
+            raise pytest.skip.Exception(f"Rust runtime unavailable: {rust_error!r}")
 
     monkeypatch.setenv("S2AND_BACKEND", backend)
 
@@ -145,6 +148,8 @@ def test_native_clusterer_runtime_config_matches_v12_pickle() -> None:
     assert native_clusterer.cluster_model.eps == legacy_clusterer.cluster_model.eps
     assert native_clusterer.featurizer_info.features_to_use == legacy_clusterer.featurizer_info.features_to_use
     assert native_clusterer.featurizer_info.featurizer_version == legacy_clusterer.featurizer_info.featurizer_version
+    assert native_clusterer.nameless_featurizer_info is not None
+    assert legacy_clusterer.nameless_featurizer_info is not None
     assert (
         native_clusterer.nameless_featurizer_info.features_to_use
         == legacy_clusterer.nameless_featurizer_info.features_to_use
@@ -204,6 +209,7 @@ def test_pairwise_stage_finalizes_into_loadable_production_bundle(tmp_path: Path
     assert final_summary.bundle_status == "complete"
     loaded = load_production_model(output_bundle)
     assert loaded.production_model_bundle_version == "9.9"
+    assert loaded.incremental_linker_artifact_dir is not None
     assert Path(loaded.incremental_linker_artifact_dir) == output_bundle / "incremental_linker"
 
     with pytest.raises(ValueError, match="existing incremental linker artifacts"):

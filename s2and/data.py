@@ -1656,7 +1656,8 @@ class ANDData:
         """
         x = []
         y = []
-        for block_id, signature in blocks_dict.items():
+        for block_id in sorted(blocks_dict):
+            signature = blocks_dict[block_id]
             x.append(block_id)
             y.append(len(signature))
 

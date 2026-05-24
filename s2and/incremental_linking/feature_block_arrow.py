@@ -7,8 +7,8 @@ import shutil
 import struct
 import tempfile
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -25,21 +25,20 @@ from s2and.incremental_linking.feature_block_contract import (
     _optional_str,
     _strict_string_tuple,
     feature_block_signature_order_from_raw_candidate_plan,
+    filter_cluster_seed_disallows_for_signature_subset,
     normalize_cluster_seed_disallow_pairs,
 )
 
 NAME_COUNTS_INDEX_SCHEMA_VERSION = "name_counts_index_v1"
 ARROW_PHYSICAL_LAYOUT_SCHEMA_VERSION = "s2and_arrow_physical_v1"
-ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION = "arrow_batch_lookup_index_v2"
+ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION = "arrow_batch_lookup_index"
 _NAME_COUNTS_INDEX_MAGIC = b"S2NCI001"
-_ARROW_BATCH_LOOKUP_INDEX_MAGIC_V1 = b"S2ABI001"
-_ARROW_BATCH_LOOKUP_INDEX_MAGIC = b"S2ABI002"
+_ARROW_BATCH_LOOKUP_INDEX_MAGIC = b"S2ABI001"
 _NAME_COUNTS_INDEX_HASH_DOMAIN = b"s2and-name-counts-index-v1\x00"
-_ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN = b"s2and-arrow-batch-lookup-index-source-v2\x00"
+_ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN = b"s2and-arrow-batch-lookup-index-source\x00"
 _ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES = 65_536
 _NAME_COUNTS_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQ")
 _NAME_COUNTS_INDEX_RECORD_STRUCT = struct.Struct("<QQQIId")
-_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT_V1 = struct.Struct("<8sQQQ")
 _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQQQ")
 _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT = struct.Struct("<QII")
 _FNV64_OFFSET = 14695981039346656037
@@ -63,25 +62,6 @@ RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS: dict[str, int] = {
     "paper_authors": 16_384,
     "specter": 2_048,
 }
-
-
-@dataclass
-class TemporaryArrowPaths:
-    """Arrow path bundle with optional request-scoped temp resources."""
-
-    paths: dict[str, str]
-    _tmpdir: tempfile.TemporaryDirectory[str] | None = field(default=None, repr=False)
-
-    def close(self) -> None:
-        if self._tmpdir is not None:
-            self._tmpdir.cleanup()
-            self._tmpdir = None
-
-    def __enter__(self) -> TemporaryArrowPaths:
-        return self
-
-    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
-        self.close()
 
 
 def write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, Any]) -> None:
@@ -137,7 +117,9 @@ def read_cluster_seeds_arrow(path: Path) -> dict[str, str]:
         if not cluster_id:
             raise ValueError(f"cluster seeds Arrow cannot contain empty cluster_id values: {signature_id!r}")
         existing_cluster_id = rows.get(signature_id)
-        if existing_cluster_id is not None and existing_cluster_id != cluster_id:
+        if existing_cluster_id is not None:
+            if existing_cluster_id == cluster_id:
+                continue
             raise ValueError(
                 f"cluster seeds Arrow assigns signature_id {signature_id!r} to multiple clusters: "
                 f"{existing_cluster_id!r} and {cluster_id!r}"
@@ -220,15 +202,16 @@ def _stringified_arrow_paths(paths: Mapping[Any, Any], *, omit_none: bool = Fals
     return stringified
 
 
-def arrow_paths_with_temporary_cluster_seeds(
+@contextmanager
+def temporary_arrow_paths_with_cluster_seeds(
     arrow_paths: Mapping[str, Any],
     cluster_seeds_require: Mapping[Any, Any],
     *,
     prefix: str,
     reuse_existing_cluster_seeds_when_empty: bool = False,
     cluster_seeds_disallow: Iterable[tuple[Any, Any]] | None = None,
-) -> TemporaryArrowPaths:
-    """Return Arrow paths with a request-scoped cluster-seeds sidecar."""
+) -> Iterator[dict[str, str]]:
+    """Yield Arrow paths with request-scoped cluster-seed sidecars."""
 
     paths = _stringified_arrow_paths(arrow_paths)
     if (
@@ -238,20 +221,26 @@ def arrow_paths_with_temporary_cluster_seeds(
         and paths.get("cluster_seeds") is not None
         and Path(paths["cluster_seeds"]).exists()
     ):
-        return TemporaryArrowPaths(paths=paths)
+        yield paths
+        return
 
-    tmpdir = tempfile.TemporaryDirectory(prefix=prefix)
-    if reuse_existing_cluster_seeds_when_empty and not cluster_seeds_require and paths.get("cluster_seeds"):
-        cluster_seed_path = Path(paths["cluster_seeds"])
-    else:
-        cluster_seed_path = Path(tmpdir.name) / "cluster_seeds.arrow"
-        write_cluster_seeds_arrow(cluster_seed_path, cluster_seeds_require)
-        paths["cluster_seeds"] = str(cluster_seed_path)
-    if cluster_seeds_disallow is not None:
-        disallow_path = Path(tmpdir.name) / "cluster_seed_disallows.arrow"
-        write_cluster_seed_disallows_arrow(disallow_path, cluster_seeds_disallow)
-        paths["cluster_seed_disallows"] = str(disallow_path)
-    return TemporaryArrowPaths(paths=paths, _tmpdir=tmpdir)
+    with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        reusable_cluster_seeds_path = (
+            reuse_existing_cluster_seeds_when_empty
+            and not cluster_seeds_require
+            and paths.get("cluster_seeds") is not None
+            and Path(paths["cluster_seeds"]).exists()
+        )
+        if not reusable_cluster_seeds_path:
+            cluster_seed_path = tmpdir_path / "cluster_seeds.arrow"
+            write_cluster_seeds_arrow(cluster_seed_path, cluster_seeds_require)
+            paths["cluster_seeds"] = str(cluster_seed_path)
+        if cluster_seeds_disallow is not None:
+            disallow_path = tmpdir_path / "cluster_seed_disallows.arrow"
+            write_cluster_seed_disallows_arrow(disallow_path, cluster_seeds_disallow)
+            paths["cluster_seed_disallows"] = str(disallow_path)
+        yield paths
 
 
 def _record_batch_limit_for_table(
@@ -334,45 +323,27 @@ def _raise_if_record_batch_limit_exceeded(
 
 def _read_arrow_batch_lookup_index_header(index_path: Path) -> dict[str, int | str]:
     with index_path.open("rb") as infile:
-        header_prefix = infile.read(_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT_V1.size)
-        if len(header_prefix) != _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT_V1.size:
+        header = infile.read(_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size)
+        if len(header) != _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size:
             raise ValueError(f"Arrow batch lookup index is truncated: {index_path!s}")
-        magic = header_prefix[:8]
-        if magic == _ARROW_BATCH_LOOKUP_INDEX_MAGIC:
-            header_suffix = infile.read(
-                _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size - _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT_V1.size
-            )
-            header = header_prefix + header_suffix
-            if len(header) != _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size:
-                raise ValueError(f"Arrow batch lookup index is truncated: {index_path!s}")
-            (
-                _magic,
-                record_count,
-                source_size,
-                source_mtime_ns,
-                key_column_hash,
-                source_fingerprint,
-            ) = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.unpack(header)
-            return {
-                "magic": magic.decode("ascii"),
-                "record_count": int(record_count),
-                "source_size": int(source_size),
-                "source_mtime_ns": int(source_mtime_ns),
-                "key_column_hash": int(key_column_hash),
-                "source_fingerprint": int(source_fingerprint),
-            }
-    if magic != _ARROW_BATCH_LOOKUP_INDEX_MAGIC_V1:
+    magic = header[:8]
+    if magic != _ARROW_BATCH_LOOKUP_INDEX_MAGIC:
         raise ValueError(f"Arrow batch lookup index has invalid magic bytes: {index_path!s}")
-    _magic, record_count, source_size, source_mtime_ns = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT_V1.unpack(
-        header_prefix
-    )
+    (
+        _magic,
+        record_count,
+        source_size,
+        source_mtime_ns,
+        key_column_hash,
+        source_fingerprint,
+    ) = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.unpack(header)
     return {
         "magic": magic.decode("ascii"),
         "record_count": int(record_count),
         "source_size": int(source_size),
         "source_mtime_ns": int(source_mtime_ns),
-        "key_column_hash": 0,
-        "source_fingerprint": 0,
+        "key_column_hash": int(key_column_hash),
+        "source_fingerprint": int(source_fingerprint),
     }
 
 
@@ -397,7 +368,6 @@ def write_arrow_batch_lookup_index(
         key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
         if (
             int(index_header["source_size"]) != source_stat.st_size
-            or int(index_header["source_mtime_ns"]) != source_stat.st_mtime_ns
             or int(index_header["key_column_hash"]) != key_column_hash
             or int(index_header["source_fingerprint"]) != _source_file_sample_fingerprint(arrow_path_obj)
         ):
@@ -416,8 +386,11 @@ def write_arrow_batch_lookup_index(
         return str(output_path), {
             "reused": True,
             "schema_version": ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION,
-            **index_header,
             **layout,
+            "magic": str(index_header["magic"]),
+            "record_count": int(index_header["record_count"]),
+            "key_column_hash": int(index_header["key_column_hash"]),
+            "source_fingerprint": int(index_header["source_fingerprint"]),
             "max_record_batch_rows": int(max_record_batch_rows or 0),
         }
 
@@ -444,7 +417,12 @@ def write_arrow_batch_lookup_index(
             )
             keys = batch.column(key_column_index).to_pylist()
             row_count += len(keys)
-            records.extend((_fnv64_bytes(str(key).encode("utf-8")), batch_index) for key in keys if key is not None)
+            if any(key is None for key in keys):
+                raise ValueError(
+                    f"Arrow IPC file {arrow_path!s} contains null values in key column {key_column!r} "
+                    f"for batch {batch_index}"
+                )
+            records.extend((_fnv64_bytes(str(key).encode("utf-8")), batch_index) for key in keys)
 
     records.sort()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -965,11 +943,11 @@ def feature_block_from_arrow_paths(
         ):
             if left is None or right is None:
                 raise ValueError("cluster seed disallows Arrow cannot contain null signature ids")
-            left_id = str(left)
-            right_id = str(right)
-            if left_id in selected_signature_id_set and right_id in selected_signature_id_set:
-                disallow_rows.append((left_id, right_id))
-        disallow_pairs = tuple(disallow_rows)
+            disallow_rows.append((str(left), str(right)))
+        disallow_pairs = filter_cluster_seed_disallows_for_signature_subset(
+            disallow_rows,
+            selected_signature_id_set,
+        )
 
     specter_paper_ids: tuple[str, ...] = ()
     specter_embeddings: np.ndarray | None = None

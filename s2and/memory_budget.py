@@ -12,8 +12,8 @@ from typing import Any, cast
 
 logger = logging.getLogger("s2and")
 
-MEMORY_TELEMETRY_JSONL_ENV = "S2AND_MEMORY_TELEMETRY_JSONL"
 _MEMORY_TELEMETRY_LOCK = threading.Lock()
+_MEMORY_TELEMETRY_JSONL_PATH: Path | None = None
 
 AUTODETECT_RAM_SAFETY_FACTOR = 0.8
 DEFAULT_SAFETY_MARGIN_FRACTION = 0.10
@@ -164,13 +164,25 @@ def _json_safe_value(value: Any) -> Any:
     return str(value)
 
 
-def emit_memory_telemetry(record: Mapping[str, Any]) -> None:
-    """Append one structured memory telemetry record when configured by env var."""
+def configure_memory_telemetry_jsonl(path: str | Path | None) -> None:
+    """Configure the optional JSONL sink for structured memory telemetry."""
 
-    output_path_raw = os.environ.get(MEMORY_TELEMETRY_JSONL_ENV)
-    if not output_path_raw:
+    global _MEMORY_TELEMETRY_JSONL_PATH
+    _MEMORY_TELEMETRY_JSONL_PATH = None if path is None else Path(path)
+
+
+def memory_telemetry_jsonl_path() -> Path | None:
+    """Return the configured structured memory telemetry sink, if any."""
+
+    return _MEMORY_TELEMETRY_JSONL_PATH
+
+
+def emit_memory_telemetry(record: Mapping[str, Any]) -> None:
+    """Append one structured memory telemetry record when a sink is configured."""
+
+    output_path = _MEMORY_TELEMETRY_JSONL_PATH
+    if output_path is None:
         return
-    output_path = Path(output_path_raw)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "schema_version": 1,

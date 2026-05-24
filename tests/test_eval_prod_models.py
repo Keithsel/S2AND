@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -24,13 +24,13 @@ def _skip_if_missing_or_lfs_pointer(paths: list[Path]) -> None:
     missing = [str(path) for path in paths if not path.exists()]
     if missing:
         if os.environ.get("CI"):
-            pytest.fail(f"missing LFS-backed artifact(s) in CI: {missing}")
-        pytest.skip(f"missing LFS-backed artifact(s): {missing}")
+            raise pytest.fail.Exception(f"missing LFS-backed artifact(s) in CI: {missing}")
+        raise pytest.skip.Exception(f"missing LFS-backed artifact(s): {missing}")
     pointers = [str(path) for path in paths if _is_lfs_pointer(path)]
     if pointers:
         if os.environ.get("CI"):
-            pytest.fail(f"Git LFS artifact(s) not materialized in CI: {pointers}")
-        pytest.skip(f"Git LFS artifact(s) not materialized: {pointers}")
+            raise pytest.fail.Exception(f"Git LFS artifact(s) not materialized in CI: {pointers}")
+        raise pytest.skip.Exception(f"Git LFS artifact(s) not materialized: {pointers}")
 
 
 def test_first_missing_arrow_dataset_error_reports_failing_pair(monkeypatch) -> None:
@@ -52,6 +52,11 @@ def test_first_missing_arrow_dataset_error_reports_failing_pair(monkeypatch) -> 
     assert "specter_suffix='_specter2.pkl'" in str(error)
 
 
+def test_empty_optional_dataset_and_specter_lists_fall_back_to_defaults() -> None:
+    assert eval_prod_models._resolve_requested_datasets(["pubmed", "qian"], [], "mini") == ["pubmed", "qian"]
+    assert eval_prod_models._resolve_requested_specter_suffixes(["s1", "s2"], []) == ["s1", "s2"]
+
+
 def test_read_arrow_s2_blocks_reads_columns_without_row_dicts(tmp_path: Path) -> None:
     import pyarrow as pa
 
@@ -70,6 +75,25 @@ def test_read_arrow_s2_blocks_reads_columns_without_row_dicts(tmp_path: Path) ->
         "a smith": ["s1", "s2"],
         "b jones": ["s3"],
     }
+
+
+@pytest.mark.parametrize("block_count", [1, 2, 4])
+def test_split_blocks_like_anddata_rejects_tiny_smoke_datasets_like_anddata(block_count: int) -> None:
+    blocks = {f"b{index}": [f"s{index}"] for index in range(block_count)}
+
+    with pytest.raises(ValueError):
+        eval_prod_models.split_blocks_like_anddata(blocks, random_seed=1)
+
+
+def test_split_blocks_like_anddata_is_independent_of_input_order() -> None:
+    block_items = [(f"b{index:02d}", [f"s{index}"]) for index in range(20)]
+    forward = dict(block_items)
+    reverse = dict(reversed(block_items))
+
+    forward_split = eval_prod_models.split_blocks_like_anddata(forward, random_seed=1)
+    reverse_split = eval_prod_models.split_blocks_like_anddata(reverse, random_seed=1)
+
+    assert [set(split) for split in forward_split] == [set(split) for split in reverse_split]
 
 
 def _read_minimal_incremental_signatures(signatures_path: Path) -> dict[str, Any]:
@@ -136,6 +160,22 @@ def test_resolve_arrow_dataset_paths_includes_name_counts_index_from_manifest(tm
     assert resolved["name_counts_index"] == str(name_counts_index)
 
 
+def test_resolve_arrow_dataset_paths_requires_eval_name_counts_index(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "arrow" / "dummy"
+    dataset_root.mkdir(parents=True)
+    for filename in (
+        "signatures.arrow",
+        "papers.arrow",
+        "paper_authors.arrow",
+        "specter.arrow",
+        "dummy_clusters.json",
+    ):
+        (dataset_root / filename).touch()
+
+    with pytest.raises(FileNotFoundError, match="Missing Arrow name_counts_index"):
+        eval_prod_models.resolve_arrow_dataset_paths(str(tmp_path / "arrow"), "dummy", "_specter.pickle")
+
+
 def test_resolve_arrow_dataset_paths_rejects_bad_manifest_name_counts_index(tmp_path: Path) -> None:
     dataset_root = tmp_path / "arrow" / "dummy"
     dataset_root.mkdir(parents=True)
@@ -198,6 +238,11 @@ def test_cluster_eval_arrow_passes_name_counts_index_and_batch_indexes(monkeypat
     assert "clusters" not in captured["arrow_paths"]
 
 
+def test_construct_cluster_to_signatures_reports_missing_assignments() -> None:
+    with pytest.raises(ValueError, match="missing cluster assignments"):
+        eval_prod_models.construct_cluster_to_signatures({"s1": "c1"}, {"block": ["s1", "s2"]})
+
+
 @pytest.mark.requires_lfs
 def test_pubmed_specter2_arrow_fixture_matches_production_eval() -> None:
     pytest.importorskip("s2and_rust")
@@ -243,7 +288,7 @@ def test_pubmed_specter2_arrow_fixture_matches_production_eval() -> None:
         n_jobs=4,
     )
 
-    assert cluster_metrics["B3 (P, R, F1)"] == pytest.approx((1.0, 0.892, 0.943), abs=5e-4)
+    assert cluster_metrics["B3 (P, R, F1)"] == pytest.approx((1.0, 0.899, 0.947), abs=5e-4)
 
 
 @pytest.mark.requires_lfs
@@ -253,7 +298,7 @@ def test_pubmed_specter2_arrow_fixture_incremental_smoke_matches_expected_b3(
 ) -> None:
     s2and_rust = pytest.importorskip("s2and_rust")
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw Arrow incremental candidate planning is unavailable")
+        raise pytest.skip.Exception("raw Arrow incremental candidate planning is unavailable")
 
     from s2and.eval import b3_precision_recall_fscore
     from s2and.incremental_linking.feature_block import write_cluster_seeds_arrow
@@ -316,14 +361,17 @@ def test_pubmed_specter2_arrow_fixture_incremental_smoke_matches_expected_b3(
         cluster_seeds_path = tmp_path / f"cluster_seeds_{block_index}.arrow"
         write_cluster_seeds_arrow(cluster_seeds_path, seed_signature_to_cluster)
         dataset = _ArrowIncrementalFixtureDataset(arrow_paths, signatures, cluster_seeds_path)
-        result = clusterer.predict_incremental(
-            list(block_signatures),
-            dataset,
-            prevent_new_incompatibilities=False,
-            batching_threshold=None,
-            total_ram_bytes=1_000_000_000_000,
+        result = cast(
+            dict[str, Any],
+            clusterer.predict_incremental(
+                list(block_signatures),
+                cast(Any, dataset),
+                prevent_new_incompatibilities=False,
+                batching_threshold=None,
+                total_ram_bytes=1_000_000_000_000,
+            ),
         )
-        telemetry = result["incremental_linker_telemetry"]
+        telemetry = cast(Mapping[str, Any], result["incremental_linker_telemetry"])
         query_count = len(block_signatures) - len(seed_signature_to_cluster)
         assert result["incremental_linker_query_view"] == "raw_arrow"
         assert telemetry["arrow_promoted_incremental"] == 1
@@ -334,12 +382,12 @@ def test_pubmed_specter2_arrow_fixture_incremental_smoke_matches_expected_b3(
         total_candidate_row_count += int(telemetry["candidate_row_count"])
 
         block_signature_set = set(block_signatures)
-        for cluster_id, members in result["clusters"].items():
+        for cluster_id, members in cast(Mapping[str, Sequence[str]], result["clusters"]).items():
             kept_members = [str(member) for member in members if str(member) in block_signature_set]
             if kept_members:
                 predicted_clusters[f"{block_index}:{block_key}:{cluster_id}"] = kept_members
 
     cluster_metrics = b3_precision_recall_fscore(cluster_to_signatures, predicted_clusters)
-    assert total_query_count == 127
+    assert total_query_count == 128
     assert total_candidate_row_count > 0
-    assert cluster_metrics[:3] == pytest.approx((1.0, 0.816, 0.899), abs=5e-4)
+    assert cluster_metrics[:3] == pytest.approx((1.0, 0.845, 0.916), abs=5e-4)

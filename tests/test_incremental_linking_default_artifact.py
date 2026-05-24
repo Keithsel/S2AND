@@ -18,12 +18,12 @@ s2and_rust = pytest.importorskip(
 def test_default_incremental_linker_artifact_loads_with_current_schema() -> None:
     artifact_dir = Path(DEFAULT_INCREMENTAL_LINKER_ARTIFACT_DIR)
     if not artifact_dir.exists():
-        pytest.skip(f"default incremental linker artifact is not present: {artifact_dir}")
+        raise pytest.skip.Exception(f"default incremental linker artifact is not present: {artifact_dir}")
     target_path = artifact_dir / "training_target.json"
     if target_path.exists():
         target = json.loads(target_path.read_text(encoding="utf-8"))
         if str(target.get("status", "")).endswith("pending_retrain"):
-            pytest.skip("default artifact is intentionally pending retrain for the promoted schema")
+            raise pytest.skip.Exception("default artifact is intentionally pending retrain for the promoted schema")
 
     artifact = load_incremental_linking_artifact(artifact_dir)
 

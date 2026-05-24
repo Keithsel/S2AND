@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import json
-import os
 from collections import Counter
 from types import SimpleNamespace
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 import pytest
 
 import s2and.incremental_linking.query_adapter as retrieval
+from s2and import text as s2and_text
 from s2and.incremental_linking.linker_pairwise import LinkerCandidateBatch
 from s2and.incremental_linking_training.classic import OfficialBundle
 from s2and.incremental_linking_training.query_support import build_rust_hybrid_centroid_retriever
@@ -304,7 +305,7 @@ def test_minimal_raw_constraint_resolution_bypasses_seed_constraints_and_ignores
 
     labels, summary = _resolve_candidate_batch_pair_labels(
         clusterer=clusterer,
-        dataset=SimpleNamespace(),
+        dataset=cast(Any, SimpleNamespace()),
         batch=batch,
         index_to_signature_id={0: "q", 1: "a", 2: "b", 3: "c"},
         runtime_context=None,
@@ -344,7 +345,7 @@ def test_minimal_raw_component_members_default_to_block_local_component_keys(tmp
     details = _component_member_details_by_key(
         members_path,
         {"a": 0, "b": 1, "c": 2, "d": 3},
-        dataset=dataset,
+        dataset=cast(Any, dataset),
     )
 
     assert details["m muller::284283"].signature_ids == ("b", "c")
@@ -354,7 +355,7 @@ def test_minimal_raw_component_members_default_to_block_local_component_keys(tmp
     frozen_details = _component_member_details_by_key(
         members_path,
         {"a": 0, "b": 1, "c": 2, "d": 3},
-        dataset=dataset,
+        dataset=cast(Any, dataset),
         component_scope="frozen",
     )
 
@@ -459,12 +460,12 @@ def test_minimal_raw_positive_label_marks_training_disallow_ignore() -> None:
     assert not _row_label_is_positive(SimpleNamespace(label=np.nan))
 
 
-def test_minimal_raw_loader_enables_fasttext_language_detection(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+def test_minimal_raw_loader_enables_fasttext_language_detection() -> None:
+    s2and_text.set_fasttext_loading_enabled(False)
 
     _enable_fasttext_language_detection()
 
-    assert os.environ["S2AND_SKIP_FASTTEXT"] == "0"
+    assert s2and_text.fasttext_loading_enabled() is True
 
 
 def test_minimal_raw_seed_bypass_detects_seeded_query_component() -> None:
@@ -484,12 +485,12 @@ def test_minimal_raw_seed_bypass_detects_seeded_query_component() -> None:
     )
 
     assert _row_allows_seed_constraint_bypass(
-        dataset,
+        cast(Any, dataset),
         row,
         seed_constraint_signature_ids=frozenset({"q", "m1", "other"}),
     )
-    assert _has_query_seed_connection(dataset, query_signature_id="q", candidate_signature_ids=["m1"])
-    assert not _has_query_seed_connection(dataset, query_signature_id="q", candidate_signature_ids=["other"])
+    assert _has_query_seed_connection(cast(Any, dataset), query_signature_id="q", candidate_signature_ids=["m1"])
+    assert not _has_query_seed_connection(cast(Any, dataset), query_signature_id="q", candidate_signature_ids=["other"])
 
 
 def test_minimal_raw_seed_bypass_keeps_loo_marker_without_query_seed_flag() -> None:
@@ -505,8 +506,10 @@ def test_minimal_raw_seed_bypass_keeps_loo_marker_without_query_seed_flag() -> N
         query_in_seed_before_holdout=0,
     )
 
-    assert _row_allows_seed_constraint_bypass(dataset, row, seed_constraint_signature_ids=frozenset({"q", "m1"}))
-    assert _has_query_seed_connection(dataset, query_signature_id="q", candidate_signature_ids=["m1"])
+    assert _row_allows_seed_constraint_bypass(
+        cast(Any, dataset), row, seed_constraint_signature_ids=frozenset({"q", "m1"})
+    )
+    assert _has_query_seed_connection(cast(Any, dataset), query_signature_id="q", candidate_signature_ids=["m1"])
 
 
 def test_minimal_raw_query_first_prefix_uses_full_author_before_masked_view() -> None:
@@ -519,7 +522,7 @@ def test_minimal_raw_query_first_prefix_uses_full_author_before_masked_view() ->
         ]
     )
 
-    assert _query_first_token_for_prefix(group, SimpleNamespace(first="j")) == "jianping"
+    assert _query_first_token_for_prefix(group, cast(Any, SimpleNamespace(first="j"))) == "jianping"
 
 
 def test_minimal_raw_retrieval_score_uses_frozen_rust_policy() -> None:

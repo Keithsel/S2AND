@@ -7,4 +7,4 @@
 - Incremental linking uses the NumPy logistic link-or-abstain gate artifact format; legacy score/margin gate thresholds are not supported.
 - Production linker finalization trains the final booster on train plus weighted calibration splits, then calibrates the final logistic gate on the held-out test split.
 - Incremental name compatibility now accepts joined and first-token aliases in addition to exact first-name tuples.
-- Artifact cache entries are keyed by validator type. Existing raw-ETag cache filenames are still probed as a read-only fallback.
+- Artifact cache entries are keyed by validator type. Raw-ETag cache filenames are no longer probed.

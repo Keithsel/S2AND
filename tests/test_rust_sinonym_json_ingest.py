@@ -22,7 +22,6 @@ assert _RUST_FEATURIZER is not None
 @pytest.fixture(autouse=True)
 def _force_rust_backend(monkeypatch):
     monkeypatch.setenv("S2AND_BACKEND", "rust")
-    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
     feature_port.clear_rust_featurizer_cache()
     yield
     feature_port.clear_rust_featurizer_cache()

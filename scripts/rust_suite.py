@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import logging
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,7 +32,6 @@ else:
     from _rust_suite.common import get_result_markers as common_get_result_markers
 
 RESULT_JSON_START, RESULT_JSON_END = common_get_result_markers("profile")
-MEMORY_TELEMETRY_JSONL_ENV = "S2AND_MEMORY_TELEMETRY_JSONL"
 
 _MODULE_IMPORTS = {
     "compare": "_rust_suite.compare_cmd",
@@ -84,11 +82,14 @@ def _configure_file_logging(log_file: str | None) -> logging.FileHandler | None:
 
 
 def _configure_memory_telemetry_jsonl(path: str | None) -> None:
+    from s2and import memory_budget
+
     if not path:
+        memory_budget.configure_memory_telemetry_jsonl(None)
         return
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    os.environ[MEMORY_TELEMETRY_JSONL_ENV] = str(output_path)
+    memory_budget.configure_memory_telemetry_jsonl(output_path)
 
 
 def _active_global_cli_args() -> list[str]:
@@ -366,7 +367,9 @@ def main(argv: list[str] | None = None) -> int:
     global _ACTIVE_LOG_FILE, _ACTIVE_MEMORY_TELEMETRY_JSONL
     previous_log_file = _ACTIVE_LOG_FILE
     previous_memory_telemetry = _ACTIVE_MEMORY_TELEMETRY_JSONL
-    previous_memory_telemetry_env = os.environ.get(MEMORY_TELEMETRY_JSONL_ENV)
+    from s2and import memory_budget
+
+    previous_memory_telemetry_path = memory_budget.memory_telemetry_jsonl_path()
     _ACTIVE_LOG_FILE = parsed.log_file
     _ACTIVE_MEMORY_TELEMETRY_JSONL = parsed.memory_telemetry_jsonl
     file_handler = _configure_file_logging(parsed.log_file)
@@ -380,11 +383,7 @@ def main(argv: list[str] | None = None) -> int:
             file_handler.close()
         _ACTIVE_LOG_FILE = previous_log_file
         _ACTIVE_MEMORY_TELEMETRY_JSONL = previous_memory_telemetry
-        if parsed.memory_telemetry_jsonl:
-            if previous_memory_telemetry_env is None:
-                os.environ.pop(MEMORY_TELEMETRY_JSONL_ENV, None)
-            else:
-                os.environ[MEMORY_TELEMETRY_JSONL_ENV] = previous_memory_telemetry_env
+        memory_budget.configure_memory_telemetry_jsonl(previous_memory_telemetry_path)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,10 @@
 """Compare incumbent full predict against direct Arrow/Rust full predict.
 
 This is the reusable gate for the complete Arrow inference schema. It builds a
-bounded incumbent ``ANDData`` first, writes Arrow IPC tables from the same
-bounded payload, builds ``RustFeaturizer.from_arrow_paths(...)``, and compares
-features, constraints, distances, and clusters.
+bounded incumbent ``ANDData`` first, writes Arrow IPC tables and current
+raw-planner batch-index sidecars from the same bounded payload, builds
+``RustFeaturizer.from_arrow_paths(...)``, and compares features, constraints,
+distances, and clusters.
 """
 
 from __future__ import annotations
@@ -264,6 +265,21 @@ def _assert_exact(report: dict[str, Any]) -> None:
         raise AssertionError("cluster outputs differ")
 
 
+def _write_raw_planner_indexes_and_layout(
+    arrow_paths: dict[str, str],
+    output_dir: Path,
+) -> tuple[dict[str, str], dict[str, Any], dict[str, Any]]:
+    """Add current raw-planner sidecars and physical-layout metrics."""
+
+    from s2and.incremental_linking.feature_block import (
+        raw_planner_arrow_physical_layout,
+        write_raw_arrow_batch_lookup_indexes,
+    )
+
+    indexed_paths, index_metrics = write_raw_arrow_batch_lookup_indexes(arrow_paths, output_dir)
+    return indexed_paths, index_metrics, raw_planner_arrow_physical_layout(indexed_paths)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     os.environ.setdefault("S2AND_BACKEND", "rust")
     os.environ.setdefault("OMP_NUM_THREADS", str(args.n_jobs))
@@ -282,6 +298,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         write_name_pairs_arrow,
     )
     from s2and.production_model import load_production_model
+    from s2and.text import set_fasttext_loading_enabled
+
+    set_fasttext_loading_enabled(False)
 
     timings: dict[str, float] = {}
     meta = _load_json(args.fixture_dir / "meta.json")
@@ -337,7 +356,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if cluster_seeds_require:
         dataset.cluster_seeds_require = cluster_seeds_require
         dataset.cluster_seeds_disallow = set()
-        dataset._cluster_seeds_version = int(getattr(dataset, "_cluster_seeds_version", 0)) + 1
     timings["anddata_subset_seconds"] = time.perf_counter() - start
 
     start = time.perf_counter()
@@ -348,6 +366,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         include_specter=not args.no_specter,
     )
     timings["write_complete_arrow_seconds"] = time.perf_counter() - start
+
+    start = time.perf_counter()
+    arrow_paths, raw_planner_index_metrics, physical_layout = _write_raw_planner_indexes_and_layout(
+        arrow_paths,
+        args.output_dir,
+    )
+    timings["write_raw_planner_indexes_seconds"] = time.perf_counter() - start
 
     start = time.perf_counter()
     name_artifact_dir = args.name_artifact_dir or args.output_dir
@@ -465,6 +490,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "use_cluster_seeds": bool(args.use_cluster_seeds),
         "cluster_seeds_require_count": int(len(cluster_seeds_require)),
         "arrow_paths": arrow_paths,
+        "physical_layout": physical_layout,
+        "raw_planner_batch_indexes": raw_planner_index_metrics,
         "name_counts_arrow_metrics": name_counts_arrow_metrics,
         "name_counts_index_metrics": name_counts_index_metrics,
         "name_pairs_arrow_metrics": name_pairs_arrow_metrics,

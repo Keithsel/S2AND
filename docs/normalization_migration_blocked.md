@@ -3,12 +3,10 @@
 Execution status (last reconfirmed 2026-05-22; originally entered blocked state 2026-03-02)
 - Blocked: normalization work is on hold until the required data/artifacts are ready.
 - Keep this plan separate from the active execution plan in `docs/work_plan.md`.
-- When unblocked, landing Bundle 5 (artifact format unification) first reduces churn so Phase 3 regeneration
-  can target MessagePack/Safetensors once instead of regenerating twice.
 
 Status
 - Draft updated from issue notes through August 31, 2025.
-- Rust Phase 1B alignment update added on February 20, 2026.
+- Rust compatibility-alignment notes added on February 20, 2026; helper porting is no longer tracked here as a separate blocking work item.
 - Reviewed on February 24, 2026 alongside big-block execution planning; no normalization-policy changes in that workstream.
 
 Scope
@@ -37,10 +35,10 @@ Open Decisions (remaining before migration freeze)
 2) Threshold tightening
    - decide whether adopted Rust-alignment thresholds should be tightened for release-grade datasets.
 
-Rust Alignment Decisions (effective February 20, 2026)
-1) Two-stage rollout contract
-   - Stage A (compatibility-preserving): Rust ports of normalization helpers must match current Python + compatibility-shim behavior.
-   - Stage B (canonical cutover): switch to canonical-only behavior only after canonical artifacts are regenerated and versioned.
+Rust Alignment Decisions (effective February 20, 2026; refreshed 2026-05-23)
+1) Canonical cutover contract
+   - Rust ingestion paths must stay compatible with current Python + compatibility-shim behavior until canonical artifacts are regenerated and versioned.
+   - Switch Rust and Python to canonical-only behavior only after the same canonical artifact gates pass.
 2) Version-compatibility contract
    - `normalization_version=legacy_compat`:
      - allows current code paths + legacy artifacts + compatibility shims.
@@ -54,7 +52,7 @@ Rust Alignment Decisions (effective February 20, 2026)
 4) Retraining contract
    - Before enabling canonical mode by default, production retraining and production inference must use the same canonical normalization + Sinonym path.
 5) Rust coupling
-   - Rust `from_json_paths` migration must treat normalization helper ports as policy-sensitive changes, not pure performance refactors.
+   - Any Rust ingestion change that affects normalized names, name-count keys, ORCID fallbacks, or block keys must be treated as a policy-sensitive change, not a pure performance refactor.
 
 Current State (post-Sinonym hyphen pass)
 - Given-name canonicalization currently preserves hyphenated Chinese given names:
@@ -113,10 +111,10 @@ Migration Plan (phased, verifiable)
    - Performance checks: runtime and memory for preprocessing/subblocking/featurization.
    - Cache/version bump as needed (featurizer cache and artifact versioning).
 
-6) Rust ingestion alignment track (required for Phase 1B)
-   - Port `normalize_text`, `split_first_middle_hyphen_aware`, and `compute_block` to Rust in compatibility-preserving mode first.
-   - Verify parity against Python outputs while compatibility shims are still enabled.
-   - After canonical artifacts/regeneration/retraining gates pass, enable canonical mode and remove compatibility shims.
+6) Rust canonical alignment track
+   - Audit Rust ingestion paths against the frozen canonical example table before cutover.
+   - Update Rust helpers or constructor policies only as needed for `canonical_v2` artifacts.
+   - Verify parity against Python outputs while compatibility shims are still enabled, then add no-shim canonical tests before enabling canonical mode.
 
 Required Evidence / Exit Criteria
 - Behavior:
@@ -143,7 +141,7 @@ Compatibility/Rollback Notes
 - Prefer fail-fast on code/artifact version mismatch unless a temporary compatibility flag is intentionally enabled.
 - Decommission compatibility mode after one validated release window.
 - Rust rollout note:
-  - Treat Stage A (compatibility-preserving Rust helper ports) and Stage B (canonical cutover) as separate release actions.
+  - Treat any remaining Rust canonical-cutover work as a separate release action from legacy compatibility-shim removal.
 
 References in code (as of this migration doc)
 - Given-name canonicalization: `s2and.text.split_first_middle_hyphen_aware`.

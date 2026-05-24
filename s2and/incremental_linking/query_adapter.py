@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -218,6 +218,10 @@ def _safe_compute_block(name: str) -> str:
 
 
 def _signature_coauthor_blocks(signature: Any, dataset: ANDData) -> frozenset[str]:
+    author_position = _signature_author_position(signature)
+    if author_position is None:
+        return EMPTY_STRING_SET
+
     coauthor_blocks = signature.author_info_coauthor_blocks
     if coauthor_blocks is not None:
         return _nonempty_feature_values(coauthor_blocks)
@@ -228,7 +232,7 @@ def _signature_coauthor_blocks(signature: Any, dataset: ANDData) -> frozenset[st
         if paper is None:
             return EMPTY_STRING_SET
         coauthors = [
-            author.author_name for author in paper.authors if author.position != signature.author_info_position
+            author.author_name for author in paper.authors if int(author.position) != author_position
         ]
     return _nonempty_feature_values([_safe_compute_block(str(author or "")) for author in coauthors])
 
@@ -249,18 +253,15 @@ def _get_specter_vector(dataset: ANDData, paper_id: Any) -> np.ndarray | None:
 
 
 def _signature_query_author(signature: Any) -> str:
-    """Return the best available raw author text for query-level gate features."""
+    """Return normalized author text for query-level gate features."""
 
-    full_name = getattr(signature, "author_info_full_name", None)
-    if full_name:
-        return str(full_name)
     parts = [
         getattr(signature, "author_info_first", None),
         getattr(signature, "author_info_middle", None),
         getattr(signature, "author_info_last", None),
         getattr(signature, "author_info_suffix", None),
     ]
-    return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
+    return normalize_text(" ".join(str(part).strip() for part in parts if part is not None and str(part).strip()))
 
 
 def _feature_block_paper_by_id(feature_block: FeatureBlock) -> dict[str, Any]:
@@ -328,10 +329,13 @@ def _feature_block_coauthor_blocks(
 ) -> frozenset[str]:
     if author_position is None:
         return EMPTY_STRING_SET
+    resolved_author_position = int(author_position)
     return frozenset(
-        _safe_compute_block(author_name)
+        block
         for position, author_name in _feature_block_author_records(author_records_by_paper, paper_id)
-        if author_name and int(position) != int(author_position)
+        for block in (_safe_compute_block(author_name),)
+        if author_name and int(position) != resolved_author_position
+        if block
     )
 
 
@@ -593,19 +597,15 @@ def _select_exemplars(vectors: list[np.ndarray], max_exemplars: int) -> list[np.
     return [np.asarray(vectors[idx], dtype=np.float32) for idx in selected_indices]
 
 
-def build_cluster_summary(
-    dataset: ANDData,
+def _cluster_summary_from_feature_rows(
     *,
     cluster_id: str,
     component_key: str,
-    signature_ids: Sequence[str],
+    feature_rows: Iterable[tuple[str, QueryFeatures]],
     max_exemplars: int,
-    feature_cache: dict[str, QueryFeatures] | None = None,
-    paper_author_name_cache: dict[str, frozenset[str]] | None = None,
-    orcid_enabled: bool = False,
-    block_key: str = "incremental",
+    block_key: str,
 ) -> ClusterSummary:
-    """Build one seed-cluster summary for Rust retrieval."""
+    """Build one seed-cluster summary from pre-extracted member features."""
 
     first_name_counts: Counter[str] = Counter()
     middle_initial_counts: Counter[str] = Counter()
@@ -626,14 +626,7 @@ def build_cluster_summary(
     member_signature_ids: list[str] = []
     member_title_terms: list[frozenset[str]] = []
 
-    for signature_id in signature_ids:
-        features = extract_query_features(
-            dataset,
-            str(signature_id),
-            feature_cache=feature_cache,
-            paper_author_name_cache=paper_author_name_cache,
-            orcid_enabled=orcid_enabled,
-        )
+    for signature_id, features in feature_rows:
         if len(features.first) > 1:
             first_name_counts[features.first] += 1
         for initial in features.middle_initials:
@@ -672,7 +665,7 @@ def build_cluster_summary(
         component_key=component_key,
         cluster_id=cluster_id,
         block_key=str(block_key),
-        size=len(signature_ids),
+        size=len(member_signature_ids),
         first_name_counts=first_name_counts,
         middle_initial_counts=middle_initial_counts,
         coauthor_counts=coauthor_counts,
@@ -698,6 +691,42 @@ def build_cluster_summary(
     )
 
 
+def build_cluster_summary(
+    dataset: ANDData,
+    *,
+    cluster_id: str,
+    component_key: str,
+    signature_ids: Sequence[str],
+    max_exemplars: int,
+    feature_cache: dict[str, QueryFeatures] | None = None,
+    paper_author_name_cache: dict[str, frozenset[str]] | None = None,
+    orcid_enabled: bool = False,
+    block_key: str = "incremental",
+) -> ClusterSummary:
+    """Build one seed-cluster summary for Rust retrieval."""
+
+    feature_rows = (
+        (
+            str(signature_id),
+            extract_query_features(
+                dataset,
+                str(signature_id),
+                feature_cache=feature_cache,
+                paper_author_name_cache=paper_author_name_cache,
+                orcid_enabled=orcid_enabled,
+            ),
+        )
+        for signature_id in signature_ids
+    )
+    return _cluster_summary_from_feature_rows(
+        cluster_id=cluster_id,
+        component_key=component_key,
+        feature_rows=feature_rows,
+        max_exemplars=max_exemplars,
+        block_key=block_key,
+    )
+
+
 def build_cluster_summary_from_feature_block(
     feature_block: FeatureBlock,
     *,
@@ -712,94 +741,25 @@ def build_cluster_summary_from_feature_block(
 ) -> ClusterSummary:
     """Build one seed-cluster summary directly from a `FeatureBlock`."""
 
-    first_name_counts: Counter[str] = Counter()
-    middle_initial_counts: Counter[str] = Counter()
-    coauthor_counts: Counter[str] = Counter()
-    non_mega_coauthor_counts: Counter[str] = Counter()
-    affiliation_counts: Counter[str] = Counter()
-    venue_counts: Counter[str] = Counter()
-    title_counts: Counter[str] = Counter()
-    year_values: list[int] = []
-    orcid_values: set[str] = set()
-    specter_vectors: list[np.ndarray] = []
-    name_counts_values: list[Any] = []
-    paper_author_counts: list[int] = []
-    member_paper_author_names: list[frozenset[str]] = []
-    member_paper_author_counts: list[int] = []
-    member_author_positions: list[int | None] = []
-    member_local10_author_names: list[frozenset[str]] = []
-    member_signature_ids: list[str] = []
-    member_title_terms: list[frozenset[str]] = []
     context = query_context or build_feature_block_query_context(feature_block, feature_cache=feature_cache)
-
-    for signature_id in signature_ids:
-        features = extract_query_features_from_feature_block(
-            feature_block,
+    feature_rows = (
+        (
             str(signature_id),
-            query_context=context,
-            orcid_enabled=orcid_enabled,
+            extract_query_features_from_feature_block(
+                feature_block,
+                str(signature_id),
+                query_context=context,
+                orcid_enabled=orcid_enabled,
+            ),
         )
-        if len(features.first) > 1:
-            first_name_counts[features.first] += 1
-        for initial in features.middle_initials:
-            middle_initial_counts[initial] += 1
-        for block in features.coauthor_blocks:
-            coauthor_counts[block] += 1
-            if int(features.paper_author_count) < 50:
-                non_mega_coauthor_counts[block] += 1
-        for term in features.affiliation_terms:
-            affiliation_counts[term] += 1
-        for term in features.venue_terms:
-            venue_counts[term] += 1
-        for term in features.title_terms:
-            title_counts[term] += 1
-        if features.year is not None:
-            year_values.append(int(features.year))
-        if features.orcid is not None:
-            orcid_values.add(features.orcid)
-        if features.specter is not None:
-            specter_vectors.append(features.specter)
-        if features.name_counts is not None:
-            name_counts_values.append(features.name_counts)
-        paper_author_counts.append(int(features.paper_author_count))
-        member_paper_author_names.append(features.paper_author_names)
-        member_paper_author_counts.append(int(features.paper_author_count))
-        member_author_positions.append(features.author_position)
-        member_local10_author_names.append(features.local10_author_names)
-        member_signature_ids.append(str(signature_id))
-        member_title_terms.append(features.title_terms)
-
-    centroid = None
-    if specter_vectors:
-        centroid = np.mean(np.vstack(specter_vectors), axis=0).astype(np.float32)
-
-    return ClusterSummary(
-        component_key=component_key,
+        for signature_id in signature_ids
+    )
+    return _cluster_summary_from_feature_rows(
         cluster_id=cluster_id,
-        block_key=str(block_key),
-        size=len(signature_ids),
-        first_name_counts=first_name_counts,
-        middle_initial_counts=middle_initial_counts,
-        coauthor_counts=coauthor_counts,
-        non_mega_coauthor_counts=non_mega_coauthor_counts,
-        affiliation_counts=affiliation_counts,
-        venue_counts=venue_counts,
-        year_values=year_values,
-        year_min=min(year_values) if year_values else None,
-        year_max=max(year_values) if year_values else None,
-        year_mean=_safe_mean(year_values),
-        orcid_values=frozenset(orcid_values),
-        specter_centroid=centroid,
-        exemplar_vectors=_select_exemplars(specter_vectors, max_exemplars=max_exemplars),
-        title_counts=title_counts,
-        name_counts_values=tuple(name_counts_values),
-        max_paper_author_count=max(paper_author_counts) if paper_author_counts else 0,
-        member_paper_author_names=tuple(member_paper_author_names),
-        member_paper_author_counts=tuple(member_paper_author_counts),
-        member_author_positions=tuple(member_author_positions),
-        member_local10_author_names=tuple(member_local10_author_names),
-        member_signature_ids=tuple(member_signature_ids),
-        member_title_terms=tuple(member_title_terms),
+        component_key=component_key,
+        feature_rows=feature_rows,
+        max_exemplars=max_exemplars,
+        block_key=block_key,
     )
 
 

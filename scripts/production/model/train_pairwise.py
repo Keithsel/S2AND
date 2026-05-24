@@ -290,9 +290,12 @@ def train_pairwise_bundle(args: argparse.Namespace) -> dict[str, Any]:
         nameless_featurizer_info=nameless_featurizer_info,
     )
     union_clusterer.fit(anddatas)
+    best_params = union_clusterer.best_params
+    if best_params is None:
+        raise RuntimeError("Clusterer fitting did not produce best clustering parameters.")
 
     training_summary = {
-        "best_clustering_params": dict(union_clusterer.best_params),
+        "best_clustering_params": dict(best_params),
         "elapsed_seconds": round(float(time.perf_counter() - started), 3),
         "main_train_rows": int(X_train.shape[0]),
         "main_val_rows": int(X_val.shape[0]),

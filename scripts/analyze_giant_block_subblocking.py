@@ -1,9 +1,9 @@
 """Sweep subblocking thresholds on a giant extracted block and write plots/tables.
 
 This script evaluates candidate `maximum_size` thresholds using repeated ORCID groups as
-an external preservation signal. Per-signature ORCIDs are masked before subblocking so the
-metric reflects only name-based and SPECTER-based partitioning, not the ORCID co-location
-override in `make_subblocks(...)`.
+an external preservation signal. It disables ORCID subblocking explicitly so the metric
+reflects only name-based and SPECTER-based partitioning, not the ORCID co-location override
+in `make_subblocks(...)`.
 
 It also reports how often SPECTER fallback was actually invoked while building subblocks,
 plus the size of the downstream retrieval target:
@@ -19,7 +19,6 @@ import os
 import time
 from collections import defaultdict
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import matplotlib
@@ -30,8 +29,12 @@ import numpy as np
 import pandas as pd
 
 from s2and.data import ANDData, Signature
-from s2and.subblocking import make_subblocks_with_telemetry, signature_name_parts_for_subblocking
-from s2and.text import ORCID_PATTERN
+from s2and.subblocking import (
+    make_subblocks_with_telemetry,
+    normalize_orcid_for_subblocking,
+    signature_name_parts_for_subblocking,
+)
+from s2and.text import set_fasttext_loading_enabled
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,13 +68,9 @@ def _required_file(dataset_root: Path, filename: str) -> Path:
 
 
 def _normalize_orcid(orcid: str | None) -> str | None:
-    """Normalize ORCID to its 16-character uppercase compact form."""
-    if not orcid:
-        return None
-    matches = ORCID_PATTERN.findall(orcid)
-    if not matches:
-        return None
-    return matches[0].upper().replace("-", "")
+    """Normalize ORCID using the subblocking/Rust-Arrow canonical key."""
+
+    return normalize_orcid_for_subblocking(orcid)
 
 
 def _build_repeated_orcid_groups(signatures: dict[str, Signature]) -> dict[str, list[str]]:
@@ -94,13 +93,6 @@ def _single_letter_first_name_ids(signatures: dict[str, Signature]) -> set[str]:
         str(signature_id)
         for signature_id, signature in signatures.items()
         if len(signature_name_parts_for_subblocking(signature)[0]) <= 1
-    }
-
-
-def _masked_signature_map(signatures: dict[str, Signature]) -> dict[str, Signature]:
-    """Return a shallow ORCID-masked copy of `signatures` for subblocking evaluation."""
-    return {
-        str(signature_id): signature._replace(author_info_orcid=None) for signature_id, signature in signatures.items()
     }
 
 
@@ -280,7 +272,7 @@ def load_dataset(dataset_root: Path, n_jobs: int, random_seed: int) -> ANDData:
     papers_path = _required_file(dataset_root, "papers.json")
     specter_path = _required_file(dataset_root, "specter.pickle")
 
-    os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
+    set_fasttext_loading_enabled(False)
     os.environ.setdefault("S2AND_BACKEND", "python")
     os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
 
@@ -325,20 +317,14 @@ def main() -> None:
     all_signature_ids = sorted(str(signature_id) for signature_id in dataset.signatures.keys())
     repeated_orcid_groups = _build_repeated_orcid_groups(dataset.signatures)
     single_letter_ids = _single_letter_first_name_ids(dataset.signatures)
-    masked_dataset = SimpleNamespace(
-        signatures=_masked_signature_map(dataset.signatures),
-        papers=dataset.papers,
-        specter_embeddings=dataset.specter_embeddings,
-        random_seed=dataset.random_seed,
-    )
-
     rows: list[dict[str, Any]] = []
     for threshold in thresholds:
         threshold_start = time.perf_counter()
         subblocks, telemetry = make_subblocks_with_telemetry(
             all_signature_ids,
-            masked_dataset,
+            dataset,
             maximum_size=int(threshold),
+            use_orcid_subblocking=False,
         )
         signature_to_subblock = _signature_to_subblock(subblocks)
         preservation_metrics = _orcid_preservation_metrics(repeated_orcid_groups, signature_to_subblock)

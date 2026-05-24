@@ -23,6 +23,7 @@ from s2and.incremental_linking.feature_block_contract import (
     _optional_str,
     _strict_string_tuple,
     feature_block_signature_order_from_raw_candidate_plan,
+    filter_cluster_seed_disallows_for_signature_subset,
 )
 
 
@@ -86,10 +87,9 @@ def feature_block_from_anddata(
         for signature_id, component_id in source_cluster_seeds.items()
         if str(signature_id) in signature_id_set
     )
-    disallow_pairs = tuple(
-        (str(left), str(right))
-        for left, right in getattr(dataset, "cluster_seeds_disallow", set())
-        if str(left) in signature_id_set and str(right) in signature_id_set
+    disallow_pairs = filter_cluster_seed_disallows_for_signature_subset(
+        getattr(dataset, "cluster_seeds_disallow", set()),
+        signature_id_set,
     )
     specter_paper_ids, specter_embeddings = _feature_block_specter_from_anddata(
         dataset,
@@ -141,10 +141,9 @@ def feature_block_from_raw_payloads(
         for signature_id, component_id in cluster_seeds_require.items()
         if str(signature_id) in selected_signature_id_set
     )
-    disallow_pairs = tuple(
-        (str(left), str(right))
-        for left, right in (cluster_seeds_disallow or ())
-        if str(left) in selected_signature_id_set and str(right) in selected_signature_id_set
+    disallow_pairs = filter_cluster_seed_disallows_for_signature_subset(
+        cluster_seeds_disallow or (),
+        selected_signature_id_set,
     )
     specter_paper_ids, specter_matrix = _feature_block_specter_from_mapping(
         paper_ids,
@@ -293,7 +292,7 @@ def _feature_block_signatures_payload(feature_block: FeatureBlock) -> dict[str, 
             "affiliations": list(row.author_affiliations),
             "email": row.author_email or "",
             "source_ids": source_ids,
-            "position": 0 if row.author_position is None else int(row.author_position),
+            "position": None if row.author_position is None else int(row.author_position),
             "block": row.author_block or "",
         }
         if row.author_orcid:

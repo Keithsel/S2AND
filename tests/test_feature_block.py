@@ -4,6 +4,7 @@ import json
 import struct
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -27,6 +28,9 @@ from s2and.incremental_linking.feature_block import (
     feature_block_signature_order_from_raw_candidate_plan,
     feature_block_to_mini_anddata,
     raw_planner_arrow_physical_layout,
+    read_cluster_seeds_arrow,
+    temporary_arrow_paths_with_cluster_seeds,
+    write_arrow_batch_lookup_index,
     write_arrow_ipc_table,
     write_feature_block_arrow_from_anddata,
     write_feature_block_arrow_tables,
@@ -71,7 +75,7 @@ def _raw_test_clusterer(
     )
 
 
-def _raw_test_artifact(*, retrieval_top_k: int = 25) -> SimpleNamespace:
+def _raw_test_artifact(*, retrieval_top_k: int = 25) -> Any:
     return SimpleNamespace(metadata=SimpleNamespace(retrieval_top_k=retrieval_top_k))
 
 
@@ -83,8 +87,8 @@ def _signature_payload(
     last: str,
     position: int,
     orcid: str | None = None,
-) -> dict[str, object]:
-    author_info: dict[str, object] = {
+) -> dict[str, Any]:
+    author_info: dict[str, Any] = {
         "first": first,
         "middle": "",
         "last": last,
@@ -105,7 +109,7 @@ def _signature_payload(
     }
 
 
-def _paper_payload(paper_id: str, *, title: str, year: int, authors: list[str]) -> dict[str, object]:
+def _paper_payload(paper_id: str, *, title: str, year: int, authors: list[str]) -> dict[str, Any]:
     return {
         "paper_id": paper_id,
         "title": title,
@@ -155,10 +159,10 @@ def _tiny_anddata() -> ANDData:
     return dataset
 
 
-def _raw_plan() -> dict[str, object]:
+def _raw_plan() -> dict[str, Any]:
     row_count = 2
     pair_count = 3
-    plan: dict[str, object] = {
+    plan: dict[str, Any] = {
         "row_count": row_count,
         "pair_count": pair_count,
         "query_signature_ids": ["q"],
@@ -208,7 +212,7 @@ def _raw_plan() -> dict[str, object]:
     return plan
 
 
-def _raw_payloads_for_plan() -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]], dict[str, str]]:
+def _raw_payloads_for_plan() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, str]]:
     signatures = {
         "q": _signature_payload(
             "q",
@@ -241,14 +245,16 @@ def _write_feature_block_arrow_paths(tmp_path: Path) -> dict[str, str]:
         papers=papers,
         raw_candidate_plan=_raw_plan(),
         cluster_seeds_require=cluster_seeds_require,
-        cluster_seeds_disallow=[("q", "s2"), ("q", "unused")],
+        cluster_seeds_disallow=[("q", "s2")],
     )
     return write_feature_block_arrow_tables(feature_block, tmp_path, include_empty_cluster_seeds=True)
 
 
 def test_feature_block_from_anddata_builds_requested_mini_contract() -> None:
+    dataset = _tiny_anddata()
+    dataset.cluster_seeds_disallow = set()
     feature_block = feature_block_from_anddata(
-        _tiny_anddata(),
+        dataset,
         signature_ids=["q", "s1"],
         query_signature_ids=["q"],
     )
@@ -268,6 +274,7 @@ def test_feature_block_from_anddata_builds_requested_mini_contract() -> None:
     ]
     assert feature_block.signatures[0].author_orcid == "0000-0000-0000-0001"
     assert feature_block.specter_paper_ids == ("p_q", "p1")
+    assert feature_block.specter_embeddings is not None
     np.testing.assert_allclose(feature_block.specter_embeddings, [[1.0, 0.0], [1.0, 0.1]])
 
 
@@ -286,9 +293,9 @@ def test_feature_block_from_anddata_rejects_signature_missing_paper() -> None:
 def test_feature_block_to_arrow_tables_matches_raw_schema() -> None:
     pa = pytest.importorskip("pyarrow")
 
-    tables = feature_block_from_anddata(
-        _tiny_anddata(), signature_ids=["q", "s1"], query_signature_ids=["q"]
-    ).to_arrow_tables()
+    dataset = _tiny_anddata()
+    dataset.cluster_seeds_disallow = set()
+    tables = feature_block_from_anddata(dataset, signature_ids=["q", "s1"], query_signature_ids=["q"]).to_arrow_tables()
 
     assert set(tables) == {
         "signatures",
@@ -354,8 +361,10 @@ def test_feature_block_to_arrow_tables_keeps_all_null_optional_columns_typed() -
 def test_write_feature_block_arrow_from_anddata_skips_empty_seed_table(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
 
+    dataset = _tiny_anddata()
+    dataset.cluster_seeds_disallow = set()
     paths = write_feature_block_arrow_from_anddata(
-        _tiny_anddata(),
+        dataset,
         tmp_path,
         signature_ids=["q"],
         query_signature_ids=["q"],
@@ -392,6 +401,53 @@ def test_feature_block_from_arrow_paths_rejects_invalid_cluster_seed_disallows(t
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
+def test_feature_block_from_arrow_paths_filters_one_sided_disallow_pair(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    one_sided = pa.table(
+        {
+            "signature_id_1": pa.array(["q"], type=pa.string()),
+            "signature_id_2": pa.array(["unused"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(one_sided, Path(arrow_paths["cluster_seed_disallows"]))
+
+    feature_block = feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+    assert feature_block.cluster_seeds_disallow == ()
+
+
+def test_feature_block_from_arrow_paths_ignores_invalid_out_of_scope_disallow_pairs(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    out_of_scope = pa.table(
+        {
+            "signature_id_1": pa.array(["unused", "", "a", "b", "q"], type=pa.string()),
+            "signature_id_2": pa.array(["unused", "unused", "b", "a", "s2"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(out_of_scope, Path(arrow_paths["cluster_seed_disallows"]))
+
+    feature_block = feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+    assert feature_block.cluster_seeds_disallow == (("q", "s2"),)
+
+
+def test_feature_block_from_arrow_paths_rejects_in_scope_self_disallow_pair(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    self_pair = pa.table(
+        {
+            "signature_id_1": pa.array(["q"], type=pa.string()),
+            "signature_id_2": pa.array(["q"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(self_pair, Path(arrow_paths["cluster_seed_disallows"]))
+
+    with pytest.raises(ValueError, match="self-pair"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
 def test_cluster_seed_disallows_from_arrow_paths_rejects_missing_explicit_path(tmp_path: Path) -> None:
     missing_path = tmp_path / "missing_cluster_seed_disallows.arrow"
 
@@ -399,16 +455,93 @@ def test_cluster_seed_disallows_from_arrow_paths_rejects_missing_explicit_path(t
         cluster_seed_disallows_from_arrow_paths({"cluster_seed_disallows": str(missing_path)})
 
 
-def test_arrow_paths_with_temporary_cluster_seeds_rejects_none_path(tmp_path: Path) -> None:
+def test_temporary_arrow_paths_with_cluster_seeds_rejects_none_path(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="papers.*None"):
-        feature_block_arrow_module.arrow_paths_with_temporary_cluster_seeds(
+        with temporary_arrow_paths_with_cluster_seeds(
             {
                 "signatures": tmp_path / "signatures.arrow",
                 "papers": None,
             },
             {},
             prefix="test-arrow-paths-",
-        )
+        ):
+            raise AssertionError("invalid paths should fail before yielding")
+
+
+def test_temporary_arrow_paths_with_cluster_seeds_cleans_up_tmpdir(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+
+    with temporary_arrow_paths_with_cluster_seeds(
+        {
+            "signatures": tmp_path / "signatures.arrow",
+            "papers": tmp_path / "papers.arrow",
+        },
+        {"s1": "c1"},
+        prefix="test-arrow-paths-",
+        cluster_seeds_disallow=[("s1", "s2")],
+    ) as paths:
+        cluster_seed_path = Path(paths["cluster_seeds"])
+        disallow_path = Path(paths["cluster_seed_disallows"])
+        temp_dir = cluster_seed_path.parent
+
+        assert paths["signatures"] == str(tmp_path / "signatures.arrow")
+        assert paths["papers"] == str(tmp_path / "papers.arrow")
+        assert cluster_seed_path.exists()
+        assert disallow_path.exists()
+        assert temp_dir.exists()
+
+    assert not temp_dir.exists()
+    assert not cluster_seed_path.exists()
+    assert not disallow_path.exists()
+
+
+def test_temporary_arrow_paths_with_cluster_seeds_rewrites_stale_empty_seed_path(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    stale_seed_path = tmp_path / "missing_cluster_seeds.arrow"
+
+    with temporary_arrow_paths_with_cluster_seeds(
+        {
+            "signatures": tmp_path / "signatures.arrow",
+            "papers": tmp_path / "papers.arrow",
+            "cluster_seeds": stale_seed_path,
+        },
+        {},
+        prefix="test-arrow-paths-",
+        reuse_existing_cluster_seeds_when_empty=True,
+        cluster_seeds_disallow=[("s1", "s2")],
+    ) as paths:
+        cluster_seed_path = Path(paths["cluster_seeds"])
+        assert cluster_seed_path.exists()
+        assert cluster_seed_path != stale_seed_path
+
+
+def test_read_cluster_seeds_arrow_dedupes_idempotent_duplicate_signature_rows(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "cluster_seeds.arrow"
+    table = pa.table(
+        {
+            "signature_id": pa.array(["s1", "s1"], type=pa.string()),
+            "cluster_id": pa.array(["c1", "c1"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(table, path)
+
+    assert read_cluster_seeds_arrow(path) == {"s1": "c1"}
+
+
+def test_read_cluster_seeds_arrow_rejects_conflicting_duplicate_signature_rows(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "cluster_seeds.arrow"
+    table = pa.table(
+        {
+            "signature_id": pa.array(["s1", "s1"], type=pa.string()),
+            "cluster_id": pa.array(["c1", "c2"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(table, path)
+
+    with pytest.raises(ValueError, match="multiple clusters"):
+        read_cluster_seeds_arrow(path)
 
 
 def test_feature_block_from_arrow_paths_rejects_duplicate_signature_rows(tmp_path: Path) -> None:
@@ -504,6 +637,7 @@ def test_feature_block_from_arrow_paths_reads_specter_when_requested(tmp_path: P
     materialized = feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan(), include_specter=True)
 
     assert materialized.specter_paper_ids == ("p_q", "p1")
+    assert materialized.specter_embeddings is not None
     np.testing.assert_allclose(materialized.specter_embeddings, [[1.0, 0.0], [0.5, 0.5]])
 
 
@@ -574,6 +708,18 @@ def test_raw_planner_index_omits_none_optional_paths(tmp_path: Path) -> None:
     assert "specter_batch_index" not in index_metrics
 
 
+def test_raw_planner_index_rejects_null_lookup_keys(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    path = write_arrow_ipc_table(
+        pa.table({"signature_id": pa.array(["s1", None], type=pa.string())}),
+        tmp_path / "signatures.arrow",
+    )
+
+    with pytest.raises(ValueError, match="null values in key column"):
+        write_raw_arrow_batch_lookup_indexes({"signatures": path}, tmp_path)
+
+
 def test_raw_planner_index_rejects_stale_python_reuse(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     path = write_arrow_ipc_table(
@@ -588,6 +734,36 @@ def test_raw_planner_index_rejects_stale_python_reuse(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="stale"):
         write_raw_arrow_batch_lookup_indexes({"signatures": path}, tmp_path, overwrite=False)
+
+
+def test_raw_planner_index_reuse_metrics_match_fresh_schema(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = write_arrow_ipc_table(
+        pa.table({"signature_id": pa.array(["s1", "s2"], type=pa.string())}),
+        tmp_path / "signatures.arrow",
+        max_record_batch_rows=1,
+    )
+    index_path = tmp_path / "signatures.signatures_batch_index.bin"
+
+    _, fresh_metrics = write_arrow_batch_lookup_index(
+        path,
+        index_path,
+        key_column="signature_id",
+        table_name="signatures",
+        max_record_batch_rows=1,
+        overwrite=True,
+    )
+    _, reused_metrics = write_arrow_batch_lookup_index(
+        path,
+        index_path,
+        key_column="signature_id",
+        table_name="signatures",
+        max_record_batch_rows=1,
+        overwrite=False,
+    )
+
+    assert set(reused_metrics) == set(fresh_metrics)
+    assert reused_metrics == {**fresh_metrics, "reused": True}
 
 
 def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -679,7 +855,7 @@ def test_write_name_counts_index_failed_overwrite_keeps_previous_manifest(
 
     real_write_file = feature_block_arrow_module._write_name_count_index_file  # noqa: SLF001
 
-    def fail_after_first_file(path: Path, kind: str, mapping: object) -> dict[str, int]:
+    def fail_after_first_file(path: Path, kind: str, mapping: Any) -> dict[str, int]:
         if kind == "last":
             raise RuntimeError("simulated index write failure")
         return real_write_file(path, kind, mapping)
@@ -728,8 +904,10 @@ def test_write_name_counts_index_overwrite_removes_stale_generations(
 
 
 def test_feature_block_to_mini_anddata_materializes_only_requested_rows() -> None:
+    dataset = _tiny_anddata()
+    dataset.cluster_seeds_disallow = set()
     feature_block = feature_block_from_anddata(
-        _tiny_anddata(),
+        dataset,
         signature_ids=["q", "s1"],
         query_signature_ids=["q"],
     )
@@ -756,7 +934,7 @@ def test_feature_block_from_raw_payloads_uses_raw_plan_mini_order() -> None:
         papers=papers,
         raw_candidate_plan=_raw_plan(),
         cluster_seeds_require=cluster_seeds_require,
-        cluster_seeds_disallow=[("q", "s2"), ("q", "unused")],
+        cluster_seeds_disallow=[("q", "s2")],
         specter_embeddings={
             "p_q": np.asarray([1.0, 0.0], dtype=np.float32),
             "p1": np.asarray([1.0, 0.1], dtype=np.float32),
@@ -770,6 +948,61 @@ def test_feature_block_from_raw_payloads_uses_raw_plan_mini_order() -> None:
     assert feature_block.cluster_seeds_disallow == (("q", "s2"),)
     assert [paper.paper_id for paper in feature_block.papers] == ["p_q", "p1", "p2", "p3"]
     assert feature_block.specter_paper_ids == ("p_q", "p1")
+
+
+def test_feature_block_from_raw_payloads_filters_one_sided_disallow_pair() -> None:
+    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
+
+    feature_block = feature_block_from_raw_payloads(
+        signatures=signatures,
+        papers=papers,
+        raw_candidate_plan=_raw_plan(),
+        cluster_seeds_require=cluster_seeds_require,
+        cluster_seeds_disallow=[("q", "unused")],
+    )
+
+    assert feature_block.cluster_seeds_disallow == ()
+
+
+def test_feature_block_from_anddata_filters_one_sided_disallow_pair() -> None:
+    feature_block = feature_block_from_anddata(
+        _tiny_anddata(),
+        signature_ids=["q", "s1"],
+        query_signature_ids=["q"],
+    )
+
+    assert feature_block.cluster_seeds_disallow == ()
+
+
+def test_feature_block_contract_rejects_out_of_block_disallow_pair() -> None:
+    with pytest.raises(ValueError, match="missing from FeatureBlock"):
+        FeatureBlock(
+            signatures=(
+                FeatureBlockSignature(
+                    signature_id="q",
+                    paper_id="p_q",
+                    author_first="Ada",
+                    author_middle=None,
+                    author_last="Lovelace",
+                    author_suffix=None,
+                    author_affiliations=(),
+                    author_orcid=None,
+                    author_position=0,
+                ),
+            ),
+            papers=(
+                FeatureBlockPaper(
+                    paper_id="p_q",
+                    title="Notes",
+                    abstract=None,
+                    venue=None,
+                    journal_name=None,
+                    year=1843,
+                ),
+            ),
+            paper_authors=(FeatureBlockPaperAuthor(paper_id="p_q", position=0, author_name="Ada Lovelace"),),
+            cluster_seeds_disallow=(("q", "outside"),),
+        )
 
 
 def test_feature_block_from_raw_payloads_rejects_missing_papers() -> None:
@@ -851,7 +1084,7 @@ def test_feature_block_rejects_scalar_sequence_fields_and_malformed_authors() ->
             author_middle=None,
             author_last="Lovelace",
             author_suffix=None,
-            author_affiliations="Lab",
+            author_affiliations=cast(Any, "Lab"),
             author_orcid=None,
             author_position=0,
         )
@@ -878,6 +1111,7 @@ def test_feature_block_from_raw_payloads_accepts_anddata_specter_tuple_payload()
     )
 
     assert feature_block.specter_paper_ids == ("p_q", "p1")
+    assert feature_block.specter_embeddings is not None
     np.testing.assert_allclose(feature_block.specter_embeddings, [[1.0, 0.0], [1.0, 0.1]])
 
 
@@ -902,8 +1136,10 @@ def test_feature_block_to_mini_anddata_preserves_abstract_presence_for_scoring()
 
 
 def test_feature_block_for_signature_order_rejects_missing_plan_signature() -> None:
+    dataset = _tiny_anddata()
+    dataset.cluster_seeds_disallow = set()
     feature_block = feature_block_from_anddata(
-        _tiny_anddata(),
+        dataset,
         signature_ids=["q", "s1"],
         query_signature_ids=["q"],
     )
@@ -911,6 +1147,18 @@ def test_feature_block_for_signature_order_rejects_missing_plan_signature() -> N
 
     with pytest.raises(ValueError, match="missing raw-plan signatures"):
         feature_block_for_signature_order(feature_block, order)
+
+
+def test_feature_block_for_signature_order_filters_cross_subset_disallow_pair() -> None:
+    feature_block = feature_block_from_anddata(
+        _tiny_anddata(),
+        query_signature_ids=["q"],
+    )
+    order = FeatureBlockSignatureOrder(signature_ids=("q", "s1"), query_signature_ids=("q",))
+
+    mini = feature_block_for_signature_order(feature_block, order)
+
+    assert mini.cluster_seeds_disallow == ()
 
 
 def test_feature_block_for_signature_order_keeps_specter_aligned_to_papers() -> None:
@@ -970,6 +1218,7 @@ def test_feature_block_for_signature_order_keeps_specter_aligned_to_papers() -> 
 
     assert tuple(paper.paper_id for paper in mini.papers) == ("p1", "p2")
     assert mini.specter_paper_ids == ("p1", "p2")
+    assert mini.specter_embeddings is not None
     np.testing.assert_allclose(mini.specter_embeddings, [[1.0, 0.0], [2.0, 0.0]])
 
 
@@ -1000,11 +1249,19 @@ def test_raw_candidate_plan_bridge_accepts_feature_block_signature_order() -> No
     )
 
     candidate_batch = retrieval_batch.candidate_batch
-    assert candidate_batch.row_query_signature_indices.tolist() == [0, 0]
+    assert cast(Any, candidate_batch.row_query_signature_indices).tolist() == [0, 0]
     assert candidate_batch.left_signature_indices.tolist() == [0, 0, 0]
     assert candidate_batch.right_signature_indices.tolist() == [1, 2, 3]
     assert candidate_batch.row_component_keys == ("c_ada", "c_other")
     np.testing.assert_allclose(retrieval_batch.row_signals["retrieval_score"], [0.9, 0.2])
+
+
+def test_raw_candidate_plan_bridge_reports_missing_signature_id() -> None:
+    with pytest.raises(KeyError, match="right_signature_ids contains signature_id not present"):
+        build_linker_retrieval_batch_from_raw_candidate_plan(
+            _raw_plan(),
+            signature_id_to_index={"q": 0, "s1": 1, "s2": 2},
+        )
 
 
 def test_feature_block_query_and_summary_helpers_match_mini_anddata_row_signals() -> None:
@@ -1117,6 +1374,66 @@ def test_feature_block_query_has_affiliations_uses_normalized_terms() -> None:
     assert direct_query.has_affiliations == mini_query.has_affiliations
 
 
+def test_feature_block_query_none_author_position_stays_unknown() -> None:
+    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
+    signatures["q"]["author_info"]["position"] = None
+    feature_block = feature_block_from_raw_payloads(
+        signatures=signatures,
+        papers=papers,
+        raw_candidate_plan=_raw_plan(),
+        cluster_seeds_require=cluster_seeds_require,
+    )
+    mini = feature_block_to_mini_anddata(
+        feature_block,
+        name="mini_feature_block_none_author_position",
+        load_name_counts=False,
+        name_tuples=set(),
+    )
+
+    direct_query = extract_query_features_from_feature_block(feature_block, "q", orcid_enabled=True)
+    mini_query = extract_query_features(mini, "q", orcid_enabled=True)
+
+    assert direct_query.author_position is None
+    assert mini_query.author_position is None
+    assert direct_query.coauthor_blocks == mini_query.coauthor_blocks
+    assert direct_query.coauthor_blocks == frozenset()
+    assert direct_query.local10_author_names == mini_query.local10_author_names
+    assert direct_query.local10_author_names == frozenset()
+
+
+def test_feature_block_rejects_duplicate_paper_author_positions() -> None:
+    with pytest.raises(ValueError, match=r"duplicate \(paper_id, position\)"):
+        FeatureBlock(
+            signatures=(
+                FeatureBlockSignature(
+                    signature_id="s1",
+                    paper_id="p1",
+                    author_first="Alice",
+                    author_middle=None,
+                    author_last="Smith",
+                    author_suffix=None,
+                    author_affiliations=(),
+                    author_orcid=None,
+                    author_position=0,
+                ),
+            ),
+            papers=(
+                FeatureBlockPaper(
+                    paper_id="p1",
+                    title="One",
+                    abstract="",
+                    venue="",
+                    journal_name="",
+                    year=2020,
+                ),
+            ),
+            paper_authors=(
+                FeatureBlockPaperAuthor(paper_id="p1", position=0, author_name="Alice Smith"),
+                FeatureBlockPaperAuthor(paper_id="p1", position=0, author_name="A. Smith"),
+            ),
+        )
+
+
 def test_raw_feature_block_scoring_wrapper_uses_direct_rust_feature_block_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1127,29 +1444,27 @@ def test_raw_feature_block_scoring_wrapper_uses_direct_rust_feature_block_path(
         raw_candidate_plan=_raw_plan(),
         cluster_seeds_require=cluster_seeds_require,
     )
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     class FakeFeaturizer:
         def signature_ids(self) -> list[str]:
             return ["s3", "q", "s1", "s2"]
 
-    def fake_build_rust_featurizer_from_feature_block(feature_block_arg: object, **_kwargs: object) -> FakeFeaturizer:
+    def fake_build_rust_featurizer_from_feature_block(feature_block_arg: Any, **_kwargs: Any) -> FakeFeaturizer:
         captured["feature_block_signature_ids"] = tuple(feature_block_arg.signature_ids)
         captured["feature_block_seed_map"] = dict(feature_block_arg.cluster_seeds_require)
         captured["build_kwargs"] = dict(_kwargs)
         return FakeFeaturizer()
 
-    def fail_get_rust_featurizer(*_args: object, **_kwargs: object) -> None:
+    def fail_get_rust_featurizer(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("raw FeatureBlock scoring must not materialize mini ANDData")
 
-    def fake_from_retrieval(**kwargs: object) -> LinkOrAbstainProductionResult:
+    def fake_from_retrieval(**kwargs: Any) -> LinkOrAbstainProductionResult:
         retrieval_batch = kwargs["retrieval_batch"]
         captured["retrieval_left_indices"] = retrieval_batch.candidate_batch.left_signature_indices.tolist()
         captured["retrieval_right_indices"] = retrieval_batch.candidate_batch.right_signature_indices.tolist()
         captured["queries"] = kwargs["queries"]
-        extra_builder = kwargs["extra_row_signal_builder"]
-        extra_signals = extra_builder(retrieval_batch, {1: "q"})
-        captured["extra_signal_keys"] = sorted(extra_signals)
+        captured["extra_row_signal_builder"] = kwargs["extra_row_signal_builder"]
         return LinkOrAbstainProductionResult(
             feature_matrix=LinkerFeatureMatrix(
                 matrix=np.empty((2, 0), dtype=np.float32),
@@ -1164,7 +1479,7 @@ def test_raw_feature_block_scoring_wrapper_uses_direct_rust_feature_block_path(
             retrieval_batch=retrieval_batch,
             pairwise_model_result=CandidateBatchPairwiseModelResult(
                 row_signals={},
-                pairwise_stats=None,
+                pairwise_stats=cast(Any, None),
                 telemetry={},
             ),
             linked_signature_clusters={"q": "c_ada"},
@@ -1193,10 +1508,10 @@ def test_raw_feature_block_scoring_wrapper_uses_direct_rust_feature_block_path(
     assert captured["build_kwargs"]["load_name_counts"] is True
     queries = captured["queries"]
     assert len(queries) == 1
-    assert queries[0].orcid is None
+    assert queries[0].query_author == "ada lovelace"
     assert captured["retrieval_left_indices"] == [1, 1, 1]
     assert captured["retrieval_right_indices"] == [2, 3, 0]
-    assert "candidate_cluster_max_paper_author_count" in captured["extra_signal_keys"]
+    assert captured["extra_row_signal_builder"] is None
     assert result.linked_signature_clusters == {"q": "c_ada"}
     assert result.telemetry["feature_block_signature_count"] == 4
     assert "feature_block_rust_featurizer_seconds" in result.telemetry
@@ -1228,15 +1543,15 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     class FakeRustModule:
         @staticmethod
         def raw_block_query_candidate_plan_arrow(
             paths_arg: dict[str, str],
             query_signature_ids: list[str],
-            **kwargs: object,
-        ) -> dict[str, object]:
+            **kwargs: Any,
+        ) -> dict[str, Any]:
             captured["retrieval_paths"] = paths_arg
             captured["retrieval_query_signature_ids"] = tuple(query_signature_ids)
             captured["retrieval_kwargs"] = kwargs
@@ -1246,12 +1561,12 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
         def signature_ids(self) -> list[str]:
             return ["q", "s1", "s2", "s3", "extra"]
 
-    def fake_build_rust_featurizer_from_arrow_paths(paths_arg: object, **kwargs: object) -> FakeFeaturizer:
+    def fake_build_rust_featurizer_from_arrow_paths(paths_arg: Any, **kwargs: Any) -> FakeFeaturizer:
         captured["featurizer_paths"] = paths_arg
         captured["featurizer_signature_ids"] = tuple(kwargs["signature_ids"])
         return FakeFeaturizer()
 
-    def fake_from_retrieval(**kwargs: object) -> LinkOrAbstainProductionResult:
+    def fake_from_retrieval(**kwargs: Any) -> LinkOrAbstainProductionResult:
         retrieval_batch = kwargs["retrieval_batch"]
         captured["retrieval_left_indices"] = retrieval_batch.candidate_batch.left_signature_indices.tolist()
         captured["retrieval_right_indices"] = retrieval_batch.candidate_batch.right_signature_indices.tolist()
@@ -1273,7 +1588,7 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
             retrieval_batch=retrieval_batch,
             pairwise_model_result=CandidateBatchPairwiseModelResult(
                 row_signals={},
-                pairwise_stats=None,
+                pairwise_stats=cast(Any, None),
                 telemetry={},
             ),
             linked_signature_clusters={"q": "c_ada"},
@@ -1319,19 +1634,114 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     assert captured["retrieval_paths"] == captured["featurizer_paths"]
 
 
+def test_raw_arrow_partial_supervision_require_unknown_seed_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeFeaturizer:
+        def signature_ids(self) -> list[str]:
+            return ["q", "s1", "s2", "s3"]
+
+    raw_plan = _raw_plan()
+    raw_plan["component_members"] = {}
+
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port.build_rust_featurizer_from_arrow_paths",
+        lambda *_args, **_kwargs: FakeFeaturizer(),
+    )
+
+    with pytest.raises(ValueError, match="partial_supervision_require_unknown_seed_signature"):
+        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            _raw_test_clusterer(),
+            _raw_test_artifact(),
+            arrow_paths={},
+            query_signature_ids=["q"],
+            raw_candidate_plan=raw_plan,
+            partial_supervision={("q", "s1"): 0},
+            load_name_counts=False,
+            name_tuples=set(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("suppress_orcid", "orcid_enabled_arg", "expected_orcid_enabled"),
+    (
+        (False, None, True),
+        (True, None, False),
+        (True, True, True),
+        (False, False, False),
+    ),
+)
+def test_raw_arrow_scoring_resolves_orcid_enabled_from_clusterer(
+    monkeypatch: pytest.MonkeyPatch,
+    suppress_orcid: bool,
+    orcid_enabled_arg: bool | None,
+    expected_orcid_enabled: bool,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class StopAfterRetrieval(RuntimeError):
+        pass
+
+    class FakeRustModule:
+        @staticmethod
+        def raw_block_query_candidate_plan_arrow(
+            _paths_arg: dict[str, str],
+            _query_signature_ids: list[str],
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            captured["orcid_enabled"] = kwargs["orcid_enabled"]
+            return _raw_plan()
+
+    def stop_before_featurizer_build(*_args: Any, **_kwargs: Any) -> Any:
+        raise StopAfterRetrieval("captured retrieval kwargs")
+
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port.normalize_arrow_paths",
+        lambda paths: dict(paths),
+    )
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.require_arrow_name_counts_index_for_clusterer",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("s2and.incremental_linking.runtime.feature_port._require_rust_runtime", lambda: FakeRustModule)
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port.build_rust_featurizer_from_arrow_paths",
+        stop_before_featurizer_build,
+    )
+
+    kwargs: dict[str, Any] = {}
+    if orcid_enabled_arg is not None:
+        kwargs["orcid_enabled"] = orcid_enabled_arg
+
+    with pytest.raises(StopAfterRetrieval):
+        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            _raw_test_clusterer(suppress_orcid=suppress_orcid),
+            _raw_test_artifact(),
+            arrow_paths={"signatures": "signatures.arrow"},
+            query_signature_ids=["q"],
+            top_k=2,
+            n_jobs=1,
+            load_name_counts=False,
+            name_tuples=set(),
+            **kwargs,
+        )
+
+    assert captured["orcid_enabled"] is expected_orcid_enabled
+
+
 def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     class FakeFeaturizer:
         def signature_ids(self) -> list[str]:
             return ["q", "s1", "s2", "s3"]
 
-    def fail_build_rust_featurizer_from_arrow_paths(*_args: object, **_kwargs: object) -> object:
+    def fail_build_rust_featurizer_from_arrow_paths(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("prebuilt raw Arrow featurizer should be reused")
 
-    def fake_from_retrieval(**kwargs: object) -> LinkOrAbstainProductionResult:
+    def fake_from_retrieval(**kwargs: Any) -> LinkOrAbstainProductionResult:
         retrieval_batch = kwargs["retrieval_batch"]
         captured["featurizer"] = kwargs["featurizer"]
         captured["retrieval_left_indices"] = retrieval_batch.candidate_batch.left_signature_indices.tolist()
@@ -1350,7 +1760,7 @@ def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
             retrieval_batch=retrieval_batch,
             pairwise_model_result=CandidateBatchPairwiseModelResult(
                 row_signals={},
-                pairwise_stats=None,
+                pairwise_stats=cast(Any, None),
                 telemetry={},
             ),
             linked_signature_clusters={"q": "c_ada"},
@@ -1503,20 +1913,20 @@ def test_from_retrieval_skips_pair_id_build_when_partial_supervision_empty(
         def signature_ids(self) -> list[str]:
             return list(order.signature_ids)
 
-    def fail_candidate_pair_ids(*_args: object, **_kwargs: object) -> None:
+    def fail_candidate_pair_ids(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("pair ids should not be materialized when partial_supervision is empty")
 
-    def fake_pairwise_model(*args: object, **_kwargs: object) -> CandidateBatchPairwiseModelResult:
+    def fake_pairwise_model(*args: Any, **_kwargs: Any) -> CandidateBatchPairwiseModelResult:
         candidate_batch = args[1]
         return CandidateBatchPairwiseModelResult(
             row_signals={
                 "paper_author_list_max_overlap_count": np.zeros(candidate_batch.row_count, dtype=np.float32),
             },
-            pairwise_stats=None,
+            pairwise_stats=cast(Any, None),
             telemetry={"feature_seconds": 0.0},
         )
 
-    def fake_retrieved_candidates(*args: object, **kwargs: object) -> LinkOrAbstainRetrievedCandidatesResult:
+    def fake_retrieved_candidates(*args: Any, **kwargs: Any) -> LinkOrAbstainRetrievedCandidatesResult:
         current_retrieval_batch = args[1]
         return LinkOrAbstainRetrievedCandidatesResult(
             feature_matrix=LinkerFeatureMatrix(
@@ -1581,9 +1991,9 @@ def test_raw_payload_scoring_wrapper_builds_feature_block_and_adds_telemetry(
         _raw_plan(),
         feature_block_signature_order=feature_block_signature_order_from_raw_candidate_plan(_raw_plan()),
     )
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
-    def fake_score(**kwargs: object) -> LinkOrAbstainProductionResult:
+    def fake_score(**kwargs: Any) -> LinkOrAbstainProductionResult:
         feature_block = kwargs["feature_block"]
         captured["feature_block_signature_ids"] = feature_block.signature_ids
         captured["feature_block_disallow"] = feature_block.cluster_seeds_disallow
@@ -1602,7 +2012,7 @@ def test_raw_payload_scoring_wrapper_builds_feature_block_and_adds_telemetry(
             retrieval_batch=retrieval_batch,
             pairwise_model_result=CandidateBatchPairwiseModelResult(
                 row_signals={},
-                pairwise_stats=None,
+                pairwise_stats=cast(Any, None),
                 telemetry={},
             ),
             linked_signature_clusters={"q": "c_ada"},
@@ -1620,7 +2030,7 @@ def test_raw_payload_scoring_wrapper_builds_feature_block_and_adds_telemetry(
         papers=papers,
         raw_candidate_plan=_raw_plan(),
         cluster_seeds_require=cluster_seeds_require,
-        cluster_seeds_disallow=[("q", "s2"), ("q", "unused")],
+        cluster_seeds_disallow=[("q", "s2")],
         load_name_counts=False,
         name_tuples=set(),
     )

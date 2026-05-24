@@ -1,8 +1,23 @@
 from __future__ import annotations
 
 from itertools import combinations
+from types import SimpleNamespace
+from typing import Any, cast
 
-from s2and.subblocking import _sorted_subblock_merge_candidates
+import numpy as np
+import pytest
+
+from s2and.incremental_linking.feature_block import write_arrow_ipc_table
+from s2and.subblocking import (
+    GraphSubblockingConfig,
+    _projection_neighbor_edge_scores,
+    _score_candidate_edge,
+    _sorted_subblock_merge_candidates,
+    cluster_with_graph_fallback,
+    make_arrow_graph_subblocking_cluster_fn,
+    make_dataset_graph_subblocking_cluster_fn,
+    make_subblocks_with_telemetry,
+)
 from s2and.text import same_prefix_tokens
 
 
@@ -90,6 +105,78 @@ def test_sorted_subblock_merge_candidates_matches_legacy_edge_cases() -> None:
     assert any(pair == ("a|middle=wei", "a|middle=weijun") for pair, _score in observed)
 
 
+def test_sorted_subblock_merge_candidates_middle_prefix_score_is_order_invariant() -> None:
+    def score_for(output):
+        candidates = _sorted_subblock_merge_candidates(output, maximum_size=3, first_k_letter_counts_sorted={})
+        assert len(candidates) == 1
+        return candidates[0][1]
+
+    short_first = {
+        "alex|middle=jo": ["s1"],
+        "alex|middle=john": ["s2"],
+    }
+    long_first = {
+        "alex|middle=john": ["s2"],
+        "alex|middle=jo": ["s1"],
+    }
+
+    assert score_for(short_first) == score_for(long_first) == 1e10 + 2
+
+
+def test_projection_neighbor_edge_scores_match_slow_reference() -> None:
+    matrix = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.96, 0.20, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.95, 0.30],
+            [0.0, 0.0, 1.0],
+            [0.20, 0.0, 0.98],
+        ],
+        dtype=np.float32,
+    )
+    matrix /= np.linalg.norm(matrix, axis=1)[:, None]
+    evidences = [
+        SimpleNamespace(coauthor_blocks=frozenset({"a"}), affiliation_keys=frozenset({"lab1"})),
+        SimpleNamespace(coauthor_blocks=frozenset({"a"}), affiliation_keys=frozenset({"lab2"})),
+        SimpleNamespace(coauthor_blocks=frozenset({"b"}), affiliation_keys=frozenset({"lab2"})),
+        SimpleNamespace(coauthor_blocks=frozenset({"b"}), affiliation_keys=frozenset({"lab3"})),
+        SimpleNamespace(coauthor_blocks=frozenset({"c"}), affiliation_keys=frozenset({"lab3"})),
+        SimpleNamespace(coauthor_blocks=frozenset({"c"}), affiliation_keys=frozenset({"lab1"})),
+    ]
+    config = GraphSubblockingConfig(
+        projection_count=4,
+        projection_window=3,
+        min_edge_score=0.25,
+        max_candidate_edges=10_000,
+    )
+    rng = np.random.default_rng(11)
+    projection_vectors = rng.standard_normal((matrix.shape[1], int(config.projection_count)), dtype=np.float32)
+    projection_norms = np.linalg.norm(projection_vectors, axis=0)
+    projection_vectors[:, projection_norms > 0] /= projection_norms[projection_norms > 0]
+    projection_scores = matrix @ projection_vectors
+    expected: dict[tuple[int, int], float] = {}
+    for projection_index in range(projection_scores.shape[1]):
+        order = np.argsort(projection_scores[:, projection_index], kind="mergesort")
+        for position, left_index_raw in enumerate(order):
+            stop = min(len(order), position + int(config.projection_window) + 1)
+            for right_index_raw in order[position + 1 : stop]:
+                _score_candidate_edge(
+                    expected,
+                    left_index=int(left_index_raw),
+                    right_index=int(right_index_raw),
+                    matrix=matrix,
+                    evidences=cast(Any, evidences),
+                    config=config,
+                )
+
+    observed = _projection_neighbor_edge_scores(matrix, cast(Any, evidences), config, seed=11)
+
+    assert set(observed) == set(expected)
+    for edge, expected_score in expected.items():
+        assert observed[edge] == pytest.approx(expected_score)
+
+
 def test_sorted_subblock_merge_candidates_matches_legacy_many_keys() -> None:
     output = {}
     counts = {}
@@ -109,3 +196,376 @@ def test_sorted_subblock_merge_candidates_matches_legacy_many_keys() -> None:
         7,
         counts,
     )
+
+
+def test_arrow_graph_subblocking_fallback_loads_arrow_evidence_and_packs_components(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signatures_path = tmp_path / "signatures.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter_path = tmp_path / "specter.arrow"
+
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1", "s2", "s3", "s4"], type=pa.string()),
+                "paper_id": pa.array(["p1", "p2", "p3", "p4"], type=pa.string()),
+                "author_first": pa.array(["hui", "hui", "hui", "hui"], type=pa.string()),
+                "author_middle": pa.array(["", "", "", ""], type=pa.string()),
+                "author_affiliations": pa.array([["lab a"], ["lab a"], ["lab b"], ["lab b"]]),
+                "author_orcid": pa.array([None, None, None, None], type=pa.string()),
+                "author_position": pa.array([0, 0, 0, 0], type=pa.int64()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p1", "p2", "p2", "p3", "p3", "p4", "p4"], type=pa.string()),
+                "position": pa.array([0, 1, 0, 1, 0, 1, 0, 1], type=pa.int64()),
+                "author_name": pa.array(
+                    [
+                        "Hui Wang",
+                        "Ada Lovelace",
+                        "Hui Wang",
+                        "Ada Lovelace",
+                        "Hui Wang",
+                        "Grace Hopper",
+                        "Hui Wang",
+                        "Grace Hopper",
+                    ],
+                    type=pa.string(),
+                ),
+            }
+        ),
+        paper_authors_path,
+    )
+    embeddings = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.99, 0.01],
+            [0.0, 1.0],
+            [0.01, 0.99],
+        ],
+        dtype=np.float32,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p2", "p3", "p4"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(
+                    pa.array(np.ravel(embeddings), type=pa.float32()),
+                    2,
+                ),
+            }
+        ),
+        specter_path,
+    )
+
+    fallback = make_arrow_graph_subblocking_cluster_fn(
+        {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter": specter_path},
+        ["s1", "s2", "s3", "s4"],
+        config=GraphSubblockingConfig(
+            neighbor_mode="exact",
+            neighbors=1,
+            min_edge_score=0.8,
+            pack_components=True,
+            component_pack_strategy="edge-greedy",
+        ),
+        random_seed=7,
+    )
+
+    signature_ids = (signature_id for signature_id in ["s1", "s2", "s3", "s4"])
+    subblocks = fallback(signature_ids, object(), target_subblock_size=2)
+
+    assert {frozenset(values) for values in subblocks.values()} == {frozenset({"s1", "s2"}), frozenset({"s3", "s4"})}
+    assert max(len(values) for values in subblocks.values()) <= 2
+    assert fallback.load_seconds >= 0.0
+    assert fallback.load_metrics["signatures_rows_loaded"] == 4
+    assert fallback.load_metrics["paper_authors_rows_loaded"] == 8
+    assert fallback.load_metrics["specter_rows_loaded"] == 4
+    assert fallback.stats[0]["raw_component_count"] == 2
+    assert fallback.stats[0]["packed_component_count"] == 2
+
+
+def test_arrow_graph_subblocking_prepare_limits_loaded_evidence_to_fallback_union(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signatures_path = tmp_path / "signatures.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter_path = tmp_path / "specter.arrow"
+
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1", "s2", "s3", "s4"], type=pa.string()),
+                "paper_id": pa.array(["p1", "p2", "p3", "p4"], type=pa.string()),
+                "author_first": pa.array(["hui", "hui", "hui", "hui"], type=pa.string()),
+                "author_middle": pa.array(["", "", "", ""], type=pa.string()),
+                "author_affiliations": pa.array([["lab a"], ["lab a"], ["lab b"], ["lab b"]]),
+                "author_orcid": pa.array([None, None, None, None], type=pa.string()),
+                "author_position": pa.array([0, 0, 0, 0], type=pa.int64()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p1", "p2", "p2", "p3", "p3", "p4", "p4"], type=pa.string()),
+                "position": pa.array([0, 1, 0, 1, 0, 1, 0, 1], type=pa.int64()),
+                "author_name": pa.array(
+                    [
+                        "Hui Wang",
+                        "Ada Lovelace",
+                        "Hui Wang",
+                        "Ada Lovelace",
+                        "Hui Wang",
+                        "Grace Hopper",
+                        "Hui Wang",
+                        "Grace Hopper",
+                    ],
+                    type=pa.string(),
+                ),
+            }
+        ),
+        paper_authors_path,
+    )
+    embeddings = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.99, 0.01],
+            [0.0, 1.0],
+            [0.01, 0.99],
+        ],
+        dtype=np.float32,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p2", "p3", "p4"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(
+                    pa.array(np.ravel(embeddings), type=pa.float32()),
+                    2,
+                ),
+            }
+        ),
+        specter_path,
+    )
+
+    fallback = make_arrow_graph_subblocking_cluster_fn(
+        {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter": specter_path},
+        ["s1", "s2", "s3", "s4"],
+        config=GraphSubblockingConfig(neighbor_mode="exact", neighbors=1, min_edge_score=0.8),
+        random_seed=7,
+    )
+
+    fallback.prepare([["s1", "s2"]])
+    subblocks = fallback(["s1", "s2"], object(), target_subblock_size=2)
+
+    assert {frozenset(values) for values in subblocks.values()} == {frozenset({"s1", "s2"})}
+    assert fallback.load_metrics["prepared_signature_count"] == 2
+    assert fallback.load_metrics["signatures_rows_loaded"] == 2
+    assert fallback.load_metrics["paper_authors_rows_loaded"] == 4
+    assert fallback.load_metrics["specter_rows_loaded"] == 2
+
+
+def test_arrow_graph_subblocking_tolerates_sparse_evidence_and_reports_load_metrics(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signatures_path = tmp_path / "signatures.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter_path = tmp_path / "specter.arrow"
+
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1", "s2", "s3", "s4"], type=pa.string()),
+                "paper_id": pa.array(["p1", "p2", "p3", "p4"], type=pa.string()),
+                "author_first": pa.array(["hui", "hui", "hui", "hui"], type=pa.string()),
+                "author_middle": pa.array(["", "", "", ""], type=pa.string()),
+                "author_affiliations": pa.array(
+                    [None, [], ["lab b"], None],
+                    type=pa.list_(pa.string()),
+                ),
+                "author_orcid": pa.array([None, None, None, None], type=pa.string()),
+                "author_position": pa.array([0, 0, 0, 0], type=pa.int64()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p1", "p2", "p2", "p3", "p4"], type=pa.string()),
+                "position": pa.array([0, 1, 0, 1, 0, 0], type=pa.int64()),
+                "author_name": pa.array(
+                    ["Hui Wang", "Ada Lovelace", "Hui Wang", "Grace Hopper", "", "   "],
+                    type=pa.string(),
+                ),
+            }
+        ),
+        paper_authors_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(
+                    pa.array(np.zeros(4, dtype=np.float32), type=pa.float32()),
+                    2,
+                ),
+            }
+        ),
+        specter_path,
+    )
+
+    fallback = make_arrow_graph_subblocking_cluster_fn(
+        {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter": specter_path},
+        ["s1", "s2", "s3", "s4"],
+        config=GraphSubblockingConfig(
+            neighbor_mode="projection",
+            projection_count=2,
+            projection_window=2,
+            min_edge_score=999.0,
+            pack_components=True,
+        ),
+        random_seed=7,
+    )
+
+    subblocks = fallback(["s1", "s2", "s3", "s4"], object(), target_subblock_size=2)
+
+    assert sorted(len(values) for values in subblocks.values()) == [2, 2]
+    assert fallback.load_metrics == {
+        "signatures_record_batches_scanned": 1,
+        "signatures_rows_scanned": 4,
+        "signatures_rows_loaded": 4,
+        "paper_authors_record_batches_scanned": 1,
+        "paper_authors_rows_scanned": 6,
+        "paper_authors_rows_loaded": 6,
+        "specter_record_batches_scanned": 1,
+        "specter_rows_scanned": 2,
+        "specter_rows_loaded": 2,
+    }
+    assert fallback.stats[0]["candidate_edge_count"] == 0
+    assert fallback.stats[0]["raw_component_count"] == 4
+    assert fallback.stats[0]["packed_component_count"] == 2
+
+
+def test_graph_subblocking_packs_micro_components_before_legacy_merge() -> None:
+    signature_ids = [f"s{index}" for index in range(6)]
+    signatures = {
+        signature_id: SimpleNamespace(
+            signature_id=signature_id,
+            paper_id=f"p{index}",
+            author_info_first="hui",
+            author_info_middle="",
+            author_info_first_normalized_without_apostrophe="hui",
+            author_info_middle_normalized_without_apostrophe="",
+            author_info_affiliations=(),
+            author_info_affiliations_n_grams=None,
+            author_info_coauthor_blocks=(),
+            author_info_coauthors=None,
+            author_info_orcid=None,
+            author_info_position=0,
+        )
+        for index, signature_id in enumerate(signature_ids)
+    }
+    dataset = SimpleNamespace(
+        signatures=signatures,
+        papers={},
+        specter_embeddings={f"p{index}": np.zeros(2, dtype=np.float32) for index in range(6)},
+        random_seed=13,
+    )
+    fallback = make_dataset_graph_subblocking_cluster_fn(
+        config=GraphSubblockingConfig(
+            neighbor_mode="projection",
+            projection_count=2,
+            projection_window=2,
+            min_edge_score=999.0,
+            pack_components=True,
+        )
+    )
+
+    subblocks, telemetry = make_subblocks_with_telemetry(
+        signature_ids,
+        dataset,
+        maximum_size=2,
+        specter_cluster_fn=fallback,
+    )
+
+    assert telemetry["specter_invocation_count"] == 1
+    assert telemetry["pre_merge_specter_labeled_subblock_count"] == 3
+    assert telemetry["final_specter_labeled_subblock_count"] == 3
+    assert max(len(values) for values in subblocks.values()) == 2
+    assert fallback.stats[0]["raw_component_count"] == 6
+    assert fallback.stats[0]["packed_component_count"] == 3
+
+
+def test_graph_subblocking_uses_raw_paper_coauthors_when_signature_blocks_are_missing() -> None:
+    signature_ids = ["s1", "s2", "s3", "s4"]
+    signatures = {
+        signature_id: SimpleNamespace(
+            signature_id=signature_id,
+            paper_id=f"p{index}",
+            author_info_affiliations=(),
+            author_info_affiliations_n_grams=None,
+            author_info_coauthor_blocks=None,
+            author_info_coauthors=None,
+            author_info_position=0,
+        )
+        for index, signature_id in enumerate(signature_ids)
+    }
+    papers = {
+        "p0": SimpleNamespace(
+            authors=[
+                SimpleNamespace(author_name="Hui Wang", position=0),
+                SimpleNamespace(author_name="Ada Lovelace", position=1),
+            ]
+        ),
+        "p1": SimpleNamespace(
+            authors=[
+                SimpleNamespace(author_name="Hui Wang", position=0),
+                SimpleNamespace(author_name="Grace Hopper", position=1),
+            ]
+        ),
+        "p2": SimpleNamespace(
+            authors=[
+                SimpleNamespace(author_name="Hui Wang", position=0),
+                SimpleNamespace(author_name="Ada Lovelace", position=1),
+            ]
+        ),
+        "p3": SimpleNamespace(
+            authors=[
+                SimpleNamespace(author_name="Hui Wang", position=0),
+                SimpleNamespace(author_name="Grace Hopper", position=1),
+            ]
+        ),
+    }
+    dataset = SimpleNamespace(
+        signatures=signatures,
+        papers=papers,
+        specter_embeddings={f"p{index}": np.zeros(2, dtype=np.float32) for index in range(4)},
+        random_seed=0,
+    )
+
+    subblocks = cluster_with_graph_fallback(
+        signature_ids,
+        dataset,
+        target_subblock_size=2,
+        config=GraphSubblockingConfig(
+            neighbor_mode="exact",
+            neighbors=3,
+            min_edge_score=0.5,
+            specter_weight=0.0,
+            coauthor_weight=1.0,
+            affiliation_weight=0.0,
+            pack_components=False,
+        ),
+    )
+
+    assert {frozenset(values) for values in subblocks.values()} == {
+        frozenset({"s1", "s3"}),
+        frozenset({"s2", "s4"}),
+    }

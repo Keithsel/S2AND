@@ -56,7 +56,7 @@ def _base_row_signals(row_count: int) -> dict[str, object]:
 
 def test_rust_retrieval_batch_returns_flat_pair_plan() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     query = build_query_features(first="alice", has_coauthors=True, has_affiliations=True)
     summaries = [
         build_cluster_summary(
@@ -91,7 +91,7 @@ def test_rust_retrieval_batch_returns_flat_pair_plan() -> None:
 
 def test_rust_chooser_feature_rows_subset_honors_num_threads() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "chooser_feature_rows_subset"):
-        pytest.skip("chooser_feature_rows_subset is unavailable")
+        raise pytest.skip.Exception("chooser_feature_rows_subset is unavailable")
     query = build_query_features(first="alice", has_coauthors=True, has_affiliations=True)
     summaries = [
         build_cluster_summary(
@@ -115,7 +115,7 @@ def test_rust_chooser_feature_rows_subset_honors_num_threads() -> None:
 
 def test_rust_retrieval_batch_preserves_single_character_title_and_venue_terms() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     query = build_query_features(
         first="alice",
         title_terms=frozenset({"a", "m", "study"}),
@@ -150,7 +150,7 @@ def test_rust_retrieval_batch_preserves_single_character_title_and_venue_terms()
 
 def test_rust_retrieval_batch_matches_direct_top_k_order() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     queries = [
         build_query_features(first="alice", has_coauthors=True, has_affiliations=True),
         build_query_features(first="bob", has_coauthors=True, has_affiliations=True),
@@ -205,8 +205,12 @@ def test_rust_retrieval_batch_matches_direct_top_k_order() -> None:
         n_jobs=2,
     )
 
-    assert list(batch.candidate_batch.row_component_keys) == direct_keys
-    np.testing.assert_allclose(batch.candidate_batch.retrieval_scores, direct_scores, rtol=1e-6, atol=1e-6)
+    row_component_keys = batch.candidate_batch.row_component_keys
+    retrieval_scores = batch.candidate_batch.retrieval_scores
+    assert row_component_keys is not None
+    assert retrieval_scores is not None
+    assert list(row_component_keys) == direct_keys
+    np.testing.assert_allclose(retrieval_scores, direct_scores, rtol=1e-6, atol=1e-6)
 
 
 def test_rust_retrieval_batch_rejects_unknown_query_view_before_retrieval() -> None:
@@ -255,7 +259,7 @@ def test_rust_retrieval_batch_rejects_stale_pair_plan_schema() -> None:
 
 def test_full_query_view_changes_same_initial_retrieval_order() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     base_query = build_query_features(first="alice", has_full_first=True)
     initial_query = mask_query_features(base_query, "initial_only")
     full_query = mask_query_features(base_query, "full")
@@ -282,12 +286,14 @@ def test_full_query_view_changes_same_initial_retrieval_order() -> None:
     assert batch.candidate_batch.row_component_keys == ("c_alice", "c_adam")
     assert batch.row_signals["query_view"].tolist() == ["full", "full"]
     assert batch.row_signals["query_first_token"].tolist() == ["alice", "alice"]
-    assert float(batch.candidate_batch.retrieval_scores[0]) > float(batch.candidate_batch.retrieval_scores[1])
+    retrieval_scores = batch.candidate_batch.retrieval_scores
+    assert retrieval_scores is not None
+    assert float(retrieval_scores[0]) > float(retrieval_scores[1])
 
 
 def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_or_year_filters() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     query = build_query_features(
         first="alice",
         middle_initials=frozenset({"q"}),
@@ -349,9 +355,11 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
     )
 
     expected = {"orcid_match", "orcid_middle_conflict", "orcid_year_conflict"}
+    row_component_keys = batch.candidate_batch.row_component_keys
+    assert row_component_keys is not None
     assert set(direct_keys) == expected
-    assert set(batch.candidate_batch.row_component_keys) == expected
-    assert "non_orcid_candidate" not in batch.candidate_batch.row_component_keys
+    assert set(row_component_keys) == expected
+    assert "non_orcid_candidate" not in row_component_keys
     assert batch.row_signals["orcid_match"].tolist() == [1.0, 1.0, 1.0]
 
 
@@ -440,7 +448,7 @@ def test_rust_experimental_retrieval_rescues_high_coverage_mega_candidates() -> 
 
 def test_rust_retrieval_batch_applies_name_compatible_full_first_window() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     query = build_query_features(first="alice", has_full_first=True)
     summaries = [
         build_cluster_summary(component_key="c_same", size=1, first_name_counts=Counter({"alice": 1})),
@@ -482,8 +490,10 @@ def test_rust_retrieval_batch_applies_name_compatible_full_first_window() -> Non
         full_first_global_backfill_count=2,
     )
 
-    assert set(batch.candidate_batch.row_component_keys) == {"c_same", "c_name", "c_backfill"}
-    assert "c_other" not in batch.candidate_batch.row_component_keys
+    row_component_keys = batch.candidate_batch.row_component_keys
+    assert row_component_keys is not None
+    assert set(row_component_keys) == {"c_same", "c_name", "c_backfill"}
+    assert "c_other" not in row_component_keys
 
 
 def test_promoted_non_pairwise_row_features_derive_group_columns() -> None:

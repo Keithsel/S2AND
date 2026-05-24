@@ -6,6 +6,7 @@ import os
 from collections import Counter, namedtuple
 from typing import Any, cast
 
+import numpy as np
 import pytest
 
 import s2and.featurizer as featurizer_mod
@@ -21,7 +22,6 @@ _S2AND_RUST = cast(Any, s2and_rust)
 
 
 def _build_minimal_dataset(name: str) -> ANDData:
-    os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
     signatures = {
         "s1": {
             "signature_id": "s1",
@@ -119,6 +119,15 @@ def _build_minimal_dataset(name: str) -> ANDData:
             os.environ.pop("S2AND_BACKEND", None)
         else:
             os.environ["S2AND_BACKEND"] = prior_backend
+
+
+def _rust_minimal_featurizer(name: str) -> tuple[Any, int, int]:
+    dataset = _build_minimal_dataset(name)
+    rust_featurizer = _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
+    signature_id_to_index = {
+        str(signature_id): index for index, signature_id in enumerate(rust_featurizer.signature_ids())
+    }
+    return rust_featurizer, signature_id_to_index["s1"], signature_id_to_index["s2"]
 
 
 def test_from_dataset_fastpath_parity_for_field_sensitive_values():
@@ -229,3 +238,124 @@ def test_from_dataset_rejects_namedtuple_field_order_mismatch():
 
     with pytest.raises(ValueError, match="Paper fast-path contract mismatch"):
         _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
+
+
+def test_matrix_entrypoints_preserve_duplicate_selected_indices_and_empty_early_return():
+    rust_featurizer, left_index, right_index = _rust_minimal_featurizer("rust_matrix_duplicate_indices")
+    full_cols = len(rust_featurizer.featurize_pair("s1", "s2"))
+    selected_indices = [2, 2, 3]
+
+    full_matrix = np.asarray(rust_featurizer.featurize_pairs_matrix([("s1", "s2")], None, 1, np.nan))
+    selected_matrix = np.asarray(rust_featurizer.featurize_pairs_matrix([("s1", "s2")], selected_indices, 1, np.nan))
+    indexed_matrix = np.asarray(
+        rust_featurizer.featurize_pairs_matrix_indexed([(left_index, right_index)], selected_indices, 1, np.nan)
+    )
+
+    assert selected_matrix.shape == (1, 3)
+    np.testing.assert_allclose(selected_matrix, full_matrix[:, selected_indices], equal_nan=True)
+    np.testing.assert_allclose(indexed_matrix, selected_matrix, equal_nan=True)
+
+    with pytest.raises(ValueError, match=f"selected_indices contains out-of-range index {full_cols}"):
+        rust_featurizer.featurize_pairs_matrix([("s1", "s2")], [full_cols], 1, np.nan)
+    with pytest.raises(ValueError, match=f"selected_indices contains out-of-range index {full_cols}"):
+        rust_featurizer.featurize_pairs_matrix_indexed([(left_index, right_index)], [full_cols], 1, np.nan)
+
+    assert np.asarray(rust_featurizer.featurize_pairs_matrix([], [full_cols], 1, np.nan)).shape == (0, 0)
+    assert np.asarray(rust_featurizer.featurize_pairs_matrix_indexed([], [full_cols], 1, np.nan)).shape == (0, 0)
+    assert np.asarray(
+        rust_featurizer.featurize_block_upper_triangle_matrix_indexed(
+            [left_index, right_index], 0, 0, [full_cols], 1, np.nan
+        )
+    ).shape == (0, 0)
+
+
+def test_aggregate_entrypoints_validate_indices_and_preserve_tuple_shapes():
+    rust_featurizer, left_index, right_index = _rust_minimal_featurizer("rust_aggregate_index_contracts")
+    full_cols = len(rust_featurizer.featurize_pair("s1", "s2"))
+    selected_indices = [2, 2, 3]
+    aggregate_indices = [2, 3, 2]
+    pairs = [(left_index, right_index)]
+    row_indices = [0]
+    left_indices = np.asarray([left_index], dtype=np.uint32)
+    right_indices = np.asarray([right_index], dtype=np.uint32)
+    owner_rows = np.asarray(row_indices, dtype=np.uint32)
+
+    matrix, counts, sums, mins, maxs = rust_featurizer.linker_pair_features_and_aggregate_stats_indexed(
+        pairs,
+        row_indices,
+        1,
+        selected_indices,
+        aggregate_indices,
+        1,
+        0.0,
+    )
+    matrix = np.asarray(matrix)
+    expected_values = matrix[:, [0, 2, 0]]
+    assert matrix.shape == (1, 3)
+    np.testing.assert_array_equal(np.asarray(counts), np.asarray([1], dtype=np.uint32))
+    np.testing.assert_allclose(np.asarray(sums), expected_values, equal_nan=True)
+    np.testing.assert_allclose(np.asarray(mins), expected_values, equal_nan=True)
+    np.testing.assert_allclose(np.asarray(maxs), expected_values, equal_nan=True)
+
+    matrix, counts, valid_counts, sums, mins, maxs = rust_featurizer.linker_pair_index_arrays_and_aggregate_stats(
+        left_indices,
+        right_indices,
+        owner_rows,
+        1,
+        selected_indices,
+        aggregate_indices,
+        1,
+        0.0,
+        None,
+    )
+    matrix = np.asarray(matrix)
+    assert matrix.shape == (1, 3)
+    np.testing.assert_array_equal(np.asarray(counts), np.asarray([1], dtype=np.uint32))
+    np.testing.assert_array_equal(np.asarray(valid_counts), np.ones((1, 3), dtype=np.uint64))
+    np.testing.assert_allclose(np.asarray(sums), matrix[:, [0, 2, 0]], equal_nan=True)
+    np.testing.assert_allclose(np.asarray(mins), matrix[:, [0, 2, 0]], equal_nan=True)
+    np.testing.assert_allclose(np.asarray(maxs), matrix[:, [0, 2, 0]], equal_nan=True)
+
+    empty = np.asarray([], dtype=np.uint32)
+    empty_matrix, empty_counts, empty_valid_counts, empty_sums, empty_mins, empty_maxs = (
+        rust_featurizer.linker_pair_index_arrays_and_aggregate_stats(
+            empty,
+            empty,
+            empty,
+            0,
+            selected_indices,
+            aggregate_indices,
+            1,
+            0.0,
+            None,
+        )
+    )
+    assert np.asarray(empty_matrix).shape == (0, 3)
+    assert np.asarray(empty_counts).shape == (0,)
+    assert np.asarray(empty_valid_counts).shape == (0, 3)
+    assert np.asarray(empty_sums).shape == (0, 3)
+    assert np.asarray(empty_mins).shape == (0, 3)
+    assert np.asarray(empty_maxs).shape == (0, 3)
+
+    with pytest.raises(ValueError, match=f"aggregate_indices contains out-of-range index {full_cols}"):
+        rust_featurizer.linker_pair_index_arrays_aggregate_stats(
+            empty,
+            empty,
+            empty,
+            0,
+            [full_cols],
+            1,
+            np.nan,
+        )
+    with pytest.raises(ValueError, match="aggregate index 3 is not present in matrix_indices"):
+        rust_featurizer.linker_pair_index_arrays_and_aggregate_stats(
+            left_indices,
+            right_indices,
+            owner_rows,
+            1,
+            [2],
+            [3],
+            1,
+            np.nan,
+            None,
+        )

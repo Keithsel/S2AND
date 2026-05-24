@@ -5,6 +5,7 @@ import os
 import struct
 from collections import Counter
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -52,6 +53,28 @@ def test_subset_raw_candidate_plan_fast_path_rejects_out_of_range_query_index() 
 
     with pytest.raises(ValueError, match="outside the selected contiguous query range"):
         subset_raw_candidate_plan_for_query_ids(raw_plan, ["q1"])
+
+
+def test_subset_raw_candidate_plan_rejects_duplicate_query_ids() -> None:
+    raw_plan = {
+        "query_signature_ids": ["q0", "q0"],
+        "query_views": ["full", "full"],
+        "query_authors": ["Alice", "Alice"],
+        "row_count": 0,
+        "pair_count": 0,
+        "row_query_signature_indices": np.asarray([], dtype=np.uint32),
+        "row_component_keys": [],
+        "pair_row_indices": np.asarray([], dtype=np.uint32),
+        "component_members": {},
+        "telemetry": {},
+    }
+
+    with pytest.raises(ValueError, match="query_signature_ids must be unique"):
+        subset_raw_candidate_plan_for_query_ids(raw_plan, ["q0"])
+
+    raw_plan["query_signature_ids"] = ["q0", "q1"]
+    with pytest.raises(ValueError, match="requested query_signature_ids must be unique"):
+        subset_raw_candidate_plan_for_query_ids(raw_plan, ["q0", "q0"])
 
 
 def test_raw_candidate_plan_seed_setup_rejects_duplicate_seed_signature() -> None:
@@ -115,7 +138,7 @@ def _write_ipc_batches(path: Path, table: pa.Table, *, batch_size: int) -> str:
     return str(path)
 
 
-def _assert_raw_candidate_plans_equal(left: dict[str, object], right: dict[str, object]) -> None:
+def _assert_raw_candidate_plans_equal(left: dict[str, Any], right: dict[str, Any]) -> None:
     assert set(left) == set(right)
     for key in sorted(set(left).difference({"telemetry"})):
         left_value = left[key]
@@ -222,7 +245,7 @@ def _base_arrow_paths(tmp_path: Path) -> dict[str, str]:
     }
 
 
-def _assert_retrieval_plan_equal(raw_plan: dict[str, object], direct_plan: dict[str, object]) -> None:
+def _assert_retrieval_plan_equal(raw_plan: dict[str, Any], direct_plan: dict[str, Any]) -> None:
     assert raw_plan["row_component_keys"] == direct_plan["row_component_keys"]
     assert int(raw_plan["row_count"]) == int(direct_plan["row_count"])
     np.testing.assert_array_equal(raw_plan["retrieval_ranks"], direct_plan["retrieval_ranks"])
@@ -242,7 +265,7 @@ def _assert_retrieval_plan_equal(raw_plan: dict[str, object], direct_plan: dict[
     )
 
 
-def _raw_plan_for_base_paths(paths: dict[str, str]) -> dict[str, object]:
+def _raw_plan_for_base_paths(paths: dict[str, str]) -> dict[str, Any]:
     return s2and_rust.raw_block_query_candidate_plan_arrow(
         paths,
         ["q1"],
@@ -255,7 +278,7 @@ def _raw_plan_for_base_paths(paths: dict[str, str]) -> dict[str, object]:
 
 def test_raw_arrow_candidate_plan_matches_existing_rust_retriever(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     raw_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
@@ -322,7 +345,7 @@ def test_raw_arrow_candidate_plan_matches_existing_rust_retriever(tmp_path: Path
 
 def test_raw_arrow_candidate_plan_rejects_hidden_query_view(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     with pytest.raises(ValueError, match="Unknown query view"):
@@ -338,7 +361,7 @@ def test_raw_arrow_candidate_plan_rejects_hidden_query_view(tmp_path: Path) -> N
 
 def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     irrelevant_count = 24
     signature_ids = ["q1", "s1", "s2"] + [f"junk_sig_{index}" for index in range(irrelevant_count)]
     paper_ids = ["p_q", "p1", "p2"] + [f"junk_paper_{index}" for index in range(irrelevant_count)]
@@ -440,12 +463,17 @@ def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(t
     assert telemetry["paper_rows_scanned"] == 3
     assert telemetry["paper_author_rows_scanned"] == 3
     assert telemetry["specter_rows_scanned"] == 3
+    timings = telemetry["timings"]
+    assert isinstance(timings["drop_secs"], float)
+    assert timings["drop_secs"] >= 0.0
+    assert isinstance(timings["wall_secs"], float)
+    assert timings["wall_secs"] >= timings["drop_secs"]
     assert index_metrics["signatures_batch_index"]["record_count"] == len(signature_ids)
 
 
 def test_raw_arrow_candidate_plan_extra_hash_selected_batch_is_exact_filtered(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s1", "s2", "bad"], type=pa.string()),
@@ -506,7 +534,7 @@ def test_raw_arrow_candidate_plan_extra_hash_selected_batch_is_exact_filtered(tm
 
 def test_rust_featurizer_from_arrow_paths_empty_indexed_keep_set_skips_stale_validation(tmp_path: Path) -> None:
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
     for key in ("signatures", "papers", "paper_authors"):
@@ -530,7 +558,7 @@ def test_rust_featurizer_from_arrow_paths_empty_indexed_keep_set_skips_stale_val
 
 def test_raw_arrow_candidate_plan_rejects_stale_batch_index(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
     with Path(paths["signatures"]).open("ab") as outfile:
@@ -545,6 +573,24 @@ def test_raw_arrow_candidate_plan_rejects_stale_batch_index(tmp_path: Path) -> N
             orcid_enabled=False,
             num_threads=1,
         )
+
+
+def test_arrow_batch_lookup_index_reuses_current_format_after_mtime_only_change(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path)
+    indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
+    signatures_path = Path(paths["signatures"])
+    stat = signatures_path.stat()
+    os.utime(signatures_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+    _index_path, metrics = write_arrow_batch_lookup_index(
+        signatures_path,
+        indexed_paths["signatures_batch_index"],
+        key_column="signature_id",
+        table_name="signatures",
+        overwrite=False,
+    )
+
+    assert metrics["reused"] is True
 
 
 def test_arrow_batch_lookup_index_rejects_wrong_key_column_reuse(tmp_path: Path) -> None:
@@ -593,7 +639,7 @@ def test_arrow_batch_lookup_index_rejects_same_size_same_mtime_source_change(tmp
 
 def test_raw_arrow_candidate_plan_rejects_duplicate_signature_ids(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
     duplicate_signatures = pa.table(
         {
@@ -619,7 +665,7 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_signature_ids(tmp_path: Path
 
 def test_raw_arrow_candidate_plan_rejects_duplicate_paper_ids(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
     duplicate_papers = pa.table(
         {
@@ -638,7 +684,7 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_paper_ids(tmp_path: Path) ->
 
 def test_raw_arrow_candidate_plan_rejects_duplicate_paper_author_positions(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
     duplicate_authors = pa.table(
         {
@@ -655,8 +701,18 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_paper_author_positions(tmp_p
 
 def test_raw_arrow_candidate_plan_rejects_invalid_cluster_seed_rows(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
+    idempotent_duplicate_seeds = pa.table(
+        {
+            "signature_id": pa.array(["s1", "s1", "s2"], type=pa.string()),
+            "cluster_id": pa.array(["c_match", "c_match", "c_other"], type=pa.string()),
+        }
+    )
+    _write_ipc(Path(paths["cluster_seeds"]), idempotent_duplicate_seeds)
+    with pytest.raises(ValueError, match="duplicate signature_id"):
+        _raw_plan_for_base_paths(paths)
+
     duplicate_seeds = pa.table(
         {
             "signature_id": pa.array(["s1", "s1", "s2"], type=pa.string()),
@@ -680,7 +736,7 @@ def test_raw_arrow_candidate_plan_rejects_invalid_cluster_seed_rows(tmp_path: Pa
 
 def test_raw_arrow_candidate_plan_rejects_duplicate_specter_paper_ids(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
     specter = pa.table(
         {
@@ -699,7 +755,7 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_specter_paper_ids(tmp_path: 
 
 def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tmp_path: Path) -> None:
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     featurizer = s2and_rust.RustFeaturizer.from_arrow_paths(
@@ -719,7 +775,7 @@ def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tm
 
 def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> None:
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
@@ -772,7 +828,7 @@ def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> 
 
 def test_raw_arrow_candidate_plan_orcid_override_returns_all_matches(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s_good", "s_middle", "s_year", "s_none"], type=pa.string()),
@@ -842,7 +898,7 @@ def test_raw_arrow_candidate_plan_missing_query_position_skips_position_zero_sel
     tmp_path: Path,
 ) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s_self", "s_real"], type=pa.string()),
@@ -904,7 +960,7 @@ def test_raw_arrow_candidate_plan_missing_query_position_skips_position_zero_sel
 
 def test_raw_arrow_candidate_plan_matches_multi_query_auto_views_and_specter(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q_full", "q_initial", "s_full", "s_initial", "s_other"], type=pa.string()),
@@ -1128,7 +1184,7 @@ def test_raw_arrow_candidate_plan_matches_multi_query_auto_views_and_specter(tmp
 
 def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metadata(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s1", "s2"], type=pa.string()),
@@ -1187,10 +1243,22 @@ def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metada
     assert "q1" not in plan["right_signature_ids"]
     assert plan["query_views"] == ["full"]
 
+    narrow_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=1,
+        query_view="auto",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+
+    assert "c_self" in narrow_plan["component_members"]
+    assert narrow_plan["component_members"]["c_other"] == ["s2"]
+
 
 def test_raw_arrow_candidate_plan_rejects_null_paper_author_position(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paper_authors = pa.table(
         {
@@ -1214,7 +1282,7 @@ def test_raw_arrow_candidate_plan_rejects_null_paper_author_position(tmp_path: P
 
 def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     raw_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
@@ -1231,7 +1299,7 @@ def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tm
     )
 
     candidate_batch = retrieval_batch.candidate_batch
-    assert candidate_batch.row_query_signature_indices.tolist() == [7, 7]
+    assert cast(Any, candidate_batch.row_query_signature_indices).tolist() == [7, 7]
     assert candidate_batch.left_signature_indices.tolist() == [7, 7]
     assert candidate_batch.right_signature_indices.tolist() == [11, 13]
     assert candidate_batch.pair_row_indices.tolist() == [0, 1]
@@ -1239,14 +1307,14 @@ def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tm
     assert retrieval_batch.row_signals["query_view"].tolist() == ["full", "full"]
     np.testing.assert_array_equal(
         retrieval_batch.row_signals["retrieval_score"],
-        candidate_batch.retrieval_scores,
+        cast(Any, candidate_batch.retrieval_scores),
     )
     assert "candidate_cluster_max_paper_author_count" in retrieval_batch.row_signals
 
 
 def test_raw_arrow_candidate_plan_rejects_name_counts_arrow_without_index(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["name_counts"] = _write_ipc(
         tmp_path / "name_counts.arrow",
@@ -1290,7 +1358,7 @@ def test_raw_arrow_candidate_plan_rejects_name_counts_index_dir_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["name_counts"] = _write_ipc(
         tmp_path / "name_counts.arrow",
@@ -1320,7 +1388,7 @@ def test_raw_arrow_candidate_plan_emits_native_row_signals_from_name_counts_inde
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
-        pytest.skip("raw_block_query_candidate_plan_arrow is unavailable")
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index", monkeypatch)
 
@@ -1367,7 +1435,7 @@ def test_raw_arrow_candidate_plan_emits_native_row_signals_from_name_counts_inde
 
 def test_rust_featurizer_from_arrow_paths_matches_feature_block(tmp_path: Path) -> None:
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     raw_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
         paths,
@@ -1418,7 +1486,7 @@ def test_rust_featurizer_missing_name_counts_presence_is_consistent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     feature_block = feature_block_from_arrow_paths(paths, raw_candidate_plan=_raw_plan_for_base_paths(paths))
     signature_ids = ["q1", "s1", "s2"]
@@ -1469,7 +1537,7 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     index_paths = _base_arrow_paths(tmp_path / "index")
     index_paths["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index_artifact", monkeypatch)
     arrow_paths = _base_arrow_paths(tmp_path / "arrow")
@@ -1567,7 +1635,7 @@ def test_rust_featurizer_rejects_unsorted_name_counts_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index_artifact", monkeypatch)
     _swap_first_two_name_count_records(paths["name_counts_index"], "first")
@@ -1588,7 +1656,7 @@ def test_rust_featurizer_rejects_unsorted_name_counts_index(
 
 def test_rust_featurizer_from_arrow_paths_uses_arrow_name_pairs(tmp_path: Path) -> None:
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        pytest.skip("RustFeaturizer.from_arrow_paths is unavailable")
+        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s1"], type=pa.string()),

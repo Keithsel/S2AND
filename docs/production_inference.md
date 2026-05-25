@@ -328,28 +328,39 @@ Compatibility rules:
 - In `ANDData(..., mode="inference")`, prediction automatically applies the semantics expected by the loaded model via the stored feature contract.
 - Do not mix model artifacts and feature semantics without retraining.
 
-## Minimal prediction flow
+## Minimal Arrow Prediction Flow
 
 ```python
-from s2and.data import ANDData
+from scripts.eval_prod_models import (
+    read_arrow_s2_blocks,
+    resolve_arrow_dataset_paths,
+    split_blocks_like_anddata,
+)
 from s2and.production_model import load_production_model
 
 clusterer = load_production_model("s2and/data/production_model_v1.21")
 
-dataset = ANDData(
-    signatures="path/to/signatures.json",
-    papers="path/to/papers.json",
-    specter_embeddings="path/to/specter_embeddings.pkl",
-    mode="inference",
-    block_type="s2",
-    n_jobs=8,
-    name="my_dataset",
+arrow_paths = resolve_arrow_dataset_paths(
+    "s2and/data/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260525",
+    "qian",
+    "_specter2.pkl",
 )
+_, _, test_blocks = split_blocks_like_anddata(read_arrow_s2_blocks(arrow_paths["signatures"]), random_seed=42)
 
-pred_clusters, pred_distance_matrices = clusterer.predict(dataset.get_blocks(), dataset)
+pred_clusters, pred_distance_matrices = clusterer.predict_from_arrow_paths(
+    test_blocks,
+    {key: value for key, value in arrow_paths.items() if key != "clusters"},
+    total_ram_bytes=32 * 1024**3,
+    load_name_counts=True,
+    name_tuples="filtered",
+)
 ```
 
 `pred_distance_matrices` may be `None` when using memory-optimized fused clustering paths.
+Use `scripts/tutorial_for_predicting_with_the_prod_model.py --input-format arrow`
+for a runnable CLI example. JSON/`ANDData` prediction remains a compatibility
+path for fixtures, training references, and parity checks; it is not the
+production Rust inference route.
 
 ## Caching
 
@@ -411,13 +422,13 @@ pred_clusters, _ = clusterer.predict(
 )
 ```
 
-When `S2AND_BACKEND` resolves to Rust and complete FeatureBlock Arrow artifacts
-are available, `Clusterer.predict(...)` routes through the direct Arrow/Rust
-featurizer by default. Callers can provide explicit paths by setting
-`dataset.arrow_paths` to at least `signatures`, `papers`, and `paper_authors`
-paths; models that use SPECTER features also require `specter`, and models
-that use name-count features require `name_counts_index`. If no complete Arrow
-artifacts are available, the normal `ANDData` path remains the fallback.
+Production Rust full-block inference should call
+`Clusterer.predict_from_arrow_paths(...)` with at least `signatures`, `papers`,
+and `paper_authors` paths. Models that use SPECTER features also require
+`specter`, and models that use name-count features require `name_counts_index`.
+The generic `Clusterer.predict(...)` compatibility path can still fall back to
+`ANDData` when Arrow artifacts are unavailable, but production scripts should
+not rely on that fallback.
 
 Incremental prediction with explicit RAM budget:
 

@@ -129,9 +129,12 @@ def _single_run(
     profile_output_path: str,
     model_path: str = str(PACKAGE_DATA_ROOT / "production_model_v1.21"),
     data_root: str = str(PACKAGE_DATA_ROOT / "s2and_mini"),
+    arrow_data_root: str = str(PACKAGE_DATA_ROOT / "s2and-release-arrow"),
     specter_file: str = "",
+    specter_suffix: str = "_specter2.pkl",
     rust_warm_featurizer_before_predict: int = 0,
     run_label: str | None = None,
+    input_format: str = "json",
 ) -> dict[str, Any]:
     result = _load_internal_module("prod_inference")._single_run(
         backend=backend,
@@ -140,9 +143,12 @@ def _single_run(
         profile_output_path=profile_output_path,
         model_path=model_path,
         data_root=data_root,
+        arrow_data_root=arrow_data_root,
         specter_file=specter_file,
+        specter_suffix=specter_suffix,
         rust_warm_featurizer_before_predict=rust_warm_featurizer_before_predict,
         run_label=run_label,
+        input_format=input_format,
     )
     # Ensure metadata points to the canonical CLI entrypoint (this file), even if
     # internal modules are invoked directly.
@@ -159,10 +165,13 @@ def _run_single_subprocess(
     profile_output_path: str,
     model_path: str = str(PACKAGE_DATA_ROOT / "production_model_v1.21"),
     data_root: str = str(PACKAGE_DATA_ROOT / "s2and_mini"),
+    arrow_data_root: str = str(PACKAGE_DATA_ROOT / "s2and-release-arrow"),
     specter_file: str = "",
+    specter_suffix: str = "_specter2.pkl",
     rust_warm_featurizer_before_predict: int = 0,
     single_write_json: str = "",
     run_label: str = "",
+    input_format: str = "json",
 ) -> dict[str, Any]:
     script_path_resolved = Path(script_path)
     if script_path_resolved.name == Path(__file__).name:
@@ -185,6 +194,12 @@ def _run_single_subprocess(
             model_path,
             "--data-root",
             data_root,
+            "--arrow-data-root",
+            arrow_data_root,
+            "--input-format",
+            input_format,
+            "--specter-suffix",
+            specter_suffix,
         ]
         if specter_file:
             cmd.extend(["--specter-file", specter_file])
@@ -204,10 +219,13 @@ def _run_single_subprocess(
         profile_output_path=profile_output_path,
         model_path=model_path,
         data_root=data_root,
+        arrow_data_root=arrow_data_root,
         specter_file=specter_file,
+        specter_suffix=specter_suffix,
         rust_warm_featurizer_before_predict=rust_warm_featurizer_before_predict,
         single_write_json=single_write_json,
         run_label=run_label,
+        input_format=input_format,
     )
 
 

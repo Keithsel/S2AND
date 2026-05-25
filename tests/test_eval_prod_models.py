@@ -71,6 +71,33 @@ def test_arrow_eval_defaults_include_full_release_root() -> None:
     )
 
 
+def test_arrow_eval_auto_selects_any_available_supported_bundle() -> None:
+    assert (
+        eval_prod_models._should_use_arrow_eval(
+            force_arrow=False,
+            no_arrow=False,
+            arrow_available=True,
+        )
+        is True
+    )
+    assert (
+        eval_prod_models._should_use_arrow_eval(
+            force_arrow=False,
+            no_arrow=True,
+            arrow_available=True,
+        )
+        is False
+    )
+    assert (
+        eval_prod_models._should_use_arrow_eval(
+            force_arrow=True,
+            no_arrow=True,
+            arrow_available=False,
+        )
+        is True
+    )
+
+
 def test_read_arrow_s2_blocks_reads_columns_without_row_dicts(tmp_path: Path) -> None:
     import pyarrow as pa
 
@@ -172,6 +199,54 @@ def test_resolve_arrow_dataset_paths_includes_name_counts_index_from_manifest(tm
     resolved = eval_prod_models.resolve_arrow_dataset_paths(str(tmp_path / "arrow"), "dummy", "_specter.pickle")
 
     assert resolved["name_counts_index"] == str(name_counts_index)
+
+
+def test_resolve_arrow_dataset_paths_supports_nested_datasets_layout(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "arrow" / "datasets" / "dummy"
+    dataset_root.mkdir(parents=True)
+    name_counts_index = tmp_path / "arrow" / "name_counts_index"
+    name_counts_index.mkdir()
+    for filename in (
+        "signatures.arrow",
+        "papers.arrow",
+        "paper_authors.arrow",
+        "specter.arrow",
+        "dummy_clusters.json",
+    ):
+        (dataset_root / filename).touch()
+    (dataset_root / "manifest.json").write_text(
+        json.dumps({"paths": {"name_counts_index": "../../name_counts_index"}}),
+        encoding="utf-8",
+    )
+
+    resolved = eval_prod_models.resolve_arrow_dataset_paths(str(tmp_path / "arrow"), "dummy", "_specter.pickle")
+
+    assert resolved["signatures"] == str(dataset_root / "signatures.arrow")
+    assert resolved["name_counts_index"] == str(name_counts_index)
+
+
+def test_resolve_arrow_dataset_paths_supports_release_parent_layout(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "arrow" / "s2and_and_big_blocks_linker_dataset_20260525" / "datasets" / "dummy"
+    dataset_root.mkdir(parents=True)
+    name_counts_index = tmp_path / "arrow" / "s2and_and_big_blocks_linker_dataset_20260525" / "name_counts_index"
+    name_counts_index.mkdir()
+    for filename in (
+        "signatures.arrow",
+        "papers.arrow",
+        "paper_authors.arrow",
+        "specter2.arrow",
+        "dummy_clusters.json",
+    ):
+        (dataset_root / filename).touch()
+    (dataset_root / "manifest.json").write_text(
+        json.dumps({"paths": {"name_counts_index": "../../name_counts_index"}}),
+        encoding="utf-8",
+    )
+
+    resolved = eval_prod_models.resolve_arrow_dataset_paths(str(tmp_path / "arrow"), "dummy", "_specter2.pkl")
+
+    assert resolved["signatures"] == str(dataset_root / "signatures.arrow")
+    assert resolved["name_counts_index"] == str(name_counts_index.resolve())
 
 
 def test_resolve_arrow_dataset_paths_requires_eval_name_counts_index(tmp_path: Path) -> None:

@@ -246,15 +246,34 @@ production inference.
   - Missing Arrow artifacts should fail with an explicit error in production
     mode rather than silently falling back to `ANDData`.
 - Update script entrypoints.
-  - Convert `scripts/tutorial_for_predicting_with_the_prod_model.py` to accept
-    Arrow input paths or an Arrow bundle root and route through
-    `Clusterer.predict_from_arrow_paths(...)`.
-  - Keep `scripts/eval_prod_models.py --use-arrow` enabled for mini fixtures
-    and released full benchmark Arrow bundles. Do not claim support for
-    `inventors_s2and` until that bundle exists.
-  - Convert `scripts/_rust_suite/prod_inference_cmd.py` to benchmark Arrow as
-    the production path; keep `from_dataset` only as an explicit legacy/parity
-    mode if still needed.
+  - Status 2026-05-25: `scripts/tutorial_for_predicting_with_the_prod_model.py`
+    accepts an Arrow bundle root and routes Arrow input through
+    `Clusterer.predict_from_arrow_paths(...)`; JSON/`ANDData` remains an
+    explicit compatibility route.
+  - Status 2026-05-25: `scripts/_rust_suite/prod_inference_cmd.py` benchmarks
+    Arrow `predict_from_arrow_paths(...)` by default; Python and
+    `from_dataset` baselines are opt-in legacy comparisons.
+  - Status 2026-05-25: `scripts/eval_prod_models.py` uses Arrow automatically
+    for supported non-training evals when complete Arrow artifacts exist,
+    including released full benchmark bundles. `--no-arrow` and `--train`
+    preserve the raw/reference routes.
+  - Status 2026-05-25: `scripts/_rust_suite/featurizer_reuse_cmd.py` runs
+    repeated Arrow production-model evaluation by default; JSON/`ANDData`
+    reuse checks remain under `--input-format json`.
+  - Status 2026-05-25: `scripts/_rust_suite/stress_rebuild_cmd.py` defaults
+    to `RustFeaturizer.from_arrow_paths`; `from_json_paths` and
+    `from_dataset` remain explicit legacy stress targets.
+  - Status 2026-05-25: `scripts/_rust_suite/largest_block_cmd.py` has an
+    explicit Rust/Arrow single-run route for `predict_from_arrow_paths(...)`.
+    Compare mode and constraint parity remain JSON/`ANDData` reference
+    workflows because they compare against the Python object path.
+  - Status 2026-05-25: `scripts/_rust_suite/compare_cmd.py` remains
+    Python-vs-Rust `many_pairs_featurize(...)` parity, and
+    `scripts/_rust_suite/big_block_incremental_cmd.py` remains JSON/`ANDData`
+    until its subset/truth-bundle contract is redesigned for Arrow artifacts.
+  - Convert remaining production/profiling scripts where the Arrow route is a
+    direct replacement, and relabel scripts whose purpose is raw/reference
+    parity.
   - Retire or relabel non-Arrow production-inference claims in rust-suite docs.
 - Make artifact conversion mandatory before production inference.
   - Keep `scripts/convert_to_arrow.py service-json` as the supported bridge

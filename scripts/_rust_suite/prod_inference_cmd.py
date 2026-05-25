@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = _SCRIPTS_DIR.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -24,6 +27,7 @@ from _rust_suite.common import (  # type: ignore  # noqa: E402
 
 RESULT_JSON_START, RESULT_JSON_END = get_result_markers("profile")
 DEFAULT_DATA_ROOT = os.path.join("s2and", "data", "s2and_mini")
+DEFAULT_ARROW_DATA_ROOT = os.path.join("s2and", "data", "s2and-release-arrow")
 DEFAULT_MODEL_PATH = os.path.join("s2and", "data", "production_model_v1.21")
 
 
@@ -103,11 +107,29 @@ def _single_run(
     profile_output_path: str,
     model_path: str = DEFAULT_MODEL_PATH,
     data_root: str = DEFAULT_DATA_ROOT,
+    arrow_data_root: str = DEFAULT_ARROW_DATA_ROOT,
     specter_file: str = "",
+    specter_suffix: str = "_specter2.pkl",
     rust_warm_featurizer_before_predict: int = 0,
     run_label: str | None = None,
     require_rust_release: bool = False,
+    input_format: str = "json",
 ) -> dict[str, Any]:
+    if input_format == "arrow":
+        if backend != "rust":
+            raise ValueError("--input-format arrow requires --backend rust")
+        return _single_arrow_run(
+            dataset_name=dataset_name,
+            n_jobs=n_jobs,
+            profile_output_path=profile_output_path,
+            model_path=model_path,
+            arrow_data_root=arrow_data_root,
+            specter_suffix=specter_suffix,
+            run_label=run_label,
+            require_rust_release=require_rust_release,
+        )
+    if input_format != "json":
+        raise ValueError(f"Unsupported input_format: {input_format}")
     if backend not in {"python", "rust"}:
         raise ValueError(f"Unsupported backend: {backend}")
 
@@ -189,6 +211,7 @@ def _single_run(
     return {
         "backend": backend,
         "backend_label": run_label or backend,
+        "input_format": "json",
         "dataset": dataset_name,
         "n_jobs": n_jobs,
         "model_path": resolved_model_path,
@@ -205,6 +228,87 @@ def _single_run(
         "cluster_macro": [round(v, 3) for v in cluster_macro],
         "profile_output_path": profile_output_path,
         "raw_cluster_metrics": cluster_metrics,
+        "rust_extension_identity": rust_extension_identity,
+        "run_metadata": build_run_metadata(script_path=Path(__file__).resolve()),
+    }
+
+
+def _single_arrow_run(
+    *,
+    dataset_name: str,
+    n_jobs: int,
+    profile_output_path: str,
+    model_path: str,
+    arrow_data_root: str,
+    specter_suffix: str,
+    run_label: str | None,
+    require_rust_release: bool,
+) -> dict[str, Any]:
+    os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
+    os.environ["S2AND_BACKEND"] = "rust"
+    rust_extension_identity = collect_rust_extension_identity(
+        require_release=bool(require_rust_release),
+        fail_if_unavailable=False,
+    )
+
+    from eval_prod_models import cluster_eval_arrow, resolve_arrow_dataset_paths
+
+    from s2and.consts import PROJECT_ROOT_PATH
+    from s2and.production_model import load_production_model
+    from s2and.text import set_fasttext_loading_enabled
+
+    set_fasttext_loading_enabled(False)
+
+    resolved_model_path = _resolve_path(PROJECT_ROOT_PATH, model_path)
+    resolved_arrow_root = _resolve_path(PROJECT_ROOT_PATH, arrow_data_root)
+    clusterer = load_production_model(resolved_model_path)
+    clusterer.use_cache = False
+    clusterer.n_jobs = n_jobs
+    arrow_paths = resolve_arrow_dataset_paths(resolved_arrow_root, dataset_name, specter_suffix)
+
+    total_start = time.perf_counter()
+    with RSSMonitor(interval_seconds=0.05) as monitor:
+        profiler = cProfile.Profile()
+        prediction_start = time.perf_counter()
+        profiler.enable()
+        cluster_metrics, _ = cluster_eval_arrow(
+            arrow_paths,
+            clusterer,
+            random_seed=42,
+            n_jobs=n_jobs,
+            split="test",
+            total_ram_bytes=1_000_000_000_000,
+        )
+        profiler.disable()
+        prediction_seconds = time.perf_counter() - prediction_start
+    total_seconds = time.perf_counter() - total_start
+
+    _write_profile_output(profiler, profile_output_path, prediction_seconds)
+
+    b3 = _as_triplet(cluster_metrics, "B3 (P, R, F1)")
+    cluster = _as_triplet(cluster_metrics, "Cluster (P, R F1)")
+    cluster_macro = _as_triplet(cluster_metrics, "Cluster Macro (P, R, F1)")
+    return {
+        "backend": "rust",
+        "backend_label": run_label or "rust_arrow",
+        "input_format": "arrow",
+        "dataset": dataset_name,
+        "n_jobs": n_jobs,
+        "model_path": resolved_model_path,
+        "arrow_data_root": resolved_arrow_root,
+        "specter_suffix": specter_suffix,
+        "rust_warm_featurizer_before_predict": 0,
+        "rust_warm_featurizer_seconds": 0.0,
+        "total_latency_seconds": round(total_seconds, 3),
+        "anddata_build_seconds": 0.0,
+        "prediction_seconds": round(prediction_seconds, 3),
+        "peak_rss_gb": round(monitor.peak_gb, 3),
+        "b3": [round(v, 3) for v in b3],
+        "cluster": [round(v, 3) for v in cluster],
+        "cluster_macro": [round(v, 3) for v in cluster_macro],
+        "profile_output_path": profile_output_path,
+        "raw_cluster_metrics": cluster_metrics,
+        "arrow_predict_telemetry": dict(getattr(clusterer, "_last_arrow_predict_telemetry", {}) or {}),
         "rust_extension_identity": rust_extension_identity,
         "run_metadata": build_run_metadata(script_path=Path(__file__).resolve()),
     }
@@ -234,11 +338,14 @@ def _run_single_subprocess(
     profile_output_path: str,
     model_path: str = DEFAULT_MODEL_PATH,
     data_root: str = DEFAULT_DATA_ROOT,
+    arrow_data_root: str = DEFAULT_ARROW_DATA_ROOT,
     specter_file: str = "",
+    specter_suffix: str = "_specter2.pkl",
     rust_warm_featurizer_before_predict: int = 0,
     single_write_json: str = "",
     run_label: str = "",
     require_rust_release: int = 0,
+    input_format: str = "json",
 ) -> dict[str, Any]:
     cmd = [
         sys.executable,
@@ -257,6 +364,12 @@ def _run_single_subprocess(
         model_path,
         "--data-root",
         data_root,
+        "--arrow-data-root",
+        arrow_data_root,
+        "--input-format",
+        input_format,
+        "--specter-suffix",
+        specter_suffix,
         "--require-rust-release",
         str(int(require_rust_release)),
     ]
@@ -279,45 +392,72 @@ def _compare_runs(args: argparse.Namespace) -> None:
     scratch_dir.mkdir(parents=True, exist_ok=True)
 
     script_path = Path(__file__).resolve()
+    arrow_profile_path = str(scratch_dir / "profile_kisti_rust_arrow.txt")
     python_profile_path = str(scratch_dir / "profile_kisti_python_path.txt")
     rust_dataset_profile_path = str(scratch_dir / "profile_kisti_rust_from_dataset.txt")
 
-    print("Running pure Python path...")
-    python_result = _run_single_subprocess(
-        script_path=script_path,
-        backend="python",
-        dataset_name=args.dataset_name,
-        n_jobs=args.n_jobs,
-        profile_output_path=python_profile_path,
-        model_path=args.model_path,
-        data_root=args.data_root,
-        specter_file=args.specter_file,
-        run_label="python",
-        require_rust_release=args.require_rust_release,
-    )
-
-    print("Running Rust path (from_dataset)...")
-    rust_dataset_result = _run_single_subprocess(
+    print("Running Rust path (Arrow predict_from_arrow_paths)...")
+    arrow_result = _run_single_subprocess(
         script_path=script_path,
         backend="rust",
         dataset_name=args.dataset_name,
         n_jobs=args.n_jobs,
-        profile_output_path=rust_dataset_profile_path,
+        profile_output_path=arrow_profile_path,
         model_path=args.model_path,
         data_root=args.data_root,
+        arrow_data_root=args.arrow_data_root,
         specter_file=args.specter_file,
-        rust_warm_featurizer_before_predict=args.rust_warm_featurizer_before_predict,
-        run_label="rust_from_dataset",
+        specter_suffix=args.specter_suffix,
+        input_format="arrow",
+        run_label="rust_arrow",
         require_rust_release=args.require_rust_release,
     )
 
-    results = [python_result, rust_dataset_result]
+    results = [arrow_result]
+
+    if args.include_python_baseline:
+        print("Running legacy pure Python path...")
+        python_result = _run_single_subprocess(
+            script_path=script_path,
+            backend="python",
+            dataset_name=args.dataset_name,
+            n_jobs=args.n_jobs,
+            profile_output_path=python_profile_path,
+            model_path=args.model_path,
+            data_root=args.data_root,
+            specter_file=args.specter_file,
+            input_format="json",
+            run_label="python_json",
+            require_rust_release=args.require_rust_release,
+        )
+        results.append(python_result)
+
+    if args.include_rust_from_dataset:
+        print("Running legacy Rust path (from_dataset)...")
+        rust_dataset_result = _run_single_subprocess(
+            script_path=script_path,
+            backend="rust",
+            dataset_name=args.dataset_name,
+            n_jobs=args.n_jobs,
+            profile_output_path=rust_dataset_profile_path,
+            model_path=args.model_path,
+            data_root=args.data_root,
+            specter_file=args.specter_file,
+            input_format="json",
+            rust_warm_featurizer_before_predict=args.rust_warm_featurizer_before_predict,
+            run_label="rust_from_dataset_json",
+            require_rust_release=args.require_rust_release,
+        )
+        results.append(rust_dataset_result)
 
     print("")
     print(_render_markdown_table(results))
     print("")
-    print(f"Python profile output: {python_profile_path}")
-    print(f"Rust profile output (from_dataset): {rust_dataset_profile_path}")
+    print(f"Rust profile output (Arrow): {arrow_profile_path}")
+    if args.include_python_baseline:
+        print(f"Python profile output: {python_profile_path}")
+    if args.include_rust_from_dataset:
+        print(f"Rust profile output (from_dataset): {rust_dataset_profile_path}")
 
     if args.write_json:
         summary_path = Path(args.write_json)
@@ -327,7 +467,9 @@ def _compare_runs(args: argparse.Namespace) -> None:
             "n_jobs": args.n_jobs,
             "model_path": args.model_path,
             "data_root": args.data_root,
+            "arrow_data_root": args.arrow_data_root,
             "specter_file": args.specter_file or f"{args.dataset_name}_specter.pickle",
+            "specter_suffix": args.specter_suffix,
             "rust_warm_featurizer_before_predict": args.rust_warm_featurizer_before_predict,
             "results": results,
             "run_metadata": build_run_metadata(script_path=Path(__file__).resolve()),
@@ -338,9 +480,10 @@ def _compare_runs(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare prod-style evaluation on pure Python path vs Rust path.")
+    parser = argparse.ArgumentParser(description="Profile prod-style evaluation through Arrow by default.")
     parser.add_argument("--mode", choices=["compare", "single"], default="compare")
-    parser.add_argument("--backend", choices=["python", "rust"], default="python")
+    parser.add_argument("--backend", choices=["python", "rust"], default="rust")
+    parser.add_argument("--input-format", choices=["arrow", "json"], default="arrow")
     parser.add_argument("--dataset-name", default="kisti")
     parser.add_argument("--n-jobs", type=int, default=4)
     parser.add_argument(
@@ -354,9 +497,20 @@ def main() -> None:
         help="Dataset root directory containing per-dataset subfolders (relative to project root or absolute).",
     )
     parser.add_argument(
+        "--arrow-data-root",
+        default=DEFAULT_ARROW_DATA_ROOT,
+        help="Arrow release root containing per-dataset manifests (relative to project root or absolute).",
+    )
+    parser.add_argument(
         "--specter-file",
         default="",
         help="Optional embedding filename under dataset folder. Defaults to <dataset>_specter.pickle.",
+    )
+    parser.add_argument(
+        "--specter-suffix",
+        choices=["_specter.pickle", "_specter2.pkl"],
+        default="_specter2.pkl",
+        help="Embedding/model suffix used to select the Arrow embedding file.",
     )
     parser.add_argument(
         "--rust-warm-featurizer-before-predict",
@@ -392,6 +546,16 @@ def main() -> None:
         default=0,
         help="Fail rust runs when extension build reports debug_assertions.",
     )
+    parser.add_argument(
+        "--include-python-baseline",
+        action="store_true",
+        help="In compare mode, also run the legacy JSON/ANDData Python path.",
+    )
+    parser.add_argument(
+        "--include-rust-from-dataset",
+        action="store_true",
+        help="In compare mode, also run the legacy JSON/ANDData Rust from_dataset path.",
+    )
     args = parser.parse_args()
 
     if args.mode == "single":
@@ -404,10 +568,13 @@ def main() -> None:
             profile_output_path=args.profile_output_path,
             model_path=args.model_path,
             data_root=args.data_root,
+            arrow_data_root=args.arrow_data_root,
             specter_file=args.specter_file,
+            specter_suffix=args.specter_suffix,
             rust_warm_featurizer_before_predict=args.rust_warm_featurizer_before_predict,
             run_label=args.run_label or None,
             require_rust_release=bool(args.require_rust_release),
+            input_format=args.input_format,
         )
         if args.single_write_json:
             output_path = Path(args.single_write_json)

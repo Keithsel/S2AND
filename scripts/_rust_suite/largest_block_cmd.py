@@ -52,6 +52,9 @@ from pathlib import Path
 from typing import Any
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = _SCRIPTS_DIR.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -73,6 +76,9 @@ from _rust_suite.common import (  # type: ignore  # noqa: E402
 RESULT_JSON_START, RESULT_JSON_END = get_result_markers("largest_block")
 DATA_DIR = PROJECT_ROOT / "s2and" / "data"
 DEFAULT_MODEL_PATH = str(DATA_DIR / "production_model_v1.21")
+DEFAULT_ARROW_DATA_ROOT = str(DATA_DIR / "s2and-release-arrow")
+DEFAULT_SPECTER_SUFFIX = "_specter2.pkl"
+DEFAULT_ARROW_TOTAL_RAM_BYTES = 1_000_000_000_000
 
 # All known dataset directories under s2and/data/.
 DATASET_CANDIDATES = [
@@ -236,6 +242,35 @@ def _write_profile_output(profiler: cProfile.Profile, output_path: str, elapsed_
         f.write(f"\nTotal runtime (predict only): {elapsed_seconds:.3f}s\n")
 
 
+def _quality_metrics_for_block(
+    block_sigs: list[str],
+    pred_clusters: dict[str, list[str]],
+    signature_to_true_cluster_id: dict[str, str],
+) -> dict[str, Any]:
+    missing = [sig for sig in block_sigs if sig not in signature_to_true_cluster_id]
+    if missing:
+        raise RuntimeError(
+            f"Quality check failed: {len(missing)}/{len(block_sigs)} signatures missing from clusters.json"
+        )
+
+    true_clusters: dict[str, list[str]] = {}
+    for signature_id in block_sigs:
+        true_cluster_id = signature_to_true_cluster_id[signature_id]
+        true_clusters.setdefault(true_cluster_id, []).append(signature_id)
+    true_cluster_sizes = sorted([len(sigs) for sigs in true_clusters.values()], reverse=True)
+
+    from s2and.eval import b3_precision_recall_fscore
+
+    b3_p, b3_r, b3_f1, _, _, _ = b3_precision_recall_fscore(true_clusters, pred_clusters)
+    pw_p, pw_r, pw_f1 = _pairwise_precision_recall_fscore_with_singleton_fix(true_clusters, pred_clusters)
+    return {
+        "b3": {"precision": float(b3_p), "recall": float(b3_r), "f1": float(b3_f1)},
+        "pairwise": {"precision": pw_p, "recall": pw_r, "f1": pw_f1},
+        "true_num_clusters": int(len(true_clusters)),
+        "true_cluster_sizes_top10": [int(x) for x in true_cluster_sizes[:10]],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Single-run logic
 # ---------------------------------------------------------------------------
@@ -256,8 +291,31 @@ def _run_single(
     constraint_sample_seed: int = 42,
     emit_signature_map: bool = False,
     require_rust_release: bool = False,
+    input_format: str = "json",
+    arrow_data_root: str = DEFAULT_ARROW_DATA_ROOT,
+    specter_suffix: str = DEFAULT_SPECTER_SUFFIX,
 ) -> dict[str, Any]:
     """Run prediction on a single block and return metrics."""
+
+    if input_format == "arrow":
+        return _run_single_arrow(
+            backend=backend,
+            dataset_name=dataset_name,
+            block_key=block_key,
+            n_jobs=n_jobs,
+            profile_output_path=profile_output_path,
+            model_path=model_path,
+            arrow_data_root=arrow_data_root,
+            specter_suffix=specter_suffix,
+            max_block_size=max_block_size,
+            run_label=run_label,
+            quality_check=quality_check,
+            constraint_sample=constraint_sample,
+            emit_signature_map=emit_signature_map,
+            require_rust_release=require_rust_release,
+        )
+    if input_format != "json":
+        raise ValueError(f"Unsupported input_format: {input_format}")
 
     os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
     os.environ["S2AND_BACKEND"] = backend
@@ -402,27 +460,7 @@ def _run_single(
                         signature_to_true_cluster_id[signature_id] = str(cluster_id)
                 if len(signature_to_true_cluster_id) == len(block_sig_set):
                     break
-        missing = [sig for sig in block_sigs if sig not in signature_to_true_cluster_id]
-        if missing:
-            raise RuntimeError(
-                f"Quality check failed: {len(missing)}/{len(block_sigs)} signatures missing from clusters.json"
-            )
-
-        true_clusters: dict[str, list[str]] = {}
-        for signature_id, true_cluster_id in signature_to_true_cluster_id.items():
-            true_clusters.setdefault(true_cluster_id, []).append(signature_id)
-        true_cluster_sizes = sorted([len(sigs) for sigs in true_clusters.values()], reverse=True)
-
-        from s2and.eval import b3_precision_recall_fscore
-
-        b3_p, b3_r, b3_f1, _, _, _ = b3_precision_recall_fscore(true_clusters, pred_clusters)
-        pw_p, pw_r, pw_f1 = _pairwise_precision_recall_fscore_with_singleton_fix(true_clusters, pred_clusters)
-        quality_metrics = {
-            "b3": {"precision": float(b3_p), "recall": float(b3_r), "f1": float(b3_f1)},
-            "pairwise": {"precision": pw_p, "recall": pw_r, "f1": pw_f1},
-            "true_num_clusters": int(len(true_clusters)),
-            "true_cluster_sizes_top10": [int(x) for x in true_cluster_sizes[:10]],
-        }
+        quality_metrics = _quality_metrics_for_block(block_sigs, pred_clusters, signature_to_true_cluster_id)
 
     constraint_parity: dict[str, Any] | None = None
     if constraint_sample > 0:
@@ -523,6 +561,7 @@ def _run_single(
     result = {
         "backend": backend,
         "backend_label": run_label or backend,
+        "input_format": "json",
         "dataset": dataset_name,
         "block_key": block_key,
         "original_block_size": original_block_size,
@@ -551,6 +590,149 @@ def _run_single(
     return result
 
 
+def _run_single_arrow(
+    *,
+    backend: str,
+    dataset_name: str,
+    block_key: str,
+    n_jobs: int,
+    profile_output_path: str,
+    model_path: str,
+    arrow_data_root: str,
+    specter_suffix: str,
+    max_block_size: int,
+    run_label: str,
+    quality_check: bool,
+    constraint_sample: int,
+    emit_signature_map: bool,
+    require_rust_release: bool,
+) -> dict[str, Any]:
+    if backend != "rust":
+        raise ValueError("--input-format arrow requires --backend rust")
+    if constraint_sample > 0:
+        raise ValueError("--constraint-sample requires JSON/ANDData input")
+
+    os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
+    os.environ["S2AND_BACKEND"] = "rust"
+
+    import s2and.model as model_module
+    from s2and.production_model import load_production_model
+    from s2and.text import set_fasttext_loading_enabled
+    from scripts.eval_prod_models import (
+        read_arrow_s2_blocks,
+        read_signature_to_cluster_id,
+        resolve_arrow_dataset_paths,
+    )
+
+    set_fasttext_loading_enabled(False)
+
+    resolved_model_path = _resolve_path(model_path)
+    resolved_arrow_root = _resolve_path(arrow_data_root)
+    arrow_paths = resolve_arrow_dataset_paths(resolved_arrow_root, dataset_name, specter_suffix)
+
+    clusterer = load_production_model(resolved_model_path)
+    model_module._ensure_lightgbm_fitted(clusterer.classifier)
+    model_module._ensure_lightgbm_fitted(clusterer.nameless_classifier)
+    clusterer.use_cache = False
+    clusterer.n_jobs = n_jobs
+
+    rust_extension_identity = collect_rust_extension_identity(
+        require_release=bool(require_rust_release),
+        fail_if_unavailable=False,
+    )
+
+    total_start = time.perf_counter()
+    with ProcessTreeRSSMonitor(interval_seconds=0.05) as monitor:
+        block_load_start = time.perf_counter()
+        all_blocks = read_arrow_s2_blocks(arrow_paths["signatures"])
+        if block_key not in all_blocks:
+            raise ValueError(
+                f"Block {block_key!r} not found in {dataset_name}. "
+                f"Available blocks ({len(all_blocks)}): {sorted(all_blocks.keys())[:10]}..."
+            )
+
+        block_sigs = all_blocks[block_key]
+        original_block_size = len(block_sigs)
+        if max_block_size > 0 and len(block_sigs) > max_block_size:
+            block_sigs = sorted(block_sigs)[:max_block_size]
+            print(f"[{backend}] Trimmed block from {original_block_size} to {max_block_size} signatures")
+        arrow_block_load_seconds = time.perf_counter() - block_load_start
+
+        block_size = len(block_sigs)
+        num_pairs = block_size * (block_size - 1) // 2
+        single_block_dict = {block_key: block_sigs}
+        predict_arrow_paths = {key: value for key, value in arrow_paths.items() if key != "clusters"}
+
+        print(
+            f"[{backend}] Running Arrow predict_from_arrow_paths on block {block_key!r} "
+            f"({block_size} sigs, {num_pairs:,} pairs)..."
+        )
+        profiler = cProfile.Profile()
+        predict_start = time.perf_counter()
+        profiler.enable()
+        pred_clusters, _ = clusterer.predict_from_arrow_paths(
+            single_block_dict,
+            predict_arrow_paths,
+            total_ram_bytes=DEFAULT_ARROW_TOTAL_RAM_BYTES,
+            load_name_counts=True,
+            name_tuples="filtered",
+        )
+        profiler.disable()
+        predict_seconds = time.perf_counter() - predict_start
+
+    total_seconds = time.perf_counter() - total_start
+    _write_profile_output(profiler, profile_output_path, predict_seconds)
+
+    cluster_sizes = sorted([len(sigs) for sigs in pred_clusters.values()], reverse=True)
+    cluster_membership_digest = _cluster_membership_digest(pred_clusters)
+    signature_to_cluster_fingerprint = (
+        _signature_to_cluster_fingerprint_map(pred_clusters) if emit_signature_map else None
+    )
+
+    quality_metrics: dict[str, Any] | None = None
+    if quality_check:
+        signature_to_cluster_id = read_signature_to_cluster_id(arrow_paths["clusters"])
+        quality_metrics = _quality_metrics_for_block(
+            block_sigs,
+            pred_clusters,
+            {signature_id: str(cluster_id) for signature_id, cluster_id in signature_to_cluster_id.items()},
+        )
+
+    return {
+        "backend": backend,
+        "backend_label": run_label or "rust_arrow",
+        "input_format": "arrow",
+        "dataset": dataset_name,
+        "block_key": block_key,
+        "original_block_size": original_block_size,
+        "effective_block_size": block_size,
+        "num_pairs": num_pairs,
+        "max_block_size_limit": max_block_size,
+        "n_jobs": n_jobs,
+        "model_path": resolved_model_path,
+        "data_root": None,
+        "arrow_data_root": resolved_arrow_root,
+        "specter_suffix": specter_suffix,
+        "anddata_build_seconds": 0.0,
+        "arrow_block_load_seconds": round(arrow_block_load_seconds, 3),
+        "warm_rust_featurizer_seconds": 0.0,
+        "predict_seconds": round(predict_seconds, 3),
+        "total_seconds": round(total_seconds, 3),
+        "peak_rss_gb": round(monitor.peak_gb, 3),
+        "num_clusters": len(pred_clusters),
+        "assigned_signatures": sum(cluster_sizes),
+        "cluster_sizes_top10": cluster_sizes[:10],
+        "cluster_membership_digest": cluster_membership_digest,
+        "signature_to_cluster_fingerprint": signature_to_cluster_fingerprint,
+        "quality_metrics": quality_metrics,
+        "constraint_parity": None,
+        "profile_output_path": profile_output_path,
+        "arrow_predict_telemetry": dict(getattr(clusterer, "_last_arrow_predict_telemetry", {}) or {}),
+        "rust_extension_identity": rust_extension_identity,
+        "run_metadata": build_run_metadata(script_path=Path(__file__).resolve()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Compare mode: runs Python and Rust in subprocesses
 # ---------------------------------------------------------------------------
@@ -572,6 +754,9 @@ def _run_single_subprocess(
     constraint_sample_seed: int,
     emit_signature_map: bool,
     require_rust_release: bool,
+    input_format: str = "json",
+    arrow_data_root: str = DEFAULT_ARROW_DATA_ROOT,
+    specter_suffix: str = DEFAULT_SPECTER_SUFFIX,
 ) -> dict[str, Any]:
     """Run a single backend in a subprocess (isolation for RSS measurement)."""
     rust_suite_path = PROJECT_ROOT / "scripts" / "rust_suite.py"
@@ -595,6 +780,12 @@ def _run_single_subprocess(
         model_path,
         "--data-root",
         data_root,
+        "--input-format",
+        input_format,
+        "--arrow-data-root",
+        arrow_data_root,
+        "--specter-suffix",
+        specter_suffix,
         "--require-rust-release",
         str(int(require_rust_release)),
         "--run-label",
@@ -677,6 +868,8 @@ def _compare_runs(args: argparse.Namespace) -> None:
     timeout_seconds = args.timeout_hours * 3600
     resolved_model_path = _resolve_path(args.model_path)
     resolved_data_root = _resolve_path(args.data_root)
+    if args.input_format != "json":
+        raise ValueError("--mode compare requires --input-format json")
 
     # Auto-detect largest block if not specified
     if not dataset_name or not block_key:
@@ -705,6 +898,7 @@ def _compare_runs(args: argparse.Namespace) -> None:
         constraint_sample_seed=int(args.constraint_sample_seed),
         emit_signature_map=True,
         require_rust_release=bool(args.require_rust_release),
+        input_format="json",
     )
 
     # Run Rust
@@ -724,6 +918,7 @@ def _compare_runs(args: argparse.Namespace) -> None:
         constraint_sample_seed=int(args.constraint_sample_seed),
         emit_signature_map=True,
         require_rust_release=bool(args.require_rust_release),
+        input_format="json",
     )
 
     cluster_equivalent = (
@@ -970,6 +1165,23 @@ def main() -> None:
         help="Dataset root directory containing per-dataset files.",
     )
     parser.add_argument(
+        "--input-format",
+        choices=["json", "arrow"],
+        default="json",
+        help="Input route for --mode single. Compare mode requires json.",
+    )
+    parser.add_argument(
+        "--arrow-data-root",
+        default=DEFAULT_ARROW_DATA_ROOT,
+        help="Arrow release root containing per-dataset manifests.",
+    )
+    parser.add_argument(
+        "--specter-suffix",
+        choices=["_specter.pickle", "_specter2.pkl"],
+        default=DEFAULT_SPECTER_SUFFIX,
+        help="Embedding/model suffix used to select the Arrow embedding file.",
+    )
+    parser.add_argument(
         "--profile-output-path",
         default="",
         help="cProfile output path (required for --mode=single).",
@@ -1053,6 +1265,9 @@ def main() -> None:
             constraint_sample_seed=int(args.constraint_sample_seed),
             emit_signature_map=bool(args.emit_signature_map),
             require_rust_release=bool(args.require_rust_release),
+            input_format=args.input_format,
+            arrow_data_root=args.arrow_data_root,
+            specter_suffix=args.specter_suffix,
         )
 
         print(f"\n[{args.backend}] Done in {result['total_seconds']:.1f}s")

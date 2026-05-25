@@ -72,7 +72,10 @@ uv run --with psutil python scripts/rust_suite.py transfer-mini \
 **3. Stress rebuild (6x)**
 ```
 uv run --with psutil python scripts/rust_suite.py stress-rebuild \
-  --dataset aminer --build-path from_json_paths \
+  --dataset aminer --build-path from_arrow_paths \
   --repeats 6 --num-threads 1 --rss-sample-ms 50 --require-rust-release 1 \
-  --write-json scratch/baselines_YYYYMMDD/stress_rust_from_json_paths_aminer_6x_YYYYMMDD.json
+  --write-json scratch/baselines_YYYYMMDD/stress_rust_from_arrow_paths_aminer_6x_YYYYMMDD.json
 ```
+
+Use `--build-path from_json_paths` or `--build-path from_dataset` only for
+explicit compatibility/lifecycle comparisons against the legacy ingest paths.

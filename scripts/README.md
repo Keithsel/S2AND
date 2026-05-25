@@ -8,11 +8,11 @@
 |---|---|---|
 | `rust_suite.py compare` | Featurize random pairs on one dataset, compare Python vs Rust outputs | Feature parity report, runtime speedup, RSS reduction |
 | `rust_suite.py transfer-mini` | Smoke-scale KISTI transfer run by default; pass the full preset for the historical 3-dataset reduced-scale run | Per-stage timing, peak RSS, clustering quality (python vs rust) |
-| `rust_suite.py prod-inference` | Run inference with pre-trained prod model + cProfile | Function-level hotspots, latency, RSS, clustering metrics |
-| `rust_suite.py featurizer-reuse` | Repeated KISTI predictions, same-object vs re-instantiated | Featurizer cache hit rate, per-iteration timing, RSS |
-| `rust_suite.py largest-block` | Profile Python vs Rust on one large block | Partition diff (digest + per-signature), latency, RSS; optional `--quality-check` + `--constraint-sample` |
-| `rust_suite.py big-block-incremental` | Measure promoted Rust `predict_incremental` on giant-block subsets; optional legacy-Python comparison treats partition differences as descriptive, not a release gate | Hot-path/runtime/RSS, broad-pair scope vs promoted scored pairs, residual-tail pairs/bytes, link/abstain and memory telemetry |
-| `rust_suite.py stress-rebuild` | Repeat Rust featurizer construction (`from_json_paths` / `from_dataset`) to stress lifecycle stability | Per-iteration elapsed + RSS peaks, RSS growth fraction, failure payloads |
+| `rust_suite.py prod-inference` | Run Arrow `predict_from_arrow_paths` inference with the pre-trained prod model + cProfile; legacy JSON/ANDData baselines are opt-in | Function-level hotspots, latency, RSS, clustering metrics |
+| `rust_suite.py featurizer-reuse` | Repeated production-model predictions through Arrow by default; `--input-format json` keeps the legacy same-object vs re-instantiated `ANDData` cache check | Per-iteration timing, RSS, Arrow telemetry or legacy featurizer cache counts |
+| `rust_suite.py largest-block` | Profile one large block; `--mode single --backend rust --input-format arrow` uses Arrow `predict_from_arrow_paths`, while compare/constraint parity remain JSON reference workflows | Partition diff (digest + per-signature), latency, RSS; optional `--quality-check` + JSON-only `--constraint-sample` |
+| `rust_suite.py big-block-incremental` | Measure promoted Rust `predict_incremental` on JSON/ANDData giant-block subsets; optional legacy-Python comparison treats partition differences as descriptive, not a release gate | Hot-path/runtime/RSS, broad-pair scope vs promoted scored pairs, residual-tail pairs/bytes, link/abstain and memory telemetry |
+| `rust_suite.py stress-rebuild` | Repeat Rust featurizer construction (`from_arrow_paths` by default; legacy `from_json_paths` / `from_dataset` explicit) to stress lifecycle stability | Per-iteration elapsed + RSS peaks, RSS growth fraction, failure payloads |
 | `rust_suite.py measure-counter-data` | Measure CounterData memory contribution to Rust featurizer | Disk and in-memory size with vs without CounterData fields |
 | `rust_suite.py calibrate-phase-a` | Calibrate memory estimates for phase-A accumulator from memory telemetry JSONL | Per-entry byte overhead percentiles |
 | `rust_suite.py calibrate-rust-batch` | Calibrate memory estimates for Rust batch persistent overhead from memory telemetry JSONL | Per-row byte overhead percentiles |
@@ -33,7 +33,7 @@
 | Script | What it does |
 |---|---|
 | `transfer_experiment_seed_paper.py` | Main script to reproduce all paper experiments |
-| `tutorial_for_predicting_with_the_prod_model.py` | Guide to using the released production model (supports `--use-rust`) |
+| `tutorial_for_predicting_with_the_prod_model.py` | Guide to using the released production model with Arrow input by default; JSON fixtures remain opt-in |
 | `tutorial.ipynb` | Notebook walkthrough of the S2AND pipeline |
 
 ### Dataset creation & preprocessing
@@ -52,7 +52,7 @@
 
 | Script | What it does |
 |---|---|
-| `eval_prod_models.py` | Evaluate production models (SPECTER1 vs SPECTER2) on full, inventors_s2and, or mini datasets; use `--dataset full --use-arrow` with the Arrow release |
+| `eval_prod_models.py` | Evaluate production models (SPECTER1 vs SPECTER2) on full, inventors_s2and, or mini datasets; non-training evals use Arrow automatically when complete Arrow artifacts exist |
 | `verification/compare_full_predict_arrow_parity.py` | Build a bounded Arrow parity artifact, including current raw-planner batch-index sidecars, and compare incumbent full predict against direct Arrow/Rust full predict |
 
 ### CI & release

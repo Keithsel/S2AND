@@ -61,7 +61,7 @@ Usage:
 
     # Evaluate on s2and_mini datasets
     uv run python scripts/eval_prod_models.py --dataset mini
-    # Uses s2and/data/s2and_mini_arrow automatically when complete Arrow artifacts exist.
+    # Uses Arrow automatically when complete Arrow artifacts exist.
 
     # Evaluate released benchmark Arrow bundles directly
     uv run python scripts/eval_prod_models.py --dataset full --use-arrow \
@@ -119,7 +119,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Force production-model evaluation through direct Arrow/Rust predict_from_arrow_paths. "
-            "Arrow is used automatically for mini evals when complete artifacts exist. Not supported with --train."
+            "Arrow is used automatically for supported evals when complete artifacts exist. Not supported with --train."
         ),
     )
     parser.add_argument(
@@ -170,6 +170,17 @@ def _supports_arrow_eval(dataset_label: str) -> bool:
     return dataset_label in {"mini", "full"}
 
 
+def _should_use_arrow_eval(
+    *,
+    force_arrow: bool,
+    no_arrow: bool,
+    arrow_available: bool,
+) -> bool:
+    if force_arrow:
+        return True
+    return bool(arrow_available and not no_arrow)
+
+
 # specter suffix -> production model artifact
 # v1.1 was trained on specter1 features; v1.21 bundles the v1.2 SPECTER2 pairwise model.
 MODELS = {
@@ -190,10 +201,37 @@ def resolve_dataset_file(data_root: str, dataset_name: str, preferred_name: str,
     raise FileNotFoundError(f"Missing dataset file. Tried '{preferred_path}' and '{fallback_path}'.")
 
 
+def resolve_arrow_dataset_root(arrow_root: str, dataset_name: str) -> str:
+    """Resolve a dataset directory under a direct Arrow root or release parent."""
+
+    candidates = [
+        os.path.join(arrow_root, dataset_name),
+        os.path.join(arrow_root, "datasets", dataset_name),
+    ]
+    if os.path.isdir(arrow_root):
+        for child_name in sorted(os.listdir(arrow_root), reverse=True):
+            child_root = os.path.join(arrow_root, child_name)
+            if os.path.isdir(child_root):
+                candidates.extend(
+                    [
+                        os.path.join(child_root, dataset_name),
+                        os.path.join(child_root, "datasets", dataset_name),
+                    ]
+                )
+    for candidate in candidates:
+        if os.path.exists(os.path.join(candidate, "manifest.json")):
+            return candidate
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    formatted = ", ".join(os.path.join(candidate, "manifest.json") for candidate in candidates)
+    raise FileNotFoundError(f"Missing Arrow manifest for dataset {dataset_name!r}; checked {formatted}")
+
+
 def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suffix: str) -> dict[str, str]:
     from s2and.incremental_linking.feature_block import RAW_PLANNER_ARROW_BATCH_INDEX_KEYS
 
-    dataset_root = os.path.join(arrow_root, dataset_name)
+    dataset_root = resolve_arrow_dataset_root(arrow_root, dataset_name)
     specter_name = "specter2.arrow" if specter_suffix == "_specter2.pkl" else "specter.arrow"
 
     paths = {
@@ -245,7 +283,7 @@ def _resolve_eval_name_counts_index_path(dataset_root: Path) -> str | None:
                 if not resolved.is_absolute():
                     resolved = dataset_root / resolved
                 if resolved.exists():
-                    return str(resolved)
+                    return str(resolved.resolve())
                 raise FileNotFoundError(
                     f"Arrow manifest {manifest_path} specifies name_counts_index path that does not exist: "
                     f"{path_value}"
@@ -380,22 +418,32 @@ def cluster_eval_arrow(
     *,
     random_seed: int,
     n_jobs: int,
+    split: str = "test",
+    total_ram_bytes: int = 1_000_000_000_000,
 ) -> tuple[dict[str, tuple], dict[str, tuple[float, float, float]]]:
     import numpy as np
 
     from s2and.eval import b3_precision_recall_fscore, pairwise_precision_recall_fscore
 
-    _train_block_dict, _val_block_dict, test_block_dict = split_blocks_like_anddata(
+    train_block_dict, val_block_dict, test_block_dict = split_blocks_like_anddata(
         read_arrow_s2_blocks(arrow_paths["signatures"]),
         random_seed=random_seed,
     )
+    if split == "test":
+        block_dict = test_block_dict
+    elif split == "val":
+        block_dict = val_block_dict
+    elif split == "train":
+        block_dict = train_block_dict
+    else:
+        raise ValueError("Split must be one of: train, val, test")
     signature_to_cluster_id = read_signature_to_cluster_id(arrow_paths["clusters"])
-    cluster_to_signatures = construct_cluster_to_signatures(signature_to_cluster_id, test_block_dict)
+    cluster_to_signatures = construct_cluster_to_signatures(signature_to_cluster_id, block_dict)
     predict_arrow_paths = {key: value for key, value in arrow_paths.items() if key != "clusters"}
     pred_clusters, _ = clusterer.predict_from_arrow_paths(
-        test_block_dict,
+        block_dict,
         predict_arrow_paths,
-        total_ram_bytes=1_000_000_000_000,
+        total_ram_bytes=total_ram_bytes,
         load_name_counts=True,
         name_tuples="filtered",
     )
@@ -409,10 +457,10 @@ def cluster_eval_arrow(
     ) = b3_precision_recall_fscore(cluster_to_signatures, pred_clusters)
     metrics: dict[str, tuple] = {"B3 (P, R, F1)": (b3_p, b3_r, b3_f1)}
     metrics["Cluster (P, R F1)"] = pairwise_precision_recall_fscore(
-        cluster_to_signatures, pred_clusters, test_block_dict, "clusters"
+        cluster_to_signatures, pred_clusters, block_dict, "clusters"
     )
     metrics["Cluster Macro (P, R, F1)"] = pairwise_precision_recall_fscore(
-        cluster_to_signatures, pred_clusters, test_block_dict, "cmacro"
+        cluster_to_signatures, pred_clusters, block_dict, "cmacro"
     )
 
     def _mean_or_nan(xs):
@@ -495,7 +543,11 @@ def main() -> None:
     arrow_available = _supports_arrow_eval(args.dataset) and not train_flag and missing_arrow_error is None
     if args.use_arrow and missing_arrow_error is not None:
         raise missing_arrow_error
-    use_arrow = bool(args.use_arrow or (args.dataset == "mini" and arrow_available and not args.no_arrow))
+    use_arrow = _should_use_arrow_eval(
+        force_arrow=bool(args.use_arrow),
+        no_arrow=bool(args.no_arrow),
+        arrow_available=bool(arrow_available),
+    )
 
     print(
         f"Config: dataset={args.dataset}, seed={random_seed}, n_jobs={n_jobs}, "

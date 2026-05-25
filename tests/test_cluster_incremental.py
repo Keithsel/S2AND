@@ -751,12 +751,13 @@ def test_predict_incremental_auto_backend_uses_promoted_linker_when_auto_resolve
     assert clusterer.predict_incremental(block, dataset, batching_threshold=None) == promoted_payload
 
 
-def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exists(
+def test_predict_incremental_auto_uses_arrow_promoted_linker_when_dataset_seed_map_exists(
     clusterer_dataset_factory,
     monkeypatch,
     tmp_path,
 ):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_auto_incremental_arrow")
+    dataset.cluster_seeds_require = {"6": "0", "7": "0", "3": "1", "4": "1"}
     dataset.cluster_seeds_disallow = {("5", "6")}
     block = ["3", "4", "5", "6", "7", "8"]
     runtime_context = SimpleNamespace(
@@ -772,7 +773,6 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
         "signatures": "signatures.arrow",
         "papers": "papers.arrow",
         "paper_authors": "paper_authors.arrow",
-        "cluster_seeds": "cluster_seeds.arrow",
     }.items():
         path = tmp_path / filename
         path.touch()
@@ -791,8 +791,17 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
         captured["artifact"] = artifact_arg
         captured["arrow_paths"] = dict(kwargs["arrow_paths"])
         captured["query_signature_ids"] = tuple(kwargs["query_signature_ids"])
+        with pa.memory_map(captured["arrow_paths"]["cluster_seeds"], "r") as source:
+            seed_table = pa.ipc.open_file(source).read_all()
         with pa.memory_map(captured["arrow_paths"]["cluster_seed_disallows"], "r") as source:
             disallow_table = pa.ipc.open_file(source).read_all()
+        captured["raw_seed_rows"] = dict(
+            zip(
+                seed_table["signature_id"].to_pylist(),
+                seed_table["cluster_id"].to_pylist(),
+                strict=True,
+            )
+        )
         captured["raw_disallow_rows"] = list(
             zip(
                 disallow_table["signature_id_1"].to_pylist(),
@@ -860,6 +869,8 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
     assert result["incremental_linker_query_view"] == "raw_arrow"
     assert result["incremental_linker_telemetry"]["arrow_promoted_incremental"] == 1
     assert result["incremental_linker_telemetry"]["seed_setup_altered_signature_count"] == 0
+    assert result["incremental_linker_telemetry"]["seed_setup_cluster_seeds_source"] == "dataset"
+    assert result["incremental_linker_telemetry"]["seed_arrow_reused_source"] == 0
     assert result["incremental_linker_telemetry"]["seed_arrow_disallow_count"] == 1
     assert isinstance(result["incremental_linker_telemetry"]["incremental_finish_seconds"], float)
     assert sync_calls == []
@@ -868,8 +879,8 @@ def test_predict_incremental_auto_uses_arrow_promoted_linker_when_seed_arrow_exi
         key: value for key, value in arrow_paths.items() if key not in generated_path_keys
     }
     assert captured["arrow_paths"]["cluster_seeds"].endswith(".arrow")
-    assert captured["arrow_paths"]["cluster_seeds"] != arrow_paths["cluster_seeds"]
     assert captured["arrow_paths"]["cluster_seed_disallows"].endswith(".arrow")
+    assert captured["raw_seed_rows"] == dataset.cluster_seeds_require
     assert captured["raw_disallow_rows"] == [("5", "6")]
     assert captured["finish_dataset"] is dataset
     assert captured["finish_runtime_context"] is runtime_context
@@ -2107,7 +2118,7 @@ def test_predict_incremental_arrow_promoted_linker_transforms_altered_seed_arrow
     assert captured["raw_seed_rows"] == {"6": "0_0", "7": "0_1", "3": "1", "4": "1"}
 
 
-def test_predict_incremental_rust_empty_seeds_uses_monolithic_fallback(clusterer_dataset_factory, monkeypatch):
+def test_predict_incremental_rust_empty_seeds_requires_seed_source(clusterer_dataset_factory, monkeypatch):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_rust_empty_seeds")
     dataset.cluster_seeds_require = {}
     block = ["3", "4", "5"]
@@ -2119,33 +2130,32 @@ def test_predict_incremental_rust_empty_seeds_uses_monolithic_fallback(clusterer
         run_id="test-rust-empty-seeds",
         source="S2AND_BACKEND",
     )
-    fallback_payload = {
-        "clusters": {"fallback": list(block)},
-        "phase_b_mode": "exact",
-        "phase_b_budget_bytes": 0,
-        "phase_b_required_bytes": 0,
-    }
 
     monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
-    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *args, **kwargs: None)
-
-    def fake_helper(self, block_signatures, dataset_arg, **kwargs):
-        del self, kwargs
-        assert list(block_signatures) == block
-        assert dataset_arg is dataset
-        return dict(fallback_payload)
-
-    monkeypatch.setattr(Clusterer, "_predict_incremental_helper", fake_helper)
+    monkeypatch.setattr(
+        model_module,
+        "_sync_rust_cluster_seeds",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("seed sync should not run")),
+    )
+    monkeypatch.setattr(
+        Clusterer,
+        "_predict_incremental_helper",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback helper should not run")),
+    )
     monkeypatch.setattr(
         Clusterer,
         "_predict_incremental_promoted_linker",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("promoted linker should not run")),
     )
 
-    assert clusterer.predict_incremental(block, dataset, batching_threshold=None) == fallback_payload
+    with pytest.raises(model_module.MissingArrowArtifactError, match="cluster_seeds_source"):
+        clusterer.predict_incremental(block, dataset, batching_threshold=None)
 
 
-def test_predict_incremental_rust_empty_seeds_rejects_batching_threshold(clusterer_dataset_factory, monkeypatch):
+def test_predict_incremental_rust_empty_seeds_rejects_batching_threshold_before_routing(
+    clusterer_dataset_factory,
+    monkeypatch,
+):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_rust_empty_seeds_batching")
     dataset.cluster_seeds_require = {}
     block = ["3", "4", "5"]
@@ -2166,7 +2176,7 @@ def test_predict_incremental_rust_empty_seeds_rejects_batching_threshold(cluster
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback helper should not run")),
     )
 
-    with pytest.raises(ValueError, match="batching_threshold is only supported for promoted Rust"):
+    with pytest.raises(model_module.MissingArrowArtifactError, match="cluster_seeds_source"):
         clusterer.predict_incremental(block, dataset, batching_threshold=2)
 
 

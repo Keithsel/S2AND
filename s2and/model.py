@@ -805,6 +805,41 @@ def _cluster_seeds_require_from_arrow_paths(arrow_paths: Mapping[str, Any] | Non
     return _read_cluster_seeds_arrow(path)
 
 
+def _cluster_seeds_arrow_path_exists(arrow_paths: Mapping[str, Any] | None) -> bool:
+    if arrow_paths is None:
+        return False
+    path_value = arrow_paths.get("cluster_seeds")
+    return path_value is not None and Path(str(path_value)).exists()
+
+
+def _has_incremental_seed_source(dataset: Any, arrow_paths: Mapping[str, Any] | None) -> bool:
+    return bool(getattr(dataset, "cluster_seeds_require", {}) or {}) or _cluster_seeds_arrow_path_exists(arrow_paths)
+
+
+def _require_incremental_seed_source(
+    dataset: Any,
+    arrow_paths: Mapping[str, Any] | None,
+    *,
+    context: str,
+) -> None:
+    if _has_incremental_seed_source(dataset, arrow_paths):
+        return
+    missing_files: dict[str, str] = {}
+    if arrow_paths is not None and arrow_paths.get("cluster_seeds") is not None:
+        missing_files["cluster_seeds"] = str(arrow_paths["cluster_seeds"])
+    raise MissingArrowArtifactError(
+        context=context,
+        required_keys=("cluster_seeds_source",),
+        missing_keys=("cluster_seeds_source",),
+        missing_files=missing_files,
+        producer_hint=(
+            "pass seed assignments through dataset.cluster_seeds_require or include a valid "
+            "cluster_seeds.arrow in the Arrow path mapping; promoted incremental Rust prediction "
+            "does not infer an empty seed source"
+        ),
+    )
+
+
 def _normalize_cluster_seeds_require(cluster_seeds_require: Mapping[Any, Any]) -> dict[str, str]:
     """Return the seed map with the same string policy used by Arrow sidecars."""
 
@@ -5553,14 +5588,13 @@ class Clusterer:
                 require_name_counts_index=_uses_name_count_features(self),
             )
         arrow_paths_available = resolved_arrow_paths_for_incremental is not None
-        arrow_cluster_seeds_available = (
-            resolved_arrow_paths_for_incremental is not None
-            and resolved_arrow_paths_for_incremental.get("cluster_seeds") is not None
-            and Path(resolved_arrow_paths_for_incremental["cluster_seeds"]).exists()
-        )
-        promoted_seed_inputs_available = bool(getattr(dataset, "cluster_seeds_require", {}) or {}) or bool(
-            arrow_cluster_seeds_available
-        )
+        promoted_seed_inputs_available = _has_incremental_seed_source(dataset, resolved_arrow_paths_for_incremental)
+        if use_rust_backend and not promoted_seed_inputs_available:
+            _require_incremental_seed_source(
+                dataset,
+                resolved_arrow_paths_for_incremental,
+                context="Clusterer.predict_incremental promoted Rust prediction",
+            )
         will_use_arrow_promoted = bool(use_rust_backend and arrow_paths_available and promoted_seed_inputs_available)
         if not will_use_arrow_promoted:
             _sync_rust_cluster_seeds(dataset, runtime_context=runtime_context)
@@ -5573,20 +5607,6 @@ class Clusterer:
                 "Use the Rust backend with cluster seeds or pass batching_threshold=None."
             )
         if use_rust_backend:
-            if not promoted_seed_inputs_available:
-                logger.info(
-                    "No cluster seeds provided for promoted incremental; "
-                    "falling back to Python incremental helper for partition coverage."
-                )
-                incremental_result = self._predict_incremental_helper(
-                    block_signatures,
-                    dataset,
-                    prevent_new_incompatibilities=prevent_new_incompatibilities,
-                    partial_supervision=partial_supervision,
-                    runtime_context=runtime_context,
-                    total_ram_bytes=total_ram_bytes,
-                )
-                return dict(incremental_result["clusters"]) if return_clusters_only else incremental_result
             incremental_result = self._predict_incremental_promoted_linker(
                 block_signatures,
                 dataset,

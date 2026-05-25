@@ -472,9 +472,10 @@ If FeatureBlock Arrow artifacts and seed inputs are available, promoted
 by default for Phase A, then finishes residual abstains through the normal
 incremental completion path. Seeds can come from `cluster_seeds.arrow` or from
 `dataset.cluster_seeds_require`; when the latter is used, the runtime writes a
-request-local temporary seed table for Rust retrieval. `cluster_seed_disallows.arrow`
-is optional and means "no pairwise seed disallow constraints" when omitted, but
-an explicit path must exist.
+request-local temporary seed table for Rust retrieval. A promoted Rust
+incremental request without either seed source fails before seed sync or helper
+fallback. `cluster_seed_disallows.arrow` is optional and means "no pairwise seed
+disallow constraints" when omitted, but an explicit path must exist.
 
 ### Incremental Seed Telemetry Contract
 

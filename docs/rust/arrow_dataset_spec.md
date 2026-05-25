@@ -77,15 +77,20 @@ Preferred on-disk layout:
 
 Notes:
 
-- `cluster_seeds.arrow` is required only for seeded/incremental datasets. It can
-  be omitted for unseeded full prediction and offline eval.
+- `cluster_seeds.arrow` is one accepted seed source for seeded/incremental
+  datasets. It can be omitted for unseeded full prediction, offline eval, and
+  incremental production requests that provide seed assignments through another
+  normalized request/dataset mapping such as `dataset.cluster_seeds_require`.
+  Promoted Rust incremental prediction still requires a seed source; when the
+  source is not a physical Arrow sidecar, the runtime materializes a
+  request-local `cluster_seeds.arrow`.
 - `cluster_seed_disallows.arrow` preserves pairwise seed disallow constraints.
   Hand-authored artifacts can omit it when the request has no seed disallows;
   converters may emit an empty table instead. An explicit path must exist when
   present.
-- When using `write_feature_block_arrow_from_anddata(...)` for
-  seeded/incremental artifacts, pass `include_empty_cluster_seeds=True` so empty
-  seed/disallow tables are still emitted.
+- When using `write_feature_block_arrow_from_anddata(...)` to publish physical
+  seeded/incremental seed sidecars, pass `include_empty_cluster_seeds=True` so
+  empty seed/disallow tables are still emitted.
 - `altered_cluster_signatures.arrow` is required for incremental datasets whose
   seed clusters include altered claimed profiles. When an in-memory
   `ANDData.altered_cluster_signatures` request value is present it is
@@ -112,7 +117,7 @@ the path mapping should use these keys:
 | `papers` | Path to `papers.arrow` |
 | `paper_authors` | Path to `paper_authors.arrow` |
 | `specter` | Path to the embedding table selected for the current model, even if the file is physically named `specter2.arrow` |
-| `cluster_seeds` | Path to `cluster_seeds.arrow` for incremental/seeded prediction |
+| `cluster_seeds` | Optional path to `cluster_seeds.arrow` for incremental/seeded prediction; required only when this sidecar is the seed source |
 | `cluster_seed_disallows` | Optional path to `cluster_seed_disallows.arrow` for pairwise seed disallow constraints |
 | `altered_cluster_signatures` | Path to `altered_cluster_signatures.arrow` when altered claimed profiles are present; text fallback is accepted for legacy callers |
 | `clusters` | Path to eval-only ground-truth clusters JSON |
@@ -326,8 +331,12 @@ permits them.
 
 ### `cluster_seeds.arrow`
 
-Required for incremental/seeded prediction through the Arrow promoted path.
-Optional for unseeded full prediction.
+One accepted seed source for incremental/seeded prediction through the Arrow
+promoted path. Optional for unseeded full prediction and for incremental
+production requests that provide seed assignments through another normalized
+request/dataset mapping. Promoted Rust incremental prediction requires some seed
+source; if the caller provides a non-Arrow mapping, the runtime writes a
+request-local `cluster_seeds.arrow` before entering raw Arrow retrieval.
 
 | Column | Arrow type | Nulls | Meaning |
 |---|---:|---:|---|
@@ -368,7 +377,7 @@ Required columns:
 |---|---:|---:|---|
 | `signature_id` | `string` | no | Seed signature id belonging to an altered claimed profile |
 
-Each id must exist in `signatures.arrow` and in `cluster_seeds.arrow`. At
+Each id must exist in `signatures.arrow` and in the active seed source. At
 runtime, S2AND maps these signature ids through the seed assignments to identify
 the claimed seed components that need altered-profile pre-splitting.
 `signature_id` values must be unique.
@@ -470,7 +479,9 @@ Conditional `paths` entries:
 - `specter2` may be included as bundle inventory when both embedding versions
   are shipped, but runtime callers still pass the selected embedding as
   `specter`.
-- `cluster_seeds` is required for seeded or incremental Arrow prediction.
+- `cluster_seeds` is required only when the published Arrow sidecar is the seed
+  source. Seeded or incremental Arrow prediction may instead receive a
+  normalized request/dataset seed mapping and materialize request-local Arrow.
   `cluster_seed_disallows` is optional; omit it when no disallows are present.
 - `altered_cluster_signatures` is required when altered claimed profiles are
   present.

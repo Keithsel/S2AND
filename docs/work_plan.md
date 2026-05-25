@@ -233,8 +233,9 @@ production inference.
   - Production full-block prediction requires complete Arrow paths:
     `signatures`, `papers`, `paper_authors`, required embedding table, and
     `name_counts_index` when the model uses name-count features.
-  - Production seeded/incremental prediction additionally requires
-    `cluster_seeds`.
+  - Production seeded/incremental prediction additionally requires a seed source:
+    either a valid `cluster_seeds.arrow` sidecar or a normalized request/dataset
+    seed mapping that production can materialize into request-local Arrow.
   - `cluster_seed_disallows` is required only when pairwise seed-disallow
     constraints are present or the manifest declares the path. Missing
     `cluster_seed_disallows` means no disallow constraints.
@@ -348,8 +349,9 @@ production inference.
       graph/legacy `ANDData` fallbacks.
     - `_predict_incremental_promoted_linker(...)` can fall back to the
       non-Arrow promoted linker, which uses `RustFeaturizer.from_dataset`.
-    - `Clusterer.predict_incremental(...)` can fall back to
-      `_predict_incremental_helper(...)` when Rust mode lacks seed inputs.
+    - `Clusterer.predict_incremental(...)` now fails closed when Rust mode lacks
+      any seed source. Remaining compatibility fallback questions are about
+      missing base Arrow artifacts and Python-only helper usage.
     - Incremental altered-profile pre-split and residual Phase B reclustering
       call `predict_from_arrow_paths(...)` when `arrow_paths` is present, but
       otherwise fall back through Python reclustering. Strict promoted
@@ -374,10 +376,17 @@ production inference.
     later need public strictness controls, handle that as a separate approved
     API migration after the private production route is stable.
   - In Rust production mode with compatibility fallback disabled:
+    - Decision 2026-05-25: a physical `cluster_seeds.arrow` is not mandatory,
+      but a seed source is mandatory. Seed source formats can include a
+      request/dataset seed mapping, and production code may convert that mapping
+      into request-local Arrow for Rust.
     - `predict(...)` validates required Arrow artifacts before selecting the
       Arrow route.
-    - `predict_incremental(...)` requires base Arrow artifacts plus
-      `cluster_seeds` before seed sync or helper fallback. It requires
+    - `predict_incremental(...)` requires base Arrow artifacts plus an
+      incremental seed source before seed sync or helper fallback. Accepted seed
+      sources are a valid `cluster_seeds.arrow` sidecar or a request/dataset seed
+      mapping such as `dataset.cluster_seeds_require`; production may materialize
+      request-local `cluster_seeds.arrow` from that mapping. It requires
       `cluster_seed_disallows` only when disallow constraints are present or
       when an explicit manifest/path key declares it.
     - `_predict_incremental_promoted_linker(...)` does not call the non-Arrow
@@ -403,7 +412,7 @@ production inference.
       `tests/test_rust_distance_matrix_blockwise.py::test_predict_auto_declines_arrow_paths_missing_required_name_counts_index`,
       which already preserves the compatibility fallback. The strict sibling
       should expect a missing `name_counts_index` error in Rust production mode.
-    - `tests/test_cluster_incremental.py` should expect missing `cluster_seeds`
+    - `tests/test_cluster_incremental.py` should expect missing seed-source
       errors in Rust production mode, plus compatibility-mode tests for
       `_predict_incremental_helper(...)`. Add separate tests proving absent
       `cluster_seed_disallows` means no disallows, while a missing declared

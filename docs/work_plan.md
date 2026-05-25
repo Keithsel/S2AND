@@ -261,12 +261,14 @@ production inference.
   - Ensure errors name the missing Arrow artifact keys and the caller/script
     that should generate them.
 - Strict routing error contract.
-  - Add `MissingArrowArtifactError` near `_resolve_dataset_arrow_paths(...)` in
-    `s2and/model.py`. It should be raised by strict production routing when
-    required Arrow artifacts are absent or mapped to missing files.
-  - The error should carry enough structured context for tests and callers:
-    `context`, `required_keys`, `missing_keys`, `missing_files`, and
-    `producer_hint`.
+  - Do not add a standalone strict helper or new strict exception until the
+    first approved strict production call site is being wired. A tested private
+    resolver with no production caller is scaffold, and it risks duplicating
+    compatibility discovery policy before the strictness authority is settled.
+  - When strict routing is approved, introduce the structured missing-artifact
+    error in the same change as the call site that raises it. It should carry
+    enough context for tests and callers: `context`, `required_keys`,
+    `missing_keys`, `missing_files`, and `producer_hint`.
   - The message should name the prediction context, list missing mapping keys
     separately from missing files, and name the command or script expected to
     produce the artifacts.
@@ -277,10 +279,10 @@ production inference.
     `require_name_counts_index`, supports `require_cluster_seeds`, and adds
     optional `cluster_seed_disallows` / `altered_cluster_signatures` sidecars
     when files exist.
-  - The remaining strict-helper work is narrower: distinguish absent mapping
-    keys from mapping keys whose files are missing, raise
-    `MissingArrowArtifactError` instead of returning `None`, and carry
-    structured context for callers and tests.
+  - The remaining strict-routing work is narrower: at the approved call site,
+    distinguish absent mapping keys from mapping keys whose files are missing,
+    raise the structured strict-routing error instead of returning `None`, and
+    carry structured context for callers and tests.
   - Current fallback surfaces to tighten:
     - `_resolve_dataset_arrow_paths(...)` in `s2and/model.py` can return
       `None` for incomplete auto-discovered Arrow artifacts and for missing
@@ -299,11 +301,10 @@ production inference.
       otherwise fall back through Python reclustering. Strict promoted
       incremental routing must require validated Arrow paths before entering
       those subpaths.
-  - Add a strict helper near `_resolve_dataset_arrow_paths(...)`, tentatively
-    `_require_dataset_arrow_paths(...)`, that wraps discovery, computes missing
-    required keys, distinguishes missing mapping keys from missing files, and
-    raises an explicit error naming the missing keys and the Arrow conversion
-    command/script that should produce them.
+  - Avoid a parallel strict/compatibility Arrow discovery implementation. The
+    first strict-routing change should either refactor the existing resolver so
+    it can emit structured diagnostics while preserving compatibility behavior,
+    or perform minimal call-site validation without reimplementing discovery.
   - In strict production mode, do not silently satisfy a missing bundle
     `name_counts_index` from the checked-in `s2and/data/name_counts_index/`
     fallback. That fallback is useful for development and compatibility, but it
@@ -311,15 +312,16 @@ production inference.
     the caller passes an explicit path.
   - Define one strictness authority before adding public parameters. Preferred
     first step: production scripts and production-only routing call the strict
-    helper directly, while general public `predict(...)` keeps current
+    authority directly, while general public `predict(...)` keeps current
     compatibility fallback behavior until a public API change is approved.
   - Do not add public strictness kwargs during the first rollout. Production
-    scripts and production-only routing should call the strict helper directly;
+    scripts and production-only routing should use the strict authority directly;
     generic public `predict(...)` remains the compatibility path. If callers
     later need public strictness controls, handle that as a separate approved
     API migration after the private production route is stable.
   - In Rust production mode with compatibility fallback disabled:
-    - `predict(...)` calls the strict helper before selecting the Arrow route.
+    - `predict(...)` validates required Arrow artifacts before selecting the
+      Arrow route.
     - `predict_incremental(...)` requires base Arrow artifacts plus
       `cluster_seeds` before seed sync or helper fallback. It requires
       `cluster_seed_disallows` only when disallow constraints are present or
@@ -352,10 +354,11 @@ production inference.
       `_predict_incremental_helper(...)`. Add separate tests proving absent
       `cluster_seed_disallows` means no disallows, while a missing declared
       disallow artifact fails explicitly.
-    - Add strict-helper tests for missing `signatures`, `papers`,
+    - Add strict-routing call-site tests for missing `signatures`, `papers`,
       `paper_authors`, `specter`, `name_counts_index`, `cluster_seeds`,
       conditionally `cluster_seed_disallows`, and conditionally
-      `altered_cluster_signatures`.
+      `altered_cluster_signatures`, using the approved production call site or
+      refactored resolver as the authority.
 - Clean up after migration.
   - Update `docs/production_inference.md` to state that production Rust
     inference requires Arrow artifacts.

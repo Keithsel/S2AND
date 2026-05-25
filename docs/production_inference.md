@@ -426,9 +426,11 @@ Production Rust full-block inference should call
 `Clusterer.predict_from_arrow_paths(...)` with at least `signatures`, `papers`,
 and `paper_authors` paths. Models that use SPECTER features also require
 `specter`, and models that use name-count features require `name_counts_index`.
-The generic `Clusterer.predict(...)` compatibility path can still fall back to
-`ANDData` when Arrow artifacts are unavailable, but production scripts should
-not rely on that fallback.
+The direct Arrow route validates required keys and declared files before Rust
+featurizer construction and raises `MissingArrowArtifactError` with structured
+`missing_keys` and `missing_files` fields. The generic `Clusterer.predict(...)`
+compatibility path can still fall back to `ANDData` when Arrow artifacts are
+unavailable, but production scripts should not rely on that fallback.
 
 Incremental prediction with explicit RAM budget:
 

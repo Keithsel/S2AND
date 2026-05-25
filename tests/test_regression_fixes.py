@@ -312,7 +312,7 @@ def test_fused_constraint_fallback_resumes_at_failed_offset(monkeypatch):
     assert [chunk.start_offset for chunk in chunks] == [0, 2, 4]
 
 
-def test_predict_from_arrow_paths_rejects_disallows_with_precomputed_dists_before_build(monkeypatch):
+def test_predict_from_arrow_paths_rejects_disallows_with_precomputed_dists_before_build(monkeypatch, tmp_path):
     def fake_build_from_arrow_paths(*_args, **_kwargs):
         raise AssertionError("precomputed dists with disallows should be rejected before Rust featurizer build")
 
@@ -325,10 +325,19 @@ def test_predict_from_arrow_paths_rejects_disallows_with_precomputed_dists_befor
         use_cache=False,
     )
     dists = {"block": np.asarray([0.5], dtype=np.float64)}
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
     with pytest.raises(ValueError, match="cluster_seeds_disallow cannot be used with precomputed dists"):
         clusterer.predict_from_arrow_paths(
             {"block": ["s0", "s1"]},
-            {"signatures": "signatures.arrow", "papers": "papers.arrow", "paper_authors": "paper_authors.arrow"},
+            arrow_paths,
             dists=dists,
             cluster_seeds_disallow={("s0", "s1")},
         )

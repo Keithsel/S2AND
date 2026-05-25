@@ -443,6 +443,95 @@ def _uses_name_count_features(clusterer: Any) -> bool:
     return clusterer_uses_name_count_features(clusterer)
 
 
+class MissingArrowArtifactError(ValueError):
+    """Raised when a strict Arrow production route is missing required artifacts."""
+
+    def __init__(
+        self,
+        *,
+        context: str,
+        required_keys: Sequence[str],
+        missing_keys: Sequence[str],
+        missing_files: Mapping[str, str],
+        producer_hint: str,
+    ) -> None:
+        self.context = str(context)
+        self.required_keys = tuple(str(key) for key in required_keys)
+        self.missing_keys = tuple(str(key) for key in missing_keys)
+        self.missing_files = {str(key): str(value) for key, value in missing_files.items()}
+        self.producer_hint = str(producer_hint)
+        details = [f"{self.context} is missing required Arrow artifacts"]
+        if self.missing_keys:
+            details.append(f"missing mapping keys: {', '.join(self.missing_keys)}")
+        if self.missing_files:
+            formatted_files = "; ".join(f"{key}={value}" for key, value in sorted(self.missing_files.items()))
+            details.append(f"missing files: {formatted_files}")
+        if self.producer_hint:
+            details.append(f"producer hint: {self.producer_hint}")
+        super().__init__(". ".join(details))
+
+
+def validate_arrow_prediction_artifacts(
+    arrow_paths: Mapping[str, Any],
+    *,
+    require_specter: bool,
+    require_name_counts_index: bool,
+    require_cluster_seeds: bool = False,
+    context: str = "Arrow prediction",
+    producer_hint: str = (
+        "generate a complete Arrow bundle with scripts/convert_to_arrow.py or use the published "
+        "s2and-release-arrow bundle"
+    ),
+) -> dict[str, str]:
+    """Validate strict production Arrow prediction artifacts and return normalized paths."""
+
+    required = {"signatures", "papers", "paper_authors"}
+    if require_specter:
+        required.add("specter")
+    if require_name_counts_index:
+        required.add("name_counts_index")
+    if require_cluster_seeds:
+        required.add("cluster_seeds")
+
+    missing_keys = sorted(key for key in required if key not in arrow_paths)
+    normalized: dict[str, str] = {}
+    invalid_paths: dict[str, str] = {}
+    for key, value in arrow_paths.items():
+        key_text = str(key)
+        if value is None:
+            invalid_paths[key_text] = "<None>"
+            continue
+        path_text = str(value)
+        if not path_text.strip():
+            invalid_paths[key_text] = "<empty>"
+            continue
+        if path_text == ".":
+            invalid_paths[key_text] = "."
+            continue
+        normalized[key_text] = path_text
+
+    missing_files = {
+        key: path
+        for key, path in normalized.items()
+        if (
+            key in required
+            or key.endswith("_batch_index")
+            or key in {"cluster_seed_disallows", "altered_cluster_signatures"}
+        )
+        and not Path(path).exists()
+    }
+    missing_files.update(invalid_paths)
+    if missing_keys or missing_files:
+        raise MissingArrowArtifactError(
+            context=context,
+            required_keys=sorted(required),
+            missing_keys=missing_keys,
+            missing_files=missing_files,
+            producer_hint=producer_hint,
+        )
+    return normalized
+
+
 def _coerce_existing_arrow_paths(
     value: Any,
     *,
@@ -3508,7 +3597,17 @@ class Clusterer:
                 "use the ANDData predict path until Arrow reference-feature artifacts are available."
             )
 
-        arrow_path_payload = normalize_arrow_paths(arrow_paths)
+        require_name_counts_index = _uses_name_count_features(self) or load_name_counts is True
+        arrow_path_payload = validate_arrow_prediction_artifacts(
+            arrow_paths,
+            require_specter=_uses_embedding_features(self),
+            require_name_counts_index=require_name_counts_index,
+            context="Clusterer.predict_from_arrow_paths",
+            producer_hint=(
+                "provide signatures, papers, paper_authors, model-required specter, and model-required "
+                "name_counts_index from scripts/convert_to_arrow.py or the published s2and-release-arrow bundle"
+            ),
+        )
         _require_arrow_name_counts_index_for_clusterer(self, arrow_path_payload, context="Arrow prediction")
         signature_ids = list(
             dict.fromkeys(str(signature_id) for signatures in block_dict.values() for signature_id in signatures)

@@ -271,6 +271,22 @@ production inference.
     Python-vs-Rust `many_pairs_featurize(...)` parity, and
     `scripts/_rust_suite/big_block_incremental_cmd.py` remains JSON/`ANDData`
     until its subset/truth-bundle contract is redesigned for Arrow artifacts.
+  - Redesign follow-up: do not bolt `--input-format arrow` onto
+    `scripts/_rust_suite/compare_cmd.py`. Its current contract is
+    Python-vs-Rust parity through `many_pairs_featurize(...)`; Arrow parity
+    should be a separate command or an extension of
+    `scripts/verification/compare_full_predict_arrow_parity.py` that compares
+    Arrow artifacts against the incumbent oracle without changing the legacy
+    feature-parity gate.
+  - Redesign follow-up: do not partially convert
+    `scripts/_rust_suite/big_block_incremental_cmd.py` while it still selects
+    JSON subsets, raw signatures/papers, synthetic seed maps, and parquet truth
+    rows independently. Define an Arrow subset/truth-bundle contract first:
+    how selected query/candidate signatures map to `datasets/<dataset>/`
+    Arrow rows, where `cluster_seeds`, optional `cluster_seed_disallows`,
+    optional `altered_cluster_signatures`, labels, splits, and component
+    parquet live, and which command produces the bounded fixture. Convert the
+    script only after that artifact contract exists.
   - Convert remaining production/profiling scripts where the Arrow route is a
     direct replacement, and relabel scripts whose purpose is raw/reference
     parity.
@@ -284,6 +300,15 @@ production inference.
   - Add a small validation command or test that opens the produced Arrow bundle
     and checks the production-required keys.
 - Tighten runtime routing.
+  - Status 2026-05-25: `Clusterer.predict_from_arrow_paths(...)` is the first
+    strict production authority. It validates required mapping keys and declared
+    files before building the Rust featurizer, and raises structured
+    `MissingArrowArtifactError` with `context`, `required_keys`,
+    `missing_keys`, `missing_files`, and `producer_hint`.
+  - Status 2026-05-25: generic `Clusterer.predict(...)` still preserves the
+    compatibility fallback when auto-discovered Arrow artifacts are incomplete;
+    direct Arrow production callers should use `predict_from_arrow_paths(...)`
+    or the Arrow-first scripts.
   - In production Rust mode, remove silent fallback from Arrow-routed
     `Clusterer.predict(...)` when Arrow artifacts are incomplete.
   - Preserve fallback only through approved compatibility/test routes.

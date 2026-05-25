@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -782,6 +783,15 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, 
     import pyarrow as pa
 
     captured = {}
+    arrow_paths = {
+        "signatures": str(tmp_path / "signatures.arrow"),
+        "papers": str(tmp_path / "papers.arrow"),
+        "paper_authors": str(tmp_path / "paper_authors.arrow"),
+    }
+    for path in arrow_paths.values():
+        Path(path).touch()
+    name_counts_index = tmp_path / "name_counts_index"
+    name_counts_index.mkdir()
     disallow_path = tmp_path / "cluster_seed_disallows.arrow"
     disallow_table = pa.table(
         {
@@ -818,9 +828,8 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, 
     result, dists = clusterer.predict_from_arrow_paths(
         {"block": ["0", "1", "2"]},
         {
-            "signatures": "signatures.arrow",
-            "papers": "papers.arrow",
-            "paper_authors": "paper_authors.arrow",
+            **arrow_paths,
+            "name_counts_index": str(name_counts_index),
             "cluster_seed_disallows": str(disallow_path),
         },
         load_name_counts=True,
@@ -881,7 +890,7 @@ def test_predict_from_arrow_paths_merges_explicit_disallows(monkeypatch):
     clusterer = _dummy_clusterer(cluster_model=None)
     result, dists = clusterer.predict_from_arrow_paths(
         {"block": ["0", "1", "2"]},
-        {"signatures": "signatures.arrow", "papers": "papers.arrow", "paper_authors": "paper_authors.arrow"},
+        {"signatures": __file__, "papers": __file__, "paper_authors": __file__},
         partial_supervision={("0", "1"): 0, ("0", "2"): 0},
         cluster_seeds_disallow={("0", "1"), ("1", "2")},
     )
@@ -1010,6 +1019,63 @@ def test_predict_auto_declines_arrow_paths_missing_required_name_counts_index(tm
     assert captured["block_dict"] == {"block": ["0", "1"]}
     assert captured["dataset"] is dataset
     assert captured["runtime_context"] is runtime_context
+
+
+def test_predict_from_arrow_paths_reports_structured_missing_artifacts(tmp_path):
+    signatures_path = tmp_path / "signatures.arrow"
+    signatures_path.touch()
+    clusterer = Clusterer(
+        featurizer_info=FeaturizationInfo(features_to_use=["name_counts"]),
+        classifier=None,
+        cluster_model=None,
+        n_jobs=1,
+    )
+
+    with pytest.raises(model_module.MissingArrowArtifactError) as exc_info:
+        clusterer.predict_from_arrow_paths(
+            {"block": ["0", "1"]},
+            {
+                "signatures": str(signatures_path),
+                "papers": str(tmp_path / "missing_papers.arrow"),
+                "paper_authors": str(tmp_path / "missing_paper_authors.arrow"),
+            },
+        )
+
+    error = exc_info.value
+    assert error.context == "Clusterer.predict_from_arrow_paths"
+    assert error.required_keys == ("name_counts_index", "paper_authors", "papers", "signatures")
+    assert error.missing_keys == ("name_counts_index",)
+    assert error.missing_files == {
+        "papers": str(tmp_path / "missing_papers.arrow"),
+        "paper_authors": str(tmp_path / "missing_paper_authors.arrow"),
+    }
+    assert "producer hint" in str(error)
+
+
+def test_predict_from_arrow_paths_rejects_declared_missing_optional_sidecar(tmp_path):
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+    with pytest.raises(model_module.MissingArrowArtifactError) as exc_info:
+        clusterer.predict_from_arrow_paths(
+            {"block": ["0", "1"]},
+            {
+                **arrow_paths,
+                "cluster_seed_disallows": str(tmp_path / "missing_cluster_seed_disallows.arrow"),
+            },
+        )
+
+    assert exc_info.value.missing_files == {
+        "cluster_seed_disallows": str(tmp_path / "missing_cluster_seed_disallows.arrow")
+    }
 
 
 def test_predict_subblocked_uses_arrow_featurizer_for_multiple_letter_groups(tmp_path, monkeypatch):

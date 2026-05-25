@@ -1468,30 +1468,33 @@ def test_resolve_dataset_arrow_paths_declines_missing_required_name_counts_index
     assert resolved is None
 
 
-def test_predict_from_arrow_paths_requires_name_counts_index_for_name_count_features() -> None:
+def test_predict_from_arrow_paths_requires_name_counts_index_for_name_count_features(tmp_path: Path) -> None:
     clusterer = Clusterer(
         featurizer_info=FeaturizationInfo(features_to_use=["name_counts"]),
         classifier=object(),
         n_jobs=1,
     )
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
 
-    with pytest.raises(ValueError, match="requires name_counts_index"):
+    with pytest.raises(model_module.MissingArrowArtifactError, match="missing mapping keys: name_counts_index"):
         clusterer.predict_from_arrow_paths(
             {"block": ["s1"]},
-            {
-                "signatures": "signatures.arrow",
-                "papers": "papers.arrow",
-                "paper_authors": "paper_authors.arrow",
-            },
+            arrow_paths,
         )
 
-    with pytest.raises(ValueError, match="requires name_counts_index"):
+    with pytest.raises(model_module.MissingArrowArtifactError, match="name_counts_index"):
         clusterer.predict_from_arrow_paths(
             {"block": ["s1"]},
             {
-                "signatures": "signatures.arrow",
-                "papers": "papers.arrow",
-                "paper_authors": "paper_authors.arrow",
+                **arrow_paths,
                 "name_counts_index": "missing_name_counts_index",
             },
         )
@@ -1508,6 +1511,15 @@ def test_predict_from_arrow_paths_loads_name_counts_by_default_for_name_count_fe
     )
     name_counts_index = tmp_path / "name_counts_index"
     name_counts_index.mkdir()
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
     captured: dict[str, Any] = {}
 
     def fake_build_rust_featurizer_from_arrow_paths(*_args: Any, **kwargs: Any) -> object:
@@ -1526,9 +1538,7 @@ def test_predict_from_arrow_paths_loads_name_counts_by_default_for_name_count_fe
     clusterer.predict_from_arrow_paths(
         {"block": ["s1"]},
         {
-            "signatures": "signatures.arrow",
-            "papers": "papers.arrow",
-            "paper_authors": "paper_authors.arrow",
+            **arrow_paths,
             "name_counts_index": str(name_counts_index),
         },
     )

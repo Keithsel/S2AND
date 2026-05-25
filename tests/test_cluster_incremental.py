@@ -1449,7 +1449,7 @@ def test_resolve_dataset_arrow_paths_rejects_bad_manifest_name_counts_index(tmp_
     )
 
     dataset = SimpleNamespace(arrow_paths=arrow_paths)
-    with pytest.raises(FileNotFoundError, match="names missing name_counts_index"):
+    with pytest.raises(FileNotFoundError, match="specifies name_counts_index path that does not exist"):
         model_module._resolve_dataset_arrow_paths(
             dataset,
             require_specter=False,
@@ -2461,6 +2461,22 @@ def test_promoted_incremental_batch_telemetry_does_not_sum_raw_plan_seed_counts(
     assert merged["query_count"] == 2
     assert merged["raw_arrow_plan_seed_signature_count"] == 10
     assert merged["raw_arrow_plan_cluster_count"] == 2
+
+
+def test_promoted_incremental_batch_telemetry_keeps_numeric_after_mixed_type_conflict() -> None:
+    merged = production_module.merge_promoted_incremental_batch_telemetry(
+        [
+            {"query_count": 1, "custom_metric": "unregistered"},
+            {"query_count": 1, "custom_metric": 3},
+            {"query_count": 1, "custom_metric": 4},
+        ],
+        batch_sizes=[1, 1, 1],
+        configured_batch_size=1,
+    )
+
+    assert merged["query_count"] == 3
+    assert merged["custom_metric"] == 7
+    assert merged["custom_metric_batch_conflict_count"] == 1
 
 
 def test_raw_window_plan_telemetry_marks_conflicting_string_values() -> None:

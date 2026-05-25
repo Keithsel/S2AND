@@ -419,6 +419,7 @@ def merge_promoted_incremental_batch_telemetry(
                     merged[key] = previous + value
                 else:
                     conflict_counts[key] = conflict_counts.get(key, 0) + 1
+                    merged[key] = value
                 continue
             if key not in merged:
                 merged[key] = value

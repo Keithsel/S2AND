@@ -343,7 +343,7 @@ def test_root_manifest_lock_surfaces_create_errors(
     assert not lock_path.exists()
 
 
-def test_convert_service_json_to_arrow_rejects_missing_required_specter_embeddings(
+def test_convert_service_json_to_arrow_reports_missing_specter_embeddings(
     tmp_path: Path,
 ) -> None:
     payload = _minimal_service_payload("s1", 1)
@@ -359,16 +359,18 @@ def test_convert_service_json_to_arrow_rejects_missing_required_specter_embeddin
     input_json = tmp_path / "service_payload.json"
     input_json.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="missing embeddings"):
-        convert_service_json_to_arrow(
-            input_json=input_json,
-            output_root=tmp_path / "arrow",
-            dataset_name="service_payload",
-            name_counts_index_root=tmp_path,
-            n_jobs=1,
-            overwrite=True,
-            skip_name_counts_index=True,
-        )
+    manifest = convert_service_json_to_arrow(
+        input_json=input_json,
+        output_root=tmp_path / "arrow",
+        dataset_name="service_payload",
+        name_counts_index_root=tmp_path,
+        n_jobs=1,
+        overwrite=True,
+        skip_name_counts_index=True,
+    )
+
+    assert manifest["validation"]["missing_specter_paper_count"] == 1
+    assert manifest["validation"]["missing_specter_paper_examples"] == ["2"]
 
 
 def test_convert_service_json_to_arrow_rejects_ambiguous_service_shaped_cluster_seeds(

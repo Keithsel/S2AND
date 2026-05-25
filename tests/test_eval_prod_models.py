@@ -193,7 +193,7 @@ def test_resolve_arrow_dataset_paths_rejects_bad_manifest_name_counts_index(tmp_
         encoding="utf-8",
     )
 
-    with pytest.raises(FileNotFoundError, match="names missing name_counts_index"):
+    with pytest.raises(FileNotFoundError, match="specifies name_counts_index path that does not exist"):
         eval_prod_models.resolve_arrow_dataset_paths(str(tmp_path / "arrow"), "dummy", "_specter.pickle")
 
 

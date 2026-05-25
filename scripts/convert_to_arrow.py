@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import pickle
 import shutil
@@ -24,6 +25,8 @@ import numpy as np
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+logger = logging.getLogger(__name__)
 
 
 BENCHMARK_DATASETS = ("aminer", "arnetminer", "inspire", "kisti", "medline", "pubmed", "qian", "zbmath")
@@ -445,11 +448,21 @@ def _write_specter_arrow(
 
     with source_path.open("rb") as infile:
         specter_by_paper_id = _specter_mapping(pickle.load(infile))
-    selected_items = [
-        (paper_id, vector)
-        for paper_id, vector in specter_by_paper_id.items()
-        if str(paper_id) in needed_paper_ids and vector.size > 0
-    ]
+    selected_items: list[tuple[str, np.ndarray]] = []
+    empty_vector_count = 0
+    for paper_id, vector in specter_by_paper_id.items():
+        if str(paper_id) not in needed_paper_ids:
+            continue
+        if vector.size == 0:
+            empty_vector_count += 1
+            continue
+        selected_items.append((paper_id, vector))
+    if empty_vector_count:
+        logger.warning(
+            "Dropped %d SPECTER embeddings with zero-size vectors from %s",
+            empty_vector_count,
+            source_path,
+        )
     selected_items.sort(key=lambda item: item[0])
     if not selected_items:
         raise ValueError(f"No SPECTER embeddings from {source_path} matched the dataset papers")
@@ -483,6 +496,7 @@ def _write_specter_arrow(
         "row_count": int(table.num_rows),
         "dimension": dimension,
         "source_path": str(source_path),
+        "dropped_empty_embedding_count": empty_vector_count,
     }
 
 
@@ -519,7 +533,6 @@ def _add_extra_specter_index_and_layout(
         "key": "paper_id",
         "max_record_batch_rows": RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS["specter"],
         "batch_index_path_key": index_key,
-        "batch_index_path": index_path,
         "batch_index_present": True,
         **arrow_ipc_physical_layout(arrow_path),
     }
@@ -759,7 +772,7 @@ def convert_service_json_to_arrow(
             require_name_counts_index=not skip_name_counts_index,
             base_dir=output_dir,
         )
-    _write_json(output_dir / "manifest.json", manifest)
+    _replace_json(output_dir / "manifest.json", manifest)
     _upsert_root_manifest(output_root, dataset_name=dataset_name, dataset_dir=output_dir)
     return manifest
 
@@ -922,7 +935,7 @@ def convert_runtime_dataset_to_arrow(
             require_name_counts_index=not skip_name_counts_index,
             base_dir=output_dir,
         )
-    _write_json(output_dir / "manifest.json", manifest)
+    _replace_json(output_dir / "manifest.json", manifest)
     _upsert_root_manifest(root_manifest_dir, dataset_name=dataset_name, dataset_dir=output_dir)
     return manifest
 
@@ -1001,6 +1014,7 @@ def validate_arrow_dataset_manifest(
     require_embeddings: bool,
     require_name_counts_index: bool,
     base_dir: Path | None = None,
+    require_complete_embeddings: bool = False,
 ) -> dict[str, Any]:
     """Validate the generated Arrow tables and return compact audit metrics."""
 
@@ -1064,9 +1078,9 @@ def validate_arrow_dataset_manifest(
         metrics["specter_count"] = int(specter.num_rows)
         metrics["missing_specter_paper_count"] = int(len(missing_embeddings))
         metrics["missing_specter_paper_examples"] = missing_embeddings[:10]
-        if missing_embeddings:
+        if require_complete_embeddings and missing_embeddings:
             raise ValueError(
-                "require_embeddings=True but specter Arrow is missing embeddings for referenced "
+                "require_complete_embeddings=True but specter Arrow is missing embeddings for referenced "
                 f"paper ids: {missing_embeddings[:10]}"
             )
 
@@ -1181,6 +1195,7 @@ def validate_arrow_dataset_dir(
     *,
     require_embeddings: bool,
     require_name_counts_index: bool,
+    require_complete_embeddings: bool = False,
 ) -> dict[str, Any]:
     manifest = _load_json(dataset_dir / "manifest.json")
     if not isinstance(manifest, Mapping):
@@ -1189,6 +1204,7 @@ def validate_arrow_dataset_dir(
         manifest,
         require_embeddings=require_embeddings,
         require_name_counts_index=require_name_counts_index,
+        require_complete_embeddings=require_complete_embeddings,
         base_dir=dataset_dir,
     )
 
@@ -1325,6 +1341,7 @@ def _run_validate(args: argparse.Namespace) -> None:
         args.dataset_dir,
         require_embeddings=bool(args.require_embeddings),
         require_name_counts_index=bool(args.require_name_counts_index),
+        require_complete_embeddings=bool(args.require_complete_embeddings),
     )
     print(json.dumps(metrics, indent=2, sort_keys=True))
 
@@ -1395,6 +1412,11 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--dataset-dir", type=Path, required=True)
     validate.add_argument("--require-embeddings", action="store_true")
     validate.add_argument("--require-name-counts-index", action="store_true")
+    validate.add_argument(
+        "--require-complete-embeddings",
+        action="store_true",
+        help="Fail if any referenced paper is missing from the embedding table.",
+    )
     validate.set_defaults(func=_run_validate)
     return parser
 

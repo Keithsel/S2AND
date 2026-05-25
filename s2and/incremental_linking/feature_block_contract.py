@@ -42,24 +42,6 @@ def normalize_cluster_seed_disallow_pairs(
     return tuple(normalized)
 
 
-def filter_cluster_seed_disallows_for_signature_set(
-    pairs: Iterable[tuple[Any, Any]],
-    signature_ids: Iterable[str],
-    *,
-    context: str,
-) -> tuple[tuple[str, str], ...]:
-    """Keep only disallow pairs whose endpoints are both in the selected signatures."""
-
-    signature_id_set = {str(signature_id) for signature_id in signature_ids}
-    filtered: list[tuple[str, str]] = []
-    for left, right in pairs:
-        left_id = str(left)
-        right_id = str(right)
-        if left_id in signature_id_set and right_id in signature_id_set:
-            filtered.append((left_id, right_id))
-    return normalize_cluster_seed_disallow_pairs(filtered)
-
-
 def filter_cluster_seed_disallows_for_signature_subset(
     pairs: Iterable[tuple[Any, Any]],
     signature_ids: Iterable[str],

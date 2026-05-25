@@ -187,6 +187,12 @@ Release contents:
   - Validate every generated dataset manifest with
     `scripts/convert_to_arrow.py validate`, requiring embeddings and
     `name_counts_index` when the selected production model uses those features.
+    `--require-embeddings` requires the embedding table to exist and validate
+    structurally; it does not require every referenced paper to have an
+    embedding. Missing per-paper embeddings are valid for some sources and must
+    be captured in the validation metrics as `missing_specter_paper_count` and
+    reviewed in the release audit. Use `--require-complete-embeddings` only for
+    datasets whose source contract guarantees full embedding coverage.
   - Produce a compact release audit file with per-dataset signature, paper,
     paper-author, embedding, cluster-seed, disallow, altered-signature, missing
     embedding, and batch-index counts; include root manifest path, generator git

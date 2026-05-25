@@ -529,7 +529,8 @@ def _resolve_name_counts_index_path(arrow_dataset_dir: Path) -> str | None:
                 if resolved is not None:
                     return str(resolved)
                 raise FileNotFoundError(
-                    f"Arrow manifest {manifest_path} names missing name_counts_index path: {path_value}"
+                    f"Arrow manifest {manifest_path} specifies name_counts_index path that does not exist: "
+                    f"{path_value}"
                 )
     for candidate in (
         arrow_dataset_dir / "name_counts_index",

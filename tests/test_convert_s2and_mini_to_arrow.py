@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import pickle
 import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 import scripts.convert_to_arrow as convert_to_arrow
@@ -307,7 +309,7 @@ def test_linker_replay_main_run_full_discovers_datasets_only_when_explicit(
     assert [call["sources"].dataset for call in calls] == ["pubmed"]
 
 
-def test_validate_manifest_require_embeddings_rejects_missing_specter_rows(tmp_path: Path) -> None:
+def test_validate_manifest_require_embeddings_reports_missing_specter_rows(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
 
     signatures_path = tmp_path / "signatures.arrow"
@@ -354,12 +356,132 @@ def test_validate_manifest_require_embeddings_rejects_missing_specter_rows(tmp_p
         "paper_count": 2,
     }
 
-    with pytest.raises(ValueError, match="require_embeddings=True.*p2"):
+    metrics = convert_to_arrow.validate_arrow_dataset_manifest(
+        manifest,
+        require_embeddings=True,
+        require_name_counts_index=False,
+    )
+
+    assert metrics["specter_count"] == 1
+    assert metrics["missing_specter_paper_count"] == 1
+    assert metrics["missing_specter_paper_examples"] == ["p2"]
+
+
+def test_validate_manifest_can_require_complete_specter_rows(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signatures_path = tmp_path / "signatures.arrow"
+    papers_path = tmp_path / "papers.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter_path = tmp_path / "specter.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1", "s2"], type=pa.string()),
+                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1", "p2"], type=pa.string())}), papers_path)
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+                "position": pa.array([0, 0], type=pa.int64()),
+            }
+        ),
+        paper_authors_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([0.1, 0.2], type=pa.float32()), 2),
+            }
+        ),
+        specter_path,
+    )
+
+    manifest = {
+        "paths": {
+            "signatures": str(signatures_path),
+            "papers": str(papers_path),
+            "paper_authors": str(paper_authors_path),
+            "specter": str(specter_path),
+        },
+        "signature_count": 2,
+        "paper_count": 2,
+    }
+
+    with pytest.raises(ValueError, match="require_complete_embeddings=True.*p2"):
         convert_to_arrow.validate_arrow_dataset_manifest(
             manifest,
             require_embeddings=True,
             require_name_counts_index=False,
+            require_complete_embeddings=True,
         )
+
+
+def test_write_specter_arrow_reports_zero_size_vectors(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    pytest.importorskip("pyarrow")
+    source_path = tmp_path / "specter.pkl"
+    output_path = tmp_path / "specter.arrow"
+    with source_path.open("wb") as outfile:
+        pickle.dump(
+            {
+                "p1": np.array([0.1, 0.2], dtype=np.float32),
+                "p2": np.array([], dtype=np.float32),
+                "p3": np.array([0.3, 0.4], dtype=np.float32),
+            },
+            outfile,
+        )
+
+    with caplog.at_level("WARNING", logger="scripts.convert_to_arrow"):
+        report = convert_to_arrow._write_specter_arrow(
+            source_path=source_path,
+            output_path=output_path,
+            needed_paper_ids={"p1", "p2"},
+            overwrite=True,
+        )
+
+    assert report["row_count"] == 1
+    assert report["dropped_empty_embedding_count"] == 1
+    assert "zero-size vectors" in caplog.text
+
+
+def test_extra_specter_physical_layout_omits_nonportable_batch_index_path(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    specter_path = tmp_path / "specter2.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(
+                    pa.array([0.1, 0.2, 0.3, 0.4], type=pa.float32()),
+                    2,
+                ),
+            }
+        ),
+        specter_path,
+    )
+    paths = {"specter2": str(specter_path)}
+    raw_planner_index_metrics: dict[str, Any] = {}
+    physical_layout: dict[str, Any] = {"tables": {}}
+
+    convert_to_arrow._add_extra_specter_index_and_layout(
+        paths=paths,
+        raw_planner_index_metrics=raw_planner_index_metrics,
+        physical_layout=physical_layout,
+        table_key="specter2",
+        output_dir=tmp_path,
+        overwrite=True,
+    )
+
+    layout = physical_layout["tables"]["specter2"]
+    assert layout["batch_index_path_key"] == "specter2_batch_index"
+    assert "batch_index_path" not in layout
+    assert Path(paths["specter2_batch_index"]).exists()
 
 
 def test_validate_arrow_dataset_dir_resolves_relative_manifest_paths() -> None:

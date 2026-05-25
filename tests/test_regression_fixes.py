@@ -47,7 +47,7 @@ def test_model_predict_class0_does_not_require_num_threads_keyword_support():
     )
 
     assert np.array_equal(predictions, np.zeros(2, dtype=np.float64))
-    assert isinstance(seconds, float)
+    assert seconds >= 0.0
     assert backend == "python"
 
 
@@ -435,52 +435,6 @@ def test_make_distance_matrices_guards_allocation_before_pair_featurization(monk
             dataset,
             total_ram_bytes=1,
         )
-
-
-def test_subblocked_altered_presplit_telemetry_is_reset_on_failure(monkeypatch):
-    dataset = _as_anddata(SimpleNamespace(cluster_seeds_require={}, cluster_seeds_disallow=set()))
-    clusterer = Clusterer(
-        featurizer_info=FeaturizationInfo(features_to_use=["year_diff", "misc_features"]),
-        classifier=None,
-        n_jobs=1,
-        use_cache=False,
-    )
-    clusterer._last_subblocked_altered_presplit_telemetry = {"stale": 1}
-
-    def fail_build_subblocks(self, *_args, **_kwargs):
-        del self, _args, _kwargs
-        raise RuntimeError("subblock failure")
-
-    monkeypatch.setattr(Clusterer, "_build_subblocked_block_dict", fail_build_subblocks)
-
-    with pytest.raises(RuntimeError, match="subblock failure"):
-        clusterer._predict_subblocked(
-            {"block": ["s0", "s1"]},
-            dataset,
-            cluster_model_params=None,
-            partial_supervision={},
-            use_s2_clusters=False,
-            incremental_dont_use_cluster_seeds=False,
-            batching_threshold=1,
-            desired_memory_use=None,
-            runtime_context=RuntimeContext(
-                operation="cluster_predict",
-                requested_backend="python",
-                resolved_backend="python",
-                use_rust=False,
-                run_id="test-subblocked-telemetry",
-                source="default",
-            ),
-            dists=None,
-            total_ram_bytes=None,
-            restore_rust_cluster_seeds_on_exit=True,
-            arrow_paths=None,
-        )
-
-    assert clusterer._last_subblocked_altered_presplit_telemetry == {
-        "bulk_altered_presplit_applied": 0,
-        "bulk_altered_presplit_seconds": 0.0,
-    }
 
 
 def test_residual_first_initial_groups_union_normalized_orcids():

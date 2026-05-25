@@ -92,13 +92,16 @@ def build_rust_json_ingest_contract(
     if not signatures_path or not papers_path:
         raise RuntimeError("Dataset does not expose signatures_path/papers_path for Rust JSON ingest")
 
+    specter_embeddings = getattr(dataset, "specter_embeddings", None)
+    if specter_embeddings is None:
+        specter_embeddings = getattr(dataset, "specter_embeddings_path", None)
+
     return RustJsonIngestContract(
         signatures_path=signatures_path,
         papers_path=papers_path,
         clusters_path=getattr(dataset, "clusters_path", None),
         cluster_seeds_path=getattr(dataset, "cluster_seeds_path", None),
-        specter_embeddings=getattr(dataset, "specter_embeddings", None)
-        or getattr(dataset, "specter_embeddings_path", None),
+        specter_embeddings=specter_embeddings,
         name_tuples_path=name_tuples_path,
         name_counts_path=name_counts_path,
         preprocess=bool(getattr(dataset, "preprocess", True)),

@@ -92,6 +92,28 @@ def test_build_rust_json_ingest_contract_prefers_loaded_dict_over_path():
     assert contract.specter_embeddings == {"p1": [0.1, 0.2]}
 
 
+def test_build_rust_json_ingest_contract_preserves_empty_loaded_dict():
+    class DatasetWithEmptyLoadedSpecter:
+        signatures_path = "signatures.json"
+        papers_path = "papers.json"
+        clusters_path = None
+        cluster_seeds_path = None
+        specter_embeddings_path = "specter.pkl"
+        specter_embeddings = {}
+        preprocess = True
+        compute_reference_features = False
+
+    contract = build_rust_json_ingest_contract(
+        DatasetWithEmptyLoadedSpecter(),
+        name_counts_path=None,
+        cluster_seed_require_value=0.0,
+        cluster_seed_disallow_value=10000.0,
+        num_threads=1,
+    )
+
+    assert contract.specter_embeddings == {}
+
+
 def test_build_rust_json_ingest_contract_accepts_service_shaped_dataset():
     specter_embeddings = {"p1": [0.1, 0.2], "p2": [0.3, 0.4]}
 

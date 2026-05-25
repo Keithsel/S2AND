@@ -9,6 +9,7 @@ from s2and import memory_budget
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.model import Clusterer
+from tests.helpers import tiny_name_counts
 
 
 def _build_dummy_clusterer_and_dataset(*, name: str = "dummy_predict_memory") -> tuple[Clusterer, ANDData]:
@@ -18,7 +19,7 @@ def _build_dummy_clusterer_and_dataset(*, name: str = "dummy_predict_memory") ->
         clusters="tests/dummy/clusters.json",
         cluster_seeds="tests/dummy/cluster_seeds.json",
         name=name,
-        load_name_counts=True,
+        load_name_counts=tiny_name_counts(),
     )
 
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
@@ -27,7 +28,9 @@ def _build_dummy_clusterer_and_dataset(*, name: str = "dummy_predict_memory") ->
     y_random = rng.randint(0, 6, 10)
     clusterer = Clusterer(
         featurizer_info=featurizer_info,
-        classifier=LGBMClassifier(random_state=1, data_random_seed=1, feature_fraction_seed=1).fit(x_random, y_random),
+        classifier=LGBMClassifier(random_state=1, data_random_seed=1, feature_fraction_seed=1, verbosity=-1).fit(
+            x_random, y_random
+        ),
         n_jobs=1,
         use_cache=False,
         use_default_constraints_as_supervision=False,

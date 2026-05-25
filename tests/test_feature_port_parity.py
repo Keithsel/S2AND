@@ -20,7 +20,7 @@ from s2and.feature_port import (
     get_constraints_matrix_rust,
 )
 from s2and.featurizer import _single_pair_featurize
-from tests.helpers import equalish, import_s2and_rust
+from tests.helpers import equalish, import_s2and_rust, tiny_name_counts
 
 HAS_RUST, _rust_import_payload = import_s2and_rust(required_method="from_dataset", prefer_site_packages=True)
 _RUST_IMPORT_ERROR = None if HAS_RUST else _rust_import_payload
@@ -56,7 +56,7 @@ def _load_dataset_from_dir(data_dir, name, *, compute_reference_features=False):
         val_pairs_size=10000,
         test_pairs_size=10000,
         n_jobs=1,
-        load_name_counts=True,
+        load_name_counts=tiny_name_counts(),
         preprocess=True,
         random_seed=42,
         name_tuples="filtered",

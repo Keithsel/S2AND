@@ -697,6 +697,24 @@ def test_predict_from_rust_featurizer_rejects_require_overrides_with_precomputed
         )
 
 
+def test_predict_from_rust_featurizer_rejects_implicit_require_with_precomputed_dists() -> None:
+    class _FakeFeaturizer:
+        def cluster_seeds_require(self):
+            return [("0", "c0"), ("1", "c1")]
+
+        def signature_rule_metadata(self):
+            return [("0", "First0", None), ("1", "First1", None)]
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+
+    with pytest.raises(ValueError, match="cluster_seeds_require cannot be used with precomputed dists"):
+        clusterer.predict_from_rust_featurizer(
+            {"block": ["0", "1"]},
+            _FakeFeaturizer(),
+            dists={"block": np.zeros((2, 2), dtype=np.float64)},
+        )
+
+
 def test_predict_from_rust_featurizer_injects_seed_overrides_into_distance_build(monkeypatch):
     captured_partial_supervision: list[dict[tuple[str, str], int | float]] = []
     captured_incremental_flags: list[bool] = []

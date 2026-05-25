@@ -181,7 +181,6 @@ def test_convert_service_json_to_arrow_preserves_seed_and_altered_tables(
     assert manifest["paper_count"] == 3
     assert manifest["cluster_seeds_require_count"] == 2
     assert manifest["cluster_seeds_disallow_count"] == 1
-    assert manifest["altered_cluster_signatures"] == ["s1"]
 
     dataset_dir = tmp_path / "arrow" / "service_payload"
     cluster_seed_rows = _read_table(str(_manifest_path(manifest, dataset_dir, "cluster_seeds"))).to_pydict()

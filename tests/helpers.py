@@ -12,6 +12,32 @@ from s2and.incremental_linking.query_adapter import ClusterSummary, QueryFeature
 from s2and.runtime import detect_rust_runtime_capabilities
 
 
+def tiny_name_counts() -> dict[str, dict[str, int]]:
+    """Return a small deterministic name-count artifact for dummy tests."""
+
+    return {
+        "first_dict": {
+            "abdul": 10,
+            "alexander": 20,
+            "dr": 30,
+        },
+        "last_dict": {
+            "sattar": 40,
+            "konovalov": 50,
+        },
+        "first_last_dict": {
+            "abdul sattar": 60,
+            "alexander konovalov": 70,
+            "dr sattar": 80,
+        },
+        "last_first_initial_dict": {
+            "sattar a": 90,
+            "sattar d": 100,
+            "konovalov a": 110,
+        },
+    }
+
+
 def equalish(a: float, b: float, rel_tol: float = 1e-6, abs_tol: float = 1e-3) -> bool:
     if math.isnan(float(a)) and math.isnan(float(b)):
         return True
@@ -65,17 +91,18 @@ def build_dummy_dataset(
     name: str,
     *,
     mode: str = "train",
-    load_name_counts: bool = False,
+    load_name_counts: bool | dict[str, dict[str, int]] = False,
     compute_reference_features: bool = False,
     n_jobs: int = 1,
 ) -> ANDData:
+    resolved_name_counts = tiny_name_counts() if load_name_counts is True else load_name_counts
     return ANDData(
         "tests/dummy/signatures.json",
         "tests/dummy/papers.json",
         clusters="tests/dummy/clusters.json",
         name=name,
         mode=mode,
-        load_name_counts=load_name_counts,
+        load_name_counts=resolved_name_counts,
         preprocess=True,
         n_jobs=n_jobs,
         compute_reference_features=compute_reference_features,

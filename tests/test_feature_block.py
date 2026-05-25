@@ -762,6 +762,40 @@ def test_raw_planner_index_rejects_stale_python_reuse(tmp_path: Path) -> None:
         write_raw_arrow_batch_lookup_indexes({"signatures": path}, tmp_path, overwrite=False)
 
 
+def test_raw_planner_index_rejects_same_size_sampled_rewrite_python_reuse(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signature_ids = [f"key{index:013d}" for index in range(30_000)]
+    path = write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(signature_ids, type=pa.string()),
+                "payload": pa.array(["x" * 8] * len(signature_ids), type=pa.string()),
+            }
+        ),
+        tmp_path / "signatures.arrow",
+        max_record_batch_rows=1000,
+    )
+    index_path = tmp_path / "signatures.signatures_batch_index.bin"
+    write_arrow_batch_lookup_index(path, index_path, key_column="signature_id", table_name="signatures")
+    payload = Path(path).read_bytes()
+    old_value = signature_ids[0].encode()
+    new_value = b"new0000000000000"
+    rewrite_offset = payload.index(old_value)
+    assert len(old_value) == len(new_value)
+    assert rewrite_offset < 65_536
+    Path(path).write_bytes(payload[:rewrite_offset] + new_value + payload[rewrite_offset + len(old_value) :])
+
+    with pytest.raises(ValueError, match="stale"):
+        write_arrow_batch_lookup_index(
+            path,
+            index_path,
+            key_column="signature_id",
+            table_name="signatures",
+            overwrite=False,
+        )
+
+
 def test_raw_planner_index_reuse_metrics_match_fresh_schema(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     path = write_arrow_ipc_table(
@@ -873,6 +907,72 @@ def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert write_name_counts_arrow(tmp_path)[1] == {"reused": True}
     assert write_name_counts_index(tmp_path)[1] == {"reused": True}
     assert write_name_pairs_arrow({("ada", "a")}, tmp_path)[1] == {"reused": False, "row_count": 1}
+
+
+def test_write_name_counts_index_rewrites_changed_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import s2and.data as data_module
+
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"ada": 3}, {"lovelace": 5}, {"ada lovelace": 2}, {"lovelace a": 7}),
+    )
+    index_path, first_metrics = write_name_counts_index(tmp_path)
+
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"grace": 11}, {"hopper": 13}, {"grace hopper": 17}, {"hopper g": 19}),
+    )
+    reused_path, second_metrics = write_name_counts_index(tmp_path)
+
+    assert reused_path == index_path
+    assert first_metrics["reused"] is False
+    assert second_metrics["reused"] is False
+    assert second_metrics["row_count"] == 4
+    manifest = json.loads((Path(index_path) / "manifest.json").read_text(encoding="utf-8"))
+    first_path = Path(index_path) / manifest["files"]["first"]["path"]
+    assert b"grace" in first_path.read_bytes()
+    assert b"ada" not in first_path.read_bytes()
+
+
+def test_write_name_counts_index_reuses_complete_manifest_without_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import s2and.data as data_module
+
+    index_dir = tmp_path / "name_counts_index"
+    generation_dir = index_dir / "generations" / "gen-legacy"
+    generation_dir.mkdir(parents=True)
+    files: dict[str, dict[str, str]] = {}
+    for kind in ("first", "last", "first_last", "last_first_initial"):
+        filename = f"{kind}.bin"
+        (generation_dir / filename).write_bytes(b"placeholder")
+        files[kind] = {"path": f"generations/gen-legacy/{filename}"}
+    (index_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "name_counts_index_v1",
+                "magic": "S2NCI001",
+                "files": files,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_load_name_counts() -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
+        raise AssertionError("complete legacy manifest should be reused before loading name counts")
+
+    monkeypatch.setattr(data_module, "_load_name_counts_cached", fail_load_name_counts)
+
+    reused_path, metrics = write_name_counts_index(tmp_path)
+
+    assert reused_path == str(index_dir)
+    assert metrics == {"reused": True}
 
 
 def test_write_name_artifacts_arrow_rewrites_stale_existing_outputs(

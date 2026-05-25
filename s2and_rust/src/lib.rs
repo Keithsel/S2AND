@@ -14040,18 +14040,32 @@ fn raw_arrow_excluded_candidate_indices_by_query(
     component_order: &[String],
     component_keys_by_member: &HashMap<String, Vec<String>>,
     cluster_seed_disallows: &HashSet<(String, String)>,
-) -> (Option<Vec<Option<HashSet<usize>>>>, usize) {
+) -> PyResult<(Option<Vec<Option<HashSet<usize>>>>, usize)> {
     let query_signature_id_set: HashSet<&str> =
         query_signature_ids.iter().map(String::as_str).collect();
     let mut disallowed_members_by_query = HashMap::<String, HashSet<String>>::new();
     for (left, right) in cluster_seed_disallows.iter() {
-        if query_signature_id_set.contains(left.as_str()) {
+        let left_is_query = query_signature_id_set.contains(left.as_str());
+        let right_is_query = query_signature_id_set.contains(right.as_str());
+        let left_is_seed = component_keys_by_member.contains_key(left);
+        let right_is_seed = component_keys_by_member.contains_key(right);
+        if left_is_query && !right_is_query && !right_is_seed {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "cluster_seed_disallows pair references unknown seed endpoint for query {left:?}: {right:?}"
+            )));
+        }
+        if right_is_query && !left_is_query && !left_is_seed {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "cluster_seed_disallows pair references unknown seed endpoint for query {right:?}: {left:?}"
+            )));
+        }
+        if left_is_query {
             disallowed_members_by_query
                 .entry(left.clone())
                 .or_default()
                 .insert(right.clone());
         }
-        if query_signature_id_set.contains(right.as_str()) {
+        if right_is_query {
             disallowed_members_by_query
                 .entry(right.clone())
                 .or_default()
@@ -14104,10 +14118,10 @@ fn raw_arrow_excluded_candidate_indices_by_query(
                     .map(HashSet::len)
                     .sum()
             });
-    (
+    Ok((
         excluded_indices_by_query,
         cluster_seed_disallowed_candidate_count,
-    )
+    ))
 }
 
 fn raw_arrow_summary_signals_cached<'a>(
@@ -14941,7 +14955,7 @@ impl RawBlockQueryCandidatePlanner {
                 component_order,
                 &self.state.component_keys_by_member,
                 &self.state.cluster_seed_disallows,
-            );
+            )?;
 
         let retrieval_start = Instant::now();
         let query_results: Vec<Result<RetrievalPairPlanQueryResult, String>> =

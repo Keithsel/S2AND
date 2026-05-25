@@ -41,7 +41,6 @@ from scripts.eps_sweep.common import (
     DEFAULT_LINKER_BUNDLE_ROOT,
     DEFAULT_MODEL_PATH,
     DEFAULT_OUTPUT_ROOT,
-    json_digest,
     load_arrow_paths,
     sha1_text,
     write_json,
@@ -132,6 +131,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Optional smoke limit after subblock selection.",
     )
     parser.add_argument(
+        "--allow-full-run",
+        action="store_true",
+        help="Permit --compute-missing-dists without --max-subblocks.",
+    )
+    parser.add_argument(
         "--subblock-selection",
         choices=["gold-heavy", "smallest"],
         default="gold-heavy",
@@ -182,6 +186,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--eps-stop must be >= --eps-start")
     if args.max_subblocks is not None and args.max_subblocks <= 0:
         raise ValueError("--max-subblocks must be > 0 when set")
+    if args.compute_missing_dists and args.max_subblocks is None and not args.allow_full_run:
+        raise ValueError("--compute-missing-dists requires --max-subblocks or explicit --allow-full-run")
 
 
 def _gold_path(args: argparse.Namespace) -> Path:
@@ -550,6 +556,85 @@ def _cache_metadata(
     }
 
 
+def _hash_file(path: Path) -> str:
+    """Return a SHA256 digest for one file."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as infile:
+        for chunk in iter(lambda: infile.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _path_stat_cache_key(path: Path) -> tuple[Any, ...]:
+    if not path.exists():
+        return ("missing", str(path))
+    stat = path.stat()
+    if path.is_file():
+        return ("file", str(path), int(stat.st_size), int(stat.st_mtime_ns))
+    if path.is_dir():
+        entries: list[tuple[str, int, int]] = []
+        for child in sorted(candidate for candidate in path.rglob("*") if candidate.is_file()):
+            child_stat = child.stat()
+            entries.append(
+                (
+                    child.relative_to(path).as_posix(),
+                    int(child_stat.st_size),
+                    int(child_stat.st_mtime_ns),
+                )
+            )
+        return ("dir", str(path), tuple(entries))
+    return ("other", str(path), int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def _hash_directory(path: Path) -> tuple[int, int, str]:
+    digest = hashlib.sha256()
+    digest.update(b"s2and-directory-fingerprint-v1\0")
+    total_size = 0
+    max_mtime_ns = int(path.stat().st_mtime_ns)
+    for child in sorted(candidate for candidate in path.rglob("*") if candidate.is_file()):
+        child_stat = child.stat()
+        rel_path = child.relative_to(path).as_posix()
+        total_size += int(child_stat.st_size)
+        max_mtime_ns = max(max_mtime_ns, int(child_stat.st_mtime_ns))
+        rel_bytes = rel_path.encode("utf-8")
+        digest.update(len(rel_bytes).to_bytes(8, "little", signed=False))
+        digest.update(rel_bytes)
+        digest.update(int(child_stat.st_size).to_bytes(8, "little", signed=False))
+        with child.open("rb") as infile:
+            for chunk in iter(lambda: infile.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return total_size, max_mtime_ns, digest.hexdigest()
+
+
+def _arrow_paths_content_digest(arrow_paths: Mapping[str, str]) -> str:
+    """Digest Arrow path identity and file metadata for cache invalidation."""
+
+    digest = hashlib.sha256()
+    digest.update(b"s2and-eps-arrow-paths-v2\0")
+    for key, raw_path in sorted((str(key), str(value)) for key, value in arrow_paths.items()):
+        path = Path(raw_path)
+        resolved = path.resolve() if path.exists() else path
+        key_bytes = key.encode("utf-8")
+        path_bytes = str(resolved).encode("utf-8")
+        digest.update(len(key_bytes).to_bytes(8, "little", signed=False))
+        digest.update(key_bytes)
+        digest.update(len(path_bytes).to_bytes(8, "little", signed=False))
+        digest.update(path_bytes)
+        if path.is_file():
+            stat = path.stat()
+            digest.update(b"file\0")
+            digest.update(int(stat.st_size).to_bytes(8, "little", signed=False))
+            digest.update(int(stat.st_mtime_ns).to_bytes(8, "little", signed=False))
+        elif path.is_dir():
+            stat_key = _path_stat_cache_key(path)
+            digest.update(b"dir\0")
+            digest.update(repr(stat_key).encode("utf-8"))
+        else:
+            digest.update(b"missing\0")
+    return digest.hexdigest()
+
+
 def _model_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
     """Return a stable fingerprint for the model artifact used by distance caches."""
 
@@ -557,19 +642,21 @@ def _model_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
     model_stat = model_path.stat() if model_path.exists() else None
     if model_stat is None:
         return {"model_path": str(model_path), "model_size": None, "model_mtime_ns": None, "model_sha256": None}
-    cache_key = (str(model_path), int(model_stat.st_size), int(model_stat.st_mtime_ns))
+    cache_key = _path_stat_cache_key(model_path)
     cached = getattr(args, "_s2and_model_fingerprint_cache", None)
     if cached is not None and cached[0] == cache_key:
         return dict(cached[1])
-    digest = hashlib.sha256()
-    with model_path.open("rb") as infile:
-        for chunk in iter(lambda: infile.read(1024 * 1024), b""):
-            digest.update(chunk)
+    if model_path.is_dir():
+        model_size, model_mtime_ns, model_sha256 = _hash_directory(model_path)
+    else:
+        model_size = int(model_stat.st_size)
+        model_mtime_ns = int(model_stat.st_mtime_ns)
+        model_sha256 = _hash_file(model_path)
     fingerprint = {
         "model_path": str(model_path),
-        "model_size": int(model_stat.st_size),
-        "model_mtime_ns": int(model_stat.st_mtime_ns),
-        "model_sha256": digest.hexdigest(),
+        "model_size": model_size,
+        "model_mtime_ns": model_mtime_ns,
+        "model_sha256": model_sha256,
     }
     try:
         args._s2and_model_fingerprint_cache = (cache_key, dict(fingerprint))
@@ -638,7 +725,7 @@ def _ensure_distance_caches(
     cache_dir.mkdir(parents=True, exist_ok=True)
     original_batch_size = clusterer.batch_size
     clusterer.batch_size = int(args.pair_chunk_size)
-    arrow_paths_digest = json_digest(dict(arrow_paths))
+    arrow_paths_digest = _arrow_paths_content_digest(arrow_paths)
     cache_rows: list[dict[str, Any]] = []
     rows_by_block: dict[str, dict[str, Any]] = {}
     blocks_to_compute: dict[str, list[str]] = {}
@@ -814,7 +901,7 @@ def _build_linkage_blocks(
 
     linkage_blocks: dict[str, CachedLinkageBlock] = {}
     linkage_rows: list[dict[str, Any]] = []
-    arrow_paths_digest = json_digest(dict(arrow_paths))
+    arrow_paths_digest = _arrow_paths_content_digest(arrow_paths)
     for index, (block_key, signature_ids) in enumerate(sorted(selected_subblocks.items())):
         started = time.perf_counter()
         signature_ids = [str(signature_id) for signature_id in signature_ids]

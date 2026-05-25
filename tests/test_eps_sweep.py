@@ -136,3 +136,72 @@ def test_distance_cache_metadata_rejects_overwritten_model_path(tmp_path) -> Non
 
     with pytest.raises(ValueError, match="model_"):
         sweep_eps_on_linking_gold._load_cached_distance(cache_path, expected_metadata)
+
+
+def test_distance_cache_metadata_rejects_overwritten_arrow_path(tmp_path) -> None:
+    model_path = tmp_path / "model.pkl"
+    model_path.write_bytes(b"model")
+    arrow_path = tmp_path / "signatures.arrow"
+    arrow_path.write_bytes(b"first arrow")
+    args = SimpleNamespace(
+        arrow_root=tmp_path / "arrow",
+        batching_threshold=10,
+        dataset="dummy",
+        model_path=model_path,
+        pair_chunk_size=3,
+        suppress_orcid_constraints=False,
+        use_orcid_subblocking=False,
+    )
+    arrow_paths = {"signatures": str(arrow_path)}
+    metadata = sweep_eps_on_linking_gold._cache_metadata(
+        cast(Any, args),
+        "block",
+        ["s1", "s2"],
+        sweep_eps_on_linking_gold._arrow_paths_content_digest(arrow_paths),  # noqa: SLF001
+    )
+    cache_path = tmp_path / "cache.pkl"
+    with cache_path.open("wb") as outfile:
+        pickle.dump({"metadata": metadata, "dist": [0.25]}, outfile)
+
+    arrow_path.write_bytes(b"second arrow")
+    expected_metadata = sweep_eps_on_linking_gold._cache_metadata(
+        cast(Any, args),
+        "block",
+        ["s1", "s2"],
+        sweep_eps_on_linking_gold._arrow_paths_content_digest(arrow_paths),  # noqa: SLF001
+    )
+
+    with pytest.raises(ValueError, match="arrow_paths_digest"):
+        sweep_eps_on_linking_gold._load_cached_distance(cache_path, expected_metadata)
+
+
+def test_model_fingerprint_accepts_directory_model_path(tmp_path) -> None:
+    model_path = tmp_path / "production_model_v1.21"
+    (model_path / "pairwise").mkdir(parents=True)
+    (model_path / "manifest.json").write_text("{}", encoding="utf-8")
+    (model_path / "pairwise" / "main.lgb").write_bytes(b"model")
+    args = SimpleNamespace(model_path=model_path)
+
+    fingerprint = sweep_eps_on_linking_gold._model_fingerprint(cast(Any, args))  # noqa: SLF001
+
+    assert fingerprint["model_path"] == str(model_path.resolve())
+    assert fingerprint["model_size"] == 7
+    assert isinstance(fingerprint["model_sha256"], str)
+    assert len(fingerprint["model_sha256"]) == 64
+
+
+def test_validate_args_requires_limit_or_full_run_for_compute_missing() -> None:
+    args = sweep_eps_on_linking_gold.parse_args(["--dataset", "dummy", "--compute-missing-dists"])
+
+    with pytest.raises(ValueError, match="--max-subblocks"):
+        sweep_eps_on_linking_gold._validate_args(args)  # noqa: SLF001
+
+    limited_args = sweep_eps_on_linking_gold.parse_args(
+        ["--dataset", "dummy", "--compute-missing-dists", "--max-subblocks", "1"]
+    )
+    sweep_eps_on_linking_gold._validate_args(limited_args)  # noqa: SLF001
+
+    full_run_args = sweep_eps_on_linking_gold.parse_args(
+        ["--dataset", "dummy", "--compute-missing-dists", "--allow-full-run"]
+    )
+    sweep_eps_on_linking_gold._validate_args(full_run_args)  # noqa: SLF001

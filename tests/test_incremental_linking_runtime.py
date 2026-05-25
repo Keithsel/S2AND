@@ -4,7 +4,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import lightgbm as lgb
 import numpy as np
 import pytest
 
@@ -49,6 +48,7 @@ from s2and.incremental_linking.runtime import (
     compute_candidate_batch_pairwise_model_and_aggregate_stats as _pairwise_model_stats_impl,
 )
 from tests.helpers import build_dummy_dataset
+from tests.promoted_linking_helpers import build_tiny_promoted_booster
 
 runtime_module: Any = runtime_module
 
@@ -418,30 +418,6 @@ def test_private_production_forwards_four_element_seed_setup_to_retrieval_slice(
 
     assert result.ok is True
     assert captured["seed_setup"][3] is split_inverse
-
-
-def _tiny_booster() -> tuple[lgb.Booster, np.ndarray]:
-    columns = promoted_linker_feature_columns()
-    matrix = np.zeros((8, len(columns)), dtype=np.float32)
-    matrix[:, columns.index("min_distance")] = np.linspace(1.0, 0.0, len(matrix), dtype=np.float32)
-    labels = np.asarray([0, 0, 0, 1, 1, 1, 1, 1], dtype=np.int8)
-    dataset = lgb.Dataset(matrix, label=labels, free_raw_data=False)
-    booster = lgb.train(
-        {
-            "objective": "binary",
-            "metric": "binary_logloss",
-            "verbosity": -1,
-            "num_threads": 1,
-            "learning_rate": 0.3,
-            "num_leaves": 3,
-            "min_data_in_leaf": 1,
-            "min_data_in_bin": 1,
-            "force_col_wise": True,
-        },
-        dataset,
-        num_boost_round=6,
-    )
-    return booster, matrix[:3]
 
 
 def _row_features(retrieval_scores: np.ndarray) -> dict[str, np.ndarray]:
@@ -1146,7 +1122,7 @@ def test_fused_pairwise_model_rust_distance_accumulator_matches_python_large(
 
 
 def test_compact_link_or_abstain_scores_artifact_rows_and_applies_gate(tmp_path: Path) -> None:
-    booster, fixture = _tiny_booster()
+    booster, fixture = build_tiny_promoted_booster()
     save_incremental_linking_artifact(
         booster,
         tmp_path,
@@ -1184,7 +1160,7 @@ def test_compact_link_or_abstain_scores_artifact_rows_and_applies_gate(tmp_path:
 
 
 def test_compact_link_or_abstain_abstains_when_artifact_score_threshold_too_high(tmp_path: Path) -> None:
-    booster, fixture = _tiny_booster()
+    booster, fixture = build_tiny_promoted_booster()
     save_incremental_linking_artifact(
         booster,
         tmp_path,

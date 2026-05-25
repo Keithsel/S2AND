@@ -196,6 +196,24 @@ def test_coauthor_blocks_from_full_arrow_normalizes_author_names(tmp_path) -> No
     }
 
 
+def test_coauthor_blocks_from_rowwise_arrow_normalizes_author_names(tmp_path) -> None:
+    paper_authors = pa.table(
+        {
+            "paper_id": pa.array(["p1", "p1"], type=pa.string()),
+            "position": pa.array([0, 1], type=pa.int64()),
+            "author_name": pa.array(["O'Connor", "Maciej Górski"], type=pa.string()),
+        }
+    )
+
+    out = subblocking._coauthor_blocks_by_paper_from_arrow(  # noqa: SLF001
+        {"paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors)},
+        ["p1"],
+        load_metrics={},
+    )
+
+    assert out == {"p1": [(0, "o connor"), (1, "m gorski")]}
+
+
 def test_subblock_merge_candidate_metadata_preserves_middle_values_with_equals() -> None:
     assert subblocking._subblock_merge_candidate_metadata("a|middle=b=c", 2) == (2, "a", "b=c", "b=c", "b=c")
 

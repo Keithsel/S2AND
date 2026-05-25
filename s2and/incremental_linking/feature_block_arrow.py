@@ -770,9 +770,19 @@ def _name_counts_index_manifest_paths(index_dir: Path) -> dict[str, Path] | None
     return resolved
 
 
-def _name_counts_index_complete(index_dir: Path) -> bool:
+def _name_counts_index_complete(index_dir: Path, *, expected_fingerprint: int | None = None) -> bool:
     manifest_paths = _name_counts_index_manifest_paths(index_dir)
-    return manifest_paths is not None and all(path.exists() for path in manifest_paths.values())
+    if manifest_paths is None or not all(path.exists() for path in manifest_paths.values()):
+        return False
+    manifest_path = index_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, Mapping):
+        return False
+    if expected_fingerprint is None:
+        return "fingerprint" not in manifest
+    if "fingerprint" not in manifest:
+        return True
+    return manifest.get("fingerprint") == expected_fingerprint
 
 
 def _remove_stale_name_counts_generations(index_dir: Path, current_generation_name: str) -> None:
@@ -796,6 +806,17 @@ def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) 
         return str(index_dir), {"reused": True}
 
     first_dict, last_dict, first_last_dict, last_first_initial_dict = _load_name_counts_cached()
+    fingerprint = _name_counts_arrow_fingerprint(
+        {
+            "first": first_dict,
+            "last": last_dict,
+            "first_last": first_last_dict,
+            "last_first_initial": last_first_initial_dict,
+        }
+    )
+    if not overwrite and _name_counts_index_complete(index_dir, expected_fingerprint=fingerprint):
+        return str(index_dir), {"reused": True}
+
     metrics: dict[str, int | bool] = {"reused": False}
     total_records = 0
     total_bytes = 0
@@ -832,6 +853,7 @@ def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) 
         manifest = {
             "schema_version": NAME_COUNTS_INDEX_SCHEMA_VERSION,
             "magic": _NAME_COUNTS_INDEX_MAGIC.decode("ascii"),
+            "fingerprint": fingerprint,
             "record_layout": "hash1:u64,hash2:u64,name_offset:u64,name_len:u32,reserved:u32,count:f64",
             "sort_order": "hash1,hash2,utf8_name_bytes",
             "hash": "fnv1a64(name_bytes), fnv1a64(domain + kind + NUL + name_bytes)",

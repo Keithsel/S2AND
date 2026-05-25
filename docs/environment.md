@@ -27,6 +27,16 @@ See [caching.md](caching.md) for cache semantics and on-disk layout.
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
 | `S2AND_PATH_CONFIG` | `<path>` | `s2and/data/path_config.json` | Path to the JSON data-path config. Use when data lives outside the package default path. |
+| `S2AND_RUST_NAME_COUNTS_JSON` | `<path>` | unset | Optional Rust JSON-ingest name-count artifact override. Prefer Arrow `name_counts_index` for Arrow inference paths. |
+| `S2AND_NORMALIZATION_VERSION` | `<version>` | code default | Expected normalization contract for Rust feature-port inputs. Use only when validating regenerated normalization-sensitive artifacts. |
+
+---
+
+## Import & Model Loading
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `S2AND_SKIP_FASTTEXT` | `1`, `true`, `yes` to skip | unset | Disables fastText model loading for scripts/tests that do not need language detection. Set before importing `s2and.text`. |
 
 ---
 

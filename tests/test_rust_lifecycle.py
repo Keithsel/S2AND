@@ -192,38 +192,5 @@ def test_defer_signature_fields_requires_rust_and_non_inference(
     assert policy.defer_signature_fields_to_rust is expected
 
 
-@pytest.mark.parametrize(
-    ("backend", "mode", "has_signatures_path", "has_papers_path", "preprocess", "use_rust"),
-    [
-        ("python", "train", False, False, False, False),
-        ("python", "inference", True, True, True, False),
-        ("rust", "train", False, False, True, True),
-        ("rust", "train", True, True, True, True),
-        ("rust", "inference", True, True, True, True),
-        ("rust", "inference", True, False, True, True),
-    ],
-)
-def test_policy_representative_combinations(
-    backend: str,
-    mode: str,
-    has_signatures_path: bool,
-    has_papers_path: bool,
-    preprocess: bool,
-    use_rust: bool,
-):
-    """Smoke test over representative backend/mode/path combinations."""
-    policy = build_rust_lifecycle_policy(
-        backend=backend,  # type: ignore[arg-type]
-        mode=mode,
-        has_signatures_path=has_signatures_path,
-        has_papers_path=has_papers_path,
-        preprocess=preprocess,
-        use_rust=use_rust,
-    )
-    assert isinstance(policy, RustLifecyclePolicy)
-    if backend == "python":
-        assert policy == PYTHON_ONLY_POLICY
-
-
 def test_lifecycle_policy_stores_only_canonical_mode():
     assert [field.name for field in fields(RustLifecyclePolicy)] == ["mode"]

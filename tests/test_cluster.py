@@ -8,6 +8,7 @@ from s2and.consts import LARGE_DISTANCE
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.model import Clusterer
+from tests.helpers import tiny_name_counts
 
 
 class TestClusterer(unittest.TestCase):
@@ -19,7 +20,7 @@ class TestClusterer(unittest.TestCase):
             clusters="tests/dummy/clusters.json",
             cluster_seeds="tests/dummy/cluster_seeds.json",
             name="dummy",
-            load_name_counts=True,
+            load_name_counts=tiny_name_counts(),
         )
 
         features_to_use = [
@@ -32,7 +33,7 @@ class TestClusterer(unittest.TestCase):
         y_random = np.random.randint(0, 6, 10)
         self.dummy_clusterer = Clusterer(
             featurizer_info=featurizer_info,
-            classifier=LGBMClassifier(random_state=1, data_random_seed=1, feature_fraction_seed=1).fit(
+            classifier=LGBMClassifier(random_state=1, data_random_seed=1, feature_fraction_seed=1, verbosity=-1).fit(
                 X_random, y_random
             ),
             n_jobs=1,
@@ -153,17 +154,3 @@ class TestClusterer(unittest.TestCase):
         }
         with pytest.raises(KeyError, match="Missing precomputed distance matrix for block"):
             self.dummy_clusterer.predict_helper(block, self.dummy_dataset, dists={})
-
-    def test_predict_from_rust_featurizer_rejects_disallows_with_precomputed_dists(self):
-        block = {
-            "a sattar": ["0", "1"],
-        }
-
-        with pytest.raises(ValueError, match="cluster_seeds_disallow.*precomputed dists"):
-            self.dummy_clusterer.predict_from_rust_featurizer(
-                block,
-                object(),
-                dists={"a sattar": np.asarray([0.1], dtype=np.float64)},
-                cluster_seeds_require={},
-                cluster_seeds_disallow={("0", "1")},
-            )

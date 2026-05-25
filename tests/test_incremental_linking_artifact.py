@@ -20,30 +20,7 @@ from s2and.incremental_linking.contracts import (
 )
 from s2and.incremental_linking.features import promoted_linker_feature_columns
 from s2and.incremental_linking.logistic_gate import logistic_gate_config
-
-
-def _tiny_booster() -> tuple[lgb.Booster, np.ndarray]:
-    columns = promoted_linker_feature_columns()
-    matrix = np.zeros((8, len(columns)), dtype=np.float32)
-    matrix[:, columns.index("min_distance")] = np.linspace(1.0, 0.0, len(matrix), dtype=np.float32)
-    labels = np.asarray([0, 0, 0, 1, 1, 1, 1, 1], dtype=np.int8)
-    dataset = lgb.Dataset(matrix, label=labels, free_raw_data=False)
-    booster = lgb.train(
-        {
-            "objective": "binary",
-            "metric": "binary_logloss",
-            "verbosity": -1,
-            "num_threads": 1,
-            "learning_rate": 0.3,
-            "num_leaves": 3,
-            "min_data_in_leaf": 1,
-            "min_data_in_bin": 1,
-            "force_col_wise": True,
-        },
-        dataset,
-        num_boost_round=6,
-    )
-    return booster, matrix[:3]
+from tests.promoted_linking_helpers import build_tiny_promoted_booster
 
 
 def _logistic_gate_config(link: bool = True) -> dict[str, object]:
@@ -57,7 +34,7 @@ def _logistic_gate_config(link: bool = True) -> dict[str, object]:
 
 
 def test_save_and_load_incremental_linking_artifact_round_trip(tmp_path: Path) -> None:
-    booster, fixture = _tiny_booster()
+    booster, fixture = build_tiny_promoted_booster()
     metadata = save_incremental_linking_artifact(
         booster,
         tmp_path,
@@ -87,7 +64,7 @@ def test_save_incremental_linking_artifact_requires_lightgbm_version(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    booster, fixture = _tiny_booster()
+    booster, fixture = build_tiny_promoted_booster()
     monkeypatch.delattr(lgb, "__version__", raising=False)
 
     with pytest.raises(RuntimeError, match="lightgbm.__version__ is required"):
@@ -114,7 +91,7 @@ def test_load_incremental_linking_artifact_rejects_digest_drift(
     field_name: str,
     message: str,
 ) -> None:
-    booster, fixture = _tiny_booster()
+    booster, fixture = build_tiny_promoted_booster()
     save_incremental_linking_artifact(
         booster,
         tmp_path,

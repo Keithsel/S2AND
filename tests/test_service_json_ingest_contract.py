@@ -50,6 +50,12 @@ def _skip_unless_rust_from_json_paths_available() -> None:
         raise pytest.skip.Exception(f"s2and_rust RustFeaturizer.from_json_paths is unavailable: {rust_module}")
 
 
+@pytest.fixture(autouse=True)
+def _rust_from_json_paths_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    _skip_unless_rust_from_json_paths_available()
+    monkeypatch.setenv("S2AND_BACKEND", "rust")
+
+
 def _service_specter_embeddings() -> dict[str, list[float]]:
     return {
         "53235312": [0.1, 0.2],
@@ -265,8 +271,6 @@ def _normalize_partition(clusters: dict[str, list[str]]) -> set[frozenset[str]]:
 
 
 def test_path_backed_inference_anddata_matches_service_lifecycle(monkeypatch):
-    _skip_unless_rust_from_json_paths_available()
-    monkeypatch.setenv("S2AND_BACKEND", "rust")
     dataset, specter_embeddings = _build_service_shaped_dataset()
 
     assert dataset.signatures_path is not None
@@ -297,8 +301,6 @@ def test_path_backed_inference_anddata_matches_service_lifecycle(monkeypatch):
 
 
 def test_service_shaped_from_json_paths_feature_parity_with_dict_backed_inference(monkeypatch):
-    _skip_unless_rust_from_json_paths_available()
-    monkeypatch.setenv("S2AND_BACKEND", "rust")
     dict_backed_dataset = _build_dict_backed_service_dataset()
     path_backed_dataset, _specter_embeddings = _build_service_shaped_dataset()
     runtime_context = build_runtime_context("service_json_ingest_feature_parity")
@@ -318,8 +320,6 @@ def test_service_shaped_from_json_paths_feature_parity_with_dict_backed_inferenc
 
 
 def test_service_shaped_from_json_paths_prediction_partition_parity_with_dict_backed_inference(monkeypatch):
-    _skip_unless_rust_from_json_paths_available()
-    monkeypatch.setenv("S2AND_BACKEND", "rust")
     dict_backed_dataset = _build_dict_backed_service_dataset()
     path_backed_dataset, _specter_embeddings = _build_service_shaped_dataset()
     block_dict = {"a sattar": ["0", "1", "2"]}
@@ -342,8 +342,6 @@ def test_service_shaped_edge_case_from_json_paths_feature_parity_with_dict_backe
     monkeypatch,
     tmp_path,
 ):
-    _skip_unless_rust_from_json_paths_available()
-    monkeypatch.setenv("S2AND_BACKEND", "rust")
     dict_backed_dataset = _build_edge_case_dataset(tmp_path=None)
     path_backed_dataset = _build_edge_case_dataset(tmp_path=tmp_path)
     runtime_context = build_runtime_context("service_json_ingest_edge_feature_parity")
@@ -366,8 +364,6 @@ def test_service_shaped_edge_case_from_json_paths_feature_parity_with_dict_backe
 
 
 def test_service_shaped_from_json_paths_reports_partial_specter_embeddings(monkeypatch):
-    _skip_unless_rust_from_json_paths_available()
-    monkeypatch.setenv("S2AND_BACKEND", "rust")
     partial_specter_embeddings = {"53235312": [0.1, 0.2]}
     dataset, _specter_embeddings = _build_service_shaped_dataset(specter_embeddings=partial_specter_embeddings)
     runtime_context = build_runtime_context("service_json_ingest_partial_specter")
@@ -384,8 +380,6 @@ def test_service_shaped_from_json_paths_reports_partial_specter_embeddings(monke
 
 
 def test_path_backed_inference_dict_cluster_seeds_sync_to_rust_constraints(monkeypatch):
-    _skip_unless_rust_from_json_paths_available()
-    monkeypatch.setenv("S2AND_BACKEND", "rust")
     dataset, _specter_embeddings = _build_service_shaped_dataset()
     runtime_context = build_runtime_context("service_json_ingest_contract_test")
 

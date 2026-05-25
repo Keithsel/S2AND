@@ -78,7 +78,7 @@ from s2and.subblocking import (
     make_subblocks_arrow_rust,
     rust_arrow_subblocking_available,
 )
-from s2and.text import first_names_name_compatible
+from s2and.text import first_names_name_compatible, normalize_orcid_compact
 from s2and.thread_config import resolve_n_jobs
 from s2and.warnings_utils import suppress_sklearn_feature_name_warnings
 
@@ -375,8 +375,7 @@ def _normalized_orcid_for_presplit_skip(dataset: Any, signature_id: str) -> str 
     raw_orcid = getattr(signature, "author_info_orcid", None)
     if raw_orcid is None:
         return None
-    normalized = str(raw_orcid).strip().upper().replace("-", "").replace(" ", "")
-    return normalized or None
+    return normalize_orcid_compact(raw_orcid)
 
 
 def _has_in_profile_pair(
@@ -3380,7 +3379,7 @@ class Clusterer:
                 "cluster_seeds_disallow cannot be used with precomputed dists because disallow pairs "
                 "would not be injected into the distance matrix"
             )
-        if dists is not None and explicit_cluster_seeds_require:
+        if dists is not None and resolved_cluster_seeds_require and not incremental_dont_use_cluster_seeds:
             raise ValueError(
                 "cluster_seeds_require cannot be used with precomputed dists because require pairs "
                 "would not be injected into the distance matrix"

@@ -92,7 +92,7 @@ The current train/calibrate/eval source bundle is published on S3 with the
 other release data:
 
 ```powershell
-aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release/s2and_and_big_blocks_linker_dataset_20260513 s2and\data\s2and_and_big_blocks_linker_dataset_20260513
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release/s2and_and_big_blocks_linker_dataset_20260513_arrow s2and\data\s2and_and_big_blocks_linker_dataset_20260513_arrow
 ```
 
 #### What the replay script does
@@ -119,13 +119,14 @@ Its main inputs are:
   under `incremental_linker/`, copies the target JSON into `reproducibility/`,
   refreshes linker audit metadata, and writes the final bundle manifest.
 
-In the default `--feature-mode minimal-raw-rust`, the script rebuilds promoted
-features from the source bundle. For each selected table and dataset, it loads
-the raw papers, signatures, SPECTER2 embeddings, and labels; applies structural
-cleaning; builds block-local query/candidate context; uses the frozen Rust
-retrieval policy to choose candidate seed clusters; builds the candidate/member
-pair plan; computes pairwise model distances and `pw_*` aggregate features; adds
-the non-pairwise row features; then writes target-ordered feature tables and
+In the default `--feature-mode arrow-rust`, the script rebuilds promoted
+features from the Arrow source bundle. For each selected table and dataset, it
+loads the Arrow papers, signatures, SPECTER2 embeddings, and labels; applies
+structural cleaning; builds block-local query/candidate context; uses the frozen
+Rust retrieval policy to choose candidate seed clusters; builds the
+candidate/member pair plan; computes pairwise model distances and `pw_*`
+aggregate features; adds the non-pairwise row features; then writes
+target-ordered feature tables and
 bundle metadata under `--output-dir`. These feature values are tied to the exact
 pairwise model passed with `--pairwise-model-path`.
 

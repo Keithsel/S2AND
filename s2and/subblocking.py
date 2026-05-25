@@ -940,7 +940,7 @@ def _coauthor_blocks_by_paper_from_arrow(
                 author_name = str(author_name_value or "").strip()
                 if not author_name:
                     continue
-                block = compute_block(author_name)
+                block = _coauthor_block_from_arrow_author_name(author_name)
                 if block:
                     out[paper_id].append((int(position), block))
     _add_load_metric(load_metrics, "paper_authors_record_batches_scanned", record_batches_scanned)

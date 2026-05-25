@@ -12,7 +12,10 @@ from s2and.model import _ensure_lightgbm_fitted, _selected_feature_indices
 from s2and.production_bundle import finalize_production_bundle, write_pairwise_production_bundle
 from s2and.production_model import NativeLightGBMBinaryClassifier, _config_choice, load_production_model
 from s2and.serialization import load_pickle_with_verified_label_encoder_compat
-from tests.helpers import import_s2and_rust
+from tests.helpers import import_s2and_rust, tiny_name_counts
+
+_NATIVE_BUNDLE_PATH = "s2and/data/production_model_v1.21"
+_LEGACY_PICKLE_PATH = "s2and/data/production_model_v1.2.pickle"
 
 
 def _load_dummy_inference_dataset(name: str) -> ANDData:
@@ -22,7 +25,7 @@ def _load_dummy_inference_dataset(name: str) -> ANDData:
         clusters="tests/dummy/clusters.json",
         name=name,
         mode="inference",
-        load_name_counts=True,
+        load_name_counts=tiny_name_counts(),
         preprocess=True,
         n_jobs=1,
     )
@@ -48,7 +51,7 @@ def _predict_dummy_block(clusterer, *, batching_threshold: int | None) -> dict[s
 
 
 def test_native_production_bundle_loads_as_mutable_clusterer() -> None:
-    clusterer = load_production_model("s2and/data/production_model_v1.21")
+    clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
 
     assert isinstance(clusterer.classifier, NativeLightGBMBinaryClassifier)
     assert isinstance(clusterer.nameless_classifier, NativeLightGBMBinaryClassifier)
@@ -66,14 +69,14 @@ def test_native_production_bundle_loads_as_mutable_clusterer() -> None:
 
 
 def test_native_lightgbm_set_params_rejects_unknown_params() -> None:
-    clusterer = load_production_model("s2and/data/production_model_v1.21")
+    clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
 
     with pytest.raises(ValueError, match="Invalid parameter"):
         clusterer.classifier.set_params(learning_rate=0.1)
 
 
 def test_native_lightgbm_deepcopy_does_not_require_model_path(tmp_path: Path) -> None:
-    clusterer = load_production_model("s2and/data/production_model_v1.21")
+    clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
     classifier = clusterer.classifier
     features = np.zeros((2, classifier.n_features_in_), dtype=np.float64)
     classifier.model_path = str(tmp_path / "missing_model.txt")
@@ -85,10 +88,8 @@ def test_native_lightgbm_deepcopy_does_not_require_model_path(tmp_path: Path) ->
 
 
 def test_native_pairwise_models_match_v12_pickle_fixture() -> None:
-    native_clusterer = load_production_model("s2and/data/production_model_v1.21")
-    legacy_clusterer = load_pickle_with_verified_label_encoder_compat("s2and/data/production_model_v1.2.pickle")[
-        "clusterer"
-    ]
+    native_clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
+    legacy_clusterer = load_pickle_with_verified_label_encoder_compat(_LEGACY_PICKLE_PATH)["clusterer"]
     _ensure_lightgbm_fitted(legacy_clusterer.classifier)
     _ensure_lightgbm_fitted(legacy_clusterer.nameless_classifier)
 
@@ -125,10 +126,10 @@ def test_native_clusterer_predict_matches_v12_pickle(monkeypatch: pytest.MonkeyP
 
     for batching_threshold in (None, 7):
         native_clusterer = _prepare_prediction_clusterer(
-            load_production_model("s2and/data/production_model_v1.21", require_incremental_linker=False)
+            load_production_model(_NATIVE_BUNDLE_PATH, require_incremental_linker=False)
         )
         legacy_clusterer = _prepare_prediction_clusterer(
-            load_pickle_with_verified_label_encoder_compat("s2and/data/production_model_v1.2.pickle")["clusterer"]
+            load_pickle_with_verified_label_encoder_compat(_LEGACY_PICKLE_PATH)["clusterer"]
         )
 
         assert _predict_dummy_block(native_clusterer, batching_threshold=batching_threshold) == _predict_dummy_block(
@@ -138,10 +139,8 @@ def test_native_clusterer_predict_matches_v12_pickle(monkeypatch: pytest.MonkeyP
 
 
 def test_native_clusterer_runtime_config_matches_v12_pickle() -> None:
-    native_clusterer = load_production_model("s2and/data/production_model_v1.21")
-    legacy_clusterer = load_pickle_with_verified_label_encoder_compat("s2and/data/production_model_v1.2.pickle")[
-        "clusterer"
-    ]
+    native_clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
+    legacy_clusterer = load_pickle_with_verified_label_encoder_compat(_LEGACY_PICKLE_PATH)["clusterer"]
 
     assert type(native_clusterer.cluster_model) is type(legacy_clusterer.cluster_model)
     assert native_clusterer.cluster_model.linkage == legacy_clusterer.cluster_model.linkage
@@ -174,7 +173,7 @@ def test_native_clusterer_runtime_config_matches_v12_pickle() -> None:
 
 
 def test_pairwise_stage_finalizes_into_loadable_production_bundle(tmp_path: Path) -> None:
-    source_bundle = Path("s2and/data/production_model_v1.21")
+    source_bundle = Path(_NATIVE_BUNDLE_PATH)
     source_clusterer = load_production_model(source_bundle)
     output_bundle = tmp_path / "production_model_v9.9"
 

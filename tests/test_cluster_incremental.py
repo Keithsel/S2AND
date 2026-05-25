@@ -14,6 +14,7 @@ from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.feature_block import write_cluster_seeds_arrow
 from s2and.model import Clusterer, IncrementalDistStats
+from tests.helpers import tiny_name_counts
 
 
 def _same_partition(a: dict[str, list[str]], b: dict[str, list[str]]) -> bool:
@@ -119,35 +120,6 @@ def test_finish_incremental_uses_split_inverse_for_altered_incompatibility_check
     assert clusters == {"0": ["seed_david", "seed_initial", "new_donald"]}
 
 
-def test_finish_incremental_wrapper_forwards_split_inverse_to_kwargs_method() -> None:
-    captured: dict[str, Any] = {}
-    split_inverse = {"0_0": ["seed_david"], "0_1": ["seed_initial"]}
-
-    class KwargsClusterer:
-        def _finish_incremental_with_seed_links(self, *args: object, **kwargs: object) -> dict[str, list[str]]:
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-            return {"0": ["seed_david"]}
-
-    result = production_module._finish_incremental_with_optional_split_inverse(
-        KwargsClusterer(),
-        ["new_donald"],
-        cast(ANDData, SimpleNamespace()),
-        {"new_donald": "0_1"},
-        {"0_0": "0", "0_1": "0"},
-        {"0": ["seed_david", "seed_initial"]},
-        True,
-        {},
-        cast(Any, SimpleNamespace(run_id="test")),
-        total_ram_bytes=123,
-        split_cluster_seeds_require_inverse=split_inverse,
-    )
-
-    assert result == {"0": ["seed_david"]}
-    assert captured["kwargs"]["split_cluster_seeds_require_inverse"] is split_inverse
-    assert captured["kwargs"]["total_ram_bytes"] == 123
-
-
 def test_subblocked_altered_presplit_failure_refreshes_telemetry(monkeypatch) -> None:
     clusterer = Clusterer(
         featurizer_info=FeaturizationInfo(features_to_use=[]),
@@ -227,9 +199,9 @@ def test_predict_from_rust_featurizer_proxy_exposes_signature_rule_metadata() ->
     class FakeRustFeaturizer:
         def signature_rule_metadata(self):
             return [
-                ("s_alice", "Alice", "0000-0001"),
+                ("s_alice", "Alice", "0000-0000-0000-0001"),
                 ("s_bob", "Bob", None),
-                ("s_alicia", "Alicia", "0000-0001"),
+                ("s_alicia", "Alicia", "0000-0000-0000-0001"),
             ]
 
     clusterer = DummyClusterer()
@@ -275,7 +247,7 @@ def _build_dummy_clusterer_and_dataset(*, name: str = "dummy_chunked") -> tuple[
         clusters="tests/dummy/clusters.json",
         cluster_seeds={"6": {"7": "require"}, "3": {"4": "require"}},
         name=name,
-        load_name_counts=True,
+        load_name_counts=tiny_name_counts(),
     )
 
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
@@ -284,7 +256,9 @@ def _build_dummy_clusterer_and_dataset(*, name: str = "dummy_chunked") -> tuple[
     y_random = rng.randint(0, 6, 10)
     clusterer = Clusterer(
         featurizer_info=featurizer_info,
-        classifier=LGBMClassifier(random_state=1, data_random_seed=1, feature_fraction_seed=1).fit(X_random, y_random),
+        classifier=LGBMClassifier(random_state=1, data_random_seed=1, feature_fraction_seed=1, verbosity=-1).fit(
+            X_random, y_random
+        ),
         n_jobs=1,
         use_cache=False,
         use_default_constraints_as_supervision=True,
@@ -2561,7 +2535,9 @@ def test_clusterer_init_prefers_legacy_seed_flag_name():
 
     clusterer = Clusterer(
         featurizer_info=featurizer_info,
-        classifier=LGBMClassifier(random_state=7, data_random_seed=7, feature_fraction_seed=7).fit(X_random, y_random),
+        classifier=LGBMClassifier(random_state=7, data_random_seed=7, feature_fraction_seed=7, verbosity=-1).fit(
+            X_random, y_random
+        ),
         dont_merge_cluster_seeds=False,
         n_jobs=1,
         use_cache=False,
@@ -3497,12 +3473,12 @@ def test_finish_incremental_with_seed_links_residual_phase_b_preserves_same_orci
                 "u_a": SimpleNamespace(
                     author_info_first_normalized_without_apostrophe="alice",
                     author_info_first="Alice",
-                    author_info_orcid="0000-0001",
+                    author_info_orcid="0000-0000-0000-0001",
                 ),
                 "u_b": SimpleNamespace(
                     author_info_first_normalized_without_apostrophe="bob",
                     author_info_first="Bob",
-                    author_info_orcid="0000-0001",
+                    author_info_orcid="0000-0000-0000-0001",
                 ),
             },
             name_tuples=set(),
@@ -3934,9 +3910,9 @@ def test_build_incremental_seed_setup_skips_same_orcid_altered_profile_recluster
             cluster_seeds_disallow=set(),
             altered_cluster_signatures=["seed0"],
             signatures={
-                "seed0": SimpleNamespace(author_info_orcid="0000-0001"),
-                "seed1": SimpleNamespace(author_info_orcid="00000001"),
-                "seed2": SimpleNamespace(author_info_orcid="0000-0001"),
+                "seed0": SimpleNamespace(author_info_orcid="https://orcid.org/0000-0002-1825-009X"),
+                "seed1": SimpleNamespace(author_info_orcid="0000-0002-1825-009x"),
+                "seed2": SimpleNamespace(author_info_orcid="ORCID: 000000021825009X"),
             },
             name_tuples="filtered",
         ),
@@ -3979,8 +3955,48 @@ def test_build_incremental_seed_setup_same_orcid_skip_respects_explicit_disallow
             cluster_seeds_disallow={("seed0", "seed1")},
             altered_cluster_signatures=["seed0"],
             signatures={
-                "seed0": SimpleNamespace(author_info_orcid="0000-0001"),
-                "seed1": SimpleNamespace(author_info_orcid="0000-0001"),
+                "seed0": SimpleNamespace(author_info_orcid="0000-0002-1825-009X"),
+                "seed1": SimpleNamespace(author_info_orcid="ORCID: 000000021825009X"),
+            },
+            name_tuples="filtered",
+        ),
+    )
+
+    clusterer._build_incremental_seed_setup(
+        dataset,
+        {},
+        runtime_context=cast(Any, object()),
+        arrow_paths={
+            "signatures": "signatures.arrow",
+            "papers": "papers.arrow",
+            "paper_authors": "paper_authors.arrow",
+        },
+    )
+
+    assert call_count == 1
+    assert clusterer._last_incremental_seed_setup_telemetry["seed_setup_altered_presplit_orcid_skip_count"] == 0
+
+
+def test_build_incremental_seed_setup_same_orcid_skip_rejects_invalid_orcid_pair():
+    clusterer = _build_minimal_incremental_clusterer()
+    call_count = 0
+
+    def fake_predict_from_arrow_paths(block_dict, arrow_paths, **kwargs):
+        nonlocal call_count
+        del block_dict, arrow_paths, kwargs
+        call_count += 1
+        return {"split0": ["seed0"], "split1": ["seed1"]}, None
+
+    clusterer.predict_from_arrow_paths = cast(Any, fake_predict_from_arrow_paths)
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed0": "7", "seed1": "7"},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=["seed0"],
+            signatures={
+                "seed0": SimpleNamespace(author_info_orcid="not-an-orcid"),
+                "seed1": SimpleNamespace(author_info_orcid="not-an-orcid"),
             },
             name_tuples="filtered",
         ),

@@ -29,6 +29,14 @@ from tests.helpers import build_cluster_summary, build_query_features
 
 pa = pytest.importorskip("pyarrow")
 s2and_rust = pytest.importorskip("s2and_rust", reason="s2and_rust is unavailable")
+_MISSING_RUST_RAW_APIS = [name for name in ("raw_block_query_candidate_plan_arrow",) if not hasattr(s2and_rust, name)]
+_RUST_FEATURIZER = getattr(s2and_rust, "RustFeaturizer", None)
+if _RUST_FEATURIZER is None:
+    _MISSING_RUST_RAW_APIS.append("RustFeaturizer")
+elif not hasattr(_RUST_FEATURIZER, "from_arrow_paths"):
+    _MISSING_RUST_RAW_APIS.append("RustFeaturizer.from_arrow_paths")
+if _MISSING_RUST_RAW_APIS:
+    pytest.fail(f"s2and_rust is missing required raw Arrow APIs: {_MISSING_RUST_RAW_APIS}")
 
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
@@ -500,6 +508,29 @@ def test_raw_arrow_candidate_plan_filters_cluster_seed_disallows(tmp_path: Path)
     assert raw_plan["telemetry"]["cluster_seed_disallowed_candidate_count"] == 1
 
 
+def test_raw_arrow_candidate_plan_rejects_disallow_with_unknown_seed_endpoint(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path)
+    paths["cluster_seed_disallows"] = _write_ipc(
+        tmp_path / "cluster_seed_disallows.arrow",
+        pa.table(
+            {
+                "signature_id_1": pa.array(["q1"], type=pa.string()),
+                "signature_id_2": pa.array(["missing_seed"], type=pa.string()),
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unknown seed endpoint"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
+
+
 def test_raw_arrow_candidate_plan_drops_zero_specter_vectors(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
         raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
@@ -823,14 +854,42 @@ def test_arrow_batch_lookup_index_rejects_wrong_key_column_reuse(tmp_path: Path)
         )
 
 
-def test_arrow_batch_lookup_index_rejects_same_size_same_mtime_source_change(tmp_path: Path) -> None:
+def test_arrow_batch_lookup_index_rejects_same_size_same_mtime_sampled_source_change(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
+    filler_count = 30_000
+    filler_ids = [f"x{index:013d}" for index in range(filler_count)]
+    paths["signatures"] = _write_ipc_batches(
+        tmp_path / "signatures.arrow",
+        pa.table(
+            {
+                "signature_id": pa.array(["q1", "s1", "s2", *filler_ids], type=pa.string()),
+                "paper_id": pa.array(
+                    ["p_q", "p1", "p2", *[f"p_x{index}" for index in range(filler_count)]], type=pa.string()
+                ),
+                "author_first": pa.array(["Alice", "Alice", "Bob", *(["Filler"] * filler_count)], type=pa.string()),
+                "author_middle": pa.array(["", "", "", *([""] * filler_count)], type=pa.string()),
+                "author_last": pa.array(["Wang", "Wang", "Jones", *(["Person"] * filler_count)], type=pa.string()),
+                "author_suffix": pa.array(["", "", "", *([""] * filler_count)], type=pa.string()),
+                "author_affiliations": pa.array(
+                    [["AI Lab"], ["AI Lab"], ["Other Lab"], *([[]] * filler_count)],
+                    type=pa.list_(pa.string()),
+                ),
+                "author_orcid": pa.array([None, None, None, *([None] * filler_count)], type=pa.string()),
+                "author_position": pa.array([0, 0, 0, *([0] * filler_count)], type=pa.int64()),
+            }
+        ),
+        batch_size=1000,
+    )
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
     signatures_path = Path(paths["signatures"])
     stat = signatures_path.stat()
     payload = signatures_path.read_bytes()
-    assert b"q1" in payload
-    signatures_path.write_bytes(payload.replace(b"q1", b"qX", 1))
+    old_value = b"q1"
+    new_value = b"qX"
+    rewrite_offset = payload.index(old_value)
+    assert len(old_value) == len(new_value)
+    assert rewrite_offset < 65_536
+    signatures_path.write_bytes(payload[:rewrite_offset] + new_value + payload[rewrite_offset + len(old_value) :])
     os.utime(signatures_path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 
     with pytest.raises(ValueError, match="stale"):

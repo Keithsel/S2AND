@@ -466,11 +466,15 @@ def test_minimal_raw_positive_label_marks_training_disallow_ignore() -> None:
 
 
 def test_minimal_raw_loader_enables_fasttext_language_detection() -> None:
+    previous_enabled = s2and_text.fasttext_loading_enabled()
     s2and_text.set_fasttext_loading_enabled(False)
 
-    _enable_fasttext_language_detection()
+    try:
+        _enable_fasttext_language_detection()
 
-    assert s2and_text.fasttext_loading_enabled() is True
+        assert s2and_text.fasttext_loading_enabled() is True
+    finally:
+        s2and_text.set_fasttext_loading_enabled(previous_enabled)
 
 
 def test_minimal_raw_seed_bypass_detects_seeded_query_component() -> None:

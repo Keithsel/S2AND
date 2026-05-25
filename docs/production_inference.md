@@ -467,15 +467,16 @@ The current Rust inference boundary, direct Arrow path, and remaining
 Python-heavy paths are summarized in
 [rust/inference_architecture.md](rust/inference_architecture.md).
 
-If FeatureBlock Arrow artifacts and seed inputs are available, promoted
-`predict_incremental(...)` uses the raw Arrow/Rust retrieval and scoring bridge
-by default for Phase A, then finishes residual abstains through the normal
-incremental completion path. Seeds can come from `cluster_seeds.arrow` or from
+Promoted Rust `predict_incremental(...)` requires FeatureBlock Arrow artifacts
+and seed inputs, then uses the raw Arrow/Rust retrieval and scoring bridge for
+Phase A before finishing residual abstains through the normal incremental
+completion path. Seeds can come from `cluster_seeds.arrow` or from
 `dataset.cluster_seeds_require`; when the latter is used, the runtime writes a
 request-local temporary seed table for Rust retrieval. A promoted Rust
-incremental request without either seed source fails before seed sync or helper
-fallback. `cluster_seed_disallows.arrow` is optional and means "no pairwise seed
-disallow constraints" when omitted, but an explicit path must exist.
+incremental request without base Arrow paths or without either seed source fails
+before seed sync or helper fallback. `cluster_seed_disallows.arrow` is optional
+and means "no pairwise seed disallow constraints" when omitted, but an explicit
+path must exist.
 
 ### Incremental Seed Telemetry Contract
 

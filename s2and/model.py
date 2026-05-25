@@ -56,10 +56,7 @@ from s2and.incremental_linking.policy import (
 from s2and.incremental_linking.policy import (
     require_arrow_name_counts_index_for_clusterer as _require_arrow_name_counts_index_for_clusterer,
 )
-from s2and.incremental_linking.production import (
-    predict_incremental_promoted_linker,
-    predict_incremental_promoted_linker_from_arrow_paths,
-)
+from s2and.incremental_linking.production import predict_incremental_promoted_linker_from_arrow_paths
 from s2and.model_pairwise import FastCluster, PairwiseModeler, VotingClassifier, intify
 from s2and.runtime import RequestedBackend, RuntimeContext, build_runtime_context, stage_uses_rust
 from s2and.rust_calls import (
@@ -836,6 +833,25 @@ def _require_incremental_seed_source(
             "pass seed assignments through dataset.cluster_seeds_require or include a valid "
             "cluster_seeds.arrow in the Arrow path mapping; promoted incremental Rust prediction "
             "does not infer an empty seed source"
+        ),
+    )
+
+
+def _missing_incremental_arrow_artifacts_error(clusterer: Any, *, context: str) -> MissingArrowArtifactError:
+    required = ["signatures", "papers", "paper_authors"]
+    if _uses_embedding_features(clusterer):
+        required.append("specter")
+    if _uses_name_count_features(clusterer):
+        required.append("name_counts_index")
+    return MissingArrowArtifactError(
+        context=context,
+        required_keys=required,
+        missing_keys=required,
+        missing_files={},
+        producer_hint=(
+            "pass complete Arrow paths for signatures, papers, paper_authors, selected embeddings, "
+            "and model-required sidecars; promoted incremental Rust prediction no longer uses "
+            "ANDData/RustFeaturizer.from_dataset as a production fallback"
         ),
     )
 
@@ -5467,40 +5483,34 @@ class Clusterer:
         runtime_context: RuntimeContext,
         total_ram_bytes: int | None,
         batching_threshold: int | None,
+        arrow_paths: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         artifact_dir = Path(
             getattr(self, "incremental_linker_artifact_dir", None) or DEFAULT_INCREMENTAL_LINKER_ARTIFACT_DIR
         )
-        arrow_paths = None
-        if not _uses_reference_features(self.featurizer_info) and not _uses_reference_features(
-            self.nameless_featurizer_info
+        resolved_arrow_paths = arrow_paths
+        if (
+            resolved_arrow_paths is None
+            and not _uses_reference_features(self.featurizer_info)
+            and not _uses_reference_features(self.nameless_featurizer_info)
         ):
-            arrow_paths = _resolve_dataset_arrow_paths(
+            resolved_arrow_paths = _resolve_dataset_arrow_paths(
                 dataset,
                 require_specter=_uses_embedding_features(self),
                 require_cluster_seeds=False,
                 require_name_counts_index=_uses_name_count_features(self),
             )
-        if arrow_paths is not None:
-            logger.info("Running promoted incremental linker through Arrow/Rust paths")
-            return predict_incremental_promoted_linker_from_arrow_paths(
+        if resolved_arrow_paths is None:
+            raise _missing_incremental_arrow_artifacts_error(
                 self,
-                block_signatures,
-                dataset,
-                arrow_paths=arrow_paths,
-                artifact_dir=artifact_dir,
-                prevent_new_incompatibilities=prevent_new_incompatibilities,
-                partial_supervision=partial_supervision,
-                runtime_context=runtime_context,
-                total_ram_bytes=total_ram_bytes,
-                batching_threshold=batching_threshold,
-                resolve_total_ram_bytes=_resolve_total_ram_bytes_for_incremental,
-                build_incremental_result=_build_incremental_result,
+                context="Clusterer._predict_incremental_promoted_linker",
             )
-        return predict_incremental_promoted_linker(
+        logger.info("Running promoted incremental linker through Arrow/Rust paths")
+        return predict_incremental_promoted_linker_from_arrow_paths(
             self,
             block_signatures,
             dataset,
+            arrow_paths=resolved_arrow_paths,
             artifact_dir=artifact_dir,
             prevent_new_incompatibilities=prevent_new_incompatibilities,
             partial_supervision=partial_supervision,
@@ -5509,8 +5519,6 @@ class Clusterer:
             batching_threshold=batching_threshold,
             resolve_total_ram_bytes=_resolve_total_ram_bytes_for_incremental,
             build_incremental_result=_build_incremental_result,
-            get_rust_featurizer=_get_rust_featurizer,
-            build_incremental_constraint_backend=_build_incremental_constraint_backend,
         )
 
     def predict_incremental(
@@ -5555,8 +5563,8 @@ class Clusterer:
             final cluster would have D Jones, David Jones, and Donald Jones.
         batching_threshold: int
             Optional promoted Rust query batch limit. This is only supported when the runtime backend resolves to
-            Rust and cluster seeds are available. Python incremental fallback raises if this is provided because it
-            does not implement incremental batching.
+            Rust and Arrow artifacts plus a seed source are available. Python incremental fallback raises if this is
+            provided because it does not implement incremental batching.
         partial_supervision: Dict
             the dictionary of partial supervision provided with this dataset/these blocks
         total_ram_bytes: Optional[int]
@@ -5588,6 +5596,11 @@ class Clusterer:
                 require_name_counts_index=_uses_name_count_features(self),
             )
         arrow_paths_available = resolved_arrow_paths_for_incremental is not None
+        if use_rust_backend and not arrow_paths_available:
+            raise _missing_incremental_arrow_artifacts_error(
+                self,
+                context="Clusterer.predict_incremental promoted Rust prediction",
+            )
         promoted_seed_inputs_available = _has_incremental_seed_source(dataset, resolved_arrow_paths_for_incremental)
         if use_rust_backend and not promoted_seed_inputs_available:
             _require_incremental_seed_source(
@@ -5615,6 +5628,7 @@ class Clusterer:
                 runtime_context=runtime_context,
                 total_ram_bytes=total_ram_bytes,
                 batching_threshold=batching_threshold,
+                arrow_paths=resolved_arrow_paths_for_incremental,
             )
             return dict(incremental_result["clusters"]) if return_clusters_only else incremental_result
         incremental_result = self._predict_incremental_helper(

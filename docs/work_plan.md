@@ -310,6 +310,11 @@ production inference.
     compatibility fallback when auto-discovered Arrow artifacts are incomplete;
     direct Arrow production callers should use `predict_from_arrow_paths(...)`
     or the Arrow-first scripts.
+  - Status 2026-05-25: Rust `Clusterer.predict_incremental(...)` now requires
+    base Arrow paths plus a seed source before seed sync or helper fallback, and
+    `_predict_incremental_promoted_linker(...)` only calls the Arrow promoted
+    implementation. The non-Arrow promoted linker remains a compatibility unit
+    tested directly, not a production route.
   - In production Rust mode, remove silent fallback from Arrow-routed
     `Clusterer.predict(...)` when Arrow artifacts are incomplete.
   - Preserve fallback only through approved compatibility/test routes.
@@ -347,11 +352,13 @@ production inference.
       Arrow paths are unavailable.
     - `_predict_subblocked(...)` accepts `arrow_paths=None` and can use
       graph/legacy `ANDData` fallbacks.
-    - `_predict_incremental_promoted_linker(...)` can fall back to the
-      non-Arrow promoted linker, which uses `RustFeaturizer.from_dataset`.
+    - `_predict_incremental_promoted_linker(...)` no longer falls back to the
+      non-Arrow promoted linker. That legacy function remains callable as a
+      compatibility/test surface.
     - `Clusterer.predict_incremental(...)` now fails closed when Rust mode lacks
-      any seed source. Remaining compatibility fallback questions are about
-      missing base Arrow artifacts and Python-only helper usage.
+      base Arrow artifacts or any seed source. Remaining compatibility fallback
+      questions are about generic full-block `predict(...)` and Python-only
+      helper usage.
     - Incremental altered-profile pre-split and residual Phase B reclustering
       call `predict_from_arrow_paths(...)` when `arrow_paths` is present, but
       otherwise fall back through Python reclustering. Strict promoted

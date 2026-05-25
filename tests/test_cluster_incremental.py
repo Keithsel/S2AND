@@ -30,6 +30,48 @@ def _clusters(result: dict[str, Any]) -> dict[str, list[str]]:
     return dict(result["clusters"])
 
 
+def _attach_minimal_arrow_paths(dataset: Any, tmp_path: Path) -> dict[str, str]:
+    paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        paths[key] = str(path)
+    dataset.arrow_paths = paths
+    return paths
+
+
+def _call_legacy_promoted_incremental_linker(
+    clusterer: Clusterer,
+    block: list[str],
+    dataset: ANDData,
+    runtime_context: Any,
+    *,
+    batching_threshold: int | None = None,
+    total_ram_bytes: int | None = None,
+    prevent_new_incompatibilities: bool = True,
+    partial_supervision: dict[tuple[str, str], int | float] | None = None,
+) -> dict[str, Any]:
+    return production_module.predict_incremental_promoted_linker(
+        clusterer,
+        block,
+        dataset,
+        artifact_dir=model_module.DEFAULT_INCREMENTAL_LINKER_ARTIFACT_DIR,
+        prevent_new_incompatibilities=prevent_new_incompatibilities,
+        partial_supervision={} if partial_supervision is None else partial_supervision,
+        runtime_context=runtime_context,
+        total_ram_bytes=total_ram_bytes,
+        batching_threshold=batching_threshold,
+        resolve_total_ram_bytes=model_module._resolve_total_ram_bytes_for_incremental,
+        build_incremental_result=model_module._build_incremental_result,
+        get_rust_featurizer=model_module._get_rust_featurizer,
+        build_incremental_constraint_backend=model_module._build_incremental_constraint_backend,
+    )
+
+
 def test_raw_arrow_plan_windows_isolate_seed_overlap_queries() -> None:
     windows = production_module._raw_arrow_plan_windows(
         ["query-1", "seed-1", "query-2", "query-3", "seed-2", "query-4"],
@@ -460,9 +502,11 @@ def test_predict_incremental_rust_promoted_linker_uses_seed_link_seam(clusterer_
         fake_private_runtime,
     )
 
-    result = clusterer.predict_incremental(
+    result = _call_legacy_promoted_incremental_linker(
+        clusterer,
         block,
         dataset,
+        runtime_context,
         batching_threshold=None,
     )
 
@@ -556,7 +600,13 @@ def test_predict_incremental_promoted_linker_respects_suppress_orcid(
         ),
     )
 
-    clusterer.predict_incremental(["3", "4", "5"], dataset, batching_threshold=None)
+    _call_legacy_promoted_incremental_linker(
+        clusterer,
+        ["3", "4", "5"],
+        dataset,
+        runtime_context,
+        batching_threshold=None,
+    )
 
     assert captured_inputs["orcid_enabled"] is False
 
@@ -641,7 +691,13 @@ def test_predict_incremental_promoted_linker_passes_orcid_fanout_floor_to_limits
         ),
     )
 
-    clusterer.predict_incremental(block, dataset, batching_threshold=None)
+    _call_legacy_promoted_incremental_linker(
+        clusterer,
+        block,
+        dataset,
+        runtime_context,
+        batching_threshold=None,
+    )
 
     assert limit_calls[0]["retrieval_top_k"] == 1
     assert limit_calls[0]["candidate_rows_per_query_floor"] == 2
@@ -679,8 +735,10 @@ def test_promoted_incremental_orcid_fanout_skips_seed_scan_without_query_orcids(
 def test_predict_incremental_explicit_rust_backend_uses_promoted_linker_by_default(
     clusterer_dataset_factory,
     monkeypatch,
+    tmp_path,
 ):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_rust_incremental_linker_default")
+    arrow_paths = _attach_minimal_arrow_paths(dataset, tmp_path)
     block = ["3", "4", "5", "6", "7", "8"]
     runtime_context = SimpleNamespace(
         operation="cluster_predict_incremental",
@@ -717,13 +775,16 @@ def test_predict_incremental_explicit_rust_backend_uses_promoted_linker_by_defau
     assert captured["block_signatures"] == block
     assert captured["dataset"] is dataset
     assert captured["runtime_context"] is runtime_context
+    assert captured["arrow_paths"] == arrow_paths
 
 
 def test_predict_incremental_auto_backend_uses_promoted_linker_when_auto_resolves_to_rust(
     clusterer_dataset_factory,
     monkeypatch,
+    tmp_path,
 ):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_auto_incremental_linker_default")
+    _attach_minimal_arrow_paths(dataset, tmp_path)
     block = ["3", "4", "5", "6", "7", "8"]
     runtime_context = SimpleNamespace(
         operation="cluster_predict_incremental",
@@ -2118,9 +2179,10 @@ def test_predict_incremental_arrow_promoted_linker_transforms_altered_seed_arrow
     assert captured["raw_seed_rows"] == {"6": "0_0", "7": "0_1", "3": "1", "4": "1"}
 
 
-def test_predict_incremental_rust_empty_seeds_requires_seed_source(clusterer_dataset_factory, monkeypatch):
+def test_predict_incremental_rust_empty_seeds_requires_seed_source(clusterer_dataset_factory, monkeypatch, tmp_path):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_rust_empty_seeds")
     dataset.cluster_seeds_require = {}
+    _attach_minimal_arrow_paths(dataset, tmp_path)
     block = ["3", "4", "5"]
     runtime_context = SimpleNamespace(
         operation="cluster_predict_incremental",
@@ -2152,12 +2214,48 @@ def test_predict_incremental_rust_empty_seeds_requires_seed_source(clusterer_dat
         clusterer.predict_incremental(block, dataset, batching_threshold=None)
 
 
+def test_predict_incremental_rust_requires_base_arrow_paths(clusterer_dataset_factory, monkeypatch):
+    clusterer, dataset = clusterer_dataset_factory(name="dummy_rust_missing_incremental_arrow")
+    dataset.cluster_seeds_require = {"3": "0", "4": "0"}
+    block = ["3", "4", "5"]
+    runtime_context = SimpleNamespace(
+        operation="cluster_predict_incremental",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="test-rust-missing-incremental-arrow",
+        source="S2AND_BACKEND",
+    )
+
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
+    monkeypatch.setattr(
+        model_module,
+        "_sync_rust_cluster_seeds",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("seed sync should not run")),
+    )
+    monkeypatch.setattr(
+        Clusterer,
+        "_predict_incremental_helper",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback helper should not run")),
+    )
+    monkeypatch.setattr(
+        Clusterer,
+        "_predict_incremental_promoted_linker",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("promoted linker should not run")),
+    )
+
+    with pytest.raises(model_module.MissingArrowArtifactError, match="signatures, papers, paper_authors"):
+        clusterer.predict_incremental(block, dataset, batching_threshold=None)
+
+
 def test_predict_incremental_rust_empty_seeds_rejects_batching_threshold_before_routing(
     clusterer_dataset_factory,
     monkeypatch,
+    tmp_path,
 ):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_rust_empty_seeds_batching")
     dataset.cluster_seeds_require = {}
+    _attach_minimal_arrow_paths(dataset, tmp_path)
     block = ["3", "4", "5"]
     runtime_context = SimpleNamespace(
         operation="cluster_predict_incremental",
@@ -2269,7 +2367,13 @@ def test_predict_incremental_promoted_linker_batches_queries(
         fake_private_runtime,
     )
 
-    result = clusterer.predict_incremental(block, dataset, batching_threshold=1)
+    result = _call_legacy_promoted_incremental_linker(
+        clusterer,
+        block,
+        dataset,
+        runtime_context,
+        batching_threshold=1,
+    )
 
     assert captured_inputs["query_signature_ids"] == ["5", "8"]
     assert captured_inputs["query_view"] is None
@@ -2408,7 +2512,13 @@ def test_predict_incremental_promoted_linker_recalibrates_query_batch_size(
     )
 
     with caplog.at_level("INFO", logger="s2and"):
-        result = clusterer.predict_incremental(block, dataset, batching_threshold=None)
+        result = _call_legacy_promoted_incremental_linker(
+            clusterer,
+            block,
+            dataset,
+            runtime_context,
+            batching_threshold=None,
+        )
 
     assert runtime_batches == [["0"], ["1", "2", "5"], ["8"]]
     telemetry = result["incremental_linker_telemetry"]
@@ -2540,7 +2650,13 @@ def test_predict_incremental_promoted_linker_fails_closed_when_single_query_exce
     )
 
     with pytest.raises(MemoryError, match="cannot fit a single query"):
-        clusterer.predict_incremental(["3", "4", "5"], dataset, batching_threshold=None)
+        _call_legacy_promoted_incremental_linker(
+            clusterer,
+            ["3", "4", "5"],
+            dataset,
+            runtime_context,
+            batching_threshold=None,
+        )
 
 
 def test_predict_incremental_dont_use_cluster_seeds_flag(clusterer_dataset_factory):

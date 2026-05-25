@@ -1653,6 +1653,164 @@ def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tm
     assert "candidate_cluster_max_paper_author_count" in retrieval_batch.row_signals
 
 
+def test_raw_arrow_labeled_candidate_plan_scores_frozen_rows_without_cluster_seeds(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_arrow_labeled_candidate_plan"):
+        raise pytest.skip.Exception("raw_arrow_labeled_candidate_plan is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paths.pop("cluster_seeds")
+
+    raw_plan = s2and_rust.raw_arrow_labeled_candidate_plan(
+        paths,
+        ["q1", "q1"],
+        ["full", "full"],
+        ["q1-full", "q1-full"],
+        ["c_other", "c_match"],
+        np.asarray([1, 2], dtype=np.uint16),
+        {"c_match": ["s1"], "c_other": ["s2"]},
+        component_scope="block-local",
+        orcid_enabled=False,
+        num_threads=1,
+        full_scan_without_index=True,
+    )
+
+    assert raw_plan["schema_version"] == "raw_arrow_labeled_candidate_plan_v1"
+    assert raw_plan["row_component_keys"] == ["c_other", "c_match"]
+    assert raw_plan["left_signature_ids"] == ["q1", "q1"]
+    assert raw_plan["right_signature_ids"] == ["s2", "s1"]
+    np.testing.assert_array_equal(raw_plan["pair_row_indices"], np.asarray([0, 1], dtype=np.uint32))
+    assert raw_plan["retrieval_ranks"].tolist() == [2, 1]
+    assert raw_plan["retrieval_scores"][1] > raw_plan["retrieval_scores"][0]
+    assert raw_plan["row_query_views"] == ["full", "full"]
+    assert "row_candidate_cluster_max_paper_author_count" in raw_plan
+    assert raw_plan["telemetry"]["component_scope"] == "block-local"
+
+
+def test_raw_arrow_labeled_candidate_plan_rejects_compact_pair_payload(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_arrow_labeled_candidate_plan"):
+        raise pytest.skip.Exception("raw_arrow_labeled_candidate_plan is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paths.pop("cluster_seeds")
+
+    with pytest.raises(ValueError, match="requires include_pair_signature_ids=True"):
+        s2and_rust.raw_arrow_labeled_candidate_plan(
+            paths,
+            ["q1"],
+            ["full"],
+            ["q1-full"],
+            ["c_match"],
+            np.asarray([1], dtype=np.uint16),
+            {"c_match": ["s1"]},
+            component_scope="block-local",
+            orcid_enabled=False,
+            num_threads=1,
+            include_pair_signature_ids=False,
+            full_scan_without_index=True,
+        )
+
+
+def test_raw_arrow_labeled_candidate_plan_scores_use_all_components_for_global_df(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_arrow_labeled_candidate_plan"):
+        raise pytest.skip.Exception("raw_arrow_labeled_candidate_plan is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paths.pop("cluster_seeds")
+    component_members = {"c_match": ["s1"], "c_other": ["s2"]}
+
+    one_row = s2and_rust.raw_arrow_labeled_candidate_plan(
+        paths,
+        ["q1"],
+        ["full"],
+        ["q1-full"],
+        ["c_match"],
+        np.asarray([1], dtype=np.uint16),
+        component_members,
+        component_scope="block-local",
+        orcid_enabled=False,
+        num_threads=1,
+        full_scan_without_index=True,
+    )
+    two_rows = s2and_rust.raw_arrow_labeled_candidate_plan(
+        paths,
+        ["q1", "q1"],
+        ["full", "full"],
+        ["q1-full", "q1-full"],
+        ["c_match", "c_other"],
+        np.asarray([1, 2], dtype=np.uint16),
+        component_members,
+        component_scope="block-local",
+        orcid_enabled=False,
+        num_threads=1,
+        full_scan_without_index=True,
+    )
+
+    assert one_row["telemetry"]["component_count"] == 2
+    assert two_rows["telemetry"]["component_count"] == 2
+    np.testing.assert_allclose(one_row["retrieval_scores"][0], two_rows["retrieval_scores"][0], rtol=1e-6, atol=1e-6)
+
+
+def test_raw_arrow_labeled_candidate_plan_initial_view_keeps_full_first_token(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_arrow_labeled_candidate_plan"):
+        raise pytest.skip.Exception("raw_arrow_labeled_candidate_plan is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paths.pop("cluster_seeds")
+
+    raw_plan = s2and_rust.raw_arrow_labeled_candidate_plan(
+        paths,
+        ["q1"],
+        ["initial_only"],
+        ["q1-initial"],
+        ["c_match"],
+        np.asarray([1], dtype=np.uint16),
+        {"c_match": ["s1"]},
+        component_scope="block-local",
+        orcid_enabled=False,
+        num_threads=1,
+        full_scan_without_index=True,
+    )
+
+    assert raw_plan["row_query_views"] == ["initial_only"]
+    assert raw_plan["row_query_first_tokens"] == ["alice"]
+
+
+def test_raw_arrow_labeled_candidate_plan_applies_block_local_members(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_arrow_labeled_candidate_plan"):
+        raise pytest.skip.Exception("raw_arrow_labeled_candidate_plan is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paths.pop("cluster_seeds")
+    signatures = pa.table(
+        {
+            "signature_id": pa.array(["q1", "s1", "s2"], type=pa.string()),
+            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
+            "author_first": pa.array(["Alice", "Alice", "Bob"], type=pa.string()),
+            "author_middle": pa.array(["", "", ""], type=pa.string()),
+            "author_last": pa.array(["Wang", "Wang", "Jones"], type=pa.string()),
+            "author_suffix": pa.array(["", "", ""], type=pa.string()),
+            "author_affiliations": pa.array([["AI Lab"], ["AI Lab"], ["Other Lab"]], type=pa.list_(pa.string())),
+            "author_orcid": pa.array([None, None, None], type=pa.string()),
+            "author_position": pa.array([0, 0, 0], type=pa.int64()),
+            "author_block": pa.array(["block-a", "block-a", "block-b"], type=pa.string()),
+        }
+    )
+    paths["signatures"] = _write_ipc(tmp_path / "signatures_with_blocks.arrow", signatures)
+
+    raw_plan = s2and_rust.raw_arrow_labeled_candidate_plan(
+        paths,
+        ["q1"],
+        ["full"],
+        ["q1-full"],
+        ["block-a::c"],
+        np.asarray([1], dtype=np.uint16),
+        {"block-a::c": ["q1", "s1", "s2"]},
+        component_scope="block-local",
+        orcid_enabled=False,
+        num_threads=1,
+        full_scan_without_index=True,
+    )
+
+    assert raw_plan["left_signature_ids"] == ["q1"]
+    assert raw_plan["right_signature_ids"] == ["s1"]
+    assert raw_plan["row_component_sizes"].tolist() == [1]
+
+
 def test_raw_arrow_candidate_plan_bridge_maps_compact_numeric_indices(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
         raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")

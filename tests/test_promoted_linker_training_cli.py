@@ -37,17 +37,18 @@ def test_incremental_linking_runtime_imports_stay_runtime_safe() -> None:
     assert model_imports == []
 
 
-def test_promoted_training_defaults_to_minimal_raw_specter_source() -> None:
+def test_promoted_training_defaults_to_arrow_rust_source() -> None:
     parser = promoted_train.build_parser()
     parser_defaults = vars(parser.parse_args([]))
     feature_mode_action = next(action for action in parser._actions if action.dest == "feature_mode")  # noqa: SLF001
 
-    assert promoted_train.DEFAULT_SOURCE_BUNDLE_ROOT.name == "s2and_and_big_blocks_linker_dataset_20260513"
+    assert promoted_train.DEFAULT_SOURCE_BUNDLE_ROOT.name == "s2and_and_big_blocks_linker_dataset_20260513_arrow"
     assert promoted_train.DEFAULT_TARGET_JSON.relative_to(promoted_train.REPO_ROOT) == Path(
         "s2and/data/production_model_v1.21/reproducibility/incremental_linker_training_target.json"
     )
-    assert parser_defaults["feature_mode"] == "minimal-raw-rust"
-    assert feature_mode_action.choices == ("minimal-raw-rust", "precomputed-promoted")
+    assert parser_defaults["feature_mode"] == "arrow-rust"
+    assert feature_mode_action.choices == ("arrow-rust", "minimal-raw-rust", "precomputed-promoted")
+    assert parser_defaults["arrow_name_counts_index_root"] is None
     assert parser_defaults["precomputed_feature_bundle_root"] is None
     assert parser_defaults["save_production_bundle_to"] is None
     assert parser_defaults["production_bundle_version"] is None

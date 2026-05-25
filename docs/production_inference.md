@@ -428,9 +428,10 @@ and `paper_authors` paths. Models that use SPECTER features also require
 `specter`, and models that use name-count features require `name_counts_index`.
 The direct Arrow route validates required keys and declared files before Rust
 featurizer construction and raises `MissingArrowArtifactError` with structured
-`missing_keys` and `missing_files` fields. The generic `Clusterer.predict(...)`
-compatibility path can still fall back to `ANDData` when Arrow artifacts are
-unavailable, but production scripts should not rely on that fallback.
+`missing_keys` and `missing_files` fields. When the generic full-block
+`Clusterer.predict(...)` route resolves to Rust without subblocking, it follows
+the same strict artifact rule and raises instead of falling back to `ANDData`;
+select the Python backend explicitly for compatibility/reference execution.
 
 Incremental prediction with explicit RAM budget:
 

@@ -837,7 +837,12 @@ def _require_incremental_seed_source(
     )
 
 
-def _missing_incremental_arrow_artifacts_error(clusterer: Any, *, context: str) -> MissingArrowArtifactError:
+def _missing_arrow_prediction_artifacts_error(
+    clusterer: Any,
+    *,
+    context: str,
+    producer_hint: str,
+) -> MissingArrowArtifactError:
     required = ["signatures", "papers", "paper_authors"]
     if _uses_embedding_features(clusterer):
         required.append("specter")
@@ -848,11 +853,7 @@ def _missing_incremental_arrow_artifacts_error(clusterer: Any, *, context: str) 
         required_keys=required,
         missing_keys=required,
         missing_files={},
-        producer_hint=(
-            "pass complete Arrow paths for signatures, papers, paper_authors, selected embeddings, "
-            "and model-required sidecars; promoted incremental Rust prediction no longer uses "
-            "ANDData/RustFeaturizer.from_dataset as a production fallback"
-        ),
+        producer_hint=producer_hint,
     )
 
 
@@ -4511,19 +4512,30 @@ class Clusterer:
             partial_supervision = {}
 
         arrow_paths = None
-        if (
+        rust_prediction_can_use_arrow = (
             dists is None
             and not use_s2_clusters
             and stage_uses_rust(runtime_context)
             and not _uses_reference_features(self.featurizer_info)
             and not _uses_reference_features(self.nameless_featurizer_info)
-        ):
+        )
+        if rust_prediction_can_use_arrow:
             arrow_paths = _resolve_dataset_arrow_paths(
                 dataset,
                 require_specter=_uses_embedding_features(self),
                 require_cluster_seeds=False,
                 require_name_counts_index=_uses_name_count_features(self),
             )
+            if arrow_paths is None and batching_threshold is None:
+                raise _missing_arrow_prediction_artifacts_error(
+                    self,
+                    context="Clusterer.predict Rust prediction",
+                    producer_hint=(
+                        "pass complete Arrow paths for signatures, papers, paper_authors, selected embeddings, "
+                        "and model-required sidecars; Rust production prediction no longer falls back to "
+                        "ANDData/RustFeaturizer.from_dataset when Arrow artifacts are incomplete"
+                    ),
+                )
 
         if arrow_paths is not None and batching_threshold is None:
             logger.info("Running predict through Arrow/Rust paths - no subblocking")
@@ -5501,9 +5513,14 @@ class Clusterer:
                 require_name_counts_index=_uses_name_count_features(self),
             )
         if resolved_arrow_paths is None:
-            raise _missing_incremental_arrow_artifacts_error(
+            raise _missing_arrow_prediction_artifacts_error(
                 self,
                 context="Clusterer._predict_incremental_promoted_linker",
+                producer_hint=(
+                    "pass complete Arrow paths for signatures, papers, paper_authors, selected embeddings, "
+                    "and model-required sidecars; promoted incremental Rust prediction no longer uses "
+                    "ANDData/RustFeaturizer.from_dataset as a production fallback"
+                ),
             )
         logger.info("Running promoted incremental linker through Arrow/Rust paths")
         return predict_incremental_promoted_linker_from_arrow_paths(
@@ -5597,9 +5614,14 @@ class Clusterer:
             )
         arrow_paths_available = resolved_arrow_paths_for_incremental is not None
         if use_rust_backend and not arrow_paths_available:
-            raise _missing_incremental_arrow_artifacts_error(
+            raise _missing_arrow_prediction_artifacts_error(
                 self,
                 context="Clusterer.predict_incremental promoted Rust prediction",
+                producer_hint=(
+                    "pass complete Arrow paths for signatures, papers, paper_authors, selected embeddings, "
+                    "and model-required sidecars; promoted incremental Rust prediction no longer uses "
+                    "ANDData/RustFeaturizer.from_dataset as a production fallback"
+                ),
             )
         promoted_seed_inputs_available = _has_incremental_seed_source(dataset, resolved_arrow_paths_for_incremental)
         if use_rust_backend and not promoted_seed_inputs_available:

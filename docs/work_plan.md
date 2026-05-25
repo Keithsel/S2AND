@@ -306,17 +306,17 @@ production inference.
     files before building the Rust featurizer, and raises structured
     `MissingArrowArtifactError` with `context`, `required_keys`,
     `missing_keys`, `missing_files`, and `producer_hint`.
-  - Status 2026-05-25: generic `Clusterer.predict(...)` still preserves the
-    compatibility fallback when auto-discovered Arrow artifacts are incomplete;
-    direct Arrow production callers should use `predict_from_arrow_paths(...)`
-    or the Arrow-first scripts.
+  - Status 2026-05-25: Rust full-block `Clusterer.predict(...)` without
+    subblocking now raises `MissingArrowArtifactError` when required Arrow
+    artifacts are incomplete, instead of falling back to `ANDData`.
+    Python/compatibility callers should select the Python route explicitly.
   - Status 2026-05-25: Rust `Clusterer.predict_incremental(...)` now requires
     base Arrow paths plus a seed source before seed sync or helper fallback, and
     `_predict_incremental_promoted_linker(...)` only calls the Arrow promoted
     implementation. The non-Arrow promoted linker remains a compatibility unit
     tested directly, not a production route.
-  - In production Rust mode, remove silent fallback from Arrow-routed
-    `Clusterer.predict(...)` when Arrow artifacts are incomplete.
+  - Status 2026-05-25: production Rust full-block `Clusterer.predict(...)`
+    no longer silently falls back when Arrow artifacts are incomplete.
   - Preserve fallback only through approved compatibility/test routes.
   - Ensure errors name the missing Arrow artifact keys and the caller/script
     that should generate them.
@@ -347,9 +347,9 @@ production inference.
     - `_resolve_dataset_arrow_paths(...)` in `s2and/model.py` can return
       `None` for incomplete auto-discovered Arrow artifacts and for missing
       required artifacts such as `cluster_seeds` or `name_counts_index`.
-    - `Clusterer.predict(...)` currently attempts Arrow routing in Rust mode,
-      then falls through to subblocked or normal `ANDData` prediction when
-      Arrow paths are unavailable.
+    - Full-block `Clusterer.predict(...)` now fails closed in Rust mode when
+      Arrow paths are unavailable. Subblocked `predict(...)` still has
+      graph/legacy fallback questions tracked separately.
     - `_predict_subblocked(...)` accepts `arrow_paths=None` and can use
       graph/legacy `ANDData` fallbacks.
     - `_predict_incremental_promoted_linker(...)` no longer falls back to the
@@ -373,15 +373,13 @@ production inference.
     fallback. That fallback is useful for development and compatibility, but it
     can hide broken release bundles. Allow local name-count overrides only when
     the caller passes an explicit path.
-  - Define one strictness authority before adding public parameters. Preferred
-    first step: production scripts and production-only routing call the strict
-    authority directly, while general public `predict(...)` keeps current
-    compatibility fallback behavior until a public API change is approved.
-  - Do not add public strictness kwargs during the first rollout. Production
-    scripts and production-only routing should use the strict authority directly;
-    generic public `predict(...)` remains the compatibility path. If callers
+  - Define one strictness authority before adding public parameters. Status
+    2026-05-25: direct Arrow prediction, Rust `predict(...)`, and Rust
+    `predict_incremental(...)` use the structured strict error. Python backend
+    selection remains the compatibility path for generic callers.
+  - Do not add public strictness kwargs during the first rollout. If callers
     later need public strictness controls, handle that as a separate approved
-    API migration after the private production route is stable.
+    API migration after the strict Rust route is stable.
   - In Rust production mode with compatibility fallback disabled:
     - Decision 2026-05-25: a physical `cluster_seeds.arrow` is not mandatory,
       but a seed source is mandatory. Seed source formats can include a
@@ -415,10 +413,10 @@ production inference.
     flow, the Arrow prod eval flow, and the Arrow rust-suite production
     benchmark flow.
   - Update existing fallback-expecting tests:
-    - Add a strict-mode sibling next to the existing
-      `tests/test_rust_distance_matrix_blockwise.py::test_predict_auto_declines_arrow_paths_missing_required_name_counts_index`,
-      which already preserves the compatibility fallback. The strict sibling
-      should expect a missing `name_counts_index` error in Rust production mode.
+    - Status 2026-05-25:
+      `tests/test_rust_distance_matrix_blockwise.py::test_predict_auto_requires_arrow_paths_with_name_counts_index`
+      expects a missing `name_counts_index` error in full-block Rust production
+      mode.
     - `tests/test_cluster_incremental.py` should expect missing seed-source
       errors in Rust production mode, plus compatibility-mode tests for
       `_predict_incremental_helper(...)`. Add separate tests proving absent

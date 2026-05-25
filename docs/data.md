@@ -4,7 +4,8 @@ This document covers dataset download, checked-in model artifacts, and `path_con
 
 ## Full dataset download
 
-Download the full S2AND release into `s2and/data/`:
+Download the legacy JSON/pickle S2AND release into `s2and/data/` only when you
+need paper-era `ANDData` inputs:
 
 ```bash
 aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release s2and/data/
@@ -12,8 +13,25 @@ aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release s2and/da
 
 Expected size is about `55.5 GiB`.
 
-The release includes dataset files. The current production model bundle is also
-checked into this repo under `s2and/data/production_model_v1.21/`.
+The Arrow-native release is the production runtime release for Rust/Arrow
+paths:
+
+```bash
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow s2and/data/s2and-release-arrow
+```
+
+The promoted-linker replay subbundle can also be downloaded by itself:
+
+```bash
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260525 s2and/data/s2and_and_big_blocks_linker_dataset_20260525
+```
+
+The Arrow release stores runtime signatures, papers, paper authors, and SPECTER
+rows as Arrow IPC files. It intentionally does not duplicate legacy `raw/`,
+`embeddings/`, or precomputed `features_corrected/` directories.
+
+The current production model bundle is checked into this repo under
+`s2and/data/production_model_v1.21/`.
 
 ## Production model bundle
 
@@ -54,12 +72,12 @@ Prediction logic does not consume it, but bundle load validation includes its
 manifest checksum. It records feature order and training params for the replay
 script.
 
-The promoted linker train/calibrate/eval replay data is also published under
-the same S3 release prefix. Download it when you need to rebuild or audit the
+The promoted linker train/calibrate/eval replay data is published under the
+Arrow release prefix. Download it when you need to rebuild or audit the
 promoted linker artifact:
 
 ```bash
-aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release/s2and_and_big_blocks_linker_dataset_20260513 s2and/data/s2and_and_big_blocks_linker_dataset_20260513
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260525 s2and/data/s2and_and_big_blocks_linker_dataset_20260525
 ```
 
 This source bundle is the default `--source-bundle-root` for
@@ -89,7 +107,7 @@ Guidance:
 
 ## Dataset file expectations
 
-Most workflows use the standard S2AND JSON files for:
+Legacy workflows use the standard S2AND JSON files for:
 
 - signatures
 - papers

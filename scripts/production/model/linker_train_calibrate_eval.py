@@ -110,7 +110,7 @@ from s2and.rust_calls import get_constraint_labels_index_arrays_rust  # noqa: E4
 os.environ.setdefault("S2AND_BACKEND", "rust")
 
 PACKAGE_DATA_ROOT = REPO_ROOT / "s2and" / "data"
-DEFAULT_SOURCE_BUNDLE_ROOT = PACKAGE_DATA_ROOT / "s2and_and_big_blocks_linker_dataset_20260513_arrow"
+DEFAULT_SOURCE_BUNDLE_ROOT = PACKAGE_DATA_ROOT / "s2and_and_big_blocks_linker_dataset_20260525"
 DEFAULT_TARGET_JSON = (
     PACKAGE_DATA_ROOT / "production_model_v1.21" / "reproducibility" / "incremental_linker_training_target.json"
 )
@@ -538,6 +538,18 @@ def _classic_table_keys(spec: Mapping[str, Any]) -> tuple[str, ...]:
             raise ValueError("classic.extra_eval_paths must be a mapping")
         for dataset_name in extra_eval_paths:
             keys.append(f"extra_eval_paths.{dataset_name}")
+    return tuple(dict.fromkeys(keys))
+
+
+def _source_featureless_table_keys(bundle: OfficialBundle) -> tuple[str, ...]:
+    files = bundle.assets.get("featureless_rows", {}).get("files", {})
+    if not isinstance(files, Mapping):
+        raise ValueError("source bundle assets.featureless_rows.files must be a mapping")
+    keys: list[str] = [key for key in REQUIRED_TABLE_KEYS if key in files]
+    for optional_key in ("s_park_eval_path", "s_lee_eval_path"):
+        if optional_key in files:
+            keys.append(optional_key)
+    keys.extend(str(key) for key in files if str(key).startswith("extra_eval_paths."))
     return tuple(dict.fromkeys(keys))
 
 
@@ -3035,17 +3047,42 @@ def _finalize_minimal_raw_bundle_metadata(
     payload["bundle_name"] = (
         f"{payload['bundle_name']}_minimal_raw_block_local_promoted_{feature_count}_{tree_count}trees"
     )
+    assets = payload.setdefault("assets", {})
+    if not isinstance(assets, dict):
+        raise ValueError("bundle assets must be an object")
+    corrected_feature_rows = assets.setdefault(
+        "corrected_feature_rows",
+        {
+            "root": "features_corrected",
+            "files": {},
+        },
+    )
+    if not isinstance(corrected_feature_rows, dict):
+        raise ValueError("assets.corrected_feature_rows must be an object")
+    corrected_feature_rows.setdefault("root", "features_corrected")
+    corrected_feature_files = corrected_feature_rows.setdefault("files", {})
+    if not isinstance(corrected_feature_files, dict):
+        raise ValueError("assets.corrected_feature_rows.files must be an object")
+    models = payload.setdefault("models", {})
+    if not isinstance(models, dict):
+        raise ValueError("bundle models must be an object")
+    classic_model = models.setdefault("classic", {})
+    if not isinstance(classic_model, dict):
+        raise ValueError("models.classic must be an object")
+    extra_eval_paths = classic_model.setdefault("extra_eval_paths", {})
+    if not isinstance(extra_eval_paths, dict):
+        raise ValueError("models.classic.extra_eval_paths must be an object")
     for table_key in selected_keys:
         labels_path = _asset_file(source_bundle, "featureless_rows", table_key)
         relpath = str(_output_table_relpath(table_key, labels_path))
-        payload["assets"]["corrected_feature_rows"]["files"][table_key] = relpath
+        corrected_feature_files[table_key] = relpath
         if table_key.startswith("extra_eval_paths."):
             dataset_name = table_key.split(".", 1)[1]
-            payload["models"]["classic"]["extra_eval_paths"][dataset_name] = relpath
+            extra_eval_paths[dataset_name] = relpath
         else:
-            payload["models"]["classic"][table_key] = relpath
-    payload["models"]["classic"]["feature_columns"] = list(target["features"])
-    payload["models"]["classic"]["best_params"] = dict(target["params"])
+            classic_model[table_key] = relpath
+    classic_model["feature_columns"] = list(target["features"])
+    classic_model["best_params"] = dict(target["params"])
     payload["expected_metrics"] = {"classic": _target_expected_metrics(target)}
     (output_bundle_root / "bundle.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -3091,10 +3128,9 @@ def _materialize_minimal_raw_feature_bundle(
         reuse_existing_features=reuse_existing_features,
     )
     table_key_set = set(table_keys) if table_keys is not None else None
-    source_spec = dict(source_bundle.models["classic"])
     selected_keys = [
         table_key
-        for table_key in _classic_table_keys(source_spec)
+        for table_key in _source_featureless_table_keys(source_bundle)
         if table_key_set is None or table_key in table_key_set
     ]
     mode_label = str(feature_mode)

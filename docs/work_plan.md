@@ -1,6 +1,6 @@
 # Work Plan
 
-Status date: 2026-05-24
+Status date: 2026-05-25
 
 This file is the active Rust/platform backlog. Stable architecture and artifact
 contracts live in:
@@ -80,8 +80,9 @@ converted or explicitly gated behind a compatibility flag.
 Target a new public release prefix:
 `s3://ai2-s2-research-public/s2and-release-arrow`.
 
-Treat this prefix as planned until the release validation command confirms the
-uploaded contents.
+This prefix was published and no-auth spot-checked on 2026-05-25. The current
+linker replay subbundle is
+`s2and_and_big_blocks_linker_dataset_20260525/`.
 
 This release should be an Arrow-native data/runtime artifact release, not a
 mirror of the legacy JSON/pickle bucket. It should omit `.feature_cache/`.
@@ -110,7 +111,7 @@ Release contents:
 - Benchmark dataset directories for `aminer`, `arnetminer`, `inspire`, `kisti`,
   `medline`, `pubmed`, `qian`, and `zbmath`, each following the Arrow dataset
   manifest contract.
-- `linker_replay_20260513/` with Arrow runtime tables under
+- `s2and_and_big_blocks_linker_dataset_20260525/` with Arrow runtime tables under
   `datasets/<dataset>/` and existing typed offline `components/`, `labels/`,
   and `splits/`.
 
@@ -122,7 +123,7 @@ Release contents:
   - Convert each benchmark embedding payload to the manifest-declared embedding
     filename, for example `specter.arrow` or `specter2.arrow`.
   - Convert linker replay `raw/<dataset>/signatures.json` to
-    `linker_replay_20260513/datasets/<dataset>/signatures.arrow`.
+    `s2and_and_big_blocks_linker_dataset_20260525/datasets/<dataset>/signatures.arrow`.
   - Convert linker replay `raw/<dataset>/papers.json` to `papers.arrow` and
     `paper_authors.arrow`.
   - Convert linker replay embeddings to the manifest-declared embedding
@@ -144,8 +145,8 @@ Release contents:
     `production_model_v1.2.pickle` exactly as legacy compatibility artifacts.
   - Keep `<dataset>_clusters.json` as eval-only truth.
   - Keep train/test split keys, pair CSVs, replay split CSVs, replay
-    `summary.json`, `bundle.json`, and manifests, with paths and checksums
-    updated where they refer to converted artifacts.
+    `summary.json`, Arrow-only `bundle.json`, and manifests, with paths and
+    checksums updated where they refer to converted artifacts.
   - Keep linker replay `components/*.parquet` and `labels/*.parquet` as-is
     because they are already typed columnar offline artifacts.
 - Omit or quarantine artifacts that are not part of the Arrow-native release.
@@ -155,6 +156,9 @@ Release contents:
     under an explicit `legacy/` prefix if paper-era compatibility requires it.
   - Do not duplicate raw JSON files after conversion. The existing
     `s2and-release` bucket remains the legacy JSON source.
+  - Do not ship replay `raw/`, pickle `embeddings/`, or precomputed
+    `features_corrected/` directories in the Arrow replay subbundle. Promoted
+    feature rows are regenerated during replay for the selected pairwise model.
 - Verification and publication runbook.
   - Before any full conversion or upload, run a tiny fixture/sample conversion
     and validation. Current expected command shape:
@@ -201,7 +205,8 @@ Release contents:
     spot-check that `manifest.json`, one benchmark dataset manifest, one
     manifest-declared embedding Arrow file, one batch-index sidecar, the
     production model manifest, and `name_counts_index/manifest.json` can be
-    read from the published prefix.
+    read from the published prefix. The 2026-05-25 publication passed these
+    checks.
   - Add a checked-in release-layout regression test, tentatively
     `tests/test_arrow_release_layout.py`. By default it should validate a tiny
     local release fixture: root manifest, one dataset manifest, required Arrow
@@ -244,10 +249,9 @@ production inference.
   - Convert `scripts/tutorial_for_predicting_with_the_prod_model.py` to accept
     Arrow input paths or an Arrow bundle root and route through
     `Clusterer.predict_from_arrow_paths(...)`.
-  - Expand `scripts/eval_prod_models.py --use-arrow` beyond the current mini
-    restriction, or split the mini-only smoke test from real production eval.
-    This depends on benchmark Arrow conversion and S3 release validation; do not
-    claim broad `--use-arrow` support until those bundles exist.
+  - Keep `scripts/eval_prod_models.py --use-arrow` enabled for mini fixtures
+    and released full benchmark Arrow bundles. Do not claim support for
+    `inventors_s2and` until that bundle exists.
   - Convert `scripts/_rust_suite/prod_inference_cmd.py` to benchmark Arrow as
     the production path; keep `from_dataset` only as an explicit legacy/parity
     mode if still needed.
@@ -558,8 +562,8 @@ recording in `tests/test_cluster_incremental.py`.
 - Next profiling should target Arrow read/summary construction and reusable
   component summaries on a realistic Arrow promoted-incremental workload:
   raw single-query or small query-batch prediction against a published
-  `linker_replay_20260513` dataset, after first sanity-checking the profiler on
-  the tiny Arrow fixture.
+  `s2and_and_big_blocks_linker_dataset_20260525` dataset, after first
+  sanity-checking the profiler on the tiny Arrow fixture.
 - Primary metrics: p50 wall time over at least five isolated runs, peak RSS, and
   summary-construction allocation volume from a stack-level allocation profiler
   (`heaptrack`/`perf` on Linux or ETW allocation tracing on Windows).

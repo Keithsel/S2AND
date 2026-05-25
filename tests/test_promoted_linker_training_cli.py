@@ -42,7 +42,7 @@ def test_promoted_training_defaults_to_arrow_rust_source() -> None:
     parser_defaults = vars(parser.parse_args([]))
     feature_mode_action = next(action for action in parser._actions if action.dest == "feature_mode")  # noqa: SLF001
 
-    assert promoted_train.DEFAULT_SOURCE_BUNDLE_ROOT.name == "s2and_and_big_blocks_linker_dataset_20260513_arrow"
+    assert promoted_train.DEFAULT_SOURCE_BUNDLE_ROOT.name == "s2and_and_big_blocks_linker_dataset_20260525"
     assert promoted_train.DEFAULT_TARGET_JSON.relative_to(promoted_train.REPO_ROOT) == Path(
         "s2and/data/production_model_v1.21/reproducibility/incremental_linker_training_target.json"
     )
@@ -57,6 +57,143 @@ def test_promoted_training_defaults_to_arrow_rust_source() -> None:
     assert parser_defaults["hyperopt_evals"] is None
     assert parser_defaults["hyperopt_metric"] == "weighted_average_error"
     assert parser_defaults["allow_normalization_version_mismatch"] is False
+
+
+def test_finalized_arrow_materialization_bundle_creates_corrected_feature_asset_group(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "output"
+    labels_path = source_root / "labels" / "train.parquet"
+    labels_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"query_group_id": "q1", "retrieval_rank": 1, "label": 1}]).to_parquet(labels_path, index=False)
+    payload = {
+        "bundle_name": "arrow_source",
+        "assets": {
+            "featureless_rows": {
+                "root": "labels",
+                "files": {
+                    "train_path": "labels/train.parquet",
+                },
+            },
+        },
+        "models": {
+            "classic": {
+                "feature_columns": [],
+                "best_params": {},
+            },
+        },
+        "expected_metrics": {},
+    }
+    source_root.mkdir(parents=True, exist_ok=True)
+    (source_root / "bundle.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "bundle.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    bundle = promoted_train._finalize_minimal_raw_bundle_metadata(  # noqa: SLF001
+        source_bundle=promoted_train.load_bundle(source_root),
+        output_bundle_root=output_root,
+        target={"feature_count": 1, "features": ["f0"], "params": {"n_estimators": 10}, "metrics": {}},
+        selected_keys=["train_path"],
+        stamp_precomputed_metadata=False,
+        source_mode="arrow-rust",
+    )
+
+    assert bundle.assets["corrected_feature_rows"]["root"] == "features_corrected"
+    feature_path = str(Path("features_corrected") / "train.parquet")
+    assert bundle.assets["corrected_feature_rows"]["files"] == {"train_path": feature_path}
+    assert bundle.models["classic"]["train_path"] == feature_path
+
+
+def test_materialization_selects_source_tables_from_featureless_assets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "source"
+    labels_dir = source_root / "labels"
+    labels_dir.mkdir(parents=True)
+    label_row = {
+        "dataset": "pubmed",
+        "query_group_id": "q1",
+        "candidate_component_key": "c1",
+        "retrieval_rank": 1,
+        "label": 1,
+    }
+    for filename in ("train.parquet", "hwang_eval.parquet"):
+        pd.DataFrame([label_row]).to_parquet(labels_dir / filename, index=False)
+
+    source_bundle = promoted_train.OfficialBundle(
+        root=source_root,
+        bundle_name="arrow_source",
+        assets={
+            "featureless_rows": {
+                "files": {
+                    "train_path": "labels/train.parquet",
+                    "hwang_eval_path": "labels/hwang_eval.parquet",
+                }
+            }
+        },
+        models={"classic": {}},
+        expected_metrics={},
+    )
+    captured: dict[str, list[str]] = {}
+
+    monkeypatch.setattr(promoted_train, "_copy_bundle_support_files", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        promoted_train,
+        "_asset_file",
+        lambda bundle, _group, key: bundle.root / bundle.assets["featureless_rows"]["files"][key],
+    )
+    monkeypatch.setattr(
+        promoted_train,
+        "_clean_minimal_raw_structural_rows",
+        lambda **kwargs: (kwargs["rows"], {"rows_before": len(kwargs["rows"]), "rows_after": len(kwargs["rows"])}),
+    )
+    monkeypatch.setattr(promoted_train, "_required_materialized_output_columns", lambda _labels, _features: ["dataset"])
+    monkeypatch.setattr(
+        promoted_train,
+        "_selected_row_positions",
+        lambda labels, _datasets, _limit_rows: __import__("numpy").arange(len(labels), dtype="int64"),
+    )
+    monkeypatch.setattr(promoted_train, "_build_minimal_raw_dataset_context", lambda **_kwargs: object())
+    monkeypatch.setattr(promoted_train, "_release_minimal_raw_dataset_context", lambda _context: None)
+
+    def fake_materialize_dataset_rows(**kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        rows = kwargs["rows"]
+        return {"f0": __import__("numpy").zeros(len(rows), dtype="float32")}, {
+            "dataset": "pubmed",
+            "rows": len(rows),
+        }
+
+    monkeypatch.setattr(promoted_train, "_materialize_minimal_raw_dataset_rows", fake_materialize_dataset_rows)
+
+    def fake_finalize(**kwargs: Any) -> promoted_train.OfficialBundle:
+        captured["selected_keys"] = list(kwargs["selected_keys"])
+        return kwargs["source_bundle"]
+
+    monkeypatch.setattr(promoted_train, "_finalize_minimal_raw_bundle_metadata", fake_finalize)
+
+    promoted_train._materialize_minimal_raw_feature_bundle(
+        source_bundle=source_bundle,
+        output_bundle_root=tmp_path / "output",
+        target={"features": ["f0"]},
+        clusterer=None,
+        n_jobs=1,
+        total_ram_bytes=1_000_000,
+        table_keys=None,
+        datasets=None,
+        limit_rows=None,
+        pair_batch_size=100,
+        query_batch_pair_limit=100,
+        max_exemplars=1,
+        max_top_k=1,
+        reuse_existing_features=False,
+        rust_build_path=None,
+        name_counts_path=None,
+        allow_normalization_version_mismatch=False,
+        pairwise_model_nan_value=float("nan"),
+        pairwise_aggregate_nan_value=0.0,
+        row_nan_policy="finite",
+    )
+
+    assert captured["selected_keys"] == ["train_path", "hwang_eval_path"]
 
 
 def _write_precomputed_promoted_bundle(root: Path, target: dict[str, Any]) -> Path:

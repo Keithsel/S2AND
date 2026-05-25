@@ -57,6 +57,20 @@ def test_empty_optional_dataset_and_specter_lists_fall_back_to_defaults() -> Non
     assert eval_prod_models._resolve_requested_specter_suffixes(["s1", "s2"], []) == ["s1", "s2"]
 
 
+def test_arrow_eval_defaults_include_full_release_root() -> None:
+    project_root = str(Path("repo").resolve())
+
+    assert eval_prod_models._supports_arrow_eval("mini") is True
+    assert eval_prod_models._supports_arrow_eval("full") is True
+    assert eval_prod_models._supports_arrow_eval("inventors_s2and") is False
+    assert eval_prod_models._default_arrow_data_root(project_root, "mini") == str(
+        Path(project_root) / "s2and" / "data" / "s2and_mini_arrow"
+    )
+    assert eval_prod_models._default_arrow_data_root(project_root, "full") == str(
+        Path(project_root) / "s2and" / "data" / "s2and-release-arrow"
+    )
+
+
 def test_read_arrow_s2_blocks_reads_columns_without_row_dicts(tmp_path: Path) -> None:
     import pyarrow as pa
 

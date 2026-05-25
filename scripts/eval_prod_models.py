@@ -63,6 +63,10 @@ Usage:
     uv run python scripts/eval_prod_models.py --dataset mini
     # Uses s2and/data/s2and_mini_arrow automatically when complete Arrow artifacts exist.
 
+    # Evaluate released benchmark Arrow bundles directly
+    uv run python scripts/eval_prod_models.py --dataset full --use-arrow \
+      --arrow-data-root s2and/data/s2and-release-arrow
+
     # Retrain from scratch instead of using prod models
     uv run python scripts/eval_prod_models.py --train
 
@@ -126,7 +130,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--arrow-data-root",
         default=None,
-        help="Arrow mini data root. Defaults to s2and/data/s2and_mini_arrow when --use-arrow is set.",
+        help=(
+            "Arrow data root. Defaults to s2and/data/s2and_mini_arrow for --dataset mini and "
+            "s2and/data/s2and-release-arrow for --dataset full."
+        ),
     )
     return parser
 
@@ -149,6 +156,18 @@ def _resolve_requested_specter_suffixes(default_suffixes: list[str], requested_s
     if not requested_suffixes:
         return list(default_suffixes)
     return [str(suffix) for suffix in requested_suffixes]
+
+
+def _default_arrow_data_root(project_root_path: str, dataset_label: str) -> str | None:
+    if dataset_label == "mini":
+        return os.path.join(project_root_path, "s2and", "data", "s2and_mini_arrow")
+    if dataset_label == "full":
+        return os.path.join(project_root_path, "s2and", "data", "s2and-release-arrow")
+    return None
+
+
+def _supports_arrow_eval(dataset_label: str) -> bool:
+    return dataset_label in {"mini", "full"}
 
 
 # specter suffix -> production model artifact
@@ -453,32 +472,30 @@ def main() -> None:
 
     if args.dataset == "mini":
         data_original = os.path.join(PROJECT_ROOT_PATH, "s2and", "data", "s2and_mini")
-        arrow_data_root = args.arrow_data_root or os.path.join(PROJECT_ROOT_PATH, "s2and", "data", "s2and_mini_arrow")
+        arrow_data_root = args.arrow_data_root or _default_arrow_data_root(PROJECT_ROOT_PATH, args.dataset)
         # aminer has too much variance; medline is pairwise only
         datasets = ["arnetminer", "inspire", "kisti", "pubmed", "qian", "zbmath"]
     elif args.dataset == "full":
         data_original = os.path.join(PROJECT_ROOT_PATH, "s2and", "data")
-        arrow_data_root = args.arrow_data_root
-        if args.use_arrow:
-            raise ValueError("--use-arrow currently supports --dataset mini only")
+        arrow_data_root = args.arrow_data_root or _default_arrow_data_root(PROJECT_ROOT_PATH, args.dataset)
         datasets = ["arnetminer", "inspire", "kisti", "pubmed", "qian", "zbmath"]
     else:
         data_original = os.path.join(PROJECT_ROOT_PATH, "s2and", "data")
         arrow_data_root = args.arrow_data_root
         if args.use_arrow:
-            raise ValueError("--use-arrow currently supports --dataset mini only")
+            raise ValueError("--use-arrow currently supports --dataset mini and --dataset full only")
         datasets = ["inventors_s2and"]
     datasets = _resolve_requested_datasets(datasets, args.datasets, args.dataset)
     active_specter_suffixes = _resolve_requested_specter_suffixes(specter_suffixes, args.specter_suffixes)
     missing_arrow_error = (
         first_missing_arrow_dataset_error(arrow_data_root, datasets, active_specter_suffixes)
-        if args.dataset == "mini" and not train_flag
+        if _supports_arrow_eval(args.dataset) and not train_flag
         else FileNotFoundError("Arrow eval is unavailable for this configuration")
     )
-    arrow_available = args.dataset == "mini" and not train_flag and missing_arrow_error is None
+    arrow_available = _supports_arrow_eval(args.dataset) and not train_flag and missing_arrow_error is None
     if args.use_arrow and missing_arrow_error is not None:
         raise missing_arrow_error
-    use_arrow = bool(args.use_arrow or (arrow_available and not args.no_arrow))
+    use_arrow = bool(args.use_arrow or (args.dataset == "mini" and arrow_available and not args.no_arrow))
 
     print(
         f"Config: dataset={args.dataset}, seed={random_seed}, n_jobs={n_jobs}, "

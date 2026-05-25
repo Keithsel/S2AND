@@ -52,7 +52,7 @@
 
 | Script | What it does |
 |---|---|
-| `eval_prod_models.py` | Evaluate production models (SPECTER1 vs SPECTER2) on full, inventors_s2and, or mini datasets |
+| `eval_prod_models.py` | Evaluate production models (SPECTER1 vs SPECTER2) on full, inventors_s2and, or mini datasets; use `--dataset full --use-arrow` with the Arrow release |
 | `verification/compare_full_predict_arrow_parity.py` | Build a bounded Arrow parity artifact, including current raw-planner batch-index sidecars, and compare incumbent full predict against direct Arrow/Rust full predict |
 
 ### CI & release

@@ -583,8 +583,9 @@ Required checks:
 - `(paper_id, position)` values in `paper_authors.arrow` are unique.
 - Every `signatures.paper_id` exists in `papers.arrow`.
 - Every `paper_authors.paper_id` exists in `papers.arrow`.
-- When embeddings are required, every referenced paper has an embedding in the
-  selected SPECTER file.
+- When embeddings are required, the selected SPECTER Arrow file exists and
+  validates structurally. Require every referenced paper to have an embedding
+  only for datasets whose source contract guarantees complete coverage.
 - `cluster_seeds.signature_id` is a subset of `signatures.signature_id`.
 - `cluster_seeds.signature_id` values are unique and every `cluster_id` is a
   non-empty string.

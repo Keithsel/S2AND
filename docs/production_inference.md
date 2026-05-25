@@ -88,12 +88,18 @@ source bundle. The default minimal-raw bundle does not store reference papers,
 so the replay script rejects pairwise models that require
 `reference_features`. If the pairwise model changes embedding source or input
 contract, rebuild the source bundle and pass it with `--source-bundle-root`.
-The current train/calibrate/eval source bundle is published on S3 with the
-other release data:
+The current train/calibrate/eval source bundle is published as an Arrow-only
+replay bundle with the other Arrow release data:
 
 ```powershell
-aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release/s2and_and_big_blocks_linker_dataset_20260513_arrow s2and\data\s2and_and_big_blocks_linker_dataset_20260513_arrow
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260525 s2and\data\s2and_and_big_blocks_linker_dataset_20260525
 ```
+
+This bundle intentionally omits legacy `raw/`, `embeddings/`, and
+`features_corrected/` directories. Replay uses Arrow tables under
+`datasets/<dataset>/` plus `components/`, `labels/`, and `splits/`; promoted
+feature rows are materialized into the run output for the selected pairwise
+model.
 
 #### What the replay script does
 
@@ -108,7 +114,7 @@ linker artifact, and finalizes the complete production bundle.
 Its main inputs are:
 
 - `--pairwise-model-path`: the pairwise model whose distances feed the linker.
-- `--source-bundle-root`: the raw+SPECTER2+labels train/calibrate/eval bundle.
+- `--source-bundle-root`: the Arrow+labels train/calibrate/eval bundle.
 - `--target-json`: the replay target with feature order, LightGBM params,
   expected metrics, status, and variant.
 - `--output-dir`: the scratch run directory for materialized features,
@@ -121,14 +127,14 @@ Its main inputs are:
 
 In the default `--feature-mode arrow-rust`, the script rebuilds promoted
 features from the Arrow source bundle. For each selected table and dataset, it
-loads the Arrow papers, signatures, SPECTER2 embeddings, and labels; applies
+loads the Arrow papers, signatures, SPECTER2 rows, and labels; applies
 structural cleaning; builds block-local query/candidate context; uses the frozen
 Rust retrieval policy to choose candidate seed clusters; builds the
 candidate/member pair plan; computes pairwise model distances and `pw_*`
 aggregate features; adds the non-pairwise row features; then writes
-target-ordered feature tables and
-bundle metadata under `--output-dir`. These feature values are tied to the exact
-pairwise model passed with `--pairwise-model-path`.
+target-ordered feature tables and bundle metadata under `--output-dir`. These
+feature values are tied to the exact pairwise model passed with
+`--pairwise-model-path`.
 
 The other feature mode is narrower:
 
@@ -232,8 +238,8 @@ the precomputed bundle was materialized for the same target and pairwise model;
 the full default replay recomputes promoted features from the source bundle.
 
 Training/evaluation replay normally recomputes promoted features from the
-self-contained minimal-raw source bundle. For compute-once/reuse workflows, the
-replay script also supports an explicit portable precomputed bundle mode:
+Arrow source bundle. For compute-once/reuse workflows, the replay script also
+supports an explicit portable precomputed bundle mode:
 
 ```powershell
 uv run python scripts\production\model\linker_train_calibrate_eval.py `

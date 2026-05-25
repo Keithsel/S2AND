@@ -74,6 +74,33 @@ def _raw_arrow_plan_window_size(
     return max(1, min(resolved_query_count, resolved_query_batch_size * max(1, int(plan_window_multiplier))))
 
 
+def _raw_arrow_plan_windows(
+    query_signature_ids: Sequence[str],
+    *,
+    window_size: int,
+    seed_signature_ids: set[str],
+) -> list[list[str]]:
+    """Build raw-planner windows without mixing seed-overlap queries."""
+
+    resolved_window_size = max(1, int(window_size))
+    windows: list[list[str]] = []
+    current: list[str] = []
+    for signature_id in query_signature_ids:
+        if signature_id in seed_signature_ids:
+            if current:
+                windows.append(current)
+                current = []
+            windows.append([signature_id])
+            continue
+        current.append(signature_id)
+        if len(current) >= resolved_window_size:
+            windows.append(current)
+            current = []
+    if current:
+        windows.append(current)
+    return windows
+
+
 def _raw_window_plan_telemetry_fields(raw_candidate_plan: Mapping[str, Any]) -> dict[str, int | float | str]:
     """Return raw Arrow planner telemetry under the window-plan prefix."""
 
@@ -1012,8 +1039,12 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             query_batch_size=query_batch_size,
             plan_window_multiplier=featurizer_window_multiplier,
         )
-        for plan_start_index in range(0, len(unassigned_signature_ids), featurizer_window_size):
-            query_plan_window = unassigned_signature_ids[plan_start_index : plan_start_index + featurizer_window_size]
+        seed_window_signature_ids = {str(signature_id) for signature_id in cluster_seeds_require}
+        for query_plan_window in _raw_arrow_plan_windows(
+            [str(signature_id) for signature_id in unassigned_signature_ids],
+            window_size=featurizer_window_size,
+            seed_signature_ids=seed_window_signature_ids,
+        ):
             if raw_request_planner is None:
                 raise RuntimeError("reusable raw Arrow planner was not initialized")
             raw_window_planner_plan_start = time.perf_counter()

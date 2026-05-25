@@ -462,6 +462,42 @@ def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: 
     assert "q1" not in planned["component_members"].get("c_query", [])
 
 
+def test_raw_arrow_candidate_planner_rejects_multi_query_seed_overlap(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
+        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    planner = s2and_rust.RawBlockQueryCandidatePlanner(
+        paths,
+        ["q1", "s1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+        include_pair_signature_ids=True,
+        include_component_members=False,
+        full_scan_without_index=True,
+    )
+
+    with pytest.raises(ValueError, match="singleton query windows"):
+        planner.plan(
+            ["q1", "s1"],
+            top_k=2,
+            query_view="full",
+            include_pair_signature_ids=True,
+            include_component_members=False,
+        )
+
+    planned = planner.plan(
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        include_pair_signature_ids=True,
+        include_component_members=False,
+    )
+    assert planned["row_component_keys"] == ["c_match", "c_other"]
+    assert planned["right_signature_ids"] == ["s1", "s2"]
+
+
 def test_raw_arrow_candidate_planner_requires_indexes_without_explicit_full_scan(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
         raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
@@ -1828,6 +1864,25 @@ def test_raw_arrow_labeled_candidate_plan_initial_view_keeps_full_first_token(tm
 
     assert raw_plan["row_query_views"] == ["initial_only"]
     assert raw_plan["row_query_first_tokens"] == ["alice"]
+
+
+def test_raw_arrow_candidate_plan_initial_view_keeps_full_first_token(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+
+    raw_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="initial_only",
+        orcid_enabled=False,
+        num_threads=1,
+        full_scan_without_index=True,
+    )
+
+    assert raw_plan["query_views"] == ["initial_only"]
+    assert raw_plan["row_query_first_tokens"] == ["alice", "alice"]
 
 
 def test_raw_arrow_labeled_candidate_plan_applies_block_local_members(tmp_path: Path) -> None:

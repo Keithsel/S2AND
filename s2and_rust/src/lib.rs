@@ -1173,6 +1173,7 @@ impl RustHybridCentroidRetriever {
     fn build_pair_plan_query_result(
         &self,
         current_query: &RetrievalQueryData,
+        row_query_first_token: &str,
         query_signature_index: u32,
         base_candidate_indices: Option<&[usize]>,
         excluded_candidate_indices: Option<&HashSet<usize>>,
@@ -1264,7 +1265,7 @@ impl RustHybridCentroidRetriever {
             ));
             result
                 .row_query_first_tokens
-                .push(current_query.first.clone());
+                .push(row_query_first_token.to_string());
             result.row_query_years.push(query_year);
             result.row_query_year_missing.push(query_year_missing);
             result
@@ -12639,6 +12640,7 @@ impl RustHybridCentroidRetriever {
                                 });
                             self.build_pair_plan_query_result(
                                 current_query,
+                                current_query.first.as_str(),
                                 query_indices[query_offset],
                                 base_candidate_indices,
                                 None,
@@ -14863,6 +14865,7 @@ impl RawBlockQueryCandidatePlanner {
         let query_start = Instant::now();
         let mut queries = Vec::<RetrievalQueryData>::with_capacity(query_signature_ids.len());
         let mut query_views = Vec::<String>::with_capacity(query_signature_ids.len());
+        let mut query_first_tokens = Vec::<String>::with_capacity(query_signature_ids.len());
         let mut query_authors = Vec::<String>::with_capacity(query_signature_ids.len());
         for signature_id in query_signature_ids.iter() {
             let base_feature = &query_features_by_signature_id[signature_id];
@@ -14871,22 +14874,29 @@ impl RawBlockQueryCandidatePlanner {
                 .map_err(pyo3::exceptions::PyValueError::new_err)?;
             queries.push(masked);
             query_views.push(resolved_view);
+            query_first_tokens.push(base.first.clone());
             query_authors.push(base_feature.query_author.clone());
         }
         let query_secs = query_start.elapsed().as_secs_f64();
 
         let query_signature_id_set: HashSet<&str> =
             query_signature_ids.iter().map(String::as_str).collect();
+        let overlapping_query_seed_ids = query_signature_ids
+            .iter()
+            .filter(|signature_id| self.state.seed_signature_id_set.contains(*signature_id))
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>();
+        if query_signature_ids.len() > 1 && !overlapping_query_seed_ids.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "RawBlockQueryCandidatePlanner.plan requires singleton query windows when query ids are also \
+                 cluster seed members; overlapping query_signature_ids={overlapping_query_seed_ids:?}"
+            )));
+        }
         let mut excluded_query_seed_count = 0usize;
         let mut filtered_component_order = Vec::<String>::new();
         let mut filtered_members_by_component = HashMap::<String, Vec<String>>::new();
-        let mut needs_filtered_retriever = false;
-        for signature_id in query_signature_ids.iter() {
-            if self.state.seed_signature_id_set.contains(signature_id) {
-                needs_filtered_retriever = true;
-                break;
-            }
-        }
+        let needs_filtered_retriever = !overlapping_query_seed_ids.is_empty();
         let summary_start = Instant::now();
         let filtered_retriever = if needs_filtered_retriever {
             for component_key in self.state.component_order.iter() {
@@ -14972,6 +14982,7 @@ impl RawBlockQueryCandidatePlanner {
                                 .and_then(|values| values[query_offset].as_ref());
                             retriever.build_pair_plan_query_result(
                                 current_query,
+                                query_first_tokens[query_offset].as_str(),
                                 query_index,
                                 None,
                                 excluded_candidate_indices,

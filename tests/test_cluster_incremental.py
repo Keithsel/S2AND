@@ -30,6 +30,16 @@ def _clusters(result: dict[str, Any]) -> dict[str, list[str]]:
     return dict(result["clusters"])
 
 
+def test_raw_arrow_plan_windows_isolate_seed_overlap_queries() -> None:
+    windows = production_module._raw_arrow_plan_windows(
+        ["query-1", "seed-1", "query-2", "query-3", "seed-2", "query-4"],
+        window_size=2,
+        seed_signature_ids={"seed-1", "seed-2"},
+    )
+
+    assert windows == [["query-1"], ["seed-1"], ["query-2", "query-3"], ["seed-2"], ["query-4"]]
+
+
 def _patch_fake_raw_arrow_planner(
     monkeypatch: pytest.MonkeyPatch,
     *,

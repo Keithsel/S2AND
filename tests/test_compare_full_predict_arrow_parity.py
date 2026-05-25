@@ -7,6 +7,10 @@ pa = pytest.importorskip("pyarrow")
 
 from scripts.verification.compare_full_predict_arrow_parity import (  # noqa: E402
     _assert_exact,
+    _build_arg_parser,
+    _cluster_partition,
+    _fixture_meta_path,
+    _load_cluster_seeds_require,
     _numeric_report,
     _write_raw_planner_indexes_and_layout,
 )
@@ -39,6 +43,61 @@ def test_numeric_report_uses_configured_nan_mismatch_policy() -> None:
 
     assert _numeric_report(left, right, treat_nan_as_mismatch=True)["nan_mismatch_count"] == 1
     assert _numeric_report(left, right, treat_nan_as_mismatch=False)["nan_mismatch_count"] == 0
+
+
+def test_cluster_partition_ignores_cluster_labels_and_member_order() -> None:
+    incumbent = {"a": ["s1", "s2"], "b": ["s3"]}
+    arrow = {"cluster_7": ["s3"], "cluster_9": ["s2", "s1"]}
+
+    assert _cluster_partition(incumbent) == _cluster_partition(arrow)
+    assert _cluster_partition(incumbent) != _cluster_partition({"a": ["s1"], "b": ["s2", "s3"]})
+
+
+def test_parity_parser_compares_features_by_default(tmp_path) -> None:
+    args = _build_arg_parser().parse_args(
+        [
+            "--fixture-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--output-json",
+            str(tmp_path / "out.json"),
+            "--block-size",
+            "2",
+        ]
+    )
+
+    assert args.compare_features is True
+
+    args = _build_arg_parser().parse_args(
+        [
+            "--fixture-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--output-json",
+            str(tmp_path / "out.json"),
+            "--block-size",
+            "2",
+            "--no-compare-features",
+        ]
+    )
+
+    assert args.compare_features is False
+
+
+def test_parity_fixture_meta_paths_resolve_relative_to_fixture_dir(tmp_path) -> None:
+    seed_path = tmp_path / "seeds.json"
+    seed_path.write_text('{"s1": "c1", "s2": "c2"}\n', encoding="utf-8")
+    meta = {
+        "paths": {
+            "signatures": "signatures.json",
+            "cluster_seeds_require": "seeds.json",
+        }
+    }
+
+    assert _fixture_meta_path(meta, tmp_path, "signatures") == tmp_path / "signatures.json"
+    assert _load_cluster_seeds_require(meta, tmp_path, ["s1"], enabled=True) == {"s1": "c1"}
 
 
 def _write_ipc(path, table) -> str:

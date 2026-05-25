@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 
+import s2and.incremental_linking  # noqa: F401
 from s2and.consts import PROJECT_ROOT_PATH
 from s2and.data import ANDData, NameCounts
 from s2and.featurizer import FeaturizationInfo
@@ -42,7 +43,13 @@ def _force_python_backend(monkeypatch):
     monkeypatch.setenv("S2AND_BACKEND", "python")
 
 
-def _load_dataset_from_dir(data_dir: str, name: str, *, compute_reference_features: bool) -> ANDData:
+def _load_dataset_from_dir(
+    data_dir: str,
+    name: str,
+    *,
+    compute_reference_features: bool,
+    preprocess: bool = True,
+) -> ANDData:
     cluster_seeds_path = os.path.join(data_dir, "cluster_seeds.json")
     cluster_seeds = cluster_seeds_path if os.path.exists(cluster_seeds_path) else None
     return ANDData(
@@ -62,7 +69,7 @@ def _load_dataset_from_dir(data_dir: str, name: str, *, compute_reference_featur
         test_pairs_size=1000,
         n_jobs=1,
         load_name_counts=False,
-        preprocess=True,
+        preprocess=preprocess,
         random_seed=42,
         name_tuples="filtered",
         use_orcid_id=True,
@@ -88,6 +95,7 @@ def _build_rust_from_json_paths(
     *,
     compute_reference_features: bool,
     specter_embeddings: dict[str, list[float]] | None = None,
+    preprocess: bool = True,
 ):
     signatures_path = os.path.join(data_dir, "signatures.json")
     papers_path = os.path.join(data_dir, "papers.json")
@@ -100,12 +108,89 @@ def _build_rust_from_json_paths(
         specter_embeddings,
         None,  # name_tuples_path
         None,  # name_counts_path
-        True,  # preprocess
+        preprocess,
         compute_reference_features,
         0.0,
         10000.0,
         1,
     )
+
+
+def _write_minimal_from_json_inputs(
+    data_dir: Path,
+    *,
+    signature_position: Any = 0,
+    cluster_seeds: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    data_dir.mkdir()
+    signatures = {
+        "q": {
+            "signature_id": "q",
+            "paper_id": 1,
+            "author_info": {
+                "first": "Alice",
+                "middle": "",
+                "last": "Smith",
+                "position": signature_position,
+                "email": None,
+                "affiliations": [],
+            },
+        },
+        "s1": {
+            "signature_id": "s1",
+            "paper_id": 2,
+            "author_info": {
+                "first": "Alice",
+                "middle": "",
+                "last": "Smith",
+                "position": 0,
+                "email": None,
+                "affiliations": [],
+            },
+        },
+    }
+    papers = {
+        "1": {
+            "paper_id": 1,
+            "title": "A title",
+            "abstract": "",
+            "journal_name": "",
+            "venue": "",
+            "year": 2024,
+            "authors": [{"position": 0, "author_name": "Alice Smith"}],
+            "references": [],
+        },
+        "2": {
+            "paper_id": 2,
+            "title": "Another title",
+            "abstract": "",
+            "journal_name": "",
+            "venue": "",
+            "year": 2024,
+            "authors": [{"position": 0, "author_name": "Alice Smith"}],
+            "references": [],
+        },
+    }
+    (data_dir / "signatures.json").write_text(json.dumps(signatures), encoding="utf-8")
+    (data_dir / "papers.json").write_text(json.dumps(papers), encoding="utf-8")
+    if cluster_seeds is not None:
+        (data_dir / "cluster_seeds.json").write_text(json.dumps(cluster_seeds), encoding="utf-8")
+
+
+def test_from_json_paths_rejects_non_integer_signature_position(tmp_path: Path) -> None:
+    data_dir = tmp_path / "bad_integer"
+    _write_minimal_from_json_inputs(data_dir, signature_position=1.5)
+
+    with pytest.raises(ValueError, match="signature author_info\\.position must be an integer"):
+        _build_rust_from_json_paths(str(data_dir), compute_reference_features=False)
+
+
+def test_from_json_paths_rejects_unknown_cluster_seed_constraint(tmp_path: Path) -> None:
+    data_dir = tmp_path / "bad_cluster_seed"
+    _write_minimal_from_json_inputs(data_dir, cluster_seeds={"q": {"s1": "maybe"}})
+
+    with pytest.raises(ValueError, match="unknown cluster seed constraint"):
+        _build_rust_from_json_paths(str(data_dir), compute_reference_features=False)
 
 
 def test_from_json_paths_language_matches_python_cld2_detail_for_beta_title(tmp_path: Path):
@@ -300,6 +385,115 @@ def test_from_json_paths_reports_default_and_missing_input_counts(tmp_path: Path
     assert counts["defaulted_name_count_last_first_initial_count"] == 0
 
 
+def test_from_json_paths_name_counts_use_apostrophe_removed_first_key(tmp_path: Path):
+    data_dir = tmp_path / "apostrophe_name_counts"
+    data_dir.mkdir()
+
+    def signature(signature_id: str, paper_id: int) -> dict[str, Any]:
+        return {
+            "signature_id": signature_id,
+            "paper_id": paper_id,
+            "author_info": {
+                "first": "O'Neil",
+                "middle": "",
+                "last": "Smith",
+                "suffix": None,
+                "position": 0,
+                "email": None,
+                "affiliations": [],
+                "block": "o smith",
+                "given_block": "o smith",
+                "estimated_ethnicity": None,
+                "estimated_gender": None,
+            },
+        }
+
+    signatures = {"q": signature("q", 1), "m": signature("m", 2)}
+    papers = {
+        "1": {
+            "paper_id": 1,
+            "title": "Shared topic one",
+            "abstract": "",
+            "journal_name": "",
+            "venue": "",
+            "year": 2024,
+            "authors": [{"position": 0, "author_name": "O'Neil Smith"}],
+            "references": [],
+        },
+        "2": {
+            "paper_id": 2,
+            "title": "Shared topic two",
+            "abstract": "",
+            "journal_name": "",
+            "venue": "",
+            "year": 2024,
+            "authors": [{"position": 0, "author_name": "O'Neil Smith"}],
+            "references": [],
+        },
+    }
+    name_counts = {
+        "normalization_version": "legacy_compat",
+        "first_dict": {"oneil": 101.0},
+        "last_dict": {"smith": 103.0},
+        "first_last_dict": {"oneil smith": 107.0},
+        "last_first_initial_dict": {"smith o": 109.0},
+    }
+    signatures_path = data_dir / "signatures.json"
+    papers_path = data_dir / "papers.json"
+    name_counts_path = data_dir / "name_counts.json"
+    signatures_path.write_text(json.dumps(signatures), encoding="utf-8")
+    papers_path.write_text(json.dumps(papers), encoding="utf-8")
+    name_counts_path.write_text(json.dumps(name_counts), encoding="utf-8")
+
+    dataset = ANDData(
+        signatures=str(signatures_path),
+        papers=str(papers_path),
+        name="apostrophe_name_counts",
+        mode="inference",
+        specter_embeddings=None,
+        clusters=None,
+        cluster_seeds=None,
+        train_pairs=None,
+        val_pairs=None,
+        test_pairs=None,
+        n_jobs=1,
+        load_name_counts=name_counts,
+        preprocess=True,
+        name_tuples=None,
+        use_orcid_id=True,
+        use_sinonym_overwrite=False,
+        compute_reference_features=False,
+    )
+    assert dataset.signatures["q"].author_info_name_counts == NameCounts(
+        first=101.0,
+        last=103.0,
+        first_last=107.0,
+        last_first_initial=109.0,
+    )
+
+    rust_from_dataset = _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
+    rust_from_json = _S2AND_RUST.RustFeaturizer.from_json_paths(
+        str(signatures_path),
+        str(papers_path),
+        None,
+        None,
+        None,
+        str(name_counts_path),
+        True,
+        False,
+        0.0,
+        10000.0,
+        1,
+        "legacy_compat",
+        False,
+    )
+
+    expected_features = rust_from_dataset.featurize_pair("q", "m")
+    got_features = rust_from_json.featurize_pair("q", "m")
+    for index in _FEATURIZATION_INFO.feature_group_to_index["name_counts"]:
+        assert equalish(got_features[index], expected_features[index])
+
+
 def test_from_json_paths_rejects_signatures_with_missing_papers(tmp_path: Path):
     data_dir = tmp_path / "missing_paper"
     data_dir.mkdir()
@@ -393,6 +587,185 @@ def test_from_json_paths_constraint_parity_vs_from_dataset_dummy():
         ref_constraint = rust_from_dataset.get_constraint(s1, s2)
         got_constraint = rust_from_json.get_constraint(s1, s2)
         assert ref_constraint == got_constraint
+
+
+def test_from_json_paths_preprocess_false_matches_python_minimal_paper_normalization(tmp_path: Path):
+    data_dir = tmp_path / "preprocess_false"
+    data_dir.mkdir()
+    signatures = {
+        "q": {
+            "signature_id": "q",
+            "paper_id": 1,
+            "author_info": {
+                "first": "Alice",
+                "middle": None,
+                "last": "Smith",
+                "suffix": None,
+                "position": 0,
+                "email": None,
+                "affiliations": [],
+                "block": "a smith",
+                "given_block": "a smith",
+                "estimated_ethnicity": None,
+                "estimated_gender": None,
+            },
+        },
+        "m": {
+            "signature_id": "m",
+            "paper_id": 2,
+            "author_info": {
+                "first": "Bob",
+                "middle": None,
+                "last": "Smith",
+                "suffix": None,
+                "position": 0,
+                "email": None,
+                "affiliations": [],
+                "block": "b smith",
+                "given_block": "b smith",
+                "estimated_ethnicity": None,
+                "estimated_gender": None,
+            },
+        },
+    }
+    papers = {
+        "1": {
+            "paper_id": 1,
+            "title": "A1 B-2 Shared Topic",
+            "abstract": "",
+            "journal_name": None,
+            "venue": None,
+            "year": 2024,
+            "authors": [{"position": 0, "author_name": "ALICE-1 Smith"}],
+            "references": [],
+        },
+        "2": {
+            "paper_id": 2,
+            "title": "a b shared topic",
+            "abstract": "",
+            "journal_name": None,
+            "venue": None,
+            "year": 2024,
+            "authors": [{"position": 0, "author_name": "Bob Smith"}],
+            "references": [],
+        },
+    }
+    clusters = {
+        "1": {"cluster_id": "1", "signature_ids": ["q"], "model_version": -1},
+        "2": {"cluster_id": "2", "signature_ids": ["m"], "model_version": -1},
+    }
+    (data_dir / "signatures.json").write_text(json.dumps(signatures), encoding="utf-8")
+    (data_dir / "papers.json").write_text(json.dumps(papers), encoding="utf-8")
+    (data_dir / "clusters.json").write_text(json.dumps(clusters), encoding="utf-8")
+
+    dataset = _load_dataset_from_dir(
+        str(data_dir),
+        "preprocess_false_from_dataset",
+        compute_reference_features=False,
+        preprocess=False,
+    )
+    rust_from_dataset = _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
+    rust_from_json = _build_rust_from_json_paths(
+        str(data_dir),
+        compute_reference_features=False,
+        preprocess=False,
+    )
+
+    ref_features = rust_from_dataset.featurize_pair("q", "m")
+    got_features = rust_from_json.featurize_pair("q", "m")
+    assert len(ref_features) == len(got_features)
+    for idx, (ref, got) in enumerate(zip(ref_features, got_features, strict=True)):
+        assert equalish(ref, got), f"Mismatch idx={idx}: ref={ref} got={got}"
+
+
+def test_from_json_paths_reference_author_ngrams_do_not_filter_stopwords(tmp_path: Path):
+    data_dir = tmp_path / "reference_author_stopwords"
+    data_dir.mkdir()
+    signatures = {
+        "q": {
+            "signature_id": "q",
+            "paper_id": 1,
+            "author_info": {
+                "first": "Alice",
+                "middle": None,
+                "last": "Smith",
+                "suffix": None,
+                "position": 0,
+                "email": None,
+                "affiliations": [],
+                "block": "a smith",
+                "given_block": "a smith",
+                "estimated_ethnicity": None,
+                "estimated_gender": None,
+            },
+        },
+        "m": {
+            "signature_id": "m",
+            "paper_id": 2,
+            "author_info": {
+                "first": "Bob",
+                "middle": None,
+                "last": "Smith",
+                "suffix": None,
+                "position": 0,
+                "email": None,
+                "affiliations": [],
+                "block": "b smith",
+                "given_block": "b smith",
+                "estimated_ethnicity": None,
+                "estimated_gender": None,
+            },
+        },
+    }
+    papers = {
+        "1": {
+            "paper_id": 1,
+            "title": "Query one",
+            "abstract": "",
+            "journal_name": None,
+            "venue": None,
+            "year": 2024,
+            "authors": [{"position": 0, "author_name": "The"}],
+            "references": [2],
+        },
+        "2": {
+            "paper_id": 2,
+            "title": "Query two",
+            "abstract": "",
+            "journal_name": None,
+            "venue": None,
+            "year": 2024,
+            "authors": [{"position": 0, "author_name": "The"}],
+            "references": [1],
+        },
+    }
+    clusters = {
+        "1": {"cluster_id": "1", "signature_ids": ["q"], "model_version": -1},
+        "2": {"cluster_id": "2", "signature_ids": ["m"], "model_version": -1},
+    }
+    (data_dir / "signatures.json").write_text(json.dumps(signatures), encoding="utf-8")
+    (data_dir / "papers.json").write_text(json.dumps(papers), encoding="utf-8")
+    (data_dir / "clusters.json").write_text(json.dumps(clusters), encoding="utf-8")
+
+    dataset = _load_dataset_from_dir(
+        str(data_dir),
+        "reference_author_stopwords_from_dataset",
+        compute_reference_features=True,
+    )
+    rust_from_dataset = _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
+    rust_from_json = _build_rust_from_json_paths(
+        str(data_dir),
+        compute_reference_features=True,
+        specter_embeddings={"1": [1.0, 0.0], "2": [0.0, 1.0]},
+    )
+
+    ref_features = rust_from_dataset.featurize_pair("q", "m")
+    got_features = rust_from_json.featurize_pair("q", "m")
+    reference_feature_indices = set(_FEATURIZATION_INFO.feature_group_to_index["reference_features"])
+    for idx in reference_feature_indices:
+        assert equalish(
+            ref_features[idx], got_features[idx]
+        ), f"Reference mismatch idx={idx}: ref={ref_features[idx]} got={got_features[idx]}"
 
 
 def test_from_json_paths_reference_feature_parity_vs_from_dataset_qian():

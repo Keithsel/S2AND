@@ -635,9 +635,17 @@ def feature_values_from_runtime(
         values["retrieval_score"] = np.asarray(candidate_batch.retrieval_scores, dtype=np.float64)
     if candidate_batch.retrieval_ranks is not None:
         values["retrieval_rank"] = np.asarray(candidate_batch.retrieval_ranks, dtype=np.float64)
+    pairwise_column_set = (
+        {str(column) for column in feature_matrix.pairwise_stats.aggregate_feature_columns}
+        if feature_matrix.pairwise_stats is not None
+        else set()
+    )
     if row_signals is not None:
         for key, value in row_signals.items():
-            values[str(key)] = value
+            key = str(key)
+            if key in pairwise_column_set and key in values:
+                continue
+            values[key] = value
     if feature_matrix.pairwise_stats is not None:
         missing_pairwise_columns = [
             str(column)

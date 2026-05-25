@@ -108,7 +108,7 @@ for _export in (FastCluster, PairwiseModeler, VotingClassifier, intify):
 
 
 def _is_recoverable_graph_subblocking_error(exc: Exception) -> bool:
-    if isinstance(exc, ValueError | KeyError | FileNotFoundError | OSError | ImportError):
+    if isinstance(exc, KeyError | FileNotFoundError | OSError | ImportError):
         return True
     exc_type = type(exc)
     return exc_type.__module__.split(".", maxsplit=1)[0] == "pyarrow" or exc_type.__name__.startswith("Arrow")
@@ -716,6 +716,29 @@ def _cluster_seeds_require_from_arrow_paths(arrow_paths: Mapping[str, Any] | Non
     return _read_cluster_seeds_arrow(path)
 
 
+def _normalize_cluster_seeds_require(cluster_seeds_require: Mapping[Any, Any]) -> dict[str, str]:
+    """Return the seed map with the same string policy used by Arrow sidecars."""
+
+    return {str(signature_id): str(cluster_id) for signature_id, cluster_id in cluster_seeds_require.items()}
+
+
+def _cluster_seed_maps_match(left: Mapping[Any, Any], right: Mapping[Any, Any]) -> bool:
+    return _normalize_cluster_seeds_require(left) == _normalize_cluster_seeds_require(right)
+
+
+def _arrow_paths_need_current_cluster_seeds(dataset: Any, arrow_paths: Mapping[str, Any]) -> bool:
+    current_cluster_seeds = getattr(dataset, "cluster_seeds_require", {}) or {}
+    if not current_cluster_seeds:
+        return False
+    cluster_seeds_path = arrow_paths.get("cluster_seeds")
+    if cluster_seeds_path is None or not Path(str(cluster_seeds_path)).exists():
+        return True
+    return not _cluster_seed_maps_match(
+        _cluster_seeds_require_from_arrow_paths(arrow_paths),
+        current_cluster_seeds,
+    )
+
+
 def _cluster_seeds_require_inverse(
     cluster_seeds_require: Mapping[str, int | str],
 ) -> dict[int | str, list[str]]:
@@ -792,8 +815,72 @@ def _partial_supervision_with_cluster_seed_disallows(
     for left, right in disallow_pairs:
         left_id = str(left)
         right_id = str(right)
+        if (
+            left_id in signature_set
+            and right_id in signature_set
+            and (left_id, right_id) not in merged
+            and (right_id, left_id) not in merged
+        ):
+            merged[(left_id, right_id)] = LARGE_DISTANCE
+    return merged
+
+
+def _set_partial_supervision_if_absent_bidirectional(
+    merged: dict[tuple[str, str], int | float],
+    left_id: str,
+    right_id: str,
+    value: int | float,
+) -> None:
+    if left_id == right_id:
+        return
+    if (left_id, right_id) in merged or (right_id, left_id) in merged:
+        return
+    merged[(left_id, right_id)] = value
+
+
+def _partial_supervision_with_cluster_seed_overrides(
+    signatures: Sequence[str],
+    partial_supervision: Mapping[tuple[str, str], int | float],
+    *,
+    cluster_seeds_require: Mapping[str, int | str] | None = None,
+    cluster_seeds_disallow: Iterable[tuple[str, str]] = (),
+    dont_merge_cluster_seeds: bool = True,
+    incremental_dont_use_cluster_seeds: bool = False,
+) -> dict[tuple[str, str], int | float]:
+    """Merge request-scoped seed overrides into block-local partial supervision."""
+
+    merged: dict[tuple[str, str], int | float] = dict(partial_supervision)
+    signature_set = {str(signature_id) for signature_id in signatures}
+    for left, right in cluster_seeds_disallow:
+        left_id = str(left)
+        right_id = str(right)
         if left_id in signature_set and right_id in signature_set:
-            merged.setdefault((left_id, right_id), LARGE_DISTANCE)
+            _set_partial_supervision_if_absent_bidirectional(merged, left_id, right_id, LARGE_DISTANCE)
+    if cluster_seeds_require and not incremental_dont_use_cluster_seeds:
+        seed_component_by_signature: dict[str, str] = {}
+        for signature_id, component_id in cluster_seeds_require.items():
+            signature_key = str(signature_id)
+            if signature_key in signature_set:
+                seed_component_by_signature[signature_key] = str(component_id)
+        if dont_merge_cluster_seeds:
+            seeded_signatures = list(seed_component_by_signature)
+            for left_index, left_id in enumerate(seeded_signatures):
+                left_component = seed_component_by_signature[left_id]
+                for right_id in seeded_signatures[left_index + 1 :]:
+                    if left_component != seed_component_by_signature[right_id]:
+                        _set_partial_supervision_if_absent_bidirectional(
+                            merged,
+                            left_id,
+                            right_id,
+                            LARGE_DISTANCE,
+                        )
+        signatures_by_component: dict[str, list[str]] = defaultdict(list)
+        for signature_id, component_id in seed_component_by_signature.items():
+            signatures_by_component[component_id].append(signature_id)
+        for component_signatures in signatures_by_component.values():
+            for left_index, left_id in enumerate(component_signatures):
+                for right_id in component_signatures[left_index + 1 :]:
+                    _set_partial_supervision_if_absent_bidirectional(merged, left_id, right_id, 0)
     return merged
 
 
@@ -3282,9 +3369,19 @@ class Clusterer:
                 str(signature_id): component_id for signature_id, component_id in cluster_seeds_require.items()
             }
         resolved_cluster_seeds_disallow = set(normalize_cluster_seed_disallow_pairs(cluster_seeds_disallow or ()))
+        explicit_cluster_seeds_require = (
+            None
+            if cluster_seeds_require is None
+            else {str(signature_id): component_id for signature_id, component_id in cluster_seeds_require.items()}
+        )
         if dists is not None and resolved_cluster_seeds_disallow:
             raise ValueError(
                 "cluster_seeds_disallow cannot be used with precomputed dists because disallow pairs "
+                "would not be injected into the distance matrix"
+            )
+        if dists is not None and explicit_cluster_seeds_require:
+            raise ValueError(
+                "cluster_seeds_require cannot be used with precomputed dists because require pairs "
                 "would not be injected into the distance matrix"
             )
         proxy_dataset = _RustFeaturizerPredictDataset(
@@ -3310,11 +3407,22 @@ class Clusterer:
             make_dists_telemetry: dict[str, int | float | str] = {}
             for block_key, signatures in block_dict.items():
                 make_block_start = time.perf_counter()
+                block_partial_supervision = _partial_supervision_with_cluster_seed_overrides(
+                    signatures,
+                    partial_supervision,
+                    cluster_seeds_require=explicit_cluster_seeds_require,
+                    cluster_seeds_disallow=resolved_cluster_seeds_disallow,
+                    dont_merge_cluster_seeds=self.dont_merge_cluster_seeds,
+                    incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
+                )
+                make_dists_incremental_dont_use_cluster_seeds = (
+                    incremental_dont_use_cluster_seeds or explicit_cluster_seeds_require is not None
+                )
                 block_dists = self.make_distance_matrices_from_rust_featurizer(
                     {block_key: signatures},
                     rust_featurizer,
-                    partial_supervision=partial_supervision,
-                    incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
+                    partial_supervision=block_partial_supervision,
+                    incremental_dont_use_cluster_seeds=make_dists_incremental_dont_use_cluster_seeds,
                     runtime_context=runtime_context,
                     total_ram_bytes=total_ram_bytes,
                 )
@@ -3387,7 +3495,7 @@ class Clusterer:
         incremental_dont_use_cluster_seeds: bool = False,
         runtime_context: RuntimeContext | None = None,
         total_ram_bytes: int | None = None,
-        load_name_counts: bool = False,
+        load_name_counts: bool | None = None,
         name_counts_path: str | None = None,
         name_tuples: set[tuple[str, str]] | str | None = "filtered",
         cluster_seeds_disallow: Iterable[tuple[Any, Any]] | None = None,
@@ -3418,7 +3526,7 @@ class Clusterer:
             arrow_path_payload,
             signature_ids=signature_ids,
             name_tuples=name_tuples,
-            load_name_counts=bool(load_name_counts),
+            load_name_counts=bool(_uses_name_count_features(self) if load_name_counts is None else load_name_counts),
             name_counts_path=name_counts_path,
             preprocess=True,
             compute_reference_features=False,
@@ -4270,19 +4378,25 @@ class Clusterer:
         if arrow_paths is not None and batching_threshold is None:
             logger.info("Running predict through Arrow/Rust paths - no subblocking")
             start = time.time()
-            pred_clusters, dists = self.predict_from_arrow_paths(
-                block_dict,
-                arrow_paths,
-                dists=dists,
-                cluster_model_params=cluster_model_params,
-                partial_supervision=partial_supervision,
-                incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
-                runtime_context=runtime_context,
-                total_ram_bytes=total_ram_bytes,
-                load_name_counts=_uses_name_count_features(self),
-                name_tuples=getattr(dataset, "name_tuples", "filtered"),
-                cluster_seeds_disallow=_cluster_seed_disallows_for_request(dataset, arrow_paths),
-            )
+            arrow_predict_context: AbstractContextManager[Mapping[str, Any]]
+            if _arrow_paths_need_current_cluster_seeds(dataset, arrow_paths):
+                arrow_predict_context = _temporary_arrow_paths_with_current_cluster_seeds(dataset, arrow_paths)
+            else:
+                arrow_predict_context = nullcontext(arrow_paths)
+            with arrow_predict_context as arrow_paths_for_predict:
+                pred_clusters, dists = self.predict_from_arrow_paths(
+                    block_dict,
+                    arrow_paths_for_predict,
+                    dists=dists,
+                    cluster_model_params=cluster_model_params,
+                    partial_supervision=partial_supervision,
+                    incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
+                    runtime_context=runtime_context,
+                    total_ram_bytes=total_ram_bytes,
+                    load_name_counts=_uses_name_count_features(self),
+                    name_tuples=getattr(dataset, "name_tuples", "filtered"),
+                    cluster_seeds_disallow=_cluster_seed_disallows_for_request(dataset, arrow_paths_for_predict),
+                )
             end = time.time()
             total_predict_time = end - start
             logger.info(f"Finished Arrow/Rust predict. Time taken: {total_predict_time}")

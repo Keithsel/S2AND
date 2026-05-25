@@ -11,6 +11,7 @@ from s2and.incremental_linking.feature_block import write_arrow_ipc_table
 from s2and.subblocking import (
     GraphSubblockingConfig,
     _projection_neighbor_edge_scores,
+    _prune_edge_scores,
     _score_candidate_edge,
     _sorted_subblock_merge_candidates,
     cluster_with_graph_fallback,
@@ -177,6 +178,17 @@ def test_projection_neighbor_edge_scores_match_slow_reference() -> None:
         assert observed[edge] == pytest.approx(expected_score)
 
 
+def test_prune_edge_scores_tie_breaker_is_independent_of_insertion_order() -> None:
+    forward = {(0, 3): 1.0, (0, 1): 1.0, (0, 2): 1.0}
+    reverse = dict(reversed(list(forward.items())))
+
+    _prune_edge_scores(forward, 2)
+    _prune_edge_scores(reverse, 2)
+
+    assert tuple(forward) == ((0, 1), (0, 2))
+    assert tuple(reverse) == tuple(forward)
+
+
 def test_sorted_subblock_merge_candidates_matches_legacy_many_keys() -> None:
     output = {}
     counts = {}
@@ -212,7 +224,14 @@ def test_arrow_graph_subblocking_fallback_loads_arrow_evidence_and_packs_compone
                 "paper_id": pa.array(["p1", "p2", "p3", "p4"], type=pa.string()),
                 "author_first": pa.array(["hui", "hui", "hui", "hui"], type=pa.string()),
                 "author_middle": pa.array(["", "", "", ""], type=pa.string()),
-                "author_affiliations": pa.array([["lab a"], ["lab a"], ["lab b"], ["lab b"]]),
+                "author_affiliations": pa.array(
+                    [
+                        ["Department of Artificial Intelligence, Example University"],
+                        ["Department of Artificial Intelligence, Example University"],
+                        ["Department of Robotics, Other University"],
+                        ["Department of Robotics, Other University"],
+                    ]
+                ),
                 "author_orcid": pa.array([None, None, None, None], type=pa.string()),
                 "author_position": pa.array([0, 0, 0, 0], type=pa.int64()),
             }
@@ -287,6 +306,10 @@ def test_arrow_graph_subblocking_fallback_loads_arrow_evidence_and_packs_compone
     assert fallback.load_metrics["specter_rows_loaded"] == 4
     assert fallback.stats[0]["raw_component_count"] == 2
     assert fallback.stats[0]["packed_component_count"] == 2
+    assert fallback._dataset is not None
+    s1_affiliation_keys = fallback._dataset.signatures["s1"].author_info_affiliations_n_grams
+    assert s1_affiliation_keys is not None
+    assert "artificial intelligence" in s1_affiliation_keys
 
 
 def test_arrow_graph_subblocking_prepare_limits_loaded_evidence_to_fallback_union(tmp_path) -> None:

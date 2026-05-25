@@ -89,6 +89,19 @@ def test_signature_ngrams_batch_rust_parity(coauthor_text: str, affiliation_text
     assert rust_affiliation[0] == expected_affiliation
 
 
+def test_signature_ngrams_batch_rust_filters_affiliation_stopwords() -> None:
+    filtered_affiliation_text = _prefilter_affiliation_text("A I lab of computer science")
+    rust_coauthor, rust_affiliation = feature_port.signature_ngrams_batch_rust(
+        [""],
+        ["A I lab of computer science"],
+        num_threads=1,
+    )
+
+    assert filtered_affiliation_text == "computer science"
+    assert rust_coauthor == [get_text_ngrams("", stopwords=None, use_bigrams=True)]
+    assert rust_affiliation == [get_text_ngrams_words(filtered_affiliation_text, stopwords=set())]
+
+
 def test_signature_preprocess_dataset_rust_defers_signature_fields():
     with _temporary_env("S2AND_BACKEND", "python"):
         dataset_python = build_dummy_dataset("dummy_signature_preprocess_python")

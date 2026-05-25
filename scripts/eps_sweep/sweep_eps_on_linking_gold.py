@@ -11,6 +11,7 @@ linkage tree per subblock.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.ipc as ipc
 
+from s2and.incremental_linking_training.classic import _drop_unlabeled_singleton_orcid_rows
 from scripts.eps_sweep.common import (
     DEFAULT_ARROW_ROOT,
     DEFAULT_GOLD_ROOT,
@@ -233,6 +235,14 @@ def _load_gold(path: Path) -> pd.DataFrame:
     gold["label"] = pd.to_numeric(gold["label"], errors="raise").astype("int8")
     for column in WEIGHT_COLUMNS:
         gold[column] = pd.to_numeric(gold[column], errors="raise").astype(float)
+    gold, filter_summary = _drop_unlabeled_singleton_orcid_rows(gold, context=f"eps_gold:{path.name}")
+    if filter_summary["rows_removed"]:
+        logging.info(
+            "dropped unlabeled_singleton_orcid rows from gold path=%s rows_removed=%d rows_after=%d",
+            path,
+            filter_summary["rows_removed"],
+            filter_summary["rows_after"],
+        )
     return gold
 
 
@@ -522,9 +532,10 @@ def _cache_metadata(
 ) -> dict[str, Any]:
     """Return metadata that must match for a cached distance vector."""
 
+    model_fingerprint = _model_fingerprint(args)
     return {
         "dataset": args.dataset,
-        "model_path": str(args.model_path.resolve()),
+        **model_fingerprint,
         "arrow_root": str(args.arrow_root.resolve()),
         "arrow_paths_digest": arrow_paths_digest,
         "block_key": block_key,
@@ -537,6 +548,34 @@ def _cache_metadata(
         "suppress_orcid_constraints": bool(args.suppress_orcid_constraints),
         "distance_source": "arrow-rust",
     }
+
+
+def _model_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
+    """Return a stable fingerprint for the model artifact used by distance caches."""
+
+    model_path = args.model_path.resolve()
+    model_stat = model_path.stat() if model_path.exists() else None
+    if model_stat is None:
+        return {"model_path": str(model_path), "model_size": None, "model_mtime_ns": None, "model_sha256": None}
+    cache_key = (str(model_path), int(model_stat.st_size), int(model_stat.st_mtime_ns))
+    cached = getattr(args, "_s2and_model_fingerprint_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return dict(cached[1])
+    digest = hashlib.sha256()
+    with model_path.open("rb") as infile:
+        for chunk in iter(lambda: infile.read(1024 * 1024), b""):
+            digest.update(chunk)
+    fingerprint = {
+        "model_path": str(model_path),
+        "model_size": int(model_stat.st_size),
+        "model_mtime_ns": int(model_stat.st_mtime_ns),
+        "model_sha256": digest.hexdigest(),
+    }
+    try:
+        args._s2and_model_fingerprint_cache = (cache_key, dict(fingerprint))
+    except Exception:
+        pass
+    return fingerprint
 
 
 def _distance_cache_path(cache_dir: Path, dataset: str, index: int, block_key: str) -> Path:
@@ -554,6 +593,9 @@ def _load_cached_distance(path: Path, expected_metadata: Mapping[str, Any]) -> A
     for key in [
         "dataset",
         "model_path",
+        "model_size",
+        "model_mtime_ns",
+        "model_sha256",
         "arrow_root",
         "arrow_paths_digest",
         "distance_source",

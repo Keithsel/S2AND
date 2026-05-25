@@ -14,6 +14,61 @@ def test_maybe_load_list_empty_file_returns_empty_list(tmp_path):
     assert ANDData.maybe_load_list(str(empty_path)) == []
 
 
+def test_preprocess_signatures_drops_empty_normalized_affiliations() -> None:
+    dataset = ANDData(
+        signatures={
+            "s1": {
+                "signature_id": "s1",
+                "paper_id": 1,
+                "author_info": {
+                    "position": 0,
+                    "block": "a lovelace",
+                    "first": "Ada",
+                    "middle": "",
+                    "last": "Lovelace",
+                    "suffix": None,
+                    "email": None,
+                    "affiliations": [",", "\u00a0", "Analytical Engine Lab"],
+                },
+            }
+        },
+        papers={
+            "1": {
+                "paper_id": 1,
+                "title": "Notes",
+                "abstract": "",
+                "journal_name": "",
+                "venue": "",
+                "year": 1843,
+                "authors": [{"position": 0, "author_name": "Ada Lovelace"}],
+                "references": [],
+            }
+        },
+        name="empty_normalized_affiliations",
+        mode="inference",
+        load_name_counts=False,
+        preprocess=True,
+        n_jobs=1,
+    )
+
+    assert dataset.signatures["s1"].author_info_affiliations == ["analytical engine lab"]
+    assert "" not in dataset.signatures["s1"].author_info_affiliations
+
+
+def test_split_blocks_helper_preserves_input_order_for_legacy_eval_split() -> None:
+    dataset = ANDData.__new__(ANDData)
+    dataset.num_clusters_for_block_size = 1
+    dataset.random_seed = 1
+    dataset.val_ratio = 0.1
+    dataset.test_ratio = 0.1
+
+    block_items = [(f"b{index:02d}", [f"s{index}"]) for index in range(20)]
+    forward_split = dataset.split_blocks_helper(dict(block_items))
+    reverse_split = dataset.split_blocks_helper(dict(reversed(block_items)))
+
+    assert [set(split) for split in forward_split] != [set(split) for split in reverse_split]
+
+
 class TestData(unittest.TestCase):
     def setUp(self):
         super().setUp()

@@ -20,6 +20,7 @@ contracts live in:
 | Name counts | Use `s2and/data/name_counts_index/` for Rust hot-path lookups. Do not embed per-signature name-count columns in `signatures.arrow`. |
 | Name aliases | Use the packaged filtered alias text by default. Keep per-dataset alias artifacts experimental only. |
 | Reference features | Direct Arrow prediction fails fast when a model requires reference features. Current production models do not use them. |
+| Optional seed sidecars | Missing `cluster_seed_disallows` means no seed-disallow constraints, and missing `altered_cluster_signatures` means no altered claimed profiles. Strict mode requires these sidecars only when the caller or manifest declares the condition; an explicit mapping key must point to an existing file. Converters may emit canonical empty tables, but strict routing does not require empty tables for empty sets. |
 
 ## Verification Invariants
 
@@ -39,14 +40,19 @@ The current Rust/platform work should move in this order:
 1. Generate local Arrow-native runtime artifacts and regenerated
    `name_counts_index/` sidecars.
 2. Publish and validate the Arrow S3 release layout.
-3. Enforce strict Arrow production routing through one approved strictness
+3. Convert production-facing script entrypoints to Arrow routes, or relabel
+   them as compatibility/parity tools with smoke tests.
+4. Enforce strict Arrow production routing through one approved strictness
    authority; keep public compatibility fallback unchanged until an API change
    is approved.
-4. Demote non-Arrow Rust entrypoints to compatibility/training/test surfaces.
-5. Split the oversized Rust module after the production boundary is locked.
+5. Demote non-Arrow Rust entrypoints to compatibility/training/test surfaces.
+6. Split oversized Rust and Arrow incremental runtime modules after the
+   production boundary is locked.
 
 Do not make strict Arrow routing the default before shippable Arrow bundles and
-their validation checks exist.
+their validation checks exist. Do not enable strict routing for generic
+`predict(...)` callers until the production scripts that exercise it have been
+converted or explicitly gated behind a compatibility flag.
 
 ## Open Work
 
@@ -167,6 +173,12 @@ Release contents:
       --require-name-counts-index
     ```
 
+    `--overwrite-name-counts-index` regenerates the shared index once for this
+    bounded sample. For a staged release with a prebuilt shared index, pass
+    `--name-counts-index-root <root>` instead, or run the name-counts-index
+    subcommand before converting datasets:
+    `uv run python scripts/convert_to_arrow.py name-counts-index --output-root <root> --overwrite`.
+
   - For the full release, record the resolved source roots, output staging root,
     exact `uv run ...` commands, expected runtime, log path, and publish target
     before starting. If a conversion or upload is expected to exceed ten
@@ -184,6 +196,16 @@ Release contents:
     manifest-declared embedding Arrow file, one batch-index sidecar, the
     production model manifest, and `name_counts_index/manifest.json` can be
     read from the published prefix.
+  - Add a checked-in release-layout regression test, tentatively
+    `tests/test_arrow_release_layout.py`. By default it should validate a tiny
+    local release fixture: root manifest, one dataset manifest, required Arrow
+    IPC files, one batch-index sidecar, production model manifest, and
+    `name_counts_index/manifest.json`.
+  - Keep S3/network validation as an explicit release smoke command, not a
+    default pytest path: open the staged public prefix, verify the same layout
+    targets, then run a bounded `predict_from_arrow_paths(...)` smoke test.
+    Add it to CI only when CI has stable network access and an explicit
+    release-validation job owns the required environment.
 - Done when: the public prefix contains a root manifest with checksums, every
   dataset manifest references existing files, a validation command can open the
   required Arrow IPC files and sidecars from the published prefix, and docs point
@@ -203,13 +225,13 @@ production inference.
   - Production seeded/incremental prediction additionally requires
     `cluster_seeds`.
   - `cluster_seed_disallows` is required only when pairwise seed-disallow
-    constraints are present. Missing `cluster_seed_disallows` means no disallow
-    constraints unless the producer contract chooses to emit a canonical empty
-    table.
+    constraints are present or the manifest declares the path. Missing
+    `cluster_seed_disallows` means no disallow constraints.
   - `altered_cluster_signatures` is required only when altered claimed profiles
-    are present. Missing `altered_cluster_signatures` means no altered claimed
-    profiles unless the producer contract chooses to emit a canonical empty
-    table.
+    are present or the manifest declares the path. Missing
+    `altered_cluster_signatures` means no altered claimed profiles.
+  - If either optional sidecar key is present in a manifest or explicit path
+    mapping, the referenced file must exist and validate.
   - Missing Arrow artifacts should fail with an explicit error in production
     mode rather than silently falling back to `ANDData`.
 - Update script entrypoints.
@@ -218,6 +240,8 @@ production inference.
     `Clusterer.predict_from_arrow_paths(...)`.
   - Expand `scripts/eval_prod_models.py --use-arrow` beyond the current mini
     restriction, or split the mini-only smoke test from real production eval.
+    This depends on benchmark Arrow conversion and S3 release validation; do not
+    claim broad `--use-arrow` support until those bundles exist.
   - Convert `scripts/_rust_suite/prod_inference_cmd.py` to benchmark Arrow as
     the production path; keep `from_dataset` only as an explicit legacy/parity
     mode if still needed.
@@ -247,6 +271,16 @@ production inference.
     separately from missing files, and name the command or script expected to
     produce the artifacts.
 - Implementation map for strict production routing.
+  - Current `_resolve_dataset_arrow_paths(...)` already validates explicit
+    mappings, auto-discovers sibling Arrow dataset directories, adds raw-planner
+    batch-index paths, resolves `name_counts_index`, supports
+    `require_name_counts_index`, supports `require_cluster_seeds`, and adds
+    optional `cluster_seed_disallows` / `altered_cluster_signatures` sidecars
+    when files exist.
+  - The remaining strict-helper work is narrower: distinguish absent mapping
+    keys from mapping keys whose files are missing, raise
+    `MissingArrowArtifactError` instead of returning `None`, and carry
+    structured context for callers and tests.
   - Current fallback surfaces to tighten:
     - `_resolve_dataset_arrow_paths(...)` in `s2and/model.py` can return
       `None` for incomplete auto-discovered Arrow artifacts and for missing
@@ -260,6 +294,11 @@ production inference.
       non-Arrow promoted linker, which uses `RustFeaturizer.from_dataset`.
     - `Clusterer.predict_incremental(...)` can fall back to
       `_predict_incremental_helper(...)` when Rust mode lacks seed inputs.
+    - Incremental altered-profile pre-split and residual Phase B reclustering
+      call `predict_from_arrow_paths(...)` when `arrow_paths` is present, but
+      otherwise fall back through Python reclustering. Strict promoted
+      incremental routing must require validated Arrow paths before entering
+      those subpaths.
   - Add a strict helper near `_resolve_dataset_arrow_paths(...)`, tentatively
     `_require_dataset_arrow_paths(...)`, that wraps discovery, computes missing
     required keys, distinguishes missing mapping keys from missing files, and
@@ -274,22 +313,23 @@ production inference.
     first step: production scripts and production-only routing call the strict
     helper directly, while general public `predict(...)` keeps current
     compatibility fallback behavior until a public API change is approved.
-  - If the strictness decision needs to flow across several layers, prefer a
-    `RuntimeContext` policy field over adding public kwargs to multiple
-    prediction methods. Add a new public kwarg only after confirming the
-    context-based path is insufficient.
-  - If a public switch is approved, preserve current behavior at introduction
-    time, for example `require_arrow_paths: bool = False` or
-    `allow_non_arrow_fallback: bool = True`, then change defaults only in a
-    separately approved API migration.
+  - Do not add public strictness kwargs during the first rollout. Production
+    scripts and production-only routing should call the strict helper directly;
+    generic public `predict(...)` remains the compatibility path. If callers
+    later need public strictness controls, handle that as a separate approved
+    API migration after the private production route is stable.
   - In Rust production mode with compatibility fallback disabled:
     - `predict(...)` calls the strict helper before selecting the Arrow route.
     - `predict_incremental(...)` requires base Arrow artifacts plus
       `cluster_seeds` before seed sync or helper fallback. It requires
       `cluster_seed_disallows` only when disallow constraints are present or
-      when the converter contract requires canonical empty tables.
+      when an explicit manifest/path key declares it.
     - `_predict_incremental_promoted_linker(...)` does not call the non-Arrow
       promoted linker.
+    - Altered-profile pre-split and residual Phase B reclustering receive the
+      same validated Arrow path payload; under strict authority, `arrow_paths=None`
+      raises `MissingArrowArtifactError` instead of selecting Python
+      reclustering.
     - `predict_from_arrow_paths(...)` remains strict and should not gain
       compatibility fallback.
   - Preserve current fallback behavior only through the approved compatibility
@@ -303,9 +343,10 @@ production inference.
     flow, the Arrow prod eval flow, and the Arrow rust-suite production
     benchmark flow.
   - Update existing fallback-expecting tests:
-    - `tests/test_rust_distance_matrix_blockwise.py` should expect a missing
-      `name_counts_index` error in Rust production mode, plus a sibling
-      compatibility-mode test that preserves the old fallback.
+    - Add a strict-mode sibling next to the existing
+      `tests/test_rust_distance_matrix_blockwise.py::test_predict_auto_declines_arrow_paths_missing_required_name_counts_index`,
+      which already preserves the compatibility fallback. The strict sibling
+      should expect a missing `name_counts_index` error in Rust production mode.
     - `tests/test_cluster_incremental.py` should expect missing `cluster_seeds`
       errors in Rust production mode, plus compatibility-mode tests for
       `_predict_incremental_helper(...)`. Add separate tests proving absent
@@ -329,8 +370,11 @@ production inference.
   - Retarget the `s2and/feature_port.py` cleanup at dispatcher behavior, not
     `__all__`: `build_rust_featurizer(...)` and `_resolve_requested_build_path`
     should not select non-Arrow production paths once strict Arrow routing is
-    enabled. Keep compatibility builders internal or explicitly named as
-    compatibility helpers.
+    enabled. Keep `__all__` alphabetized and exported for compatibility; do not
+    use export ordering as a production-routing signal. Concrete demotion means
+    production docs and strict production callsites use
+    `build_rust_featurizer_from_arrow_paths(...)`, while
+    `build_rust_featurizer(...)` remains a compatibility/training dispatcher.
   - Remove or quarantine stale non-Arrow production-inference commands from
     `scripts/README.md`.
   - Keep training/materialization scripts on `ANDData`; they are not part of
@@ -350,7 +394,15 @@ production inference.
 - Prefer the raw Arrow wrapper for single-query/seeded incremental requests
   before optimizing raw payload to Python `FeatureBlock` adapters.
 - Keep JSON loaders and Python-object adapters as compatibility surfaces unless
-  profiling shows they are still on a production hot path.
+  profiling shows they are still on a production hot path. In particular,
+  `RustFeaturizer.from_feature_block(...)`, raw payload wrappers, and
+  `feature_block_from_arrow_paths(...)` are bridge/test surfaces unless a caller
+  still needs Python `FeatureBlock` compatibility.
+- Keep `RustFeaturizer.from_dataset(...)` as the Python-reference,
+  training/eval, and parity surface. Do not add production-only behavior there.
+- Treat `RustFeaturizer.from_json_paths(...)` as a compatibility and benchmark
+  surface until the Arrow release and strict Arrow routing are complete; then
+  remove it from core runtime capability checks before deleting the loader.
 - Done when: production scripts and docs no longer recommend
   `RustFeaturizer.from_dataset(...)`, `RustFeaturizer.from_json_paths(...)`, or
   `RustFeaturizer.from_feature_block(...)` for inference, and remaining direct
@@ -361,11 +413,68 @@ production inference.
 Goal: after strict Arrow production routing lands, make the Rust codebase easier
 to maintain without changing runtime behavior.
 
+- Current surface notes:
+  - `s2and_rust/src/lib.rs` is roughly 15.7k lines in the current working tree
+    and owns PyO3 exports, Arrow IO, JSON ingest, Python object ingest, text
+    compatibility, name-count indexes, pair features, constraints, retrieval,
+    promoted linker row features, and subblocking. The branch diff against
+    `origin/main` is large enough that line-count reductions should target
+    public surface area first, not only module splitting.
+  - No Rust training surface exists today. Keep training, calibration, model
+    fitting, and release replay in Python unless a measured bottleneck justifies
+    a separate port.
+  - Do not delete the `RustNameCompatibleSubblockSelector` helper trio
+    (`from_py`, `allowed_component_keys`,
+    `select_candidate_indices_for_summaries`). They are live internal helpers
+    used by `top_k_hybrid_centroid_pair_plan(...)` when retrieval subblock
+    filtering is enabled.
+  - `RustHybridCentroidRetriever.summary_count(...)` appears to be a trivial
+    unused public getter and can be removed with its tests if no external
+    compatibility promise exists.
+- Use the Rust public-surface inventory to choose one good API per behavior
+  before moving code:
+  - Canonical raw Arrow planning API: decide between the reusable
+    `RawBlockQueryCandidatePlanner` class and the one-shot
+    `raw_block_query_candidate_plan_arrow(...)` wrapper. The wrapper is small
+    and currently documented, but it now just constructs the planner and calls
+    `plan(...)`; if the class is the canonical API, migrate the remaining
+    runtime call and delete wrapper-specific tests.
+  - Canonical linker pair aggregation API: keep the numpy-array
+    `linker_pair_index_arrays_and_aggregate_stats(...)` path used by promoted
+    incremental linking. Migrate any remaining callers away from
+    `linker_pair_features_and_aggregate_stats_indexed(...)`, then delete that
+    list-of-tuples API and its tests.
+  - Canonical aggregate-only API: either add an explicit `emit_matrix` or
+    matrix-empty mode to `linker_pair_index_arrays_and_aggregate_stats(...)`,
+    or prove the aggregate-only wrapper is still needed. Otherwise delete
+    `linker_pair_index_arrays_aggregate_stats(...)` and update capability
+    probes that currently key off it.
+  - Canonical constraint API: prefer indexed and block-upper-triangle
+    constraint APIs. Migrate public wrappers/tests off string-pair
+    `get_constraints_matrix(...)`, then delete that Rust method and remove it
+    from core capability checks.
+  - Canonical pairwise feature API: prefer matrix/indexed APIs. Keep
+    `featurize_pair(...)` only as a parity/debug helper, and keep
+    `featurize_pairs(...)` only while `s2and/featurizer.py` still requires the
+    legacy row-by-row fallback.
+  - Canonical retriever API: prefer
+    `RustHybridCentroidRetriever.top_k_hybrid_centroid_pair_plan(...)` for
+    runtime retrieval. Remove direct `top_k_hybrid_centroid(...)` and
+    `chooser_feature_rows_subset(...)` only after capability probes and tests
+    no longer require them.
+- Deletion order:
+  1. Lock strict Arrow production routing so compatibility fallbacks are no
+     longer confused with production Rust.
+  2. Remove or consolidate duplicate linker pair aggregate APIs.
+  3. Remove the string-pair constraint API from core/public routing.
+  4. Prune retriever debug/test APIs after pair-plan probes replace them.
+  5. Decide whether the planner class or one-shot wrapper is the supported raw
+     Arrow API, then delete the other surface if appropriate.
+  6. Demote or delete raw payload / Python `FeatureBlock` scoring bridges only
+     after Arrow request-table assembly covers the same compatibility use cases.
+  7. Demote `from_json_paths(...)` from core runtime capability checks before
+     removing JSON ingest helpers.
 - Split `s2and_rust/src/lib.rs` after the production boundary is locked.
-  - Current state: `lib.rs` is roughly 15k lines and owns PyO3 exports, Arrow
-    IO, JSON ingest, Python object ingest, text compatibility, name-count
-    indexes, pair features, constraints, retrieval, promoted linker row
-    features, and subblocking.
   - Start with a compact public-surface inventory before moving code: list each
     PyO3 export, Rust helper used from Python, and test-only helper, plus the
     owning caller class or module.
@@ -385,6 +494,11 @@ to maintain without changing runtime behavior.
   - Verification: run Rust unit tests plus focused Python/Rust integration
     tests after each small module extraction. Prefer moving tests with the code
     they exercise rather than creating broad snapshot tests.
+- Treat `s2and/incremental_linking/runtime.py` as a second cleanup target after
+  strict Arrow production routing is locked. It owns Arrow-routed promoted
+  incremental runtime and builder orchestration, so include it in the
+  public-surface inventory, but do not split it in the same change as the first
+  Rust module extraction.
 - Use the Rust public-surface inventory to decide which Python wrappers should
   remain public and which should become compatibility helpers.
 - Done when: `lib.rs` is reduced to PyO3 exports and small wiring, extracted
@@ -397,7 +511,8 @@ to maintain without changing runtime behavior.
 Evidence: `s2and_rust/src/lib.rs` has shared staging structs and preprocessing
 helpers for Arrow and FeatureBlock construction, while `from_json_paths(...)`
 still keeps local `SignatureInput`, `PaperInput`, and `PaperPreprocessed`
-records.
+records. `from_dataset(...)` also keeps a local `PaperInput` record, so include
+both non-Arrow ingest paths in the inventory.
 
 - Start with a source-policy inventory for unidecode, language handling, name
   splitting, name-count telemetry/defaulting, paper-author handling,
@@ -413,14 +528,17 @@ records.
 ### Incremental Helper Shim Decision
 
 Evidence: `Clusterer._predict_incremental_helper(...)` still exists in
-`s2and/model.py`, and tests still monkeypatch it directly.
+`s2and/model.py`, and tests still monkeypatch it directly. Current monkeypatch
+sites are test plumbing: mutation capture, failure injection, and routing
+recording in `tests/test_cluster_incremental.py`.
 
-- Decide whether the shim is removable, narrowable, or still an external
-  compatibility surface.
-- Migrate tests that monkeypatch `Clusterer._predict_incremental_helper(...)`
-  before any rename/removal. Prefer fault injection through a public routing
-  surface, dependency parameter, or explicit test hook over patching the private
-  helper directly.
+- Current decision: treat `_predict_incremental_helper(...)` as an internal-only
+  test seam for now. Leave it in place and document that it is not an external
+  compatibility API.
+- Before any future rename/removal, migrate tests that monkeypatch
+  `Clusterer._predict_incremental_helper(...)`. Prefer fault injection through a
+  public routing surface, dependency parameter, or explicit test hook over
+  patching the private helper directly.
 - Treat public-surface removal as ask-first.
 - Done when: monkeypatched tests use the chosen call surface, focused
   incremental-linking tests pass, and docs or code comments identify whether
@@ -429,7 +547,17 @@ Evidence: `Clusterer._predict_incremental_helper(...)` still exists in
 ### Performance Targets
 
 - Next profiling should target Arrow read/summary construction and reusable
-  component summaries.
+  component summaries on a realistic Arrow promoted-incremental workload:
+  raw single-query or small query-batch prediction against a published
+  `linker_replay_20260513` dataset, after first sanity-checking the profiler on
+  the tiny Arrow fixture.
+- Primary metrics: p50 wall time over at least five isolated runs, peak RSS, and
+  summary-construction allocation volume from a stack-level allocation profiler
+  (`heaptrack`/`perf` on Linux or ETW allocation tracing on Windows).
+- Act only when Arrow read or summary construction is at least a 10% contributor
+  to p50 wall time or allocation volume, or when a change removes a real
+  `ANDData` dependency. Stop iterating once the measured improvement is below
+  10% for the selected workload.
 - Earlier profiling suggested pairwise/model scoring and the old Python
   row-signal bridge were not the main raw single-query bottlenecks. Keep this
   as a hypothesis to re-check before optimizing them again.

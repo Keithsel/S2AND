@@ -8,11 +8,13 @@ from typing import Any
 
 import numpy as np
 
+from s2and.incremental_linking.array_validation import as_uint16_1d, as_uint32_1d
 from s2and.incremental_linking.feature_block import FeatureBlockSignatureOrder
 from s2and.incremental_linking.gate_buckets import first_name_bucket_array, normalize_query_views
 from s2and.incremental_linking.linker_pairwise import LinkerCandidateBatch
 
 _REQUIRED_RUST_PAIR_PLAN_KEYS: tuple[str, ...] = ("row_orcid_match",)
+RAW_CANDIDATE_PLAN_SCHEMA_VERSION = "raw_arrow_candidate_plan_v1"
 RAW_CANDIDATE_PLAN_BATCH_ROW_KEYS: tuple[str, ...] = (
     "row_query_signature_indices",
     "row_component_keys",
@@ -69,12 +71,18 @@ RAW_CANDIDATE_PLAN_ROW_KEYS: tuple[str, ...] = (
     *RAW_CANDIDATE_PLAN_BATCH_ROW_KEYS,
     *(raw_key for raw_key, _signal_key, _dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS),
 )
-RAW_CANDIDATE_PLAN_PAIR_KEYS: tuple[str, ...] = (
+RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS: tuple[str, ...] = (
     "left_signature_indices",
     "right_signature_indices",
+    "pair_row_indices",
+)
+RAW_CANDIDATE_PLAN_PAIR_ID_KEYS: tuple[str, ...] = (
     "left_signature_ids",
     "right_signature_ids",
-    "pair_row_indices",
+)
+RAW_CANDIDATE_PLAN_PAIR_KEYS: tuple[str, ...] = (
+    *RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS,
+    *RAW_CANDIDATE_PLAN_PAIR_ID_KEYS,
 )
 
 
@@ -92,7 +100,7 @@ def _rust_retriever_object(retriever: Any) -> Any:
 
 def _as_uint32_mapping(component_member_indices_by_key: Mapping[str, Sequence[int] | np.ndarray]) -> dict[str, Any]:
     return {
-        str(component_key): np.ascontiguousarray(member_indices, dtype=np.uint32)
+        str(component_key): as_uint32_1d(f"component_member_indices_by_key[{component_key!r}]", member_indices)
         for component_key, member_indices in component_member_indices_by_key.items()
     }
 
@@ -113,10 +121,79 @@ def _required_raw_plan_value(plan: Mapping[str, Any], key: str) -> Any:
 
 
 def _raw_plan_array(plan: Mapping[str, Any], key: str, dtype: Any, expected_length: int) -> np.ndarray:
-    values = np.asarray(_required_raw_plan_value(plan, key), dtype=dtype)
+    if dtype == np.uint32:
+        values = as_uint32_1d(key, _required_raw_plan_value(plan, key))
+    else:
+        values = np.asarray(_required_raw_plan_value(plan, key), dtype=dtype)
     if values.ndim != 1 or len(values) != int(expected_length):
         raise ValueError(f"raw candidate plan key {key!r} must be 1D with length {expected_length}, got {values.shape}")
     return values
+
+
+def _raw_plan_nonnegative_count(plan: Mapping[str, Any], key: str) -> int:
+    value = int(_required_raw_plan_value(plan, key))
+    if value < 0:
+        raise ValueError(f"raw candidate plan {key} must be non-negative")
+    return value
+
+
+def _raw_plan_sequence_length(plan: Mapping[str, Any], key: str) -> int:
+    try:
+        return len(_required_raw_plan_value(plan, key))
+    except TypeError as exc:
+        raise ValueError(f"raw candidate plan key {key!r} must be a sized 1D sequence") from exc
+
+
+def validate_raw_candidate_plan_schema(plan: Mapping[str, Any]) -> None:
+    """Validate the raw Arrow candidate-plan payload before slicing or remapping it."""
+
+    schema_version = _required_raw_plan_value(plan, "schema_version")
+    if schema_version != RAW_CANDIDATE_PLAN_SCHEMA_VERSION:
+        raise ValueError(
+            "raw candidate plan schema_version must be "
+            f"{RAW_CANDIDATE_PLAN_SCHEMA_VERSION!r}, got {schema_version!r}"
+        )
+    row_count = _raw_plan_nonnegative_count(plan, "row_count")
+    pair_count = _raw_plan_nonnegative_count(plan, "pair_count")
+    missing = sorted(
+        key
+        for key in (
+            "query_signature_ids",
+            "query_views",
+            "query_authors",
+            *RAW_CANDIDATE_PLAN_ROW_KEYS,
+            *RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS,
+        )
+        if key not in plan
+    )
+    if missing:
+        raise KeyError(f"raw candidate plan is missing required keys: {missing}")
+    has_pair_signature_ids = all(key in plan for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS)
+    if any(key in plan for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS) and not has_pair_signature_ids:
+        raise KeyError(
+            "raw candidate plan must include both left_signature_ids and right_signature_ids when either is present"
+        )
+    if not has_pair_signature_ids and "seed_signature_ids" not in plan:
+        raise KeyError("raw candidate plan without pair signature ids must include seed_signature_ids")
+
+    query_count = _raw_plan_sequence_length(plan, "query_signature_ids")
+    if query_count == 0:
+        raise ValueError("raw candidate plan query_signature_ids must be non-empty")
+    for key in ("query_views", "query_authors"):
+        length = _raw_plan_sequence_length(plan, key)
+        if length != query_count:
+            raise ValueError(
+                f"raw candidate plan {key} length must match query_signature_ids: {length} != {query_count}"
+            )
+    for key in RAW_CANDIDATE_PLAN_ROW_KEYS:
+        _raw_plan_array(plan, key, object, row_count)
+    for key in RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS:
+        _raw_plan_array(plan, key, np.uint32, pair_count)
+    if has_pair_signature_ids:
+        for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS:
+            length = _raw_plan_sequence_length(plan, key)
+            if length != pair_count:
+                raise ValueError(f"raw candidate plan {key} length must match pair_count: {length} != {pair_count}")
 
 
 def _signature_indices_from_ids(
@@ -126,8 +203,9 @@ def _signature_indices_from_ids(
     field_name: str,
 ) -> np.ndarray:
     try:
-        return np.asarray(
-            [int(signature_id_to_index[str(signature_id)]) for signature_id in signature_ids], dtype=np.uint32
+        return as_uint32_1d(
+            field_name,
+            [int(signature_id_to_index[str(signature_id)]) for signature_id in signature_ids],
         )
     except KeyError as exc:
         raise KeyError(
@@ -157,6 +235,7 @@ def build_linker_retrieval_batch_from_raw_candidate_plan(
     it does not rerun retrieval.
     """
 
+    validate_raw_candidate_plan_schema(plan)
     if signature_id_to_index is None:
         if feature_block_signature_order is None:
             raise ValueError("signature_id_to_index or feature_block_signature_order is required")
@@ -179,16 +258,42 @@ def build_linker_retrieval_batch_from_raw_candidate_plan(
         field_name="query_signature_ids",
     )
     row_query_signature_indices = query_indices_by_offset[row_query_offsets]
-    left_signature_indices = _signature_indices_from_ids(
-        [str(value) for value in _required_raw_plan_value(plan, "left_signature_ids")],
-        signature_id_to_index,
-        field_name="left_signature_ids",
-    )
-    right_signature_indices = _signature_indices_from_ids(
-        [str(value) for value in _required_raw_plan_value(plan, "right_signature_ids")],
-        signature_id_to_index,
-        field_name="right_signature_ids",
-    )
+    if "left_signature_ids" in plan and "right_signature_ids" in plan:
+        left_signature_indices = _signature_indices_from_ids(
+            [str(value) for value in _required_raw_plan_value(plan, "left_signature_ids")],
+            signature_id_to_index,
+            field_name="left_signature_ids",
+        )
+        right_signature_indices = _signature_indices_from_ids(
+            [str(value) for value in _required_raw_plan_value(plan, "right_signature_ids")],
+            signature_id_to_index,
+            field_name="right_signature_ids",
+        )
+    else:
+        seed_signature_ids = [str(value) for value in _required_raw_plan_value(plan, "seed_signature_ids")]
+        signature_ids_by_plan_index = (*query_signature_ids, *seed_signature_ids)
+
+        def _remap_plan_signature_indices(key: str) -> np.ndarray:
+            raw_indices = _raw_plan_array(plan, key, np.uint32, pair_count)
+            remapped: list[int] = []
+            for raw_index in raw_indices:
+                plan_index = int(raw_index)
+                if plan_index >= len(signature_ids_by_plan_index):
+                    raise ValueError(
+                        f"raw candidate plan {key} contains signature index {plan_index} outside "
+                        f"signature table length {len(signature_ids_by_plan_index)}"
+                    )
+                signature_id = signature_ids_by_plan_index[plan_index]
+                try:
+                    remapped.append(int(signature_id_to_index[signature_id]))
+                except KeyError as exc:
+                    raise KeyError(
+                        f"{key} contains signature_id not present in signature_id_to_index: {signature_id!r}"
+                    ) from exc
+            return as_uint32_1d(key, remapped)
+
+        left_signature_indices = _remap_plan_signature_indices("left_signature_indices")
+        right_signature_indices = _remap_plan_signature_indices("right_signature_indices")
     if len(left_signature_indices) != pair_count or len(right_signature_indices) != pair_count:
         raise ValueError(
             "raw candidate plan pair_count does not match left/right signature id lengths: "
@@ -203,7 +308,12 @@ def build_linker_retrieval_batch_from_raw_candidate_plan(
         )
 
     retrieval_scores = _raw_plan_array(plan, "retrieval_scores", np.float32, row_count)
-    retrieval_ranks = _raw_plan_array(plan, "retrieval_ranks", np.uint16, row_count)
+    retrieval_ranks = as_uint16_1d("retrieval_ranks", _required_raw_plan_value(plan, "retrieval_ranks"))
+    if len(retrieval_ranks) != row_count:
+        raise ValueError(
+            "raw candidate plan key 'retrieval_ranks' must be 1D with length "
+            f"{row_count}, got {retrieval_ranks.shape}"
+        )
     candidate_batch = LinkerCandidateBatch(
         row_count=row_count,
         left_signature_indices=left_signature_indices,
@@ -276,7 +386,7 @@ def build_linker_retrieval_batch_rust(
             )
         plan = method(
             list(queries),
-            np.ascontiguousarray(query_signature_indices, dtype=np.uint32),
+            as_uint32_1d("query_signature_indices", query_signature_indices),
             _as_uint32_mapping(component_member_indices_by_key),
             int(top_k),
             None if n_jobs is None else int(n_jobs),
@@ -295,7 +405,7 @@ def build_linker_retrieval_batch_rust(
     else:
         plan = method(
             list(queries),
-            np.ascontiguousarray(query_signature_indices, dtype=np.uint32),
+            as_uint32_1d("query_signature_indices", query_signature_indices),
             _as_uint32_mapping(component_member_indices_by_key),
             int(top_k),
             None if n_jobs is None else int(n_jobs),
@@ -304,10 +414,13 @@ def build_linker_retrieval_batch_rust(
     row_count = int(plan["row_count"])
     candidate_batch = LinkerCandidateBatch(
         row_count=row_count,
-        left_signature_indices=np.asarray(plan["left_signature_indices"], dtype=np.uint32),
-        right_signature_indices=np.asarray(plan["right_signature_indices"], dtype=np.uint32),
-        pair_row_indices=np.asarray(plan["pair_row_indices"], dtype=np.uint32),
-        row_query_signature_indices=np.asarray(plan["row_query_signature_indices"], dtype=np.uint32),
+        left_signature_indices=as_uint32_1d("left_signature_indices", plan["left_signature_indices"]),
+        right_signature_indices=as_uint32_1d("right_signature_indices", plan["right_signature_indices"]),
+        pair_row_indices=as_uint32_1d("pair_row_indices", plan["pair_row_indices"]),
+        row_query_signature_indices=as_uint32_1d(
+            "row_query_signature_indices",
+            plan["row_query_signature_indices"],
+        ),
         row_component_keys=tuple(str(value) for value in plan["row_component_keys"]),
         retrieval_scores=np.asarray(plan["retrieval_scores"], dtype=np.float32),
         retrieval_ranks=np.asarray(plan["retrieval_ranks"], dtype=np.uint16),

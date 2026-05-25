@@ -36,7 +36,7 @@ def normalize_cluster_seed_disallow_pairs(
                 raise ValueError(f"cluster seed disallow pair contains signatures missing from FeatureBlock: {missing}")
         pair = (left_id, right_id) if left_id <= right_id else (right_id, left_id)
         if pair in seen:
-            raise ValueError(f"cluster seed disallow pair is duplicated: {pair}")
+            continue
         seen.add(pair)
         normalized.append(pair)
     return tuple(normalized)
@@ -405,12 +405,30 @@ def feature_block_signature_order_from_raw_candidate_plan(plan: Mapping[str, Any
     """Build a deterministic mini-block signature order from a raw candidate plan."""
 
     query_signature_ids = tuple(str(value) for value in _required_plan_sequence(plan, "query_signature_ids"))
+    if "left_signature_ids" in plan and "right_signature_ids" in plan:
+        pair_signature_ids = (
+            *_required_plan_sequence(plan, "left_signature_ids"),
+            *_required_plan_sequence(plan, "right_signature_ids"),
+        )
+    else:
+        seed_signature_ids = tuple(str(value) for value in _required_plan_sequence(plan, "seed_signature_ids"))
+        signature_ids_by_plan_index = (*query_signature_ids, *seed_signature_ids)
+        pair_signature_ids = []
+        for key in ("left_signature_indices", "right_signature_indices"):
+            indices = np.asarray(plan[key], dtype=np.uint32)
+            for index in indices:
+                offset = int(index)
+                if offset >= len(signature_ids_by_plan_index):
+                    raise ValueError(
+                        f"raw candidate plan {key} contains signature index {offset} outside "
+                        f"signature table length {len(signature_ids_by_plan_index)}"
+                    )
+                pair_signature_ids.append(signature_ids_by_plan_index[offset])
     ordered_ids: list[str] = []
     seen: set[str] = set()
     for value in (
         *query_signature_ids,
-        *_required_plan_sequence(plan, "left_signature_ids"),
-        *_required_plan_sequence(plan, "right_signature_ids"),
+        *pair_signature_ids,
     ):
         signature_id = str(value)
         if signature_id in seen:

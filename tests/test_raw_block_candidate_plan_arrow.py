@@ -12,6 +12,7 @@ import pytest
 
 from s2and.incremental_linking.feature_block import (
     feature_block_from_arrow_paths,
+    feature_block_signature_order_from_raw_candidate_plan,
     write_arrow_batch_lookup_index,
     write_name_counts_index,
     write_raw_arrow_batch_lookup_indexes,
@@ -19,6 +20,8 @@ from s2and.incremental_linking.feature_block import (
 from s2and.incremental_linking.retrieval import (
     RAW_CANDIDATE_PLAN_PAIR_KEYS,
     RAW_CANDIDATE_PLAN_ROW_KEYS,
+    RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS,
+    RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
     build_linker_retrieval_batch_from_raw_candidate_plan,
 )
 from s2and.incremental_linking.runtime import _raw_candidate_plan_seed_setup, subset_raw_candidate_plan_for_query_ids
@@ -35,39 +38,63 @@ _NAME_COUNTS_INDEX_HEADER_LEN = 32
 _NAME_COUNTS_INDEX_RECORD_LEN = 40
 
 
-def test_subset_raw_candidate_plan_fast_path_rejects_out_of_range_query_index() -> None:
-    raw_plan = {
-        "query_signature_ids": ["q0", "q1", "q2"],
-        "query_views": ["full", "full", "full"],
-        "query_authors": ["Alice", "Bob", "Carol"],
-        "row_count": 1,
-        "pair_count": 1,
-        "row_query_signature_indices": np.asarray([1], dtype=np.uint32),
-        "row_component_keys": ["c1"],
-        "pair_row_indices": np.asarray([0], dtype=np.uint32),
-        "left_signature_indices": np.asarray([0], dtype=np.uint32),
-        "right_signature_indices": np.asarray([3], dtype=np.uint32),
-        "component_members": {"c1": ["s1"]},
+def _minimal_raw_candidate_plan(**overrides: Any) -> dict[str, Any]:
+    query_signature_ids = list(overrides.pop("query_signature_ids", ["q0"]))
+    row_count = int(overrides.pop("row_count", 0))
+    pair_count = int(overrides.pop("pair_count", 0))
+    plan: dict[str, Any] = {
+        "schema_version": RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
+        "query_signature_ids": query_signature_ids,
+        "query_views": ["full"] * len(query_signature_ids),
+        "query_authors": ["Alice"] * len(query_signature_ids),
+        "row_count": row_count,
+        "pair_count": pair_count,
+        "row_query_signature_indices": np.zeros(row_count, dtype=np.uint32),
+        "row_component_keys": [f"c{index}" for index in range(row_count)],
+        "retrieval_scores": np.zeros(row_count, dtype=np.float32),
+        "retrieval_ranks": np.arange(1, row_count + 1, dtype=np.uint16),
+        "pair_row_indices": np.zeros(pair_count, dtype=np.uint32),
+        "left_signature_indices": np.zeros(pair_count, dtype=np.uint32),
+        "right_signature_indices": np.zeros(pair_count, dtype=np.uint32),
+        "seed_signature_ids": [],
+        "component_members": {},
         "telemetry": {},
     }
+    for raw_key, _signal_key, dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS:
+        if dtype is object:
+            plan[raw_key] = np.asarray([""] * row_count, dtype=object)
+        else:
+            plan[raw_key] = np.zeros(row_count, dtype=dtype)
+    plan.update(overrides)
+    return plan
+
+
+def test_subset_raw_candidate_plan_fast_path_rejects_out_of_range_query_index() -> None:
+    raw_plan = _minimal_raw_candidate_plan(
+        query_signature_ids=["q0", "q1", "q2"],
+        query_views=["full", "full", "full"],
+        query_authors=["Alice", "Bob", "Carol"],
+        row_count=1,
+        pair_count=1,
+        row_query_signature_indices=np.asarray([1], dtype=np.uint32),
+        row_component_keys=["c1"],
+        pair_row_indices=np.asarray([0], dtype=np.uint32),
+        left_signature_indices=np.asarray([0], dtype=np.uint32),
+        right_signature_indices=np.asarray([3], dtype=np.uint32),
+        seed_signature_ids=["s1"],
+        component_members={"c1": ["s1"]},
+    )
 
     with pytest.raises(ValueError, match="outside the selected contiguous query range"):
         subset_raw_candidate_plan_for_query_ids(raw_plan, ["q1"])
 
 
 def test_subset_raw_candidate_plan_rejects_duplicate_query_ids() -> None:
-    raw_plan = {
-        "query_signature_ids": ["q0", "q0"],
-        "query_views": ["full", "full"],
-        "query_authors": ["Alice", "Alice"],
-        "row_count": 0,
-        "pair_count": 0,
-        "row_query_signature_indices": np.asarray([], dtype=np.uint32),
-        "row_component_keys": [],
-        "pair_row_indices": np.asarray([], dtype=np.uint32),
-        "component_members": {},
-        "telemetry": {},
-    }
+    raw_plan = _minimal_raw_candidate_plan(
+        query_signature_ids=["q0", "q0"],
+        query_views=["full", "full"],
+        query_authors=["Alice", "Alice"],
+    )
 
     with pytest.raises(ValueError, match="query_signature_ids must be unique"):
         subset_raw_candidate_plan_for_query_ids(raw_plan, ["q0"])
@@ -230,18 +257,11 @@ def _base_arrow_paths(tmp_path: Path) -> dict[str, str]:
             "cluster_id": pa.array(["c_match", "c_other"], type=pa.string()),
         }
     )
-    cluster_seed_disallows = pa.table(
-        {
-            "signature_id_1": pa.array(["q1"], type=pa.string()),
-            "signature_id_2": pa.array(["s2"], type=pa.string()),
-        }
-    )
     return {
         "signatures": _write_ipc(tmp_path / "signatures.arrow", signatures),
         "papers": _write_ipc(tmp_path / "papers.arrow", papers),
         "paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors),
         "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
-        "cluster_seed_disallows": _write_ipc(tmp_path / "cluster_seed_disallows.arrow", cluster_seed_disallows),
     }
 
 
@@ -343,6 +363,173 @@ def test_raw_arrow_candidate_plan_matches_existing_rust_retriever(tmp_path: Path
     assert raw_plan["telemetry"]["signature_count"] == 3
 
 
+def test_raw_arrow_candidate_planner_matches_one_shot_plan(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
+        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+
+    one_shot = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+        include_pair_signature_ids=True,
+        include_component_members=True,
+        full_scan_without_index=True,
+    )
+    planner = s2and_rust.RawBlockQueryCandidatePlanner(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+        include_pair_signature_ids=True,
+        include_component_members=True,
+        full_scan_without_index=True,
+    )
+    planned = planner.plan(
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        include_pair_signature_ids=True,
+        include_component_members=True,
+    )
+
+    _assert_raw_candidate_plans_equal(planned, one_shot)
+    assert planner.build_telemetry()["query_signature_count"] == 1
+    assert planner.build_telemetry()["planner_seed_state"] == 1
+    assert planned["telemetry"]["planner_seed_state_reused"] == 1
+    assert planned["telemetry"]["timings"]["read_cluster_seeds_secs"] == 0.0
+    assert planned["telemetry"]["timings"]["read_name_counts_secs"] == 0.0
+
+
+def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
+        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paths["cluster_seeds"] = _write_ipc(
+        tmp_path / "cluster_seeds_with_query.arrow",
+        pa.table(
+            {
+                "signature_id": pa.array(["q1", "s1", "s2"], type=pa.string()),
+                "cluster_id": pa.array(["c_query", "c_match", "c_other"], type=pa.string()),
+            }
+        ),
+    )
+
+    one_shot = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+        include_pair_signature_ids=True,
+        include_component_members=True,
+        full_scan_without_index=True,
+    )
+    planner = s2and_rust.RawBlockQueryCandidatePlanner(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+        include_pair_signature_ids=True,
+        include_component_members=True,
+        full_scan_without_index=True,
+    )
+    planned = planner.plan(
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        include_pair_signature_ids=True,
+        include_component_members=True,
+    )
+
+    _assert_raw_candidate_plans_equal(planned, one_shot)
+    assert "q1" not in planned["component_members"].get("c_query", [])
+
+
+def test_raw_arrow_candidate_planner_requires_indexes_without_explicit_full_scan(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
+        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+
+    with pytest.raises(ValueError, match="batch lookup index"):
+        s2and_rust.RawBlockQueryCandidatePlanner(
+            paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
+
+
+def test_raw_arrow_candidate_plan_filters_cluster_seed_disallows(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paths["cluster_seed_disallows"] = _write_ipc(
+        tmp_path / "cluster_seed_disallows.arrow",
+        pa.table(
+            {
+                "signature_id_1": pa.array(["q1", "s2"], type=pa.string()),
+                "signature_id_2": pa.array(["s2", "q1"], type=pa.string()),
+            }
+        ),
+    )
+
+    raw_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+
+    assert raw_plan["row_component_keys"] == ["c_match"]
+    assert raw_plan["left_signature_ids"] == ["q1"]
+    assert raw_plan["right_signature_ids"] == ["s1"]
+    assert raw_plan["telemetry"]["cluster_seed_disallow_pair_count"] == 1
+    assert raw_plan["telemetry"]["cluster_seed_disallowed_candidate_count"] == 1
+
+
+def test_raw_arrow_candidate_plan_drops_zero_specter_vectors(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    paths["specter"] = _write_ipc(
+        tmp_path / "specter.arrow",
+        pa.table(
+            {
+                "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(
+                    pa.array([1.0, 0.0, 1.0, 0.0, 0.0, 0.0], type=pa.float32()),
+                    2,
+                ),
+            }
+        ),
+    )
+
+    raw_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+
+    assert raw_plan["telemetry"]["specter_count"] == 2
+    assert np.isfinite(np.asarray(raw_plan["specter_centroid_similarity"], dtype=np.float32)).all()
+
+
 def test_raw_arrow_candidate_plan_rejects_hidden_query_view(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
         raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
@@ -354,6 +541,22 @@ def test_raw_arrow_candidate_plan_rejects_hidden_query_view(tmp_path: Path) -> N
             ["q1"],
             top_k=2,
             query_view="initial_only_no_specter",
+            orcid_enabled=False,
+            num_threads=1,
+        )
+
+
+def test_raw_arrow_candidate_plan_rejects_duplicate_query_signature_ids(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+
+    with pytest.raises(ValueError, match="query_signature_ids must be unique"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            paths,
+            ["q1", "q1"],
+            top_k=2,
+            query_view="full",
             orcid_enabled=False,
             num_threads=1,
         )
@@ -450,11 +653,15 @@ def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(t
     telemetry = indexed_plan["telemetry"]
     assert telemetry["indexed_arrow_candidate_plan"] is True
     assert full_scan_plan["telemetry"]["indexed_arrow_candidate_plan"] is False
-    assert full_scan_plan["telemetry"]["signature_count"] == 3 + irrelevant_count
-    assert full_scan_plan["telemetry"]["signature_rows_scanned"] == 0
-    assert full_scan_plan["telemetry"]["paper_rows_scanned"] == 0
-    assert full_scan_plan["telemetry"]["paper_author_rows_scanned"] == 0
-    assert full_scan_plan["telemetry"]["specter_rows_scanned"] == 0
+    assert full_scan_plan["telemetry"]["signature_count"] == 3
+    assert full_scan_plan["telemetry"]["paper_count"] == 3
+    assert full_scan_plan["telemetry"]["paper_author_paper_count"] == 3
+    assert full_scan_plan["telemetry"]["specter_count"] == 3
+    full_scan_rows = len(signature_ids) * 2
+    assert full_scan_plan["telemetry"]["signature_rows_scanned"] == full_scan_rows
+    assert full_scan_plan["telemetry"]["paper_rows_scanned"] == full_scan_rows
+    assert full_scan_plan["telemetry"]["paper_author_rows_scanned"] == full_scan_rows
+    assert full_scan_plan["telemetry"]["specter_rows_scanned"] == full_scan_rows
     assert telemetry["signature_count"] == 3
     assert telemetry["paper_count"] == 3
     assert telemetry["paper_author_paper_count"] == 3
@@ -498,9 +705,9 @@ def test_raw_arrow_candidate_plan_extra_hash_selected_batch_is_exact_filtered(tm
     )
     paper_authors = pa.table(
         {
-            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
-            "position": pa.array([0, 0, 0], type=pa.int64()),
-            "author_name": pa.array(["Alice Wang", "Alice Wang", "Bob Jones"], type=pa.string()),
+            "paper_id": pa.array(["p_q", "p_q", "p1", "p2"], type=pa.string()),
+            "position": pa.array([0, 1, 0, 0], type=pa.int64()),
+            "author_name": pa.array(["Alice Wang", "Ann Smith", "Alice Wang", "Bob Jones"], type=pa.string()),
         }
     )
     cluster_seeds = pa.table(
@@ -710,8 +917,7 @@ def test_raw_arrow_candidate_plan_rejects_invalid_cluster_seed_rows(tmp_path: Pa
         }
     )
     _write_ipc(Path(paths["cluster_seeds"]), idempotent_duplicate_seeds)
-    with pytest.raises(ValueError, match="duplicate signature_id"):
-        _raw_plan_for_base_paths(paths)
+    _raw_plan_for_base_paths(paths)
 
     duplicate_seeds = pa.table(
         {
@@ -720,7 +926,7 @@ def test_raw_arrow_candidate_plan_rejects_invalid_cluster_seed_rows(tmp_path: Pa
         }
     )
     _write_ipc(Path(paths["cluster_seeds"]), duplicate_seeds)
-    with pytest.raises(ValueError, match="duplicate signature_id"):
+    with pytest.raises(ValueError, match="multiple clusters"):
         _raw_plan_for_base_paths(paths)
 
     empty_cluster_id = pa.table(
@@ -840,8 +1046,8 @@ def test_raw_arrow_candidate_plan_orcid_override_returns_all_matches(tmp_path: P
             "author_affiliations": pa.array([[], [], [], [], []], type=pa.list_(pa.string())),
             "author_orcid": pa.array(
                 [
-                    "https://orcid.org/0000-0002-1825-0097",
-                    "0000-0002-1825-0097",
+                    "https://orcid.org/0000\u20100002\u20101825\u20100097",
+                    "0000\u20110002\u20111825\u20110097",
                     "ORCID: 0000000218250097",
                     "0000-0002-1825-0097",
                     None,
@@ -894,7 +1100,78 @@ def test_raw_arrow_candidate_plan_orcid_override_returns_all_matches(tmp_path: P
     assert plan["row_orcid_match"].tolist() == [1, 1, 1]
 
 
-def test_raw_arrow_candidate_plan_missing_query_position_skips_position_zero_self_author(
+def test_raw_arrow_candidate_plan_orcid_override_is_exempt_from_seed_disallows(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
+    signatures = pa.table(
+        {
+            "signature_id": pa.array(["q1", "s_good", "s_other"], type=pa.string()),
+            "paper_id": pa.array(["p_q", "p_good", "p_other"], type=pa.string()),
+            "author_first": pa.array(["Alice", "Alice", "Alice"], type=pa.string()),
+            "author_middle": pa.array(["", "", ""], type=pa.string()),
+            "author_last": pa.array(["Wang", "Wang", "Wang"], type=pa.string()),
+            "author_suffix": pa.array(["", "", ""], type=pa.string()),
+            "author_affiliations": pa.array([[], [], []], type=pa.list_(pa.string())),
+            "author_orcid": pa.array(
+                ["0000-0002-1825-0097", "0000-0002-1825-0097", "0000-0002-1825-0097"],
+                type=pa.string(),
+            ),
+            "author_position": pa.array([0, 0, 0], type=pa.int64()),
+        }
+    )
+    papers = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p_good", "p_other"], type=pa.string()),
+            "title": pa.array(["", "", ""], type=pa.string()),
+            "venue": pa.array(["", "", ""], type=pa.string()),
+            "journal_name": pa.array(["", "", ""], type=pa.string()),
+            "year": pa.array([2024, 2024, 2024], type=pa.int64()),
+        }
+    )
+    paper_authors = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p_good", "p_other"], type=pa.string()),
+            "position": pa.array([0, 0, 0], type=pa.int64()),
+            "author_name": pa.array(["Alice Wang"] * 3, type=pa.string()),
+        }
+    )
+    cluster_seeds = pa.table(
+        {
+            "signature_id": pa.array(["s_good", "s_other"], type=pa.string()),
+            "cluster_id": pa.array(["c_good", "c_other"], type=pa.string()),
+        }
+    )
+    disallows = pa.table(
+        {
+            "signature_id_1": pa.array(["q1"], type=pa.string()),
+            "signature_id_2": pa.array(["s_good"], type=pa.string()),
+        }
+    )
+    paths = {
+        "signatures": _write_ipc(tmp_path / "signatures.arrow", signatures),
+        "papers": _write_ipc(tmp_path / "papers.arrow", papers),
+        "paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors),
+        "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
+        "cluster_seed_disallows": _write_ipc(tmp_path / "cluster_seed_disallows.arrow", disallows),
+    }
+
+    plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=1,
+        query_view="full",
+        orcid_enabled=True,
+        num_threads=1,
+    )
+
+    assert set(plan["row_component_keys"]) == {"c_good", "c_other"}
+    assert set(plan["left_signature_ids"]) == {"q1"}
+    assert set(plan["right_signature_ids"]) == {"s_good", "s_other"}
+    assert plan["row_orcid_match"].tolist() == [1, 1]
+    assert plan["telemetry"]["cluster_seed_disallowed_candidate_count"] == 1
+
+
+def test_raw_arrow_candidate_plan_missing_query_position_has_no_coauthor_overlap(
     tmp_path: Path,
 ) -> None:
     if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
@@ -955,7 +1232,7 @@ def test_raw_arrow_candidate_plan_missing_query_position_skips_position_zero_sel
 
     overlap_by_component = dict(zip(plan["row_component_keys"], plan["coauthor_overlap"], strict=True))
     assert overlap_by_component["c_self"] == 0.0
-    assert overlap_by_component["c_real"] > 0.0
+    assert overlap_by_component["c_real"] == 0.0
 
 
 def test_raw_arrow_candidate_plan_matches_multi_query_auto_views_and_specter(tmp_path: Path) -> None:
@@ -1238,10 +1515,14 @@ def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metada
 
     assert plan["telemetry"]["excluded_query_seed_count"] == 1
     assert plan["component_members"]["c_self"] == ["s1"]
-    assert "seed_signature_ids" not in plan
+    assert plan["seed_signature_ids"] == []
+    assert plan["telemetry"]["payload_seed_signature_count"] == 0
     assert "seed_component_keys" not in plan
     assert "q1" not in plan["right_signature_ids"]
+    assert set(plan["right_signature_ids"]) == {"s1", "s2"}
     assert plan["query_views"] == ["full"]
+    np.testing.assert_array_equal(plan["row_query_has_coauthors"], np.zeros(int(plan["row_count"]), dtype=np.uint8))
+    np.testing.assert_allclose(plan["coauthor_overlap"], np.zeros(int(plan["row_count"]), dtype=np.float32))
 
     narrow_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
         paths,
@@ -1270,6 +1551,66 @@ def test_raw_arrow_candidate_plan_rejects_null_paper_author_position(tmp_path: P
     paths["paper_authors"] = _write_ipc(tmp_path / "paper_authors.arrow", paper_authors)
 
     with pytest.raises(ValueError, match="position is null"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
+
+
+def test_raw_arrow_candidate_plan_rejects_null_string_list_elements(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    signatures = pa.table(
+        {
+            "signature_id": pa.array(["q1", "s1", "s2"], type=pa.string()),
+            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
+            "author_first": pa.array(["Alice", "Alice", "Bob"], type=pa.string()),
+            "author_middle": pa.array(["", "", ""], type=pa.string()),
+            "author_last": pa.array(["Wang", "Wang", "Jones"], type=pa.string()),
+            "author_suffix": pa.array(["", "", ""], type=pa.string()),
+            "author_affiliations": pa.array([[None], ["AI Lab"], ["Other Lab"]], type=pa.list_(pa.string())),
+            "author_orcid": pa.array([None, None, None], type=pa.string()),
+            "author_position": pa.array([0, 0, 0], type=pa.int64()),
+        }
+    )
+    paths["signatures"] = _write_ipc(tmp_path / "signatures_with_null_list_element.arrow", signatures)
+
+    with pytest.raises(ValueError, match="author_affiliations cannot contain null list elements"):
+        s2and_rust.raw_block_query_candidate_plan_arrow(
+            paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
+
+
+def test_raw_arrow_candidate_plan_rejects_nonempty_null_list_child(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+    signatures = pa.table(
+        {
+            "signature_id": pa.array(["q1", "s1", "s2"], type=pa.string()),
+            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
+            "author_first": pa.array(["Alice", "Alice", "Bob"], type=pa.string()),
+            "author_middle": pa.array(["", "", ""], type=pa.string()),
+            "author_last": pa.array(["Wang", "Wang", "Jones"], type=pa.string()),
+            "author_suffix": pa.array(["", "", ""], type=pa.string()),
+            "author_affiliations": pa.array([[None], [], []], type=pa.list_(pa.null())),
+            "author_orcid": pa.array([None, None, None], type=pa.string()),
+            "author_position": pa.array([0, 0, 0], type=pa.int64()),
+        }
+    )
+    paths["signatures"] = _write_ipc(tmp_path / "signatures_with_null_child.arrow", signatures)
+
+    with pytest.raises(ValueError, match="author_affiliations cannot contain null list elements"):
         s2and_rust.raw_block_query_candidate_plan_arrow(
             paths,
             ["q1"],
@@ -1310,6 +1651,43 @@ def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tm
         cast(Any, candidate_batch.retrieval_scores),
     )
     assert "candidate_cluster_max_paper_author_count" in retrieval_batch.row_signals
+
+
+def test_raw_arrow_candidate_plan_bridge_maps_compact_numeric_indices(tmp_path: Path) -> None:
+    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+        raise pytest.skip.Exception("raw_block_query_candidate_plan_arrow is unavailable")
+    paths = _base_arrow_paths(tmp_path)
+
+    raw_plan = s2and_rust.raw_block_query_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=1,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+        include_pair_signature_ids=False,
+        include_component_members=False,
+    )
+    assert "left_signature_ids" not in raw_plan
+    assert "right_signature_ids" not in raw_plan
+    assert "component_members" not in raw_plan
+    assert raw_plan["seed_signature_ids"] == ["s1"]
+    assert raw_plan["telemetry"]["seed_signature_count"] == 2
+    assert raw_plan["telemetry"]["payload_seed_signature_count"] == 1
+
+    signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_plan)
+    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
+        raw_plan,
+        feature_block_signature_order=signature_order,
+    )
+
+    candidate_batch = retrieval_batch.candidate_batch
+    assert signature_order.signature_ids == ("q1", "s1")
+    assert cast(Any, candidate_batch.row_query_signature_indices).tolist() == [0]
+    assert candidate_batch.left_signature_indices.tolist() == [0]
+    assert candidate_batch.right_signature_indices.tolist() == [1]
+    assert candidate_batch.pair_row_indices.tolist() == [0]
+    assert candidate_batch.row_component_keys == ("c_match",)
 
 
 def test_raw_arrow_candidate_plan_rejects_name_counts_arrow_without_index(tmp_path: Path) -> None:
@@ -1444,6 +1822,15 @@ def test_rust_featurizer_from_arrow_paths_matches_feature_block(tmp_path: Path) 
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
+    )
+    paths["cluster_seed_disallows"] = _write_ipc(
+        tmp_path / "cluster_seed_disallows.arrow",
+        pa.table(
+            {
+                "signature_id_1": pa.array(["q1"], type=pa.string()),
+                "signature_id_2": pa.array(["s2"], type=pa.string()),
+            }
+        ),
     )
     feature_block = feature_block_from_arrow_paths(paths, raw_candidate_plan=raw_plan)
 

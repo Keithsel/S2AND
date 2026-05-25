@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -57,6 +58,68 @@ def test_cacheable_value_preserves_list_order_but_sorts_sets():
     assert model_module._cacheable_value({"year_diff", "name_counts"}) == model_module._cacheable_value(
         {"name_counts", "year_diff"}
     )
+
+
+def test_predict_arrow_full_predict_rewrites_stale_cluster_seed_sidecar(monkeypatch):
+    dataset = _as_anddata(
+        SimpleNamespace(
+            cluster_seeds_require={"s1": "c_current", "s2": "c_current"},
+            cluster_seeds_disallow=set(),
+            name_tuples=set(),
+        )
+    )
+    arrow_paths = {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+        "cluster_seeds": "stale_cluster_seeds.arrow",
+    }
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(model_module, "_resolve_dataset_arrow_paths", lambda *_args, **_kwargs: arrow_paths)
+    monkeypatch.setattr(model_module, "_cluster_seeds_require_from_arrow_paths", lambda _paths: {"s1": "stale"})
+
+    @contextmanager
+    def fake_temporary_arrow_paths_with_current_cluster_seeds(dataset_arg, arrow_paths_arg, **_kwargs):
+        captured["current_cluster_seeds"] = dict(dataset_arg.cluster_seeds_require)
+        yield {**dict(arrow_paths_arg), "cluster_seeds": "fresh_cluster_seeds.arrow"}
+
+    def fake_predict_from_arrow_paths(self, block_dict, arrow_paths_arg, **kwargs):
+        del self, kwargs
+        captured["block_dict"] = block_dict
+        captured["arrow_paths"] = dict(arrow_paths_arg)
+        return {"block": ["s1", "s2"]}, None
+
+    monkeypatch.setattr(
+        model_module,
+        "_temporary_arrow_paths_with_current_cluster_seeds",
+        fake_temporary_arrow_paths_with_current_cluster_seeds,
+    )
+    monkeypatch.setattr(Clusterer, "predict_from_arrow_paths", fake_predict_from_arrow_paths)
+
+    clusterer = Clusterer(
+        featurizer_info=FeaturizationInfo(features_to_use=["year_diff"]),
+        classifier=None,
+        n_jobs=1,
+        use_cache=False,
+    )
+    pred_clusters, dists = clusterer.predict(
+        {"block": ["s1", "s2"]},
+        dataset,
+        runtime_context=RuntimeContext(
+            operation="cluster_predict",
+            requested_backend="rust",
+            resolved_backend="rust",
+            use_rust=True,
+            run_id="test",
+            source="argument",
+        ),
+    )
+
+    assert pred_clusters == {"block": ["s1", "s2"]}
+    assert dists is None
+    assert captured["current_cluster_seeds"] == {"s1": "c_current", "s2": "c_current"}
+    assert captured["arrow_paths"]["cluster_seeds"] == "fresh_cluster_seeds.arrow"
 
 
 def _expected_upper_triangle_pairs_for_range(

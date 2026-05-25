@@ -39,13 +39,14 @@ from s2and.text import (
     AFFILIATIONS_STOP_WORDS,
     DROPPED_AFFIXES,
     NAME_PREFIXES,
-    ORCID_PATTERN,
     VENUE_STOP_WORDS,
     compute_block,
     detect_language,
     first_names_name_compatible,
     get_text_ngrams,
     get_text_ngrams_words,
+    has_name_dash,
+    normalize_orcid_compact,
     normalize_text,
     split_first_middle_hyphen_aware,
 )
@@ -239,6 +240,8 @@ def _signature_preprocess_backend_decision(runtime_context: RuntimeContext) -> b
 
 
 def _ordered_coauthors_for_signature(signature: "Signature", papers: dict[str, "Paper"]) -> list[str]:
+    if signature.author_info_position is None:
+        return []
     paper = papers.get(str(signature.paper_id))
     if paper is None:
         logger.warning(
@@ -284,6 +287,8 @@ def _build_signature_ngram_texts(
     affiliation_values = (
         [normalize_text(affiliation) for affiliation in affiliations] if normalize_affiliations else affiliations
     )
+    coauthor_values = [value for value in coauthor_values if value]
+    affiliation_values = [value for value in affiliation_values if value]
     coauthor_text = " ".join(coauthor_values) if len(coauthor_values) > 0 else ""
     affiliation_text = " ".join(affiliation_values)
     return coauthor_text, affiliation_text
@@ -963,7 +968,7 @@ class ANDData:
             counts_first_without_apostrophe.split(" ")[0] if counts_first_without_apostrophe else ""
         )
         first_for_counts = first_normalized_token_for_counts
-        if "-" in first_raw:
+        if has_name_dash(first_raw):
             joined = (counts_first_without_apostrophe or "").replace(" ", "")
             if joined:
                 first_for_counts = joined
@@ -1114,7 +1119,9 @@ class ANDData:
                             stored_last_normalized = normalize_text(signature.author_info_last)
                             stored_suffix_normalized = normalize_text(signature.author_info_suffix or "")
                             affiliations = [
-                                normalize_text(affiliation) for affiliation in signature.author_info_affiliations
+                                normalized_affiliation
+                                for affiliation in signature.author_info_affiliations
+                                if (normalized_affiliation := normalize_text(affiliation))
                             ]
                             if not defer_signature_ngrams_to_rust:
                                 coauthor_text, affiliation_text = _build_signature_ngram_texts(
@@ -1145,13 +1152,8 @@ class ANDData:
                                 ]
                             )
 
-                            # we need a regex to extract the 16 digits, keeping in mind the last digit could be X
                             if signature.author_info_orcid is not None:
-                                orcid = re.findall(ORCID_PATTERN, signature.author_info_orcid)
-                                if len(orcid) > 0:
-                                    normalized_orcid = orcid[0].upper().replace("-", "")
-                                else:
-                                    normalized_orcid = None
+                                normalized_orcid = normalize_orcid_compact(signature.author_info_orcid)
 
                     batch_rows.append(
                         {
@@ -1550,8 +1552,8 @@ class ANDData:
         first_2, middle_2_text = _materialize_constraint_name_parts(signature_2)
         middle_1 = middle_1_text.split()
 
-        orcid_1 = signature_1.author_info_orcid
-        orcid_2 = signature_2.author_info_orcid
+        orcid_1 = normalize_orcid_compact(signature_1.author_info_orcid)
+        orcid_2 = normalize_orcid_compact(signature_2.author_info_orcid)
 
         # Explicit disallow pairs are hard negatives; the incremental flag only
         # suppresses seed-cluster require groups and derived cross-group disallows.
@@ -1656,8 +1658,9 @@ class ANDData:
         """
         x = []
         y = []
-        for block_id in sorted(blocks_dict):
-            signature = blocks_dict[block_id]
+        # The seeded stratified split is order-sensitive. Preserve the incoming
+        # block order here; sorting changes pinned production-eval test sets.
+        for block_id, signature in blocks_dict.items():
             x.append(block_id)
             y.append(len(signature))
 

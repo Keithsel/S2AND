@@ -871,7 +871,7 @@ def convert_runtime_dataset_to_arrow(
     )
     write_raw_planner_indexes_seconds = time.perf_counter() - start
     physical_layout = raw_planner_arrow_physical_layout(paths)
-    if sources.specter2_path is not None and paths.get("specter2") != paths.get("specter"):
+    if sources.specter2_path is not None:
         _add_extra_specter_index_and_layout(
             paths=paths,
             raw_planner_index_metrics=raw_planner_index_metrics,

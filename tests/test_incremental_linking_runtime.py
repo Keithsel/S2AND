@@ -27,7 +27,12 @@ from s2and.incremental_linking.linker_pairwise import (
     promoted_pairwise_aggregate_columns,
 )
 from s2and.incremental_linking.logistic_gate import logistic_gate_config
-from s2and.incremental_linking.retrieval import LinkerRetrievalBatch
+from s2and.incremental_linking.retrieval import (
+    RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS,
+    RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
+    LinkerRetrievalBatch,
+    build_linker_retrieval_batch_from_raw_candidate_plan,
+)
 from s2and.incremental_linking.runtime import (
     CandidateBatchPairwiseModelResult,
     _predict_incremental_link_or_abstain_compact,
@@ -116,11 +121,11 @@ def test_pairwise_predict_class0_does_not_require_num_threads_keyword_support() 
     assert np.allclose(predictions, [0.25, 0.75])
 
 
-def test_pairwise_model_feature_indices_preserve_group_order() -> None:
+def test_pairwise_model_feature_indices_match_sorted_featurizer_order() -> None:
     featurizer_info = FeaturizationInfo(features_to_use=["second", "first"])
     featurizer_info.feature_group_to_index = {"first": [3, 1], "second": [5, 1]}
 
-    assert runtime_module._pairwise_model_feature_indices(featurizer_info) == (5, 1, 3)  # noqa: SLF001
+    assert runtime_module._pairwise_model_feature_indices(featurizer_info) == (1, 3, 5)  # noqa: SLF001
 
 
 def test_distance_row_signals_distinguish_top3_and_top5_means() -> None:
@@ -157,6 +162,7 @@ def test_raw_candidate_plan_telemetry_preserves_seed_counts_for_window_reuse() -
 
 def test_subset_raw_candidate_plan_preserves_unretrieved_component_members() -> None:
     raw_plan = {
+        "schema_version": RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
         "query_signature_ids": ["q0", "q1"],
         "query_views": ["full", "full"],
         "query_authors": ["Alice", "Alice"],
@@ -164,17 +170,47 @@ def test_subset_raw_candidate_plan_preserves_unretrieved_component_members() -> 
         "pair_count": 1,
         "row_query_signature_indices": np.asarray([0], dtype=np.uint32),
         "row_component_keys": ["c1"],
+        "retrieval_scores": np.asarray([0.9], dtype=np.float32),
+        "retrieval_ranks": np.asarray([1], dtype=np.uint16),
         "pair_row_indices": np.asarray([0], dtype=np.uint32),
         "left_signature_indices": np.asarray([0], dtype=np.uint32),
         "right_signature_indices": np.asarray([2], dtype=np.uint32),
+        "seed_signature_ids": ["s1"],
         "component_members": {"c1": ["s1"], "c2": ["s2"]},
         "telemetry": {},
     }
+    for raw_key, _signal_key, dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS:
+        raw_plan[raw_key] = np.asarray([""] if dtype is object else [0], dtype=dtype)
 
     subset = runtime_module.subset_raw_candidate_plan_for_query_ids(raw_plan, ["q0"])
 
     assert subset["row_component_keys"] == ["c1"]
     assert subset["component_members"] == {"c1": ["s1"], "c2": ["s2"]}
+
+
+def test_raw_candidate_plan_rejects_negative_retrieval_rank() -> None:
+    raw_plan = {
+        "schema_version": RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
+        "query_signature_ids": ["q0"],
+        "query_views": ["full"],
+        "query_authors": ["Alice"],
+        "row_count": 1,
+        "pair_count": 1,
+        "row_query_signature_indices": np.asarray([0], dtype=np.uint32),
+        "row_component_keys": ["c1"],
+        "retrieval_scores": np.asarray([0.9], dtype=np.float32),
+        "retrieval_ranks": [-1],
+        "pair_row_indices": np.asarray([0], dtype=np.uint32),
+        "left_signature_indices": np.asarray([0], dtype=np.uint32),
+        "right_signature_indices": np.asarray([1], dtype=np.uint32),
+        "left_signature_ids": ["q0"],
+        "right_signature_ids": ["s1"],
+    }
+    for raw_key, _signal_key, dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS:
+        raw_plan[raw_key] = np.asarray([""] if dtype is object else [0], dtype=dtype)
+
+    with pytest.raises(ValueError, match="retrieval_ranks"):
+        build_linker_retrieval_batch_from_raw_candidate_plan(raw_plan, signature_id_to_index={"q0": 0, "s1": 1})
 
 
 def test_subset_row_signals_rejects_non_1d_signals() -> None:
@@ -341,6 +377,47 @@ class FakeProductionClusterer:
             api_mode="fake",
             elapsed_seconds=0.0,
         )
+
+
+def test_private_production_forwards_four_element_seed_setup_to_retrieval_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    split_inverse = {"c1_0": ["s1"]}
+    captured: dict[str, Any] = {}
+
+    class FourElementSeedSetupClusterer(FakeProductionClusterer):
+        def _build_incremental_seed_setup(
+            self,
+            _dataset: object,
+            _partial_supervision: dict[tuple[str, str], int | float],
+            _runtime_context: object,
+            total_ram_bytes: int | None = None,
+        ):
+            del total_ram_bytes
+            return {"s1": "c1_0"}, {"c1_0": "c1"}, {"c1": ["s1"]}, split_inverse
+
+    def fake_from_retrieval_private(*_args: Any, **kwargs: Any) -> Any:
+        captured["seed_setup"] = kwargs["seed_setup"]
+        return SimpleNamespace(ok=True)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_predict_incremental_link_or_abstain_production_from_retrieval_private",
+        fake_from_retrieval_private,
+    )
+
+    result = runtime_module._predict_incremental_link_or_abstain_production_private(  # noqa: SLF001
+        FourElementSeedSetupClusterer({"s1": "c1"}),
+        _static_artifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0)),
+        dataset=SimpleNamespace(),
+        featurizer=FakeRuntimeFeaturizer(["s1"]),
+        retriever=object(),
+        queries=[],
+        query_signature_ids=[],
+    )
+
+    assert result.ok is True
+    assert captured["seed_setup"][3] is split_inverse
 
 
 def _tiny_booster() -> tuple[lgb.Booster, np.ndarray]:
@@ -1651,6 +1728,46 @@ def test_private_production_slice_supplies_query_author_to_logistic_gate(
     )
 
     assert result.compact_result.decisions[0].action == "link"
+
+
+def test_private_production_slice_uses_explicit_retrieval_top_k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = SimpleNamespace()
+    featurizer = FakeRuntimeFeaturizer(["q1", "s1"])
+    clusterer = FakeProductionClusterer({"s1": "c1"})
+    artifact = _static_artifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0))
+    captured: dict[str, int] = {}
+    sentinel = object()
+
+    def fake_retrieval(**kwargs: Any) -> LinkerRetrievalBatch:
+        captured["top_k"] = int(kwargs["top_k"])
+        return runtime_module._empty_retrieval_batch()  # noqa: SLF001
+
+    def fake_from_retrieval(*args: Any, **kwargs: Any) -> object:
+        captured["forwarded_retrieval_top_k"] = int(kwargs["retrieval_top_k"])
+        return sentinel
+
+    monkeypatch.setattr(runtime_module, "build_linker_retrieval_batch_rust", fake_retrieval)
+    monkeypatch.setattr(
+        runtime_module,
+        "_predict_incremental_link_or_abstain_production_from_retrieval_private",
+        fake_from_retrieval,
+    )
+
+    result = _predict_incremental_link_or_abstain_production_private(
+        clusterer,
+        artifact,
+        dataset=dataset,
+        featurizer=featurizer,
+        retriever=object(),
+        queries=[object()],
+        query_signature_ids=["q1"],
+        retrieval_top_k=7,
+    )
+
+    assert result is sentinel
+    assert captured == {"top_k": 7, "forwarded_retrieval_top_k": 7}
 
 
 def test_production_query_author_row_signals_reuses_retrieval_signal() -> None:

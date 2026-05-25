@@ -8,6 +8,7 @@ import numpy as np
 
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
+from s2and.incremental_linking.array_validation import as_uint32_1d
 from s2and.runtime import min_supported_rust_extension_version_string
 from s2and.thread_config import resolve_n_jobs
 
@@ -64,10 +65,11 @@ def update_rust_cluster_seeds(
     bump_version: bool = True,
 ) -> None:
     featurizer = _get_rust_featurizer_for_cluster_seed_update(dataset, runtime_context=runtime_context)
-    if bump_version:
-        dataset._cluster_seeds_version = int(getattr(dataset, "_cluster_seeds_version", 0)) + 1
-    target_seed_version = int(getattr(dataset, "_cluster_seeds_version", 0))
+    current_seed_version = int(getattr(dataset, "_cluster_seeds_version", 0))
+    target_seed_version = current_seed_version + 1 if bump_version else current_seed_version
     featurizer.update_cluster_seeds(dataset.cluster_seeds_require, dataset.cluster_seeds_disallow)
+    if bump_version:
+        dataset._cluster_seeds_version = target_seed_version
     _promote_rust_featurizer_cluster_seed_version(
         dataset,
         featurizer,
@@ -195,8 +197,8 @@ def get_constraint_labels_index_arrays_rust(
         )
     return np.asarray(
         method(
-            np.ascontiguousarray(left_signature_indices, dtype=np.uint32),
-            np.ascontiguousarray(right_signature_indices, dtype=np.uint32),
+            as_uint32_1d("left_signature_indices", left_signature_indices),
+            as_uint32_1d("right_signature_indices", right_signature_indices),
             float(low_value),
             float(high_value),
             bool(dont_merge_cluster_seeds),
@@ -234,7 +236,7 @@ def build_linker_pair_distance_accumulators_rust(
     resolved_num_threads = None if num_threads is None else resolve_n_jobs(num_threads)
     labels_arg = None if pair_labels is None else np.ascontiguousarray(pair_labels, dtype=np.float64)
     counts, sums, mins, top_distances, hard_disallow_pair_count = method(
-        np.ascontiguousarray(row_indices, dtype=np.uint32),
+        as_uint32_1d("row_indices", row_indices),
         int(row_count),
         np.ascontiguousarray(pair_distances, dtype=np.float64),
         labels_arg,
@@ -396,9 +398,9 @@ def build_linker_pair_features_and_aggregate_stats_arrays_rust(
     resolved_num_threads = None if num_threads is None else resolve_n_jobs(num_threads)
     resolved_aggregate_nan_value = nan_value if aggregate_nan_value is None else float(aggregate_nan_value)
     result = method(
-        np.ascontiguousarray(left_signature_indices, dtype=np.uint32),
-        np.ascontiguousarray(right_signature_indices, dtype=np.uint32),
-        np.ascontiguousarray(row_indices, dtype=np.uint32),
+        as_uint32_1d("left_signature_indices", left_signature_indices),
+        as_uint32_1d("right_signature_indices", right_signature_indices),
+        as_uint32_1d("row_indices", row_indices),
         int(row_count),
         matrix_indices,
         aggregate_indices,
@@ -440,7 +442,7 @@ def build_linker_pair_aggregate_stats_arrays_rust(
     nan_value: float = np.nan,
     runtime_context: Any | None = None,
     featurizer: Any | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Build row-level aggregate stats from numeric pair index arrays without returning pair features."""
 
     featurizer = _resolve_featurizer(dataset, featurizer, runtime_context)
@@ -451,10 +453,10 @@ def build_linker_pair_aggregate_stats_arrays_rust(
             "rebuild/install a newer s2and-rust extension."
         )
     resolved_num_threads = None if num_threads is None else resolve_n_jobs(num_threads)
-    counts, sums, mins, maxs = method(
-        np.ascontiguousarray(left_signature_indices, dtype=np.uint32),
-        np.ascontiguousarray(right_signature_indices, dtype=np.uint32),
-        np.ascontiguousarray(row_indices, dtype=np.uint32),
+    counts, valid_counts, sums, mins, maxs = method(
+        as_uint32_1d("left_signature_indices", left_signature_indices),
+        as_uint32_1d("right_signature_indices", right_signature_indices),
+        as_uint32_1d("row_indices", row_indices),
         int(row_count),
         aggregate_indices,
         resolved_num_threads,
@@ -462,6 +464,7 @@ def build_linker_pair_aggregate_stats_arrays_rust(
     )
     return (
         np.asarray(counts, dtype=np.uint32),
+        np.asarray(valid_counts, dtype=np.uint64),
         np.asarray(sums, dtype=np.float64),
         np.asarray(mins, dtype=np.float64),
         np.asarray(maxs, dtype=np.float64),

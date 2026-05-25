@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
-use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -487,6 +486,7 @@ type PaperId = String;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct SignatureData {
+    // Python author_info_first_normalized_without_apostrophe.
     first: Option<String>,
     middle: Option<String>,
     last_normalized: Option<String>,
@@ -499,7 +499,18 @@ struct SignatureData {
     position: i64,
     paper_id: PaperId,
     name_counts: Option<NameCountsData>,
+    // Same canonical first-name field used by Python name_text_features.
     adv_name: Option<String>,
+}
+
+impl SignatureData {
+    fn first_without_apostrophe(&self) -> Option<&str> {
+        self.first.as_deref()
+    }
+
+    fn adv_name_for_features(&self) -> Option<&str> {
+        self.adv_name.as_deref()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -670,6 +681,34 @@ impl RetrievalHybridWeights {
     }
 }
 
+fn filter_excluded_candidate_indices(
+    indices: Vec<usize>,
+    excluded_candidate_indices: Option<&HashSet<usize>>,
+) -> Vec<usize> {
+    let Some(excluded) = excluded_candidate_indices else {
+        return indices;
+    };
+    if excluded.is_empty() {
+        return indices;
+    }
+    indices
+        .into_iter()
+        .filter(|index| !excluded.contains(index))
+        .collect()
+}
+
+fn default_candidate_indices(
+    summary_count: usize,
+    base_candidate_indices: Option<&[usize]>,
+    excluded_candidate_indices: Option<&HashSet<usize>>,
+) -> Vec<usize> {
+    let values = base_candidate_indices.map_or_else(
+        || (0..summary_count).collect::<Vec<_>>(),
+        |base_values| base_values.to_vec(),
+    );
+    filter_excluded_candidate_indices(values, excluded_candidate_indices)
+}
+
 #[derive(Clone, Copy)]
 enum RetrievalFirstNameMode {
     Prefix,
@@ -784,6 +823,7 @@ struct PairAggregateRowRange {
 
 struct PairAggregateBuffers {
     counts: Vec<u32>,
+    valid_counts: Vec<u64>,
     sums: Vec<f64>,
     mins: Vec<f64>,
     maxs: Vec<f64>,
@@ -796,6 +836,26 @@ fn checked_retrieved_row_index(base_row_index: u32, local_row_index: usize) -> P
     base_row_index.checked_add(local_row_index).ok_or_else(|| {
         pyo3::exceptions::PyOverflowError::new_err("retrieved candidate row count exceeds u32")
     })
+}
+
+fn validate_positive_top_k(top_k: usize) -> PyResult<()> {
+    if top_k == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "top_k must be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retrieval_rank_top_k(top_k: usize) -> PyResult<()> {
+    validate_positive_top_k(top_k)?;
+    if top_k > u16::MAX as usize {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "top_k must be <= {} because retrieval_ranks are stored as uint16",
+            u16::MAX
+        )));
+    }
+    Ok(())
 }
 
 struct LinkerPairDistanceAccumulator {
@@ -991,21 +1051,10 @@ impl RustHybridCentroidRetriever {
         query_data: &RetrievalQueryData,
         mut candidate_indices: Vec<usize>,
     ) -> RetrievalCandidateSelection {
-        if let Some(orcid_hash) = query_data.orcid_hash {
-            let orcid_matches: Vec<usize> = self
-                .summaries
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, summary)| {
-                    contains_hashed_value(&summary.orcid_hashes, orcid_hash).then_some(idx)
-                })
-                .collect();
-            if !orcid_matches.is_empty() {
-                return RetrievalCandidateSelection {
-                    indices: orcid_matches,
-                    return_all: true,
-                };
-            }
+        if let Some(selection) =
+            self.orcid_candidate_selection_for_query(query_data, candidate_indices.iter().copied())
+        {
+            return selection;
         }
 
         let middle_filtered: Vec<usize> = candidate_indices
@@ -1043,14 +1092,46 @@ impl RustHybridCentroidRetriever {
         }
     }
 
+    fn orcid_candidate_selection_for_query<I>(
+        &self,
+        query_data: &RetrievalQueryData,
+        candidate_indices: I,
+    ) -> Option<RetrievalCandidateSelection>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let orcid_hash = query_data.orcid_hash?;
+        let orcid_matches: Vec<usize> = candidate_indices
+            .into_iter()
+            .filter(|idx| contains_hashed_value(&self.summaries[*idx].orcid_hashes, orcid_hash))
+            .collect();
+        if orcid_matches.is_empty() {
+            None
+        } else {
+            Some(RetrievalCandidateSelection {
+                indices: orcid_matches,
+                return_all: true,
+            })
+        }
+    }
+
     fn candidate_indices_for_pair_plan_query(
         &self,
         query_data: &RetrievalQueryData,
         base_candidate_indices: Option<&[usize]>,
+        excluded_candidate_indices: Option<&HashSet<usize>>,
         query_signature_id: Option<&str>,
         selector: Option<&RustNameCompatibleSubblockSelector>,
         global_backfill_count: usize,
+        allow_global_orcid_override: bool,
     ) -> RetrievalCandidateSelection {
+        if allow_global_orcid_override {
+            if let Some(selection) =
+                self.orcid_candidate_selection_for_query(query_data, 0..self.summaries.len())
+            {
+                return selection;
+            }
+        }
         let selected = if query_data.has_full_first {
             match (query_signature_id, selector) {
                 (Some(signature_id), Some(selector)) => selector
@@ -1066,12 +1147,26 @@ impl RustHybridCentroidRetriever {
         } else {
             None
         };
-        let candidate_indices = selected.unwrap_or_else(|| {
-            base_candidate_indices.map_or_else(
-                || (0..self.summaries.len()).collect(),
-                |values| values.to_vec(),
-            )
-        });
+        let candidate_indices = match selected {
+            Some(indices) => {
+                let filtered =
+                    filter_excluded_candidate_indices(indices, excluded_candidate_indices);
+                if filtered.is_empty() {
+                    default_candidate_indices(
+                        self.summaries.len(),
+                        base_candidate_indices,
+                        excluded_candidate_indices,
+                    )
+                } else {
+                    filtered
+                }
+            }
+            None => default_candidate_indices(
+                self.summaries.len(),
+                base_candidate_indices,
+                excluded_candidate_indices,
+            ),
+        };
         self.hard_filtered_candidate_indices_for_query(query_data, candidate_indices)
     }
 
@@ -1080,18 +1175,22 @@ impl RustHybridCentroidRetriever {
         current_query: &RetrievalQueryData,
         query_signature_index: u32,
         base_candidate_indices: Option<&[usize]>,
+        excluded_candidate_indices: Option<&HashSet<usize>>,
         query_signature_id: Option<&str>,
         component_member_indices: &HashMap<String, Vec<u32>>,
         top_k: usize,
         selector: Option<&RustNameCompatibleSubblockSelector>,
         global_backfill_count: usize,
+        allow_global_orcid_override: bool,
     ) -> Result<RetrievalPairPlanQueryResult, String> {
         let selection = self.candidate_indices_for_pair_plan_query(
             current_query,
             base_candidate_indices,
+            excluded_candidate_indices,
             query_signature_id,
             selector,
             global_backfill_count,
+            allow_global_orcid_override,
         );
         if selection.indices.is_empty() {
             return Ok(RetrievalPairPlanQueryResult::default());
@@ -1269,50 +1368,6 @@ impl RustHybridCentroidRetriever {
             override_index,
             override_summary,
         );
-        Ok(self.scored_candidates_to_keys_scores(scored, override_index, override_summary))
-    }
-
-    fn score_top_k_candidate_indices(
-        &self,
-        py: Python<'_>,
-        query_data: &RetrievalQueryData,
-        candidate_indices: &[usize],
-        top_k: usize,
-        num_threads: Option<usize>,
-        override_index: Option<usize>,
-        override_summary: Option<&RetrievalSummaryData>,
-        weights: RetrievalHybridWeights,
-    ) -> PyResult<(Vec<String>, Vec<f32>)> {
-        if candidate_indices.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        let scored: Vec<(usize, f32)> = py.allow_threads(|| {
-            let compute = || {
-                let mut scored = candidate_indices
-                    .par_iter()
-                    .map(|idx| {
-                        let summary = self.summary_for_candidate_index(
-                            *idx,
-                            override_index,
-                            override_summary,
-                        );
-                        (
-                            *idx,
-                            score_hybrid_centroid_query(query_data, summary, weights),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                self.keep_sorted_top_k_scored_candidates(
-                    &mut scored,
-                    top_k,
-                    override_index,
-                    override_summary,
-                );
-                scored
-            };
-            install_with_optional_rayon_pool(num_threads, compute)
-        });
         Ok(self.scored_candidates_to_keys_scores(scored, override_index, override_summary))
     }
 }
@@ -1582,15 +1637,10 @@ fn extract_pair_set(obj: &Bound<'_, PyAny>) -> PyResult<HashSet<(String, String)
 }
 
 fn insert_name_tuple_alias(map: &mut HashMap<String, HashSet<String>>, a: String, b: String) {
-    let left = a.trim().to_lowercase();
-    let right = b.trim().to_lowercase();
-    if left.is_empty() || right.is_empty() {
-        return;
-    }
-    map.entry(left.clone())
+    map.entry(a.clone())
         .or_insert_with(HashSet::new)
-        .insert(right.clone());
-    map.entry(right).or_insert_with(HashSet::new).insert(left);
+        .insert(b.clone());
+    map.entry(b).or_insert_with(HashSet::new).insert(a);
 }
 
 fn extract_name_tuples_map(obj: &Bound<'_, PyAny>) -> PyResult<HashMap<String, HashSet<String>>> {
@@ -1860,16 +1910,13 @@ fn normalize_text_compat_from_map(
             transliterated.push(ch.to_ascii_lowercase());
             continue;
         }
-        if let Some(mapped) = unidecode_char_map.get(&ch) {
-            for mapped_ch in mapped.chars() {
-                for lowered in mapped_ch.to_lowercase() {
-                    transliterated.push(lowered);
-                }
+        let mapped = unidecode_char_map
+            .get(&ch)
+            .unwrap_or_else(|| panic!("missing unidecode mapping for non-ASCII character {ch:?}"));
+        for mapped_ch in mapped.chars() {
+            for lowered in mapped_ch.to_lowercase() {
+                transliterated.push(lowered);
             }
-            continue;
-        }
-        for lowered in ch.to_lowercase() {
-            transliterated.push(lowered);
         }
     }
 
@@ -1895,13 +1942,47 @@ fn normalize_text_compat_from_map(
     normalized
 }
 
+fn first_normalized_token_python_compat(
+    first_normalized: &str,
+    middle_normalized: &str,
+    name_prefixes: &HashSet<String>,
+) -> String {
+    let joined = format!("{} {}", first_normalized, middle_normalized);
+    let mut parts: Vec<String> = joined.split(' ').map(|token| token.to_string()).collect();
+    if let Some(prefix) = parts.first() {
+        if name_prefixes.contains(prefix) {
+            parts.remove(0);
+        }
+    }
+    parts.get(0).cloned().unwrap_or_default()
+}
+
+fn is_name_dash(ch: char) -> bool {
+    matches!(
+        ch,
+        '-' | '\u{2010}'
+            | '\u{2011}'
+            | '\u{2012}'
+            | '\u{2013}'
+            | '\u{2014}'
+            | '\u{2212}'
+            | '\u{FE58}'
+            | '\u{FE63}'
+            | '\u{FF0D}'
+    )
+}
+
+fn contains_name_dash(value: &str) -> bool {
+    value.chars().any(is_name_dash)
+}
+
 fn split_first_middle_hyphen_aware_compat(
     first_raw: &str,
     middle_raw: &str,
     name_prefixes: &HashSet<String>,
     unidecode_char_map: &HashMap<char, String>,
 ) -> (String, String) {
-    let has_dash_in_first = first_raw.contains('-');
+    let has_dash_in_first = contains_name_dash(first_raw);
     let first_noapos = normalize_text_compat_from_map(first_raw, true, unidecode_char_map);
     let middle_norm = normalize_text_compat_from_map(middle_raw, false, unidecode_char_map);
 
@@ -1949,15 +2030,6 @@ fn compute_block_compat(name: &str) -> String {
     format!("{} {}", first_initial, name_parts[name_parts.len() - 1])
 }
 
-fn env_flag_true(name: &str) -> bool {
-    env::var(name)
-        .map(|value| {
-            let lower = value.to_ascii_lowercase();
-            lower == "1" || lower == "true" || lower == "yes"
-        })
-        .unwrap_or(false)
-}
-
 fn parse_fasttext_label(label: &str) -> String {
     label.rsplit("__").next().unwrap_or(label).to_string()
 }
@@ -1968,6 +2040,14 @@ fn resolve_fasttext_model_path(py: Python<'_>) -> Option<String> {
     let file_cache = py.import("s2and.file_cache").ok()?;
     let cached_path = file_cache.getattr("cached_path").ok()?;
     cached_path.call1((fasttext_path,)).ok()?.extract().ok()
+}
+
+fn python_fasttext_loading_enabled(py: Python<'_>) -> bool {
+    py.import("s2and.text")
+        .and_then(|text_module| text_module.getattr("fasttext_loading_enabled"))
+        .and_then(|enabled_fn| enabled_fn.call0())
+        .and_then(|enabled| enabled.extract::<bool>())
+        .unwrap_or(true)
 }
 
 fn emit_runtime_warning(py: Python<'_>, message: &str) {
@@ -1982,7 +2062,7 @@ struct LanguageDetectorCompat {
 
 impl LanguageDetectorCompat {
     fn new(py: Python<'_>) -> Self {
-        if env_flag_true("S2AND_SKIP_FASTTEXT") {
+        if !python_fasttext_loading_enabled(py) {
             return Self { fasttext: None };
         }
         let fasttext = resolve_fasttext_model_path(py).and_then(|model_path| {
@@ -2066,48 +2146,6 @@ impl LanguageDetectorCompat {
     }
 }
 
-fn extract_orcid_from_source_id(source_id: &str) -> Option<String> {
-    let chars: Vec<char> = source_id.chars().collect();
-    if chars.len() < 16 {
-        return None;
-    }
-    for start in 0..chars.len() {
-        let mut idx = start;
-        let mut compact = String::with_capacity(16);
-        let mut valid = true;
-
-        for (group_idx, group_len) in [4usize, 4, 4, 3].iter().enumerate() {
-            for _ in 0..*group_len {
-                if idx >= chars.len() || !chars[idx].is_ascii_digit() {
-                    valid = false;
-                    break;
-                }
-                compact.push(chars[idx]);
-                idx += 1;
-            }
-            if !valid {
-                break;
-            }
-            if group_idx < 3 && idx < chars.len() && chars[idx] == '-' {
-                idx += 1;
-            }
-        }
-        if !valid {
-            continue;
-        }
-        if idx >= chars.len() {
-            continue;
-        }
-        let last = chars[idx];
-        if !(last.is_ascii_digit() || last == 'X') {
-            continue;
-        }
-        compact.push(last);
-        return Some(compact);
-    }
-    None
-}
-
 fn counter_data_from_usize_map(counter_map: HashMap<String, usize>) -> Option<CounterData> {
     if counter_map.is_empty() {
         return None;
@@ -2169,29 +2207,83 @@ fn term_set_from_normalized_text(text: &str) -> HashSet<String> {
         .collect()
 }
 
+fn is_orcid_dash(ch: char) -> bool {
+    matches!(
+        ch,
+        '-' | '\u{2010}'
+            | '\u{2011}'
+            | '\u{2012}'
+            | '\u{2013}'
+            | '\u{2014}'
+            | '\u{2212}'
+            | '\u{FE58}'
+            | '\u{FE63}'
+            | '\u{FF0D}'
+    )
+}
+
 fn normalize_orcid_owned(value: &str) -> Option<String> {
-    let mut compact = String::with_capacity(16);
-    for ch in value.trim().chars() {
-        if ch.is_ascii_digit() {
-            compact.push(ch);
-        } else if ch == 'X' || ch == 'x' {
-            compact.push('X');
+    let chars: Vec<char> = value.trim().chars().collect();
+    for start in 0..chars.len() {
+        if !chars[start].is_ascii_digit() {
+            continue;
+        }
+        if start > 0
+            && (chars[start - 1].is_ascii_digit()
+                || chars[start - 1] == 'X'
+                || chars[start - 1] == 'x')
+        {
+            continue;
+        }
+        let mut compact = String::with_capacity(16);
+        let mut idx = start;
+        let mut valid = true;
+        for (group_index, group_len) in [4usize, 4, 4, 3].iter().enumerate() {
+            for _ in 0..*group_len {
+                if idx >= chars.len() || !chars[idx].is_ascii_digit() {
+                    valid = false;
+                    break;
+                }
+                compact.push(chars[idx]);
+                idx += 1;
+            }
+            if !valid {
+                break;
+            }
+            if group_index < 3 && idx < chars.len() && is_orcid_dash(chars[idx]) {
+                idx += 1;
+            }
+        }
+        if !valid || idx >= chars.len() {
+            continue;
+        }
+        let check_digit = chars[idx];
+        if !(check_digit.is_ascii_digit() || check_digit == 'X' || check_digit == 'x') {
+            continue;
+        }
+        compact.push(check_digit.to_ascii_uppercase());
+        idx += 1;
+        let bytes = compact.as_bytes();
+        if bytes.len() == 16
+            && bytes[..15].iter().all(|byte| byte.is_ascii_digit())
+            && (bytes[15].is_ascii_digit() || bytes[15] == b'X')
+            && (idx == chars.len()
+                || !(chars[idx].is_ascii_digit() || chars[idx] == 'X' || chars[idx] == 'x'))
+        {
+            return Some(format!(
+                "{}-{}-{}-{}",
+                &compact[0..4],
+                &compact[4..8],
+                &compact[8..12],
+                &compact[12..16]
+            ));
         }
     }
-    let bytes = compact.as_bytes();
-    if bytes.len() != 16
-        || bytes[..15].iter().any(|byte| !byte.is_ascii_digit())
-        || !(bytes[15].is_ascii_digit() || bytes[15] == b'X')
-    {
-        return None;
-    }
-    Some(format!(
-        "{}-{}-{}-{}",
-        &compact[0..4],
-        &compact[4..8],
-        &compact[8..12],
-        &compact[12..16]
-    ))
+    None
+}
+
+fn normalize_orcid_compact_owned(value: &str) -> Option<String> {
+    normalize_orcid_owned(value).map(|orcid| orcid.replace('-', ""))
 }
 
 #[derive(Clone)]
@@ -2254,86 +2346,6 @@ struct RawArrowPaperEvidenceRow {
     local_author_window10_jaccard_max: f32,
     local_author_window10_overlap_count_max: f32,
     best_author_count_log_absdiff: f32,
-}
-
-struct RawArrowCandidatePlanState {
-    features_by_signature_id: HashMap<String, RawArrowFeature>,
-    specter_by_paper_id: Option<HashMap<String, Arc<Vec<f32>>>>,
-    signatures: HashMap<String, RawArrowSignature>,
-    papers: HashMap<String, RawArrowPaper>,
-    paper_authors: HashMap<String, Vec<(i64, String)>>,
-    raw_members_by_component: HashMap<String, Vec<String>>,
-    members_by_component: HashMap<String, Vec<String>>,
-    component_member_indices: HashMap<String, Vec<u32>>,
-    summary_signals_by_component: HashMap<String, RawArrowSummarySignalData>,
-    author_signals_by_query_signature_id: HashMap<String, RawArrowAuthorSignalData>,
-    retriever: RustHybridCentroidRetriever,
-    component_order: Vec<String>,
-    seed_signature_ids: Vec<String>,
-    seed_component_keys: Vec<String>,
-}
-
-impl RawArrowCandidatePlanState {
-    fn cleanup_success(self) {
-        let RawArrowCandidatePlanState {
-            features_by_signature_id,
-            specter_by_paper_id,
-            signatures,
-            papers,
-            paper_authors,
-            raw_members_by_component,
-            members_by_component,
-            component_member_indices,
-            summary_signals_by_component,
-            author_signals_by_query_signature_id,
-            retriever,
-            component_order,
-            seed_signature_ids,
-            seed_component_keys,
-        } = self;
-        let RustHybridCentroidRetriever {
-            summaries,
-            component_index_by_key,
-            coauthor_cluster_df,
-            non_mega_coauthor_cluster_df,
-            affiliation_cluster_df,
-        } = retriever;
-        parallel_drop_hashmap(features_by_signature_id);
-        if let Some(specter) = specter_by_paper_id {
-            parallel_drop_hashmap(specter);
-        }
-        parallel_drop_hashmap(signatures);
-        parallel_drop_hashmap(papers);
-        parallel_drop_hashmap(paper_authors);
-        parallel_drop_hashmap(raw_members_by_component);
-        parallel_drop_hashmap(members_by_component);
-        parallel_drop_hashmap(component_member_indices);
-        parallel_drop_hashmap(summary_signals_by_component);
-        parallel_drop_hashmap(author_signals_by_query_signature_id);
-        parallel_drop_vec(summaries);
-        parallel_drop_vec(component_order);
-        parallel_drop_vec(seed_signature_ids);
-        parallel_drop_vec(seed_component_keys);
-        drop(component_index_by_key);
-        drop(coauthor_cluster_df);
-        drop(non_mega_coauthor_cluster_df);
-        drop(affiliation_cluster_df);
-    }
-}
-
-fn log_raw_arrow_candidate_plan_state_error(stage: &str, total_start: Instant) {
-    eprintln!(
-        "raw_block_query_candidate_plan_arrow stage={stage} elapsed_secs={} cleanup=ordinary_rust_drop",
-        total_start.elapsed().as_secs_f64()
-    );
-}
-
-fn parallel_drop_vec<T: Send>(values: Vec<T>) {
-    values.into_par_iter().for_each(drop);
-}
-
-fn parallel_drop_hashmap<K: Send, V: Send>(values: HashMap<K, V>) {
-    values.into_par_iter().for_each(drop);
 }
 
 fn io_error_to_py(context: &str, path: &str, err: impl std::fmt::Display) -> PyErr {
@@ -2492,7 +2504,9 @@ impl ArrowBatchLookupIndex {
             })?;
         if mmap.len() != expected_len {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Arrow batch lookup index '{path}' length {} does not match expected length {expected_len}",
+                "Arrow batch lookup index '{path}' length {} does not match expected length {expected_len} \
+                 (record_count={record_count}, header_len={ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN}, \
+                 record_len={ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN})",
                 mmap.len()
             )));
         }
@@ -2973,10 +2987,16 @@ fn arrow_string_array_values(array: &dyn Array, context: &str) -> PyResult<Vec<S
                 .ok_or_else(|| {
                     pyo3::exceptions::PyTypeError::new_err(format!("{context} is not a Utf8 array"))
                 })?;
-            Ok((0..values.len())
-                .filter(|idx| !values.is_null(*idx))
-                .map(|idx| values.value(idx).to_string())
-                .collect())
+            let mut out = Vec::with_capacity(values.len());
+            for idx in 0..values.len() {
+                if values.is_null(idx) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{context} cannot contain null list elements"
+                    )));
+                }
+                out.push(values.value(idx).to_string());
+            }
+            Ok(out)
         }
         DataType::LargeUtf8 => {
             let values = array
@@ -2987,12 +3007,26 @@ fn arrow_string_array_values(array: &dyn Array, context: &str) -> PyResult<Vec<S
                         "{context} is not a LargeUtf8 array"
                     ))
                 })?;
-            Ok((0..values.len())
-                .filter(|idx| !values.is_null(*idx))
-                .map(|idx| values.value(idx).to_string())
-                .collect())
+            let mut out = Vec::with_capacity(values.len());
+            for idx in 0..values.len() {
+                if values.is_null(idx) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{context} cannot contain null list elements"
+                    )));
+                }
+                out.push(values.value(idx).to_string());
+            }
+            Ok(out)
         }
-        DataType::Null => Ok(Vec::new()),
+        DataType::Null => {
+            if array.len() == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{context} cannot contain null list elements"
+                )))
+            }
+        }
         other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
             "{context} list values must be strings, got {other:?}"
         ))),
@@ -3340,12 +3374,7 @@ fn read_raw_arrow_cluster_seed_disallows(path: &str) -> PyResult<HashSet<(String
                 )));
             }
             let pair = canonical_signature_pair_owned(left, right);
-            if !out.insert(pair.clone()) {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "cluster_seed_disallows contains a duplicate undirected pair: {:?} / {:?}",
-                    pair.0, pair.1
-                )));
-            }
+            out.insert(pair);
         }
     }
     Ok(out)
@@ -3382,7 +3411,7 @@ fn read_raw_arrow_specter_from_batches(
                 arrow_optional_f32_vector(embedding_col.as_ref(), row, "embedding")?
             {
                 if !vector.is_empty() {
-                    out.insert(paper_id, vector);
+                    insert_nonzero_specter_row(&mut out, &paper_id, &vector);
                 }
             }
         }
@@ -3405,17 +3434,20 @@ where
         let (batches, stats) = read_indexed_arrow_batches(path, index_path, key_column, keep_ids)?;
         return Ok((read_from_batches(path, batches, Some(keep_ids))?, stats));
     }
+    if keep_ids.is_some() && index_path.is_none() && !full_scan_without_index {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Refusing filtered full scan of Arrow IPC file '{path}' without a batch lookup index for key column \
+             '{key_column}'. Provide the matching *_batch_index path or set full_scan_without_index=true for an \
+             explicit small/full-scan path."
+        )));
+    }
     let batches = read_arrow_batches(path)?;
-    let loaded = read_from_batches(
-        path,
-        batches,
-        if full_scan_without_index {
-            None
-        } else {
-            keep_ids
-        },
-    )?;
-    Ok((loaded, IndexedArrowReadStats::default()))
+    let stats = IndexedArrowReadStats {
+        batches_read: batches.len(),
+        rows_scanned: batches.iter().map(|batch| batch.num_rows()).sum(),
+    };
+    let loaded = read_from_batches(path, batches, keep_ids)?;
+    Ok((loaded, stats))
 }
 
 fn read_raw_arrow_signatures_with_optional_index(
@@ -3631,11 +3663,8 @@ fn preprocess_stage_papers(
     paper_inputs
         .par_iter()
         .map(|paper_input| {
-            let title = if preprocess {
-                normalize_text_compat_from_map(&paper_input.raw_title, false, unidecode_char_map)
-            } else {
-                paper_input.raw_title.clone()
-            };
+            let title =
+                normalize_text_compat_from_map(&paper_input.raw_title, false, unidecode_char_map);
             let venue = if preprocess {
                 normalize_text_compat_from_map(&paper_input.raw_venue, false, unidecode_char_map)
             } else {
@@ -3646,25 +3675,18 @@ fn preprocess_stage_papers(
             } else {
                 paper_input.raw_journal.clone()
             };
-            let authors = if preprocess {
-                paper_input
-                    .raw_authors
-                    .iter()
-                    .map(|(position, raw_name)| {
-                        (
-                            *position,
-                            normalize_text_compat_from_map(raw_name, false, unidecode_char_map),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                paper_input.raw_authors.clone()
-            };
-            let title_words = if preprocess {
-                counter_data_from_usize_map(word_ngrams_counter_python_compat(&title, stop_words))
-            } else {
-                None
-            };
+            let authors = paper_input
+                .raw_authors
+                .iter()
+                .map(|(position, raw_name)| {
+                    (
+                        *position,
+                        normalize_text_compat_from_map(raw_name, false, unidecode_char_map),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let title_words =
+                counter_data_from_usize_map(word_ngrams_counter_python_compat(&title, stop_words));
             let title_chars = if preprocess {
                 counter_data_from_usize_map(char_ngrams_counter_python_compat(
                     &title,
@@ -3729,17 +3751,11 @@ fn preprocess_stage_signatures(
                 normalize_text_compat_from_map(&entry.raw_middle, false, unidecode_char_map);
             let first_normalized =
                 normalize_text_compat_from_map(&entry.raw_first, false, unidecode_char_map);
-            let mut first_middle_split: Vec<String> =
-                format!("{} {}", first_normalized, middle_normalized)
-                    .split_whitespace()
-                    .map(|token| token.to_string())
-                    .collect();
-            if let Some(prefix) = first_middle_split.first() {
-                if name_prefixes.contains(prefix) {
-                    first_middle_split.remove(0);
-                }
-            }
-            let first_normalized_token = first_middle_split.get(0).cloned().unwrap_or_default();
+            let first_normalized_token = first_normalized_token_python_compat(
+                &first_normalized,
+                &middle_normalized,
+                name_prefixes,
+            );
             let (first_without_apostrophe, middle_without_apostrophe) =
                 split_first_middle_hyphen_aware_compat(
                     &entry.raw_first,
@@ -3776,8 +3792,14 @@ fn preprocess_stage_signatures(
                 entry
                     .affiliation_values
                     .iter()
-                    .map(|affiliation| {
-                        normalize_text_compat_from_map(affiliation, false, unidecode_char_map)
+                    .filter_map(|affiliation| {
+                        let normalized =
+                            normalize_text_compat_from_map(affiliation, false, unidecode_char_map);
+                        if normalized.is_empty() {
+                            None
+                        } else {
+                            Some(normalized)
+                        }
                     })
                     .collect()
             } else {
@@ -3803,12 +3825,10 @@ fn preprocess_stage_signatures(
             } else {
                 None
             };
-            let normalized_orcid = entry.orcid.as_ref().and_then(|value| {
-                let upper_value = value.to_ascii_uppercase();
-                extract_orcid_from_source_id(value)
-                    .or_else(|| extract_orcid_from_source_id(&upper_value))
-                    .or_else(|| Some(value.clone()))
-            });
+            let normalized_orcid = entry
+                .orcid
+                .as_ref()
+                .and_then(|value| normalize_orcid_compact_owned(value));
             let name_counts = build_name_counts_data_from_artifact(
                 raw_name_counts,
                 &entry.raw_first,
@@ -3875,20 +3895,22 @@ fn build_raw_arrow_feature(
 
     let mut coauthor_blocks = HashSet::new();
     let mut paper_author_count = 0usize;
-    let signature_position = signature.position.unwrap_or(0);
     if let Some(authors) = paper_authors {
         paper_author_count = authors.len();
-        for (position, author_name) in authors.iter() {
-            let normalized = normalize_text_compat_from_map(author_name, false, unidecode_char_map);
-            if *position == signature_position {
-                continue;
-            }
-            if normalized.is_empty() {
-                continue;
-            }
-            let block = compute_block_compat(&normalized);
-            if !block.is_empty() {
-                coauthor_blocks.insert(block);
+        if let Some(signature_position) = signature.position {
+            for (position, author_name) in authors.iter() {
+                let normalized =
+                    normalize_text_compat_from_map(author_name, false, unidecode_char_map);
+                if *position == signature_position {
+                    continue;
+                }
+                if normalized.is_empty() {
+                    continue;
+                }
+                let block = compute_block_compat(&normalized);
+                if !block.is_empty() {
+                    coauthor_blocks.insert(block);
+                }
             }
         }
     }
@@ -3956,21 +3978,17 @@ fn build_raw_arrow_feature(
             .sum::<f64>()
             .sqrt()
     });
-    let query_author = normalize_text_compat_from_map(
-        &[
-            signature.author_first.as_str(),
-            signature.author_middle.as_str(),
-            signature.author_last.as_str(),
-            signature.author_suffix.as_str(),
-        ]
-        .iter()
-        .filter(|value| !value.trim().is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" "),
-        false,
-        unidecode_char_map,
-    );
+    let query_author = [
+        signature.author_first.as_str(),
+        signature.author_middle.as_str(),
+        signature.author_last.as_str(),
+        signature.author_suffix.as_str(),
+    ]
+    .iter()
+    .filter(|value| !value.trim().is_empty())
+    .copied()
+    .collect::<Vec<_>>()
+    .join(" ");
 
     RawArrowFeature {
         query: RetrievalQueryData {
@@ -4083,6 +4101,27 @@ fn euclidean_distance_f32(left: &[f32], right: &[f32]) -> f64 {
         })
         .sum::<f64>()
         .sqrt()
+}
+
+fn validate_raw_arrow_specter_dimensions(
+    component_key: &str,
+    vectors: &[&[f32]],
+) -> Result<(), String> {
+    let Some(first) = vectors.first() else {
+        return Ok(());
+    };
+    let expected_dim = first.len();
+    for vector in vectors.iter().skip(1) {
+        if vector.len() != expected_dim {
+            return Err(format!(
+                "component_key '{}' has mixed SPECTER dimensions: expected {}, got {}",
+                component_key,
+                expected_dim,
+                vector.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn select_raw_arrow_exemplars(vectors: &[&[f32]], max_exemplars: usize) -> Vec<Vec<f32>> {
@@ -4215,6 +4254,7 @@ fn build_raw_arrow_summary(
         }
         max_paper_author_count = max_paper_author_count.max(feature.paper_author_count);
     }
+    validate_raw_arrow_specter_dimensions(component_key, &specter_vectors)?;
 
     let mut first_name_pairs: Vec<(String, f32)> = first_name_counts
         .into_iter()
@@ -4440,6 +4480,9 @@ fn raw_arrow_paper_evidence_row(
             .zip(summary_signals.member_local10_author_names.iter())
             .zip(summary_signals.member_signature_ids.iter())
     {
+        if query_signature_id == candidate_signature_id {
+            continue;
+        }
         let intersection =
             set_intersection_count(&query_author_signals.paper_author_names, candidate_names);
         let union =
@@ -4457,21 +4500,18 @@ fn raw_arrow_paper_evidence_row(
         }
         best_author_overlap = best_author_overlap.max(intersection as f64);
 
-        if query_signature_id != candidate_signature_id {
-            let local10_intersection = set_intersection_count(
-                &query_author_signals.local10_author_names,
-                candidate_local10_names,
-            );
-            let local10_union = query_author_signals.local10_author_names.len()
-                + candidate_local10_names.len()
-                - local10_intersection;
-            if local10_union > 0 {
-                best_local10_jaccard = best_local10_jaccard
-                    .max((local10_intersection as f64) / (local10_union as f64));
-            }
-            best_local10_overlap_count =
-                best_local10_overlap_count.max(local10_intersection as f64);
+        let local10_intersection = set_intersection_count(
+            &query_author_signals.local10_author_names,
+            candidate_local10_names,
+        );
+        let local10_union = query_author_signals.local10_author_names.len()
+            + candidate_local10_names.len()
+            - local10_intersection;
+        if local10_union > 0 {
+            best_local10_jaccard =
+                best_local10_jaccard.max((local10_intersection as f64) / (local10_union as f64));
         }
+        best_local10_overlap_count = best_local10_overlap_count.max(local10_intersection as f64);
 
         let count_delta =
             ((query_paper_author_count as f64).ln_1p() - (*candidate_count as f64).ln_1p()).abs();
@@ -4981,22 +5021,6 @@ fn middle_initial_score_hashes(
     }
 }
 
-fn first_name_score_prefix(query_first: &str, counts: &[(String, f32)], size: usize) -> f64 {
-    if size == 0 || py_len(query_first) <= 1 || counts.is_empty() {
-        return 0.0;
-    }
-    let mut best = 0.0f64;
-    for (first_name, count) in counts.iter() {
-        if py_len(first_name) <= 1 {
-            continue;
-        }
-        if same_prefix_tokens_compat(query_first, first_name) {
-            best = best.max((*count as f64) / (size as f64));
-        }
-    }
-    best
-}
-
 fn first_name_score_mode(
     query_first: &str,
     counts: &[(String, f32)],
@@ -5358,46 +5382,6 @@ fn specter_exemplar_score(query: &RetrievalQueryData, summary: &RetrievalSummary
         .fold(0.0f64, f64::max)
 }
 
-fn score_hybrid_centroid_query(
-    query: &RetrievalQueryData,
-    summary: &RetrievalSummaryData,
-    weights: RetrievalHybridWeights,
-) -> f32 {
-    let coauthor_score = counter_query_overlap_hashes(
-        &query.coauthor_hashes,
-        &summary.coauthor_counts,
-        summary.size,
-    );
-    let affiliation_score = counter_query_overlap_hashes(
-        &query.affiliation_hashes,
-        &summary.affiliation_counts,
-        summary.size,
-    );
-    let middle_score = middle_initial_score_hashes(
-        &query.middle_initial_hashes,
-        &summary.middle_initial_counts,
-        summary.size,
-    );
-    let first_name_score =
-        first_name_score_prefix(&query.first, &summary.first_name_counts, summary.size);
-    let centroid_score = match (
-        query.specter.as_ref(),
-        query.specter_norm,
-        summary.specter_centroid.as_ref(),
-        summary.specter_centroid_norm,
-    ) {
-        (Some(query_specter), Some(query_norm), Some(summary_specter), Some(summary_norm)) => {
-            cosine_sim_with_norms(query_specter, query_norm, summary_specter, summary_norm)
-        }
-        _ => 0.0,
-    };
-    (weights.centroid * centroid_score
-        + weights.coauthor * coauthor_score
-        + weights.affiliation * affiliation_score
-        + weights.middle * middle_score
-        + weights.first_name * first_name_score) as f32
-}
-
 fn query_counter_overlap_count(
     query_terms: &[RetrievalQueryTerm],
     counter: &Option<CounterData>,
@@ -5679,18 +5663,27 @@ fn json_value_to_id(value: &JsonValue) -> Option<String> {
     }
 }
 
-fn json_value_to_i64(value: &JsonValue) -> Option<i64> {
+fn json_value_to_i64(value: &JsonValue, context: &str) -> PyResult<Option<i64>> {
     match value {
         JsonValue::Number(v) => {
             if let Some(i) = v.as_i64() {
-                Some(i)
+                Ok(Some(i))
             } else if let Some(u) = v.as_u64() {
-                Some(u as i64)
+                i64::try_from(u).map(Some).map_err(|_| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "{context} is outside i64 range: {u}"
+                    ))
+                })
             } else {
-                v.as_f64().map(|f| f as i64)
+                Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{context} must be an integer, got floating-point value {v}"
+                )))
             }
         }
-        _ => None,
+        JsonValue::Null => Ok(None),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{context} must be an integer or null"
+        ))),
     }
 }
 
@@ -5717,8 +5710,12 @@ fn json_get_optional_string(obj: &JsonObject, key: &str) -> Option<String> {
     })
 }
 
-fn json_get_i64_optional(obj: &JsonObject, key: &str) -> Option<i64> {
-    obj.get(key).and_then(json_value_to_i64)
+fn json_get_i64_optional(obj: &JsonObject, key: &str, context: &str) -> PyResult<Option<i64>> {
+    let field_context = format!("{context}.{key}");
+    match obj.get(key) {
+        Some(value) => json_value_to_i64(value, &field_context),
+        None => Ok(None),
+    }
 }
 
 fn json_get_string_list(value: Option<&JsonValue>) -> Vec<String> {
@@ -5866,7 +5863,7 @@ fn has_name_counts_artifact(raw_name_counts: &RawNameCountMaps) -> bool {
 }
 
 fn canonical_last_for_counts(raw_last: &str, normalized_last: &str) -> String {
-    if raw_last.contains('-') || normalized_last.contains(' ') {
+    if contains_name_dash(raw_last) || normalized_last.contains(' ') {
         normalized_last.replace(' ', "")
     } else {
         normalized_last.to_string()
@@ -5895,7 +5892,7 @@ struct NameCountsBuildResult {
 fn build_name_counts_data_from_artifact(
     raw_name_counts: &RawNameCountMaps,
     raw_first: &str,
-    first_normalized_token: &str,
+    _first_normalized_token: &str,
     first_without_apostrophe: &str,
     raw_last: &str,
     last_normalized: &str,
@@ -5908,15 +5905,12 @@ fn build_name_counts_data_from_artifact(
     }
 
     let mut telemetry = NameCountsDefaultTelemetry::default();
-    let mut first_for_counts = first_normalized_token.to_string();
-    if first_for_counts.is_empty() {
-        first_for_counts = first_without_apostrophe
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string();
-    }
-    if raw_first.contains('-') {
+    let mut first_for_counts = first_without_apostrophe
+        .split(' ')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if contains_name_dash(raw_first) {
         let joined = first_without_apostrophe.replace(' ', "");
         if !joined.is_empty() {
             first_for_counts = joined;
@@ -6020,25 +6014,12 @@ fn same_prefix_tokens(a: &str, b: &str) -> bool {
 }
 
 fn name_tuple_contains(map: &HashMap<String, HashSet<String>>, a: &str, b: &str) -> bool {
-    if map.get(a).map_or(false, |vals| vals.contains(b))
+    map.get(a).map_or(false, |vals| vals.contains(b))
         || map.get(b).map_or(false, |vals| vals.contains(a))
-    {
-        return true;
-    }
-    let a_normalized = a.trim().to_lowercase();
-    let b_normalized = b.trim().to_lowercase();
-    if a_normalized.as_str() == a && b_normalized.as_str() == b {
-        return false;
-    }
-    map.get(a_normalized.as_str())
-        .map_or(false, |vals| vals.contains(b_normalized.as_str()))
-        || map
-            .get(b_normalized.as_str())
-            .map_or(false, |vals| vals.contains(a_normalized.as_str()))
 }
 
 fn first_name_forms(value: &str) -> (String, String, String) {
-    let normalized = value.trim().to_lowercase();
+    let normalized = value.to_string();
     let parts: Vec<&str> = normalized.split_whitespace().collect();
     let joined = parts.join("");
     let token = parts
@@ -6052,37 +6033,25 @@ fn first_names_name_compatible(
     first_2: &str,
     name_tuples: &HashMap<String, HashSet<String>>,
 ) -> bool {
-    let first_1 = first_1.trim().to_lowercase();
-    let first_2 = first_2.trim().to_lowercase();
-    if first_1.is_empty() || first_2.is_empty() {
+    if same_prefix_tokens(first_1, first_2) {
         return true;
     }
-    if first_1.chars().next() != first_2.chars().next() {
-        return false;
-    }
-    if same_prefix_tokens(&first_1, &first_2) {
-        return true;
-    }
-    let forms_1 = first_name_forms(&first_1);
-    let forms_2 = first_name_forms(&first_2);
+    let forms_1 = first_name_forms(first_1);
+    let forms_2 = first_name_forms(first_2);
     name_tuple_contains(name_tuples, &forms_1.0, &forms_2.0)
         || name_tuple_contains(name_tuples, &forms_1.1, &forms_2.1)
         || name_tuple_contains(name_tuples, &forms_1.2, &forms_2.2)
 }
 
 fn subblock_tokens_from_key(subblock_key: &str) -> Vec<String> {
-    let local_key = subblock_key
-        .rsplit_once("::")
-        .map_or(subblock_key, |(_prefix, suffix)| suffix);
     let mut values = HashSet::new();
-    for raw_token in local_key.split(',') {
+    for raw_token in subblock_key.split(',') {
         let token = raw_token
             .trim()
             .split_once('|')
-            .map_or(raw_token.trim(), |(token, _rest)| token.trim())
-            .to_lowercase();
+            .map_or(raw_token.trim(), |(token, _rest)| token.trim());
         if py_len(&token) > 1 {
-            values.insert(token);
+            values.insert(token.to_string());
         }
     }
     let mut out: Vec<String> = values.into_iter().collect();
@@ -6544,12 +6513,6 @@ fn sorted_subblock_merge_candidates(
             } else if let (Some(left_lookup), Some(right_lookup)) = (&left.lookup, &right.lookup) {
                 if let Some(right_counts) = first_k_letter_counts_sorted.get(left_lookup) {
                     if let Some(score) = right_counts.get(right_lookup) {
-                        if score.is_nan() {
-                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                                "first_k_letter_counts_sorted contains NaN score for pair \
-                                 ({left_lookup:?}, {right_lookup:?})"
-                            )));
-                        }
                         candidates.push((pair, *score));
                     }
                 }
@@ -7000,7 +6963,8 @@ fn make_subblocks_with_telemetry_from_rows(
     fallback_cluster_fn,
     anddata,
     compute_block_fn = None,
-    use_orcid_subblocking = true
+    use_orcid_subblocking = true,
+    full_scan_without_index = false
 ))]
 fn make_subblocks_with_telemetry_arrow(
     py: Python<'_>,
@@ -7012,6 +6976,7 @@ fn make_subblocks_with_telemetry_arrow(
     anddata: &Bound<'_, PyAny>,
     compute_block_fn: Option<&Bound<'_, PyAny>>,
     use_orcid_subblocking: bool,
+    full_scan_without_index: bool,
 ) -> PyResult<(HashMap<String, Vec<String>>, Py<PyDict>)> {
     let signatures_path = extract_path_mapping_string(paths, "signatures", true)?
         .expect("required signatures path exists");
@@ -7029,7 +6994,7 @@ fn make_subblocks_with_telemetry_arrow(
         &signatures_path,
         signatures_index_path.as_deref(),
         Some(&keep_signature_ids),
-        false,
+        full_scan_without_index,
     )?;
     let missing_signature_ids: Vec<String> = requested_signature_ids
         .iter()
@@ -7275,6 +7240,9 @@ fn signature_ngrams_batch(
         ));
     }
     let n = coauthor_texts.len();
+    let text_module = py.import("s2and.text")?;
+    let affiliation_stopwords =
+        extract_required_string_set(&text_module.getattr("AFFILIATIONS_STOP_WORDS")?)?;
 
     let pairs = py.allow_threads(|| {
         let compute = || {
@@ -7282,7 +7250,10 @@ fn signature_ngrams_batch(
                 .into_par_iter()
                 .map(|idx| {
                     let coauthors = char_ngrams_counter(&coauthor_texts[idx]);
-                    let affiliations = word_ngrams_counter(&affiliation_texts[idx]);
+                    let affiliations = word_ngrams_counter_python_compat(
+                        &affiliation_texts[idx],
+                        &affiliation_stopwords,
+                    );
                     (coauthors, affiliations)
                 })
                 .collect::<Vec<_>>()
@@ -7591,11 +7562,13 @@ fn position_diff(p1: i64, p2: i64) -> f64 {
 }
 
 fn cosine_sim_vec_f32(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     let mut dot = 0.0;
     let mut norm_a = 0.0;
     let mut norm_b = 0.0;
-    let len = a.len().min(b.len());
-    for i in 0..len {
+    for i in 0..a.len() {
         let av = a[i] as f64;
         let bv = b[i] as f64;
         dot += av * bv;
@@ -7610,12 +7583,14 @@ fn cosine_sim_vec_f32(a: &[f32], b: &[f32]) -> f64 {
 }
 
 fn cosine_sim_with_norms(a: &[f32], norm_a: f64, b: &[f32], norm_b: f64) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     if norm_a == 0.0 || norm_b == 0.0 {
         return 0.0;
     }
     let mut dot = 0.0;
-    let len = a.len().min(b.len());
-    for i in 0..len {
+    for i in 0..a.len() {
         dot += (a[i] as f64) * (b[i] as f64);
     }
     dot / (norm_a * norm_b)
@@ -8067,8 +8042,8 @@ impl RustFeaturizer {
             }};
         }
 
-        let first1 = s1.first.as_deref();
-        let first2 = s2.first.as_deref();
+        let first1 = s1.first_without_apostrophe();
+        let first2 = s2.first_without_apostrophe();
         let middle1 = s1.middle.as_deref();
         let middle2 = s2.middle.as_deref();
 
@@ -8214,7 +8189,7 @@ impl RustFeaturizer {
             f64::INFINITY,
         ));
 
-        let advanced = name_text_features(s1.adv_name.as_deref(), s2.adv_name.as_deref());
+        let advanced = name_text_features(s1.adv_name_for_features(), s2.adv_name_for_features());
         for value in advanced.iter() {
             push_feat!(*value);
         }
@@ -8229,8 +8204,6 @@ impl RustFeaturizer {
         sig_id2: &str,
         s1: &SignatureData,
         s2: &SignatureData,
-        _p1: &PaperData,
-        _p2: &PaperData,
         low_value: f64,
         high_value: f64,
         dont_merge_cluster_seeds: bool,
@@ -8277,8 +8250,8 @@ impl RustFeaturizer {
             return Some(high_value);
         }
 
-        let first1 = s1.first.as_deref().unwrap_or("");
-        let first2 = s2.first.as_deref().unwrap_or("");
+        let first1 = s1.first_without_apostrophe().unwrap_or("");
+        let first2 = s2.first_without_apostrophe().unwrap_or("");
         if !first1.is_empty() && !first2.is_empty() {
             if let (Some(c1), Some(c2)) = (first1.chars().next(), first2.chars().next()) {
                 if c1 != c2 {
@@ -8398,21 +8371,11 @@ impl RustFeaturizer {
             .signatures
             .get(sig_id2)
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id2.to_string()))?;
-        let p1 = self
-            .papers
-            .get(&s1.paper_id)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(s1.paper_id.to_string()))?;
-        let p2 = self
-            .papers
-            .get(&s2.paper_id)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(s2.paper_id.to_string()))?;
         Ok(self.constraint_value_from_records(
             sig_id1,
             sig_id2,
             s1,
             s2,
-            p1,
-            p2,
             low_value,
             high_value,
             dont_merge_cluster_seeds,
@@ -8422,24 +8385,12 @@ impl RustFeaturizer {
     }
 
     fn validate_constraint_pair_inputs(&self, sig_id1: &str, sig_id2: &str) -> PyResult<()> {
-        let s1 = self
-            .signatures
+        self.signatures
             .get(sig_id1)
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id1.to_string()))?;
-        let s2 = self
-            .signatures
+        self.signatures
             .get(sig_id2)
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id2.to_string()))?;
-        if self.papers.get(&s1.paper_id).is_none() {
-            return Err(pyo3::exceptions::PyKeyError::new_err(
-                s1.paper_id.to_string(),
-            ));
-        }
-        if self.papers.get(&s2.paper_id).is_none() {
-            return Err(pyo3::exceptions::PyKeyError::new_err(
-                s2.paper_id.to_string(),
-            ));
-        }
         Ok(())
     }
 
@@ -8460,10 +8411,47 @@ impl RustFeaturizer {
         FULL_FEATURE_COUNT
     }
 
-    fn signature_paper_lookup(&self) -> PyResult<Vec<(&SignatureData, &PaperData)>> {
+    fn signature_lookup(&self) -> PyResult<Vec<&SignatureData>> {
         let signature_ids = self.signature_id_order();
-        let mut lookup: Vec<(&SignatureData, &PaperData)> = Vec::with_capacity(signature_ids.len());
+        let mut lookup: Vec<&SignatureData> = Vec::with_capacity(signature_ids.len());
         for signature_id in signature_ids.iter() {
+            let signature = self
+                .signatures
+                .get(signature_id)
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(signature_id.clone()))?;
+            lookup.push(signature);
+        }
+        Ok(lookup)
+    }
+
+    fn sparse_signature_paper_lookup_for_indices(
+        &self,
+        left_indices: &[u32],
+        right_indices: &[u32],
+    ) -> PyResult<Vec<Option<(&SignatureData, &PaperData)>>> {
+        let signature_ids = self.signature_id_order();
+        let signature_count = signature_ids.len();
+        let mut used_indices = HashSet::<usize>::new();
+        let mut max_index = 0usize;
+        for (left_idx, right_idx) in left_indices.iter().zip(right_indices.iter()) {
+            for raw_index in [*left_idx, *right_idx] {
+                let index = raw_index as usize;
+                if index >= signature_count {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                        "pair index out of range: index={} signature_count={}",
+                        index, signature_count
+                    )));
+                }
+                max_index = max_index.max(index);
+                used_indices.insert(index);
+            }
+        }
+        if used_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut lookup = vec![None; max_index + 1];
+        for index in used_indices {
+            let signature_id = &signature_ids[index];
             let signature = self
                 .signatures
                 .get(signature_id)
@@ -8471,9 +8459,22 @@ impl RustFeaturizer {
             let paper = self.papers.get(&signature.paper_id).ok_or_else(|| {
                 pyo3::exceptions::PyKeyError::new_err(signature.paper_id.to_string())
             })?;
-            lookup.push((signature, paper));
+            lookup[index] = Some((signature, paper));
         }
         Ok(lookup)
+    }
+
+    fn sparse_signature_paper_lookup_for_pair_tuples(
+        &self,
+        pairs: &[(u32, u32)],
+    ) -> PyResult<Vec<Option<(&SignatureData, &PaperData)>>> {
+        let mut left_indices = Vec::with_capacity(pairs.len());
+        let mut right_indices = Vec::with_capacity(pairs.len());
+        for (left_idx, right_idx) in pairs.iter() {
+            left_indices.push(*left_idx);
+            right_indices.push(*right_idx);
+        }
+        self.sparse_signature_paper_lookup_for_indices(&left_indices, &right_indices)
     }
 
     fn pair_aggregate_row_ranges(owner_row_indices: &[u32]) -> Option<Vec<PairAggregateRowRange>> {
@@ -8511,6 +8512,7 @@ impl RustFeaturizer {
     ) -> PairAggregateBuffers {
         PairAggregateBuffers {
             counts: vec![0_u32; row_count],
+            valid_counts: vec![0_u64; row_count * aggregate_cols],
             sums: vec![0.0_f64; row_count * aggregate_cols],
             mins: vec![f64::INFINITY; row_count * aggregate_cols],
             maxs: vec![f64::NEG_INFINITY; row_count * aggregate_cols],
@@ -8525,7 +8527,7 @@ impl RustFeaturizer {
         row_count: usize,
         aggregate_indices: &[usize],
         nan_value: f64,
-        lookup: &[(&SignatureData, &PaperData)],
+        lookup: &[Option<(&SignatureData, &PaperData)>],
     ) -> PairAggregateBuffers {
         let aggregate_cols = aggregate_indices.len();
         let mut out = Self::empty_pair_aggregate_buffers(row_count, aggregate_cols);
@@ -8539,42 +8541,56 @@ impl RustFeaturizer {
 
         let group_count = row_ranges.len();
         let mut group_counts = vec![0_u32; group_count];
+        let mut group_valid_counts = vec![0_u64; group_count * aggregate_cols];
         let mut group_sums = vec![0.0_f64; group_count * aggregate_cols];
         let mut group_mins = vec![f64::INFINITY; group_count * aggregate_cols];
         let mut group_maxs = vec![f64::NEG_INFINITY; group_count * aggregate_cols];
         group_counts
             .par_iter_mut()
+            .zip(group_valid_counts.par_chunks_mut(aggregate_cols))
             .zip(group_sums.par_chunks_mut(aggregate_cols))
             .zip(group_mins.par_chunks_mut(aggregate_cols))
             .zip(group_maxs.par_chunks_mut(aggregate_cols))
             .zip(row_ranges.par_iter())
-            .for_each(|((((count, sums_row), mins_row), maxs_row), range)| {
-                for pair_offset in range.start..range.stop {
-                    *count = count.saturating_add(1);
-                    let (s1, p1) = lookup[left_indices[pair_offset] as usize];
-                    let (s2, p2) = lookup[right_indices[pair_offset] as usize];
-                    let row = self.featurize_pair_data(s1, s2, p1, p2);
-                    for (aggregate_position, feature_index) in aggregate_indices.iter().enumerate()
-                    {
-                        let mut value = row[*feature_index];
-                        if value.is_nan() && !nan_value.is_nan() {
-                            value = nan_value;
-                        }
-                        sums_row[aggregate_position] += value;
-                        if value < mins_row[aggregate_position] {
-                            mins_row[aggregate_position] = value;
-                        }
-                        if value > maxs_row[aggregate_position] {
-                            maxs_row[aggregate_position] = value;
+            .for_each(
+                |(((((count, valid_counts_row), sums_row), mins_row), maxs_row), range)| {
+                    for pair_offset in range.start..range.stop {
+                        *count = count.saturating_add(1);
+                        let (s1, p1) = lookup[left_indices[pair_offset] as usize]
+                            .expect("left signature index was validated before aggregation");
+                        let (s2, p2) = lookup[right_indices[pair_offset] as usize]
+                            .expect("right signature index was validated before aggregation");
+                        let row = self.featurize_pair_data(s1, s2, p1, p2);
+                        for (aggregate_position, feature_index) in
+                            aggregate_indices.iter().enumerate()
+                        {
+                            let mut value = row[*feature_index];
+                            if value.is_nan() && !nan_value.is_nan() {
+                                value = nan_value;
+                            }
+                            if value.is_nan() {
+                                continue;
+                            }
+                            valid_counts_row[aggregate_position] =
+                                valid_counts_row[aggregate_position].saturating_add(1);
+                            sums_row[aggregate_position] += value;
+                            if value < mins_row[aggregate_position] {
+                                mins_row[aggregate_position] = value;
+                            }
+                            if value > maxs_row[aggregate_position] {
+                                maxs_row[aggregate_position] = value;
+                            }
                         }
                     }
-                }
-            });
+                },
+            );
 
         for (group_offset, range) in row_ranges.iter().enumerate() {
             out.counts[range.row_offset] = group_counts[group_offset];
             let source_start = group_offset * aggregate_cols;
             let target_start = range.row_offset * aggregate_cols;
+            out.valid_counts[target_start..target_start + aggregate_cols]
+                .copy_from_slice(&group_valid_counts[source_start..source_start + aggregate_cols]);
             out.sums[target_start..target_start + aggregate_cols]
                 .copy_from_slice(&group_sums[source_start..source_start + aggregate_cols]);
             out.mins[target_start..target_start + aggregate_cols]
@@ -8593,7 +8609,7 @@ impl RustFeaturizer {
         row_count: usize,
         aggregate_indices: &[usize],
         nan_value: f64,
-        lookup: &[(&SignatureData, &PaperData)],
+        lookup: &[Option<(&SignatureData, &PaperData)>],
     ) -> PairAggregateBuffers {
         let aggregate_cols = aggregate_indices.len();
         let mut out = Self::empty_pair_aggregate_buffers(row_count, aggregate_cols);
@@ -8608,15 +8624,21 @@ impl RustFeaturizer {
             let row_offset = *row_index as usize;
             out.counts[row_offset] = out.counts[row_offset].saturating_add(1);
             let aggregate_row_start = row_offset * aggregate_cols;
-            let (s1, p1) = lookup[left_indices[pair_offset] as usize];
-            let (s2, p2) = lookup[right_indices[pair_offset] as usize];
+            let (s1, p1) = lookup[left_indices[pair_offset] as usize]
+                .expect("left signature index was validated before aggregation");
+            let (s2, p2) = lookup[right_indices[pair_offset] as usize]
+                .expect("right signature index was validated before aggregation");
             let row = self.featurize_pair_data(s1, s2, p1, p2);
             for (aggregate_position, feature_index) in aggregate_indices.iter().enumerate() {
                 let mut value = row[*feature_index];
                 if value.is_nan() && !nan_value.is_nan() {
                     value = nan_value;
                 }
+                if value.is_nan() {
+                    continue;
+                }
                 let stats_index = aggregate_row_start + aggregate_position;
+                out.valid_counts[stats_index] = out.valid_counts[stats_index].saturating_add(1);
                 out.sums[stats_index] += value;
                 if value < out.mins[stats_index] {
                     out.mins[stats_index] = value;
@@ -9145,14 +9167,7 @@ impl RustFeaturizer {
                 SIG_IDX_ORCID,
                 "author_info_orcid",
             )?)?;
-            let orcid = if let Some(value) = raw_orcid {
-                let upper_value = value.to_ascii_uppercase();
-                extract_orcid_from_source_id(&value)
-                    .or_else(|| extract_orcid_from_source_id(&upper_value))
-                    .or(Some(value))
-            } else {
-                None
-            };
+            let orcid = raw_orcid.and_then(|value| normalize_orcid_compact_owned(&value));
             let email = extract_string_opt(&get_namedtuple_item_or_attr(
                 &sig_obj,
                 use_signature_tuple_fastpath,
@@ -9427,7 +9442,7 @@ impl RustFeaturizer {
             &signatures_path,
             signatures_batch_index_path.as_deref(),
             keep_signature_ids.as_ref(),
-            false,
+            true,
         )?;
         let mut signature_ids = match requested_signature_ids {
             Some(ids) => ids,
@@ -9460,13 +9475,13 @@ impl RustFeaturizer {
             &papers_path,
             papers_batch_index_path.as_deref(),
             &needed_paper_ids,
-            false,
+            true,
         )?;
         let (mut raw_authors_by_paper, _) = read_raw_arrow_paper_authors_with_optional_index(
             &paper_authors_path,
             paper_authors_batch_index_path.as_deref(),
             &needed_paper_ids,
-            false,
+            true,
         )?;
         let specter_by_paper = match specter_path.as_ref() {
             Some(path) => {
@@ -9474,7 +9489,7 @@ impl RustFeaturizer {
                     path,
                     specter_batch_index_path.as_deref(),
                     &needed_paper_ids,
-                    false,
+                    true,
                 )?
                 .0
             }
@@ -9522,22 +9537,16 @@ impl RustFeaturizer {
                 None => load_raw_name_counts_from_json_path(name_counts_path, None, false)?,
             },
         };
-        let language_detector = if preprocess {
-            Some(LanguageDetectorCompat::new(py))
-        } else {
-            None
-        };
+        let language_detector = Some(LanguageDetectorCompat::new(py));
 
         let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
-        if preprocess {
-            ensure_unidecode_for_raw_arrow_inputs(
-                &unidecode,
-                &raw_signatures,
-                &raw_papers,
-                &raw_authors_by_paper,
-                &mut unidecode_char_map,
-            )?;
-        }
+        ensure_unidecode_for_raw_arrow_inputs(
+            &unidecode,
+            &raw_signatures,
+            &raw_papers,
+            &raw_authors_by_paper,
+            &mut unidecode_char_map,
+        )?;
         let mut defaulted_signature_author_position_count = 0usize;
         let mut signature_inputs = Vec::<StageSignatureInput>::with_capacity(signature_ids.len());
         for signature_id in signature_ids.iter() {
@@ -9576,14 +9585,12 @@ impl RustFeaturizer {
                     raw_paper.is_reliable.unwrap_or(false),
                     raw_paper.predicted_language.clone(),
                 )
-            } else if preprocess {
+            } else {
                 let detector = language_detector.as_ref().ok_or_else(|| {
                     pyo3::exceptions::PyRuntimeError::new_err("missing language detector")
                 })?;
                 let (reliable, _is_english, language) = detector.detect(&raw_paper.title);
                 (reliable, Some(language))
-            } else {
-                (false, None)
             };
             paper_inputs.push(StagePaperInput {
                 paper_id: paper_id.clone(),
@@ -9757,11 +9764,7 @@ impl RustFeaturizer {
         let name_prefixes = extract_required_string_set(&text_module.getattr("NAME_PREFIXES")?)?;
         let affiliation_stopwords = extract_affiliation_stopwords(py)?;
         let raw_name_counts = load_raw_name_counts_from_json_path(name_counts_path, None, false)?;
-        let language_detector = if preprocess {
-            Some(LanguageDetectorCompat::new(py))
-        } else {
-            None
-        };
+        let language_detector = Some(LanguageDetectorCompat::new(py));
 
         let parse_start = Instant::now();
         let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
@@ -9849,13 +9852,11 @@ impl RustFeaturizer {
         for authors in raw_authors_by_paper.values_mut() {
             authors.sort_by_key(|(position, _name)| *position);
         }
-        if preprocess {
-            ensure_unidecode_for_paper_author_texts(
-                &unidecode,
-                raw_authors_by_paper.values().map(Vec::as_slice),
-                &mut unidecode_char_map,
-            )?;
-        }
+        ensure_unidecode_for_paper_author_texts(
+            &unidecode,
+            raw_authors_by_paper.values().map(Vec::as_slice),
+            &mut unidecode_char_map,
+        )?;
 
         let papers_obj = feature_block.getattr("papers")?;
         let mut paper_inputs: Vec<StagePaperInput> = Vec::new();
@@ -9894,14 +9895,12 @@ impl RustFeaturizer {
                     supplied_is_reliable.unwrap_or(false),
                     supplied_predicted_language,
                 )
-            } else if preprocess {
+            } else {
                 let detector = language_detector.as_ref().ok_or_else(|| {
                     pyo3::exceptions::PyRuntimeError::new_err("missing language detector")
                 })?;
                 let (reliable, _is_english, language) = detector.detect(&raw_title);
                 (reliable, Some(language))
-            } else {
-                (false, None)
             };
             paper_inputs.push(StagePaperInput {
                 paper_id,
@@ -9915,17 +9914,15 @@ impl RustFeaturizer {
                 is_reliable,
             });
         }
-        if preprocess {
-            ensure_unidecode_for_paper_texts(
-                &unidecode,
-                paper_inputs.iter().map(|paper| PaperTextFields {
-                    title: &paper.raw_title,
-                    venue: &paper.raw_venue,
-                    journal_name: &paper.raw_journal,
-                }),
-                &mut unidecode_char_map,
-            )?;
-        }
+        ensure_unidecode_for_paper_texts(
+            &unidecode,
+            paper_inputs.iter().map(|paper| PaperTextFields {
+                title: &paper.raw_title,
+                venue: &paper.raw_venue,
+                journal_name: &paper.raw_journal,
+            }),
+            &mut unidecode_char_map,
+        )?;
         let parse_seconds = parse_start.elapsed().as_secs_f64();
 
         let paper_preprocess_start = Instant::now();
@@ -10123,11 +10120,7 @@ impl RustFeaturizer {
         let venue_stop_words = extract_required_string_set(&venue_stop_words_obj)?;
         let name_prefixes = extract_required_string_set(&name_prefixes_obj)?;
 
-        let language_detector = if preprocess {
-            Some(LanguageDetectorCompat::new(py))
-        } else {
-            None
-        };
+        let language_detector = Some(LanguageDetectorCompat::new(py));
 
         let json_parse_start = Instant::now();
         let signatures_json = load_json_value(signatures_path)?;
@@ -10188,13 +10181,14 @@ impl RustFeaturizer {
             let raw_middle = json_get_string(author_info, "middle", "");
             let raw_last = json_get_string(author_info, "last", "");
             let email = json_get_optional_string(author_info, "email");
-            let position = match json_get_i64_optional(author_info, "position") {
-                Some(value) => value,
-                None => {
-                    defaulted_signature_author_position_count += 1;
-                    0
-                }
-            };
+            let position =
+                match json_get_i64_optional(author_info, "position", "signature author_info")? {
+                    Some(value) => value,
+                    None => {
+                        defaulted_signature_author_position_count += 1;
+                        0
+                    }
+                };
             let affiliation_values = json_get_string_list(author_info.get("affiliations"));
             let source_id_source = json_get_optional_string(author_info, "source_id_source");
             let source_ids = if source_id_source.as_deref() == Some("ORCID") {
@@ -10259,11 +10253,9 @@ impl RustFeaturizer {
             let raw_venue = json_get_string(paper_dict, "venue", "");
             let raw_journal = json_get_string(paper_dict, "journal_name", "");
 
-            if preprocess {
-                ensure_unidecode_for_text(&unidecode, &raw_title, &mut unidecode_char_map)?;
-                ensure_unidecode_for_text(&unidecode, &raw_venue, &mut unidecode_char_map)?;
-                ensure_unidecode_for_text(&unidecode, &raw_journal, &mut unidecode_char_map)?;
-            }
+            ensure_unidecode_for_text(&unidecode, &raw_title, &mut unidecode_char_map)?;
+            ensure_unidecode_for_text(&unidecode, &raw_venue, &mut unidecode_char_map)?;
+            ensure_unidecode_for_text(&unidecode, &raw_journal, &mut unidecode_char_map)?;
 
             let mut raw_authors: Vec<(i64, String)> = Vec::new();
             if let Some(author_values) = paper_dict.get("authors").and_then(JsonValue::as_array) {
@@ -10271,28 +10263,28 @@ impl RustFeaturizer {
                     let Some(author_dict) = author_value.as_object() else {
                         continue;
                     };
-                    let position = match json_get_i64_optional(author_dict, "position") {
-                        Some(value) => value,
-                        None => {
-                            defaulted_paper_author_position_count += 1;
-                            0
-                        }
-                    };
+                    let position =
+                        match json_get_i64_optional(author_dict, "position", "paper author entry")?
+                        {
+                            Some(value) => value,
+                            None => {
+                                defaulted_paper_author_position_count += 1;
+                                0
+                            }
+                        };
                     let raw_author_name = json_get_string(author_dict, "author_name", "");
-                    if preprocess {
-                        ensure_unidecode_for_text(
-                            &unidecode,
-                            &raw_author_name,
-                            &mut unidecode_char_map,
-                        )?;
-                    }
+                    ensure_unidecode_for_text(
+                        &unidecode,
+                        &raw_author_name,
+                        &mut unidecode_char_map,
+                    )?;
                     raw_authors.push((position, raw_author_name));
                 }
             }
 
             let references = json_get_id_set(paper_dict.get("references"));
 
-            let year = match json_get_i64_optional(paper_dict, "year") {
+            let year = match json_get_i64_optional(paper_dict, "year", "paper entry")? {
                 Some(v) if v > 0 => Some(v),
                 _ => None,
             };
@@ -10303,15 +10295,11 @@ impl RustFeaturizer {
                 Some(_) => true,
             };
 
-            let (is_reliable, predicted_language) = if preprocess {
-                let detector = language_detector.as_ref().ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err("missing language detector")
-                })?;
-                let (reliable, _is_english, language) = detector.detect(&raw_title);
-                (reliable, Some(language))
-            } else {
-                (false, None)
-            };
+            let detector = language_detector.as_ref().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("missing language detector")
+            })?;
+            let (is_reliable, _is_english, language) = detector.detect(&raw_title);
+            let predicted_language = Some(language);
 
             paper_inputs.push(PaperInput {
                 paper_id,
@@ -10335,15 +10323,11 @@ impl RustFeaturizer {
                 paper_inputs
                     .par_iter()
                     .map(|paper_input| {
-                        let title = if preprocess {
-                            normalize_text_compat_from_map(
-                                &paper_input.raw_title,
-                                false,
-                                &unidecode_char_map,
-                            )
-                        } else {
-                            paper_input.raw_title.clone()
-                        };
+                        let title = normalize_text_compat_from_map(
+                            &paper_input.raw_title,
+                            false,
+                            &unidecode_char_map,
+                        );
                         let venue = if preprocess {
                             normalize_text_compat_from_map(
                                 &paper_input.raw_venue,
@@ -10362,33 +10346,24 @@ impl RustFeaturizer {
                         } else {
                             paper_input.raw_journal.clone()
                         };
-                        let authors = if preprocess {
-                            paper_input
-                                .raw_authors
-                                .iter()
-                                .map(|(position, raw_name)| {
-                                    (
-                                        *position,
-                                        normalize_text_compat_from_map(
-                                            raw_name,
-                                            false,
-                                            &unidecode_char_map,
-                                        ),
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        } else {
-                            paper_input.raw_authors.clone()
-                        };
+                        let authors = paper_input
+                            .raw_authors
+                            .iter()
+                            .map(|(position, raw_name)| {
+                                (
+                                    *position,
+                                    normalize_text_compat_from_map(
+                                        raw_name,
+                                        false,
+                                        &unidecode_char_map,
+                                    ),
+                                )
+                            })
+                            .collect::<Vec<_>>();
 
-                        let title_words = if preprocess {
-                            counter_data_from_usize_map(word_ngrams_counter_python_compat(
-                                &title,
-                                &stop_words,
-                            ))
-                        } else {
-                            None
-                        };
+                        let title_words = counter_data_from_usize_map(
+                            word_ngrams_counter_python_compat(&title, &stop_words),
+                        );
 
                         let title_chars = if preprocess {
                             counter_data_from_usize_map(char_ngrams_counter_python_compat(
@@ -10489,18 +10464,11 @@ impl RustFeaturizer {
                             false,
                             &unidecode_char_map,
                         );
-                        let mut first_middle_split: Vec<String> =
-                            format!("{} {}", first_normalized, middle_normalized)
-                                .split_whitespace()
-                                .map(|token| token.to_string())
-                                .collect();
-                        if let Some(prefix) = first_middle_split.first() {
-                            if name_prefixes.contains(prefix) {
-                                first_middle_split.remove(0);
-                            }
-                        }
-                        let first_normalized_token =
-                            first_middle_split.get(0).cloned().unwrap_or_default();
+                        let first_normalized_token = first_normalized_token_python_compat(
+                            &first_normalized,
+                            &middle_normalized,
+                            &name_prefixes,
+                        );
                         let (first_without_apostrophe, middle_without_apostrophe) =
                             split_first_middle_hyphen_aware_compat(
                                 &entry.raw_first,
@@ -10543,12 +10511,17 @@ impl RustFeaturizer {
                             entry
                                 .affiliation_values
                                 .iter()
-                                .map(|affiliation| {
-                                    normalize_text_compat_from_map(
+                                .filter_map(|affiliation| {
+                                    let normalized = normalize_text_compat_from_map(
                                         affiliation,
                                         false,
                                         &unidecode_char_map,
-                                    )
+                                    );
+                                    if normalized.is_empty() {
+                                        None
+                                    } else {
+                                        Some(normalized)
+                                    }
                                 })
                                 .collect()
                         } else {
@@ -10585,7 +10558,7 @@ impl RustFeaturizer {
                             entry
                                 .source_ids
                                 .first()
-                                .and_then(|source_id| extract_orcid_from_source_id(source_id))
+                                .and_then(|source_id| normalize_orcid_compact_owned(source_id))
                         } else {
                             None
                         };
@@ -10729,7 +10702,7 @@ impl RustFeaturizer {
                         &author_names,
                         false,
                         true,
-                        Some(&stop_words),
+                        None,
                     ));
                 }
 
@@ -10855,22 +10828,35 @@ impl RustFeaturizer {
                 let values_obj = json_as_object(values_value, "cluster seed entry")?;
                 let mut root_added = false;
                 for (signature_id_b, constraint_value) in values_obj.iter() {
-                    let Some(constraint) = json_value_to_string(constraint_value) else {
-                        continue;
-                    };
-                    if constraint == "disallow" {
-                        cluster_seeds_disallow.insert(canonical_signature_pair_cloned(
-                            signature_id_a,
-                            signature_id_b,
-                        ));
-                    } else if constraint == "require" {
-                        if !root_added {
-                            cluster_seeds_require
-                                .insert(signature_id_a.clone(), ClusterId::Int(cluster_num));
-                            root_added = true;
+                    let constraint = match constraint_value {
+                        JsonValue::String(value) => value.as_str(),
+                        _ => {
+                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                                "cluster seed constraint for ({signature_id_a:?}, {signature_id_b:?}) must be a string"
+                            )));
                         }
-                        cluster_seeds_require
-                            .insert(signature_id_b.clone(), ClusterId::Int(cluster_num));
+                    };
+                    match constraint {
+                        "disallow" => {
+                            cluster_seeds_disallow.insert(canonical_signature_pair_cloned(
+                                signature_id_a,
+                                signature_id_b,
+                            ));
+                        }
+                        "require" => {
+                            if !root_added {
+                                cluster_seeds_require
+                                    .insert(signature_id_a.clone(), ClusterId::Int(cluster_num));
+                                root_added = true;
+                            }
+                            cluster_seeds_require
+                                .insert(signature_id_b.clone(), ClusterId::Int(cluster_num));
+                        }
+                        _ => {
+                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                                "unknown cluster seed constraint {constraint:?} for ({signature_id_a:?}, {signature_id_b:?}); expected 'require' or 'disallow'"
+                            )));
+                        }
                     }
                 }
                 cluster_num += 1;
@@ -10994,19 +10980,11 @@ impl RustFeaturizer {
                         let s2 = self.signatures.get(sig_id2).ok_or_else(|| {
                             pyo3::exceptions::PyKeyError::new_err(sig_id2.to_string())
                         })?;
-                        let p1 = self.papers.get(&s1.paper_id).ok_or_else(|| {
-                            pyo3::exceptions::PyKeyError::new_err(s1.paper_id.to_string())
-                        })?;
-                        let p2 = self.papers.get(&s2.paper_id).ok_or_else(|| {
-                            pyo3::exceptions::PyKeyError::new_err(s2.paper_id.to_string())
-                        })?;
                         Ok(self.constraint_value_from_records(
                             sig_id1,
                             sig_id2,
                             s1,
                             s2,
-                            p1,
-                            p2,
                             low_value,
                             high_value,
                             dont_merge_cluster_seeds,
@@ -11060,17 +11038,13 @@ impl RustFeaturizer {
             }
         }
 
-        let mut lookup: Vec<(&String, &SignatureData, &PaperData)> =
-            Vec::with_capacity(signature_count);
+        let mut lookup: Vec<(&String, &SignatureData)> = Vec::with_capacity(signature_count);
         for signature_id in signature_ids.iter() {
             let signature = self
                 .signatures
                 .get(signature_id)
                 .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(signature_id.clone()))?;
-            let paper = self.papers.get(&signature.paper_id).ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(signature.paper_id.to_string())
-            })?;
-            lookup.push((signature_id, signature, paper));
+            lookup.push((signature_id, signature));
         }
 
         let values = py.allow_threads(|| {
@@ -11078,15 +11052,13 @@ impl RustFeaturizer {
                 pairs
                     .par_iter()
                     .map(|(left_idx, right_idx)| {
-                        let (left_id, s1, p1) = lookup[*left_idx as usize];
-                        let (right_id, s2, p2) = lookup[*right_idx as usize];
+                        let (left_id, s1) = lookup[*left_idx as usize];
+                        let (right_id, s2) = lookup[*right_idx as usize];
                         self.constraint_value_from_records(
                             left_id,
                             right_id,
                             s1,
                             s2,
-                            p1,
-                            p2,
                             low_value,
                             high_value,
                             dont_merge_cluster_seeds,
@@ -11153,7 +11125,7 @@ impl RustFeaturizer {
             }
         }
 
-        let lookup = self.signature_paper_lookup()?;
+        let lookup = self.signature_lookup()?;
         let labels = py.allow_threads(|| {
             let compute = || {
                 left_indices
@@ -11164,15 +11136,13 @@ impl RustFeaturizer {
                         let right = *right_idx as usize;
                         let sig_id1 = signature_ids[left].as_str();
                         let sig_id2 = signature_ids[right].as_str();
-                        let (s1, p1) = lookup[left];
-                        let (s2, p2) = lookup[right];
+                        let s1 = lookup[left];
+                        let s2 = lookup[right];
                         match self.constraint_value_from_records(
                             sig_id1,
                             sig_id2,
                             s1,
                             s2,
-                            p1,
-                            p2,
                             low_value,
                             high_value,
                             dont_merge_cluster_seeds,
@@ -11368,7 +11338,7 @@ impl RustFeaturizer {
             }
         }
 
-        let mut block_lookup: Vec<(&String, &SignatureData, &PaperData)> =
+        let mut block_lookup: Vec<(&String, &SignatureData)> =
             Vec::with_capacity(block_signature_indices.len());
         for signature_index in block_signature_indices.iter() {
             let global_idx = *signature_index as usize;
@@ -11377,10 +11347,7 @@ impl RustFeaturizer {
                 .signatures
                 .get(signature_id)
                 .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(signature_id.clone()))?;
-            let paper = self.papers.get(&signature.paper_id).ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(signature.paper_id.to_string())
-            })?;
-            block_lookup.push((signature_id, signature, paper));
+            block_lookup.push((signature_id, signature));
         }
 
         let local_pairs =
@@ -11396,15 +11363,13 @@ impl RustFeaturizer {
                 local_pairs
                     .par_iter()
                     .map(|(left_idx, right_idx)| {
-                        let (left_id, s1, p1) = block_lookup[*left_idx];
-                        let (right_id, s2, p2) = block_lookup[*right_idx];
+                        let (left_id, s1) = block_lookup[*left_idx];
+                        let (right_id, s2) = block_lookup[*right_idx];
                         self.constraint_value_from_records(
                             left_id,
                             right_id,
                             s1,
                             s2,
-                            p1,
-                            p2,
                             low_value,
                             high_value,
                             dont_merge_cluster_seeds,
@@ -11503,7 +11468,7 @@ impl RustFeaturizer {
                 self.signatures.get(signature_id).map(|signature| {
                     (
                         signature_id.clone(),
-                        signature.first.clone(),
+                        signature.first_without_apostrophe().map(str::to_owned),
                         signature.orcid.clone(),
                     )
                 })
@@ -11675,31 +11640,7 @@ impl RustFeaturizer {
             return Ok(empty.to_pyarray(py));
         }
 
-        let signature_ids = self.signature_id_order();
-        for (left_idx, right_idx) in pairs.iter() {
-            let left = *left_idx as usize;
-            let right = *right_idx as usize;
-            if left >= signature_ids.len() || right >= signature_ids.len() {
-                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "pair index out of range: left={} right={} signature_count={}",
-                    left,
-                    right,
-                    signature_ids.len()
-                )));
-            }
-        }
-
-        let mut lookup: Vec<(&SignatureData, &PaperData)> = Vec::with_capacity(signature_ids.len());
-        for signature_id in signature_ids.iter() {
-            let signature = self
-                .signatures
-                .get(signature_id)
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(signature_id.clone()))?;
-            let paper = self.papers.get(&signature.paper_id).ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(signature.paper_id.to_string())
-            })?;
-            lookup.push((signature, paper));
-        }
+        let lookup = self.sparse_signature_paper_lookup_for_pair_tuples(&pairs)?;
 
         let full_cols = self.full_feature_count();
         let indices = resolve_feature_indices("selected_indices", selected_indices, full_cols)?;
@@ -11716,8 +11657,10 @@ impl RustFeaturizer {
                     .par_chunks_mut(out_cols)
                     .zip(pairs.par_iter())
                     .for_each(|(out_row, (left_idx, right_idx))| {
-                        let (s1, p1) = lookup[*left_idx as usize];
-                        let (s2, p2) = lookup[*right_idx as usize];
+                        let (s1, p1) = lookup[*left_idx as usize]
+                            .expect("left signature index was validated before featurization");
+                        let (s2, p2) = lookup[*right_idx as usize]
+                            .expect("right signature index was validated before featurization");
                         let row = self.featurize_pair_data(s1, s2, p1, p2);
                         for (dest, idx) in out_row.iter_mut().zip(indices.iter()) {
                             let mut value = row[*idx];
@@ -11786,19 +11729,7 @@ impl RustFeaturizer {
         let resolved_aggregate_indices = index_selection.aggregate_indices;
         let aggregate_matrix_positions = index_selection.aggregate_matrix_positions;
 
-        let signature_ids = self.signature_id_order();
-        for (left_idx, right_idx) in pairs.iter() {
-            let left = *left_idx as usize;
-            let right = *right_idx as usize;
-            if left >= signature_ids.len() || right >= signature_ids.len() {
-                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "pair index out of range: left={} right={} signature_count={}",
-                    left,
-                    right,
-                    signature_ids.len()
-                )));
-            }
-        }
+        let lookup = self.sparse_signature_paper_lookup_for_pair_tuples(&pairs)?;
         for row_index in row_indices.iter() {
             let bounded = *row_index as usize;
             if bounded >= row_count {
@@ -11807,18 +11738,6 @@ impl RustFeaturizer {
                     bounded, row_count
                 )));
             }
-        }
-
-        let mut lookup: Vec<(&SignatureData, &PaperData)> = Vec::with_capacity(signature_ids.len());
-        for signature_id in signature_ids.iter() {
-            let signature = self
-                .signatures
-                .get(signature_id)
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(signature_id.clone()))?;
-            let paper = self.papers.get(&signature.paper_id).ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(signature.paper_id.to_string())
-            })?;
-            lookup.push((signature, paper));
         }
 
         let out_cols = resolved_matrix_indices.len();
@@ -11833,8 +11752,10 @@ impl RustFeaturizer {
                     .par_chunks_mut(out_cols)
                     .zip(pairs.par_iter())
                     .for_each(|(out_row, (left_idx, right_idx))| {
-                        let (s1, p1) = lookup[*left_idx as usize];
-                        let (s2, p2) = lookup[*right_idx as usize];
+                        let (s1, p1) = lookup[*left_idx as usize]
+                            .expect("left signature index was validated before featurization");
+                        let (s2, p2) = lookup[*right_idx as usize]
+                            .expect("right signature index was validated before featurization");
                         let row = self.featurize_pair_data(s1, s2, p1, p2);
                         for (dest, idx) in out_row.iter_mut().zip(resolved_matrix_indices.iter()) {
                             let mut value = row[*idx];
@@ -11863,6 +11784,9 @@ impl RustFeaturizer {
                     aggregate_matrix_positions.iter().enumerate()
                 {
                     let value = matrix_buffer[matrix_row_start + *matrix_position];
+                    if value.is_nan() {
+                        continue;
+                    }
                     let stats_index = aggregate_row_start + aggregate_position;
                     sums[stats_index] += value;
                     if value < mins[stats_index] {
@@ -11971,19 +11895,7 @@ impl RustFeaturizer {
         let resolved_aggregate_indices = index_selection.aggregate_indices;
         let aggregate_matrix_positions = index_selection.aggregate_matrix_positions;
 
-        let signature_ids = self.signature_id_order();
-        for (left_idx, right_idx) in left_indices.iter().zip(right_indices.iter()) {
-            let left = *left_idx as usize;
-            let right = *right_idx as usize;
-            if left >= signature_ids.len() || right >= signature_ids.len() {
-                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "pair index out of range: left={} right={} signature_count={}",
-                    left,
-                    right,
-                    signature_ids.len()
-                )));
-            }
-        }
+        let lookup = self.sparse_signature_paper_lookup_for_indices(left_indices, right_indices)?;
         for row_index in owner_row_indices.iter() {
             let bounded = *row_index as usize;
             if bounded >= row_count {
@@ -11992,18 +11904,6 @@ impl RustFeaturizer {
                     bounded, row_count
                 )));
             }
-        }
-
-        let mut lookup: Vec<(&SignatureData, &PaperData)> = Vec::with_capacity(signature_ids.len());
-        for signature_id in signature_ids.iter() {
-            let signature = self
-                .signatures
-                .get(signature_id)
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(signature_id.clone()))?;
-            let paper = self.papers.get(&signature.paper_id).ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(signature.paper_id.to_string())
-            })?;
-            lookup.push((signature, paper));
         }
 
         let out_cols = resolved_matrix_indices.len();
@@ -12019,8 +11919,10 @@ impl RustFeaturizer {
                     .par_chunks_mut(out_cols)
                     .zip(left_indices.par_iter().zip(right_indices.par_iter()))
                     .for_each(|(out_row, (left_idx, right_idx))| {
-                        let (s1, p1) = lookup[*left_idx as usize];
-                        let (s2, p2) = lookup[*right_idx as usize];
+                        let (s1, p1) = lookup[*left_idx as usize]
+                            .expect("left signature index was validated before featurization");
+                        let (s2, p2) = lookup[*right_idx as usize]
+                            .expect("right signature index was validated before featurization");
                         let row = self.featurize_pair_data(s1, s2, p1, p2);
                         for (dest, idx) in out_row.iter_mut().zip(resolved_matrix_indices.iter()) {
                             let mut value = row[*idx];
@@ -12144,6 +12046,7 @@ impl RustFeaturizer {
         nan_value: f64,
     ) -> PyResult<(
         Bound<'py, PyArray1<u32>>,
+        Bound<'py, PyArray2<u64>>,
         Bound<'py, PyArray2<f64>>,
         Bound<'py, PyArray2<f64>>,
         Bound<'py, PyArray2<f64>>,
@@ -12165,19 +12068,7 @@ impl RustFeaturizer {
         let resolved_aggregate_indices =
             resolve_feature_indices("aggregate_indices", aggregate_indices, full_cols)?;
 
-        let signature_ids = self.signature_id_order();
-        for (left_idx, right_idx) in left_indices.iter().zip(right_indices.iter()) {
-            let left = *left_idx as usize;
-            let right = *right_idx as usize;
-            if left >= signature_ids.len() || right >= signature_ids.len() {
-                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "pair index out of range: left={} right={} signature_count={}",
-                    left,
-                    right,
-                    signature_ids.len()
-                )));
-            }
-        }
+        let lookup = self.sparse_signature_paper_lookup_for_indices(left_indices, right_indices)?;
         for row_index in owner_row_indices.iter() {
             let bounded = *row_index as usize;
             if bounded >= row_count {
@@ -12188,7 +12079,6 @@ impl RustFeaturizer {
             }
         }
 
-        let lookup = self.signature_paper_lookup()?;
         let row_ranges = Self::pair_aggregate_row_ranges(owner_row_indices);
         let aggregate_cols = resolved_aggregate_indices.len();
         let aggregate_buffers = py.allow_threads(|| {
@@ -12215,6 +12105,16 @@ impl RustFeaturizer {
             install_with_optional_rayon_pool(num_threads, compute)
         });
 
+        let valid_counts_array = numpy::ndarray::Array2::from_shape_vec(
+            (row_count, aggregate_cols),
+            aggregate_buffers.valid_counts,
+        )
+        .map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to build aggregate valid-counts matrix: {}",
+                err
+            ))
+        })?;
         let sums_array = numpy::ndarray::Array2::from_shape_vec(
             (row_count, aggregate_cols),
             aggregate_buffers.sums,
@@ -12247,6 +12147,7 @@ impl RustFeaturizer {
         })?;
         Ok((
             numpy::ndarray::Array1::from_vec(aggregate_buffers.counts).to_pyarray(py),
+            valid_counts_array.to_pyarray(py),
             sums_array.to_pyarray(py),
             mins_array.to_pyarray(py),
             maxs_array.to_pyarray(py),
@@ -12519,7 +12420,6 @@ impl RustNameCompatibleSubblockSelector {
         let ordered_component_keys: Vec<String> = PyIterator::from_object(component_keys)?
             .map(|item| item.and_then(|value| value.extract()))
             .collect::<PyResult<Vec<_>>>()?;
-
         Ok(self.select_ordered_component_keys(
             query_signature_id,
             query_first,
@@ -12578,11 +12478,7 @@ impl RustHybridCentroidRetriever {
         top_k: usize,
         num_threads: Option<usize>,
     ) -> PyResult<(Vec<String>, Vec<f32>)> {
-        if top_k == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "top_k must be positive",
-            ));
-        }
+        validate_positive_top_k(top_k)?;
         let query_data = extract_retrieval_query(query)?;
 
         let selection = self.hard_filtered_candidate_indices_for_query(
@@ -12636,11 +12532,7 @@ impl RustHybridCentroidRetriever {
         query_candidate_component_keys_by_signature_id: Option<&Bound<'py, PyAny>>,
         full_first_global_backfill_count: usize,
     ) -> PyResult<Py<PyDict>> {
-        if top_k == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "top_k must be positive",
-            ));
-        }
+        validate_retrieval_rank_top_k(top_k)?;
         let mut query_data = Vec::new();
         for item in PyIterator::from_object(queries)? {
             query_data.push(extract_retrieval_query(&item?)?);
@@ -12739,11 +12631,13 @@ impl RustHybridCentroidRetriever {
                                 current_query,
                                 query_indices[query_offset],
                                 base_candidate_indices,
+                                None,
                                 query_signature_id,
                                 &component_member_indices,
                                 top_k,
                                 selector.as_ref(),
                                 full_first_global_backfill_count,
+                                true,
                             )
                         })
                         .collect::<Vec<_>>()
@@ -12876,180 +12770,6 @@ impl RustHybridCentroidRetriever {
         Ok(payload.unbind())
     }
 
-    #[pyo3(signature = (query, top_k, weights, num_threads = None))]
-    fn top_k_weighted_hybrid_centroid(
-        &self,
-        py: Python<'_>,
-        query: &Bound<'_, PyAny>,
-        top_k: usize,
-        weights: Vec<f64>,
-        num_threads: Option<usize>,
-    ) -> PyResult<(Vec<String>, Vec<f32>)> {
-        if top_k == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "top_k must be positive",
-            ));
-        }
-        let query_data = extract_retrieval_query(query)?;
-        let weights_data = extract_retrieval_weights(weights)?;
-
-        let selection = self.hard_filtered_candidate_indices_for_query(
-            &query_data,
-            (0..self.summaries.len()).collect(),
-        );
-
-        if selection.indices.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let effective_top_k = if selection.return_all {
-            selection.indices.len()
-        } else {
-            top_k
-        };
-
-        self.score_top_k_candidate_indices(
-            py,
-            &query_data,
-            &selection.indices,
-            effective_top_k,
-            num_threads,
-            None,
-            None,
-            weights_data,
-        )
-    }
-
-    #[pyo3(signature = (query, component_keys, top_k, num_threads = None, override_summary = None))]
-    fn top_k_hybrid_centroid_subset(
-        &self,
-        py: Python<'_>,
-        query: &Bound<'_, PyAny>,
-        component_keys: &Bound<'_, PyAny>,
-        top_k: usize,
-        num_threads: Option<usize>,
-        override_summary: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<(Vec<String>, Vec<f32>)> {
-        if top_k == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "top_k must be positive",
-            ));
-        }
-
-        let query_data = extract_retrieval_query(query)?;
-        let mut candidate_indices = Vec::new();
-        for item in PyIterator::from_object(component_keys)? {
-            let component_key: String = item?.extract()?;
-            let Some(candidate_index) = self.component_index_by_key.get(&component_key) else {
-                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                    "Unknown component_key for RustHybridCentroidRetriever: {component_key}"
-                )));
-            };
-            candidate_indices.push(*candidate_index);
-        }
-
-        let override_data = override_summary
-            .map(|value| extract_retrieval_summary(value, true))
-            .transpose()?;
-        let override_index = if let Some(override_summary_data) = override_data.as_ref() {
-            let Some(candidate_index) = self
-                .component_index_by_key
-                .get(&override_summary_data.component_key)
-            else {
-                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                    "Unknown override component_key for RustHybridCentroidRetriever: {}",
-                    override_summary_data.component_key
-                )));
-            };
-            if !candidate_indices.contains(candidate_index) {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "override_summary component_key {} was not present in component_keys",
-                    override_summary_data.component_key
-                )));
-            }
-            Some(*candidate_index)
-        } else {
-            None
-        };
-
-        self.score_top_k_candidate_indices_experimental(
-            py,
-            &query_data,
-            &candidate_indices,
-            top_k,
-            num_threads,
-            override_index,
-            override_data.as_ref(),
-            Self::default_hybrid_weights_for_query(&query_data),
-            Self::default_experimental_config_for_query(&query_data),
-        )
-    }
-
-    #[pyo3(signature = (query, component_keys, top_k, weights, num_threads = None, override_summary = None))]
-    fn top_k_weighted_hybrid_centroid_subset(
-        &self,
-        py: Python<'_>,
-        query: &Bound<'_, PyAny>,
-        component_keys: &Bound<'_, PyAny>,
-        top_k: usize,
-        weights: Vec<f64>,
-        num_threads: Option<usize>,
-        override_summary: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<(Vec<String>, Vec<f32>)> {
-        if top_k == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "top_k must be positive",
-            ));
-        }
-
-        let query_data = extract_retrieval_query(query)?;
-        let weights_data = extract_retrieval_weights(weights)?;
-        let mut candidate_indices = Vec::new();
-        for item in PyIterator::from_object(component_keys)? {
-            let component_key: String = item?.extract()?;
-            let Some(candidate_index) = self.component_index_by_key.get(&component_key) else {
-                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                    "Unknown component_key for RustHybridCentroidRetriever: {component_key}"
-                )));
-            };
-            candidate_indices.push(*candidate_index);
-        }
-
-        let override_data = override_summary
-            .map(|value| extract_retrieval_summary(value, false))
-            .transpose()?;
-        let override_index = if let Some(override_summary_data) = override_data.as_ref() {
-            let Some(candidate_index) = self
-                .component_index_by_key
-                .get(&override_summary_data.component_key)
-            else {
-                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                    "Unknown override component_key for RustHybridCentroidRetriever: {}",
-                    override_summary_data.component_key
-                )));
-            };
-            if !candidate_indices.contains(candidate_index) {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "override_summary component_key {} was not present in component_keys",
-                    override_summary_data.component_key
-                )));
-            }
-            Some(*candidate_index)
-        } else {
-            None
-        };
-
-        self.score_top_k_candidate_indices(
-            py,
-            &query_data,
-            &candidate_indices,
-            top_k,
-            num_threads,
-            override_index,
-            override_data.as_ref(),
-            weights_data,
-        )
-    }
-
     #[pyo3(
         signature = (
             query,
@@ -13098,11 +12818,7 @@ impl RustHybridCentroidRetriever {
         num_threads: Option<usize>,
         override_summary: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Vec<String>, Vec<f32>)> {
-        if top_k == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "top_k must be positive",
-            ));
-        }
+        validate_positive_top_k(top_k)?;
 
         let query_data = extract_retrieval_query(query)?;
         let weights_data = extract_retrieval_weights(weights)?;
@@ -13372,10 +13088,12 @@ fn linker_optional_string_vec(
     key: &str,
     row_count: usize,
 ) -> PyResult<Option<Vec<String>>> {
-    if dict.get_item(key)?.is_none() {
-        return Ok(None);
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => {
+            Ok(Some(linker_extract_string_vec(dict, key, row_count)?))
+        }
+        _ => Ok(None),
     }
-    Ok(Some(linker_extract_string_vec(dict, key, row_count)?))
 }
 
 fn linker_groups(row_query_signature_indices: &[u32]) -> Vec<Vec<usize>> {
@@ -13415,22 +13133,24 @@ fn linker_retrieval_ordered_groups(
     out
 }
 
-fn linker_normalize_alpha(value: &str) -> String {
-    value
+fn linker_normalize_alpha(value: &str, unidecode_char_map: &HashMap<char, String>) -> String {
+    normalize_text_compat_from_map(value, false, unidecode_char_map)
         .chars()
-        .flat_map(|character| character.to_lowercase())
         .filter(|character| character.is_ascii_alphabetic())
         .collect()
 }
 
-fn linker_normalized_alpha_vec(values: &[String]) -> Vec<String> {
+fn linker_normalized_alpha_vec(
+    values: &[String],
+    unidecode_char_map: &HashMap<char, String>,
+) -> Vec<String> {
     let mut cache = HashMap::<&str, String>::new();
     let mut out = Vec::with_capacity(values.len());
     for value in values {
         if let Some(normalized) = cache.get(value.as_str()) {
             out.push(normalized.clone());
         } else {
-            let normalized = linker_normalize_alpha(value);
+            let normalized = linker_normalize_alpha(value, unidecode_char_map);
             cache.insert(value.as_str(), normalized.clone());
             out.push(normalized);
         }
@@ -13678,8 +13398,16 @@ fn promoted_linker_non_pairwise_features<'py>(
         .zip(component_keys.iter())
         .filter(|(family, component)| !family.is_empty() && *family != *component)
         .count();
-    let query_first_alpha = linker_normalized_alpha_vec(&query_first_token);
-    let dominant_first_alpha = linker_normalized_alpha_vec(&dominant_first_name);
+    let text_module = py.import("s2and.text")?;
+    let unidecode = text_module.getattr("unidecode")?;
+    let mut linker_unidecode_char_map = HashMap::<char, String>::new();
+    for value in query_first_token.iter().chain(dominant_first_name.iter()) {
+        ensure_unidecode_for_text(&unidecode, value, &mut linker_unidecode_char_map)?;
+    }
+    let query_first_alpha =
+        linker_normalized_alpha_vec(&query_first_token, &linker_unidecode_char_map);
+    let dominant_first_alpha =
+        linker_normalized_alpha_vec(&dominant_first_name, &linker_unidecode_char_map);
     let group_features = linker_derive_group_features(
         &ordered_groups,
         &retrieval_score,
@@ -13946,8 +13674,90 @@ fn optional_name_counts_index_path_from_py_dict(
     optional_path_from_py_dict(paths, "name_counts_index")
 }
 
+fn py_dict_usize_or_zero(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<usize> {
+    dict.get_item(key)?
+        .map(|value| value.extract::<usize>())
+        .transpose()
+        .map(|value| value.unwrap_or(0))
+}
+
+fn py_dict_f64_or_zero(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<f64> {
+    dict.get_item(key)?
+        .map(|value| value.extract::<f64>())
+        .transpose()
+        .map(|value| value.unwrap_or(0.0))
+}
+
+fn merge_raw_arrow_planner_build_telemetry(
+    py: Python<'_>,
+    raw_plan: &Py<PyDict>,
+    build_telemetry: &Py<PyDict>,
+) -> PyResult<()> {
+    let telemetry_obj = raw_plan
+        .bind(py)
+        .get_item("telemetry")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("raw plan is missing telemetry"))?;
+    let telemetry = telemetry_obj.downcast::<PyDict>()?;
+    let build = build_telemetry.bind(py);
+    for key in [
+        "signature_batches_read",
+        "signature_rows_scanned",
+        "paper_batches_read",
+        "paper_rows_scanned",
+        "paper_author_batches_read",
+        "paper_author_rows_scanned",
+        "specter_batches_read",
+        "specter_rows_scanned",
+    ] {
+        telemetry.set_item(
+            key,
+            py_dict_usize_or_zero(telemetry, key)? + py_dict_usize_or_zero(build, key)?,
+        )?;
+    }
+    let timings_obj = telemetry.get_item("timings")?.ok_or_else(|| {
+        pyo3::exceptions::PyKeyError::new_err("raw plan telemetry is missing timings")
+    })?;
+    let timings = timings_obj.downcast::<PyDict>()?;
+    let build_timings_obj = build.get_item("timings")?.ok_or_else(|| {
+        pyo3::exceptions::PyKeyError::new_err("planner build telemetry is missing timings")
+    })?;
+    let build_timings = build_timings_obj.downcast::<PyDict>()?;
+    for key in [
+        "read_cluster_seeds_secs",
+        "read_signatures_secs",
+        "read_papers_secs",
+        "read_paper_authors_secs",
+        "read_specter_secs",
+        "read_name_counts_secs",
+        "metadata_reads_parallel_secs",
+        "text_context_secs",
+        "feature_secs",
+        "summary_secs",
+        "component_members_secs",
+    ] {
+        timings.set_item(
+            key,
+            py_dict_f64_or_zero(timings, key)? + py_dict_f64_or_zero(build_timings, key)?,
+        )?;
+    }
+    telemetry.set_item("planner_seed_state_reused", 0)?;
+    telemetry.set_item("planner_seed_state_built", 1)?;
+    Ok(())
+}
+
 #[pyfunction]
-#[pyo3(signature = (paths, query_signature_ids, top_k = 25, query_view = "auto", orcid_enabled = true, num_threads = None, max_exemplars = 4))]
+#[pyo3(signature = (
+    paths,
+    query_signature_ids,
+    top_k = 25,
+    query_view = "auto",
+    orcid_enabled = true,
+    num_threads = None,
+    max_exemplars = 4,
+    include_pair_signature_ids = true,
+    include_component_members = true,
+    full_scan_without_index = true
+))]
 fn raw_block_query_candidate_plan_arrow<'py>(
     py: Python<'py>,
     paths: &Bound<'py, PyDict>,
@@ -13957,273 +13767,160 @@ fn raw_block_query_candidate_plan_arrow<'py>(
     orcid_enabled: bool,
     num_threads: Option<usize>,
     max_exemplars: usize,
+    include_pair_signature_ids: bool,
+    include_component_members: bool,
+    full_scan_without_index: bool,
 ) -> PyResult<Py<PyDict>> {
-    if top_k == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "top_k must be positive",
-        ));
+    let mut planner = RawBlockQueryCandidatePlanner::new(
+        py,
+        paths,
+        query_signature_ids.clone(),
+        top_k,
+        query_view,
+        orcid_enabled,
+        num_threads,
+        max_exemplars,
+        include_pair_signature_ids,
+        include_component_members,
+        full_scan_without_index,
+    )?;
+    let plan = planner.plan(
+        py,
+        query_signature_ids,
+        Some(top_k),
+        Some(query_view.to_string()),
+        Some(include_pair_signature_ids),
+        Some(include_component_members),
+    )?;
+    let build_telemetry = planner.build_telemetry(py)?;
+    merge_raw_arrow_planner_build_telemetry(py, &plan, &build_telemetry)?;
+    Ok(plan)
+}
+
+struct RawArrowPlannerPaths {
+    signatures_path: String,
+    papers_path: String,
+    paper_authors_path: String,
+    cluster_seeds_path: String,
+    cluster_seed_disallows_path: Option<String>,
+    specter_path: Option<String>,
+    name_counts_arrow_path: Option<String>,
+    name_counts_index_path: Option<String>,
+    signatures_batch_index_path: Option<String>,
+    papers_batch_index_path: Option<String>,
+    paper_authors_batch_index_path: Option<String>,
+    specter_batch_index_path: Option<String>,
+}
+
+impl RawArrowPlannerPaths {
+    fn from_py_dict(paths: &Bound<'_, PyDict>) -> PyResult<Self> {
+        Ok(Self {
+            signatures_path: required_path_from_py_dict(paths, "signatures")?,
+            papers_path: required_path_from_py_dict(paths, "papers")?,
+            paper_authors_path: required_path_from_py_dict(paths, "paper_authors")?,
+            cluster_seeds_path: required_path_from_py_dict(paths, "cluster_seeds")?,
+            cluster_seed_disallows_path: optional_path_from_py_dict(
+                paths,
+                "cluster_seed_disallows",
+            )?,
+            specter_path: optional_path_from_py_dict(paths, "specter")?,
+            name_counts_arrow_path: optional_path_from_py_dict(paths, "name_counts")?,
+            name_counts_index_path: optional_name_counts_index_path_from_py_dict(paths)?,
+            signatures_batch_index_path: optional_path_from_py_dict(
+                paths,
+                "signatures_batch_index",
+            )?,
+            papers_batch_index_path: optional_path_from_py_dict(paths, "papers_batch_index")?,
+            paper_authors_batch_index_path: optional_path_from_py_dict(
+                paths,
+                "paper_authors_batch_index",
+            )?,
+            specter_batch_index_path: optional_path_from_py_dict(paths, "specter_batch_index")?,
+        })
     }
+}
+
+struct RawArrowPlannerBuildTelemetry {
+    read_cluster_seeds_secs: f64,
+    read_signatures_secs: f64,
+    read_papers_secs: f64,
+    read_paper_authors_secs: f64,
+    read_specter_secs: f64,
+    read_name_counts_secs: f64,
+    metadata_reads_parallel_secs: f64,
+    text_context_secs: f64,
+    feature_secs: f64,
+    summary_secs: f64,
+    component_members_secs: f64,
+    signature_index_stats: IndexedArrowReadStats,
+    paper_index_stats: IndexedArrowReadStats,
+    paper_author_index_stats: IndexedArrowReadStats,
+    specter_index_stats: IndexedArrowReadStats,
+    indexed_arrow_candidate_plan: bool,
+}
+
+struct ReusableRawArrowCandidatePlanState {
+    features_by_signature_id: HashMap<String, RawArrowFeature>,
+    signatures: HashMap<String, RawArrowSignature>,
+    paper_authors: HashMap<String, Vec<(i64, String)>>,
+    raw_name_counts: RawNameCountMaps,
+    members_by_component: HashMap<String, Vec<String>>,
+    component_keys_by_member: HashMap<String, Vec<String>>,
+    summary_signals_by_component: HashMap<String, RawArrowSummarySignalData>,
+    retriever: RustHybridCentroidRetriever,
+    component_order: Vec<String>,
+    seed_signature_ids: Vec<String>,
+    seed_signature_id_set: HashSet<String>,
+    cluster_seed_disallows: HashSet<(String, String)>,
+    unidecode_char_map: HashMap<char, String>,
+    name_prefixes: HashSet<String>,
+    affiliation_stopwords: HashSet<String>,
+    seed_paper_count: usize,
+    seed_specter_count: usize,
+    build_telemetry: RawArrowPlannerBuildTelemetry,
+}
+
+struct RawArrowQueryInputReadResult {
+    signatures: HashMap<String, RawArrowSignature>,
+    papers: HashMap<String, RawArrowPaper>,
+    paper_authors: HashMap<String, Vec<(i64, String)>>,
+    specter_by_paper_id: Option<HashMap<String, Arc<Vec<f32>>>>,
+    signature_index_stats: IndexedArrowReadStats,
+    paper_index_stats: IndexedArrowReadStats,
+    paper_author_index_stats: IndexedArrowReadStats,
+    specter_index_stats: IndexedArrowReadStats,
+    read_signatures_secs: f64,
+    read_papers_secs: f64,
+    read_paper_authors_secs: f64,
+    read_specter_secs: f64,
+    metadata_reads_parallel_secs: f64,
+}
+
+fn validate_raw_arrow_query_signature_ids(query_signature_ids: &[String]) -> PyResult<()> {
     if query_signature_ids.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "query_signature_ids must be non-empty",
         ));
     }
-
-    let total_start = Instant::now();
-    let signatures_path = required_path_from_py_dict(paths, "signatures")?;
-    let papers_path = required_path_from_py_dict(paths, "papers")?;
-    let paper_authors_path = required_path_from_py_dict(paths, "paper_authors")?;
-    let cluster_seeds_path = required_path_from_py_dict(paths, "cluster_seeds")?;
-    let specter_path = optional_path_from_py_dict(paths, "specter")?;
-    let name_counts_arrow_path = optional_path_from_py_dict(paths, "name_counts")?;
-    let name_counts_index_path = optional_name_counts_index_path_from_py_dict(paths)?;
-    let signatures_batch_index_path = optional_path_from_py_dict(paths, "signatures_batch_index")?;
-    let papers_batch_index_path = optional_path_from_py_dict(paths, "papers_batch_index")?;
-    let paper_authors_batch_index_path =
-        optional_path_from_py_dict(paths, "paper_authors_batch_index")?;
-    let specter_batch_index_path = optional_path_from_py_dict(paths, "specter_batch_index")?;
-
-    let read_cluster_seeds_start = Instant::now();
-    let (raw_component_order, mut raw_members_by_component) =
-        read_raw_arrow_cluster_seeds(&cluster_seeds_path)?;
-    let read_cluster_seeds_secs = read_cluster_seeds_start.elapsed().as_secs_f64();
-
-    let query_signature_id_set: HashSet<&str> =
-        query_signature_ids.iter().map(String::as_str).collect();
-    let mut component_order = Vec::with_capacity(raw_component_order.len());
-    let mut members_by_component = HashMap::<String, Vec<String>>::new();
-    let mut excluded_query_seed_count = 0usize;
-    for component_key in raw_component_order {
-        let members = raw_members_by_component
-            .remove(&component_key)
-            .unwrap_or_default();
-        let mut filtered_members = Vec::with_capacity(members.len());
-        for signature_id in members {
-            if query_signature_id_set.contains(signature_id.as_str()) {
-                excluded_query_seed_count += 1;
-            } else {
-                filtered_members.push(signature_id);
-            }
-        }
-        if !filtered_members.is_empty() {
-            component_order.push(component_key.clone());
-            members_by_component.insert(component_key, filtered_members);
-        }
-    }
-
-    let mut required_signature_ids = Vec::<String>::new();
-    let mut required_seen = HashSet::<String>::new();
+    let mut seen = HashSet::<&str>::with_capacity(query_signature_ids.len());
     for signature_id in query_signature_ids.iter() {
-        if required_seen.insert(signature_id.clone()) {
-            required_signature_ids.push(signature_id.clone());
-        }
-    }
-    for component_key in component_order.iter() {
-        if let Some(members) = members_by_component.get(component_key) {
-            for signature_id in members {
-                if required_seen.insert(signature_id.clone()) {
-                    required_signature_ids.push(signature_id.clone());
-                }
-            }
-        }
-    }
-    let required_signature_id_set: HashSet<String> =
-        required_signature_ids.iter().cloned().collect();
-
-    let read_signatures_start = Instant::now();
-    let (signatures, signature_index_stats) = read_raw_arrow_signatures_with_optional_index(
-        &signatures_path,
-        signatures_batch_index_path.as_deref(),
-        Some(&required_signature_id_set),
-        true,
-    )?;
-    let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
-
-    for signature_id in required_signature_ids.iter() {
-        if !signatures.contains_key(signature_id) {
-            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                "signature_id '{}' is required by queries or cluster seeds but is missing from signatures Arrow input",
-                signature_id
+        if !seen.insert(signature_id.as_str()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "query_signature_ids must be unique; duplicate signature_id={signature_id:?}"
             )));
         }
     }
+    Ok(())
+}
 
-    let needed_paper_ids: HashSet<String> = required_signature_ids
-        .iter()
-        .filter_map(|signature_id| signatures.get(signature_id))
-        .map(|signature| signature.paper_id.clone())
-        .collect();
-
-    let metadata_reads_parallel_start = Instant::now();
-    let (
-        (papers_result, paper_authors_result),
-        (raw_specter_by_paper_id_result, raw_name_counts_result),
-    ) = py.allow_threads(|| {
-        let compute = || {
-            rayon::join(
-                || {
-                    rayon::join(
-                        || -> PyResult<(
-                            HashMap<String, RawArrowPaper>,
-                            IndexedArrowReadStats,
-                            f64,
-                        )> {
-                            let start = Instant::now();
-                            let (loaded, stats) = read_raw_arrow_papers_with_optional_index(
-                                &papers_path,
-                                papers_batch_index_path.as_deref(),
-                                &needed_paper_ids,
-                                true,
-                            )?;
-                            Ok((loaded, stats, start.elapsed().as_secs_f64()))
-                        },
-                        || -> PyResult<(
-                            HashMap<String, Vec<(i64, String)>>,
-                            IndexedArrowReadStats,
-                            f64,
-                        )> {
-                            let start = Instant::now();
-                            let (loaded, stats) = read_raw_arrow_paper_authors_with_optional_index(
-                                &paper_authors_path,
-                                paper_authors_batch_index_path.as_deref(),
-                                &needed_paper_ids,
-                                true,
-                            )?;
-                            Ok((loaded, stats, start.elapsed().as_secs_f64()))
-                        },
-                    )
-                },
-                || {
-                    rayon::join(
-                        || -> PyResult<(
-                            Option<HashMap<String, Vec<f32>>>,
-                            IndexedArrowReadStats,
-                            f64,
-                        )> {
-                            let start = Instant::now();
-                            let (loaded, stats) = match specter_path.as_ref() {
-                                Some(path) => {
-                                    let (loaded, stats) = read_raw_arrow_specter_with_optional_index(
-                                        path,
-                                        specter_batch_index_path.as_deref(),
-                                        &needed_paper_ids,
-                                        true,
-                                    )?;
-                                    (loaded, stats)
-                                }
-                                None => (HashMap::new(), IndexedArrowReadStats::default()),
-                            };
-                            Ok((
-                                if specter_path.is_some() { Some(loaded) } else { None },
-                                stats,
-                                start.elapsed().as_secs_f64(),
-                            ))
-                        },
-                        || -> PyResult<(RawNameCountMaps, f64)> {
-                            let start = Instant::now();
-                            let loaded = match name_counts_index_path.as_ref() {
-                                Some(path) => read_raw_name_counts_index(path)?,
-                                None => match name_counts_arrow_path.as_ref() {
-                                    Some(path) => {
-                                        return Err(pyo3::exceptions::PyValueError::new_err(
-                                            format!(
-                                                "name_counts Arrow path '{path}' requires name_counts_index; refusing slow Arrow fallback"
-                                            ),
-                                        ));
-                                    }
-                                    None => RawNameCountMaps::default(),
-                                },
-                            };
-                            Ok((loaded, start.elapsed().as_secs_f64()))
-                        },
-                    )
-                },
-            )
-        };
-        install_with_optional_rayon_pool(num_threads, compute)
-    });
-    let (papers, paper_index_stats, read_papers_secs) = papers_result?;
-    let (paper_authors, paper_author_index_stats, read_paper_authors_secs) = paper_authors_result?;
-    let (raw_specter_by_paper_id, specter_index_stats, read_specter_secs) =
-        raw_specter_by_paper_id_result?;
-    let (raw_name_counts, read_name_counts_secs) = raw_name_counts_result?;
-    let metadata_reads_parallel_secs = metadata_reads_parallel_start.elapsed().as_secs_f64();
-    let specter_by_paper_id = raw_specter_by_paper_id.map(|values| {
-        values
-            .into_iter()
-            .map(|(paper_id, vector)| (paper_id, Arc::new(vector)))
-            .collect::<HashMap<_, _>>()
-    });
-
-    let text_context_start = Instant::now();
-    let text_module = py.import("s2and.text")?;
-    let unidecode = text_module.getattr("unidecode")?;
-    let name_prefixes = extract_required_string_set(&text_module.getattr("NAME_PREFIXES")?)?;
-    let affiliation_stopwords = extract_affiliation_stopwords(py)?;
-    let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
-    ensure_unidecode_for_raw_arrow_inputs(
-        &unidecode,
-        &signatures,
-        &papers,
-        &paper_authors,
-        &mut unidecode_char_map,
-    )?;
-    let text_context_secs = text_context_start.elapsed().as_secs_f64();
-
-    let feature_start = Instant::now();
-    let raw_feature_results: Vec<Result<(String, RawArrowFeature), String>> =
-        py.allow_threads(|| {
-            let compute = || {
-                required_signature_ids
-                    .par_iter()
-                    .map(|signature_id| {
-                        let signature = signatures.get(signature_id).ok_or_else(|| {
-                            format!("signature_id '{}' is missing from signatures", signature_id)
-                        })?;
-                        let paper = papers.get(&signature.paper_id);
-                        let authors = paper_authors.get(&signature.paper_id);
-                        Ok((
-                            signature_id.clone(),
-                            build_raw_arrow_feature(
-                                signature,
-                                paper,
-                                authors,
-                                specter_by_paper_id.as_ref(),
-                                &raw_name_counts,
-                                &name_prefixes,
-                                &affiliation_stopwords,
-                                &unidecode_char_map,
-                                orcid_enabled,
-                            ),
-                        ))
-                    })
-                    .collect::<Vec<_>>()
-            };
-            install_with_optional_rayon_pool(num_threads, compute)
-        });
-    let mut features_by_signature_id = HashMap::with_capacity(raw_feature_results.len());
-    for result in raw_feature_results {
-        let (signature_id, feature) = result.map_err(pyo3::exceptions::PyKeyError::new_err)?;
-        features_by_signature_id.insert(signature_id, feature);
-    }
-    let feature_secs = feature_start.elapsed().as_secs_f64();
-
-    let query_start = Instant::now();
-    let mut queries = Vec::<RetrievalQueryData>::with_capacity(query_signature_ids.len());
-    let mut query_views = Vec::<String>::with_capacity(query_signature_ids.len());
-    let mut query_authors = Vec::<String>::with_capacity(query_signature_ids.len());
-    for signature_id in query_signature_ids.iter() {
-        let base_feature = &features_by_signature_id[signature_id];
-        let base = &base_feature.query;
-        let (masked, resolved_view) = mask_raw_arrow_query(base, query_view)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        queries.push(masked);
-        query_views.push(resolved_view);
-        query_authors.push(base_feature.query_author.clone());
-    }
-    let query_secs = query_start.elapsed().as_secs_f64();
-
-    let summary_start = Instant::now();
+fn build_retriever_from_raw_arrow_components(
+    py: Python<'_>,
+    component_order: &[String],
+    members_by_component: &HashMap<String, Vec<String>>,
+    features_by_signature_id: &HashMap<String, RawArrowFeature>,
+    max_exemplars: usize,
+    num_threads: Option<usize>,
+) -> PyResult<RustHybridCentroidRetriever> {
     let summary_results: Vec<Result<RetrievalSummaryData, String>> = py.allow_threads(|| {
         let compute = || {
             component_order
@@ -14238,7 +13935,7 @@ fn raw_block_query_candidate_plan_arrow<'py>(
                     build_raw_arrow_summary(
                         component_key,
                         members,
-                        &features_by_signature_id,
+                        features_by_signature_id,
                         max_exemplars,
                     )
                 })
@@ -14263,20 +13960,24 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         );
         increment_df_from_counter(&summary.affiliation_counts, &mut affiliation_cluster_df);
     }
-    let retriever = RustHybridCentroidRetriever {
+    Ok(RustHybridCentroidRetriever {
         summaries,
         component_index_by_key,
         coauthor_cluster_df,
         non_mega_coauthor_cluster_df,
         affiliation_cluster_df,
-    };
-    let summary_secs = summary_start.elapsed().as_secs_f64();
+    })
+}
 
-    let component_members_start = Instant::now();
+fn raw_arrow_component_member_indices_for_batch(
+    component_order: &[String],
+    members_by_component: &HashMap<String, Vec<String>>,
+    query_count: usize,
+) -> PyResult<(HashMap<String, Vec<u32>>, Vec<String>, Vec<String>)> {
     let mut component_member_indices = HashMap::<String, Vec<u32>>::new();
     let mut seed_signature_ids = Vec::<String>::new();
     let mut seed_component_keys = Vec::<String>::new();
-    let query_count_u32 = u32::try_from(query_signature_ids.len())
+    let query_count_u32 = u32::try_from(query_count)
         .map_err(|_| pyo3::exceptions::PyOverflowError::new_err("query count exceeds u32"))?;
     for component_key in component_order.iter() {
         let mut member_indices = Vec::<u32>::new();
@@ -14295,155 +13996,1016 @@ fn raw_block_query_candidate_plan_arrow<'py>(
         }
         component_member_indices.insert(component_key.clone(), member_indices);
     }
-    let component_members_secs = component_members_start.elapsed().as_secs_f64();
-    let mut state = RawArrowCandidatePlanState {
-        features_by_signature_id,
-        specter_by_paper_id,
+    Ok((
+        component_member_indices,
+        seed_signature_ids,
+        seed_component_keys,
+    ))
+}
+
+fn raw_arrow_excluded_candidate_indices_by_query(
+    query_signature_ids: &[String],
+    component_order: &[String],
+    component_keys_by_member: &HashMap<String, Vec<String>>,
+    cluster_seed_disallows: &HashSet<(String, String)>,
+) -> (Option<Vec<Option<HashSet<usize>>>>, usize) {
+    let query_signature_id_set: HashSet<&str> =
+        query_signature_ids.iter().map(String::as_str).collect();
+    let mut disallowed_members_by_query = HashMap::<String, HashSet<String>>::new();
+    for (left, right) in cluster_seed_disallows.iter() {
+        if query_signature_id_set.contains(left.as_str()) {
+            disallowed_members_by_query
+                .entry(left.clone())
+                .or_default()
+                .insert(right.clone());
+        }
+        if query_signature_id_set.contains(right.as_str()) {
+            disallowed_members_by_query
+                .entry(right.clone())
+                .or_default()
+                .insert(left.clone());
+        }
+    }
+    let excluded_indices_by_query = if disallowed_members_by_query.is_empty() {
+        None
+    } else {
+        let mut component_index_by_key =
+            HashMap::<&str, usize>::with_capacity(component_order.len());
+        for (component_index, component_key) in component_order.iter().enumerate() {
+            component_index_by_key.insert(component_key.as_str(), component_index);
+        }
+        Some(
+            query_signature_ids
+                .iter()
+                .map(|query_signature_id| {
+                    let Some(disallowed_members) =
+                        disallowed_members_by_query.get(query_signature_id)
+                    else {
+                        return None;
+                    };
+                    let mut excluded_indices = HashSet::<usize>::new();
+                    for disallowed_member in disallowed_members.iter() {
+                        if let Some(component_keys) =
+                            component_keys_by_member.get(disallowed_member.as_str())
+                        {
+                            for component_key in component_keys {
+                                if let Some(component_index) =
+                                    component_index_by_key.get(component_key.as_str())
+                                {
+                                    excluded_indices.insert(*component_index);
+                                }
+                            }
+                        }
+                    }
+                    Some(excluded_indices)
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let cluster_seed_disallowed_candidate_count =
+        excluded_indices_by_query
+            .as_ref()
+            .map_or(0usize, |indices_by_query| {
+                indices_by_query
+                    .iter()
+                    .filter_map(|excluded| excluded.as_ref())
+                    .map(HashSet::len)
+                    .sum()
+            });
+    (
+        excluded_indices_by_query,
+        cluster_seed_disallowed_candidate_count,
+    )
+}
+
+fn raw_arrow_summary_signals_cached<'a>(
+    cache: &'a mut HashMap<String, RawArrowSummarySignalData>,
+    component_key: &str,
+    members_by_component: &HashMap<String, Vec<String>>,
+    features_by_signature_id: &HashMap<String, RawArrowFeature>,
+    signatures: &HashMap<String, RawArrowSignature>,
+    paper_authors: &HashMap<String, Vec<(i64, String)>>,
+    unidecode_char_map: &HashMap<char, String>,
+) -> PyResult<&'a RawArrowSummarySignalData> {
+    if let Entry::Vacant(entry) = cache.entry(component_key.to_string()) {
+        let members = members_by_component.get(component_key).ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!(
+                "component_key '{}' disappeared while building row signals",
+                component_key
+            ))
+        })?;
+        let summary_signals = build_raw_arrow_summary_signals(
+            members,
+            features_by_signature_id,
+            signatures,
+            paper_authors,
+            unidecode_char_map,
+        )
+        .map_err(pyo3::exceptions::PyKeyError::new_err)?;
+        entry.insert(summary_signals);
+    }
+    cache.get(component_key).ok_or_else(|| {
+        pyo3::exceptions::PyKeyError::new_err(format!(
+            "component_key '{}' is missing raw row signal summary",
+            component_key
+        ))
+    })
+}
+
+fn read_reusable_raw_arrow_query_inputs(
+    py: Python<'_>,
+    paths: &RawArrowPlannerPaths,
+    query_signature_ids: &[String],
+    num_threads: Option<usize>,
+    full_scan_without_index: bool,
+) -> PyResult<RawArrowQueryInputReadResult> {
+    let query_signature_id_set: HashSet<String> = query_signature_ids.iter().cloned().collect();
+    let read_signatures_start = Instant::now();
+    let (signatures, signature_index_stats) = read_raw_arrow_signatures_with_optional_index(
+        &paths.signatures_path,
+        paths.signatures_batch_index_path.as_deref(),
+        Some(&query_signature_id_set),
+        full_scan_without_index,
+    )?;
+    let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
+    for signature_id in query_signature_ids.iter() {
+        if !signatures.contains_key(signature_id) {
+            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                "query signature_id '{}' is missing from signatures Arrow input",
+                signature_id
+            )));
+        }
+    }
+    let needed_paper_ids: HashSet<String> = query_signature_ids
+        .iter()
+        .filter_map(|signature_id| signatures.get(signature_id))
+        .map(|signature| signature.paper_id.clone())
+        .collect();
+    let metadata_reads_parallel_start = Instant::now();
+    let ((papers_result, paper_authors_result), raw_specter_by_paper_id_result) =
+        py.allow_threads(|| {
+            let compute = || {
+                rayon::join(
+                    || {
+                        rayon::join(
+                            || -> PyResult<(
+                                HashMap<String, RawArrowPaper>,
+                                IndexedArrowReadStats,
+                                f64,
+                            )> {
+                                let start = Instant::now();
+                                let (loaded, stats) = read_raw_arrow_papers_with_optional_index(
+                                    &paths.papers_path,
+                                    paths.papers_batch_index_path.as_deref(),
+                                    &needed_paper_ids,
+                                    full_scan_without_index,
+                                )?;
+                                Ok((loaded, stats, start.elapsed().as_secs_f64()))
+                            },
+                            || -> PyResult<(
+                                HashMap<String, Vec<(i64, String)>>,
+                                IndexedArrowReadStats,
+                                f64,
+                            )> {
+                                let start = Instant::now();
+                                let (loaded, stats) =
+                                    read_raw_arrow_paper_authors_with_optional_index(
+                                        &paths.paper_authors_path,
+                                        paths.paper_authors_batch_index_path.as_deref(),
+                                        &needed_paper_ids,
+                                        full_scan_without_index,
+                                    )?;
+                                Ok((loaded, stats, start.elapsed().as_secs_f64()))
+                            },
+                        )
+                    },
+                    || -> PyResult<(
+                        Option<HashMap<String, Vec<f32>>>,
+                        IndexedArrowReadStats,
+                        f64,
+                    )> {
+                        let start = Instant::now();
+                        let (loaded, stats) = match paths.specter_path.as_ref() {
+                            Some(path) => {
+                                let (loaded, stats) = read_raw_arrow_specter_with_optional_index(
+                                    path,
+                                    paths.specter_batch_index_path.as_deref(),
+                                    &needed_paper_ids,
+                                    full_scan_without_index,
+                                )?;
+                                (loaded, stats)
+                            }
+                            None => (HashMap::new(), IndexedArrowReadStats::default()),
+                        };
+                        Ok((
+                            if paths.specter_path.is_some() {
+                                Some(loaded)
+                            } else {
+                                None
+                            },
+                            stats,
+                            start.elapsed().as_secs_f64(),
+                        ))
+                    },
+                )
+            };
+            install_with_optional_rayon_pool(num_threads, compute)
+        });
+    let (papers, paper_index_stats, read_papers_secs) = papers_result?;
+    let (paper_authors, paper_author_index_stats, read_paper_authors_secs) = paper_authors_result?;
+    let (raw_specter_by_paper_id, specter_index_stats, read_specter_secs) =
+        raw_specter_by_paper_id_result?;
+    let specter_by_paper_id = raw_specter_by_paper_id.map(|values| {
+        values
+            .into_iter()
+            .map(|(paper_id, vector)| (paper_id, Arc::new(vector)))
+            .collect::<HashMap<_, _>>()
+    });
+    Ok(RawArrowQueryInputReadResult {
         signatures,
         papers,
         paper_authors,
-        raw_members_by_component,
-        members_by_component,
-        component_member_indices,
-        summary_signals_by_component: HashMap::new(),
-        author_signals_by_query_signature_id: HashMap::new(),
-        retriever,
-        component_order,
-        seed_signature_ids,
-        seed_component_keys,
-    };
+        specter_by_paper_id,
+        signature_index_stats,
+        paper_index_stats,
+        paper_author_index_stats,
+        specter_index_stats,
+        read_signatures_secs,
+        read_papers_secs,
+        read_paper_authors_secs,
+        read_specter_secs,
+        metadata_reads_parallel_secs: metadata_reads_parallel_start.elapsed().as_secs_f64(),
+    })
+}
 
-    let retrieval_start = Instant::now();
-    let query_results: Vec<Result<RetrievalPairPlanQueryResult, String>> = py.allow_threads(|| {
-        let compute = || {
-            queries
-                .par_iter()
-                .enumerate()
-                .map(|(query_offset, current_query)| {
-                    let query_index = u32::try_from(query_offset)
-                        .map_err(|_| "query index exceeds u32".to_string())?;
-                    state.retriever.build_pair_plan_query_result(
-                        current_query,
-                        query_index,
-                        None,
-                        Some(query_signature_ids[query_offset].as_str()),
-                        &state.component_member_indices,
-                        top_k,
-                        None,
-                        0,
-                    )
-                })
-                .collect::<Vec<_>>()
+#[pyclass]
+struct RawBlockQueryCandidatePlanner {
+    paths: RawArrowPlannerPaths,
+    state: ReusableRawArrowCandidatePlanState,
+    planner_query_signature_count: usize,
+    planner_query_signature_id_set: HashSet<String>,
+    top_k: usize,
+    query_view: String,
+    orcid_enabled: bool,
+    num_threads: Option<usize>,
+    max_exemplars: usize,
+    include_pair_signature_ids: bool,
+    include_component_members: bool,
+    full_scan_without_index: bool,
+}
+
+#[pymethods]
+impl RawBlockQueryCandidatePlanner {
+    #[new]
+    #[pyo3(signature = (
+        paths,
+        query_signature_ids,
+        top_k,
+        query_view = "auto",
+        orcid_enabled = true,
+        num_threads = None,
+        max_exemplars = 4,
+        include_pair_signature_ids = false,
+        include_component_members = false,
+        full_scan_without_index = false
+    ))]
+    fn new(
+        py: Python<'_>,
+        paths: &Bound<'_, PyDict>,
+        query_signature_ids: Vec<String>,
+        top_k: usize,
+        query_view: &str,
+        orcid_enabled: bool,
+        num_threads: Option<usize>,
+        max_exemplars: usize,
+        include_pair_signature_ids: bool,
+        include_component_members: bool,
+        full_scan_without_index: bool,
+    ) -> PyResult<Self> {
+        validate_retrieval_rank_top_k(top_k)?;
+        validate_raw_arrow_query_signature_ids(&query_signature_ids)?;
+        let planner_query_signature_id_set = query_signature_ids.iter().cloned().collect();
+        let paths = RawArrowPlannerPaths::from_py_dict(paths)?;
+
+        let read_cluster_seeds_start = Instant::now();
+        let (component_order, members_by_component) =
+            read_raw_arrow_cluster_seeds(&paths.cluster_seeds_path)?;
+        let read_cluster_seeds_secs = read_cluster_seeds_start.elapsed().as_secs_f64();
+        let cluster_seed_disallows = match paths.cluster_seed_disallows_path.as_ref() {
+            Some(path) => read_raw_arrow_cluster_seed_disallows(path)?,
+            None => HashSet::new(),
         };
-        install_with_optional_rayon_pool(num_threads, compute)
-    });
 
-    let mut row_query_signature_indices = Vec::<u32>::new();
-    let mut row_component_keys = Vec::<String>::new();
-    let mut row_retrieval_scores = Vec::<f32>::new();
-    let mut row_retrieval_ranks = Vec::<u16>::new();
-    let mut row_component_sizes = Vec::<u32>::new();
-    let mut row_named_signature_counts = Vec::<u32>::new();
-    let mut row_dominant_first_names = Vec::<String>::new();
-    let mut row_candidate_year_min = Vec::<i32>::new();
-    let mut row_candidate_year_max = Vec::<i32>::new();
-    let mut row_candidate_year_range_missing = Vec::<u8>::new();
-    let mut row_query_first_tokens = Vec::<String>::new();
-    let mut row_query_years = Vec::<i32>::new();
-    let mut row_query_year_missing = Vec::<u8>::new();
-    let mut row_query_has_affiliations = Vec::<u8>::new();
-    let mut row_query_has_coauthors = Vec::<u8>::new();
-    let mut row_orcid_match = Vec::<u8>::new();
-    let mut row_middle_initial_compatibility = Vec::<f32>::new();
-    let mut row_affiliation_overlap = Vec::<f32>::new();
-    let mut row_coauthor_overlap = Vec::<f32>::new();
-    let mut row_venue_overlap = Vec::<f32>::new();
-    let mut row_year_compatibility = Vec::<f32>::new();
-    let mut row_title_overlap = Vec::<f32>::new();
-    let mut row_specter_centroid_similarity = Vec::<f32>::new();
-    let mut row_specter_exemplar_similarity = Vec::<f32>::new();
-    let mut row_last_name_count_min_rarity = Vec::<f32>::new();
-    let mut row_candidate_last_name_count_min_rarity = Vec::<f32>::new();
-    let mut row_candidate_last_first_name_count_min_rarity = Vec::<f32>::new();
-    let mut row_last_first_name_count_min_rarity = Vec::<f32>::new();
-    let mut row_first_prefix_x_last_first_name_count_min_rarity = Vec::<f32>::new();
-    let mut row_candidate_cluster_max_paper_author_count = Vec::<f32>::new();
-    let mut row_paper_author_list_max_jaccard = Vec::<f32>::new();
-    let mut row_paper_author_list_max_containment = Vec::<f32>::new();
-    let mut row_paper_author_list_max_overlap_count = Vec::<f32>::new();
-    let mut row_local_author_window10_jaccard_max = Vec::<f32>::new();
-    let mut row_local_author_window10_overlap_count_max = Vec::<f32>::new();
-    let mut row_best_author_count_log_absdiff = Vec::<f32>::new();
-    let mut left_signature_indices = Vec::<u32>::new();
-    let mut right_signature_indices = Vec::<u32>::new();
-    let mut pair_row_indices = Vec::<u32>::new();
-    for query_result in query_results {
-        let mut query_result = query_result.map_err(pyo3::exceptions::PyKeyError::new_err)?;
-        let base_row_index = u32::try_from(row_component_keys.len()).map_err(|_| {
-            pyo3::exceptions::PyOverflowError::new_err("retrieved candidate row count exceeds u32")
-        })?;
-        for (local_row_index, member_indices) in query_result
-            .right_signature_indices_by_row
-            .iter()
-            .enumerate()
-        {
-            let row_index = checked_retrieved_row_index(base_row_index, local_row_index)?;
-            let query_signature_index = query_result.row_query_signature_indices[local_row_index];
-            for member_index in member_indices.iter() {
-                left_signature_indices.push(query_signature_index);
-                right_signature_indices.push(*member_index);
-                pair_row_indices.push(row_index);
+        let mut seed_signature_ids = Vec::<String>::new();
+        let mut seed_seen = HashSet::<String>::new();
+        let mut component_keys_by_member = HashMap::<String, Vec<String>>::new();
+        for component_key in component_order.iter() {
+            if let Some(members) = members_by_component.get(component_key) {
+                for signature_id in members {
+                    component_keys_by_member
+                        .entry(signature_id.clone())
+                        .or_default()
+                        .push(component_key.clone());
+                    if seed_seen.insert(signature_id.clone()) {
+                        seed_signature_ids.push(signature_id.clone());
+                    }
+                }
             }
         }
-        for (local_row_index, component_key) in query_result.row_component_keys.iter().enumerate() {
-            let query_offset = query_result.row_query_signature_indices[local_row_index] as usize;
-            let query_signature_id = query_signature_ids.get(query_offset).ok_or_else(|| {
-                pyo3::exceptions::PyIndexError::new_err(format!(
-                    "row query signature offset {} is outside query_signature_ids",
-                    query_offset
-                ))
-            })?;
-            let query_feature = state
-                .features_by_signature_id
-                .get(query_signature_id)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyKeyError::new_err(format!(
-                        "query signature_id '{}' is missing from computed raw Arrow features",
-                        query_signature_id
-                    ))
-                })?;
-            let query = queries.get(query_offset).ok_or_else(|| {
-                pyo3::exceptions::PyIndexError::new_err(format!(
-                    "row query signature offset {} is outside query feature table",
-                    query_offset
-                ))
-            })?;
-            let component_index = state
-                .retriever
-                .component_index_by_key
-                .get(component_key)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyKeyError::new_err(format!(
-                        "component_key '{}' disappeared while building row signals",
-                        component_key
-                    ))
-                })?;
-            let summary = state
-                .retriever
-                .summaries
-                .get(*component_index)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyIndexError::new_err(format!(
-                        "component index {} is outside summary table",
-                        component_index
-                    ))
-                })?;
-            if let Entry::Vacant(entry) = state
-                .summary_signals_by_component
-                .entry(component_key.clone())
-            {
-                let members = state
+        let seed_signature_id_set: HashSet<String> = seed_signature_ids.iter().cloned().collect();
+
+        let read_signatures_start = Instant::now();
+        let (signatures, signature_index_stats) = if seed_signature_id_set.is_empty() {
+            (HashMap::new(), IndexedArrowReadStats::default())
+        } else {
+            read_raw_arrow_signatures_with_optional_index(
+                &paths.signatures_path,
+                paths.signatures_batch_index_path.as_deref(),
+                Some(&seed_signature_id_set),
+                full_scan_without_index,
+            )?
+        };
+        let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
+        for signature_id in seed_signature_ids.iter() {
+            if !signatures.contains_key(signature_id) {
+                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                    "cluster seed signature_id '{}' is missing from signatures Arrow input",
+                    signature_id
+                )));
+            }
+        }
+
+        let needed_paper_ids: HashSet<String> = seed_signature_ids
+            .iter()
+            .filter_map(|signature_id| signatures.get(signature_id))
+            .map(|signature| signature.paper_id.clone())
+            .collect();
+        let metadata_reads_parallel_start = Instant::now();
+        let (
+            (papers_result, paper_authors_result),
+            (raw_specter_by_paper_id_result, raw_name_counts_result),
+        ) = py.allow_threads(|| {
+            let compute = || {
+                rayon::join(
+                    || {
+                        rayon::join(
+                            || -> PyResult<(
+                                HashMap<String, RawArrowPaper>,
+                                IndexedArrowReadStats,
+                                f64,
+                            )> {
+                                let start = Instant::now();
+                                let (loaded, stats) = if needed_paper_ids.is_empty() {
+                                    (HashMap::new(), IndexedArrowReadStats::default())
+                                } else {
+                                    read_raw_arrow_papers_with_optional_index(
+                                        &paths.papers_path,
+                                        paths.papers_batch_index_path.as_deref(),
+                                        &needed_paper_ids,
+                                        full_scan_without_index,
+                                    )?
+                                };
+                                Ok((loaded, stats, start.elapsed().as_secs_f64()))
+                            },
+                            || -> PyResult<(
+                                HashMap<String, Vec<(i64, String)>>,
+                                IndexedArrowReadStats,
+                                f64,
+                            )> {
+                                let start = Instant::now();
+                                let (loaded, stats) = if needed_paper_ids.is_empty() {
+                                    (HashMap::new(), IndexedArrowReadStats::default())
+                                } else {
+                                    read_raw_arrow_paper_authors_with_optional_index(
+                                        &paths.paper_authors_path,
+                                        paths.paper_authors_batch_index_path.as_deref(),
+                                        &needed_paper_ids,
+                                        full_scan_without_index,
+                                    )?
+                                };
+                                Ok((loaded, stats, start.elapsed().as_secs_f64()))
+                            },
+                        )
+                    },
+                    || {
+                        rayon::join(
+                            || -> PyResult<(
+                                Option<HashMap<String, Vec<f32>>>,
+                                IndexedArrowReadStats,
+                                f64,
+                            )> {
+                                let start = Instant::now();
+                                let (loaded, stats) = match paths.specter_path.as_ref() {
+                                    Some(path) if !needed_paper_ids.is_empty() => {
+                                        let (loaded, stats) =
+                                            read_raw_arrow_specter_with_optional_index(
+                                                path,
+                                                paths.specter_batch_index_path.as_deref(),
+                                                &needed_paper_ids,
+                                                full_scan_without_index,
+                                            )?;
+                                        (loaded, stats)
+                                    }
+                                    Some(_) | None => {
+                                        (HashMap::new(), IndexedArrowReadStats::default())
+                                    }
+                                };
+                                Ok((
+                                    if paths.specter_path.is_some() {
+                                        Some(loaded)
+                                    } else {
+                                        None
+                                    },
+                                    stats,
+                                    start.elapsed().as_secs_f64(),
+                                ))
+                            },
+                            || -> PyResult<(RawNameCountMaps, f64)> {
+                                let start = Instant::now();
+                                let loaded = match paths.name_counts_index_path.as_ref() {
+                                    Some(path) => read_raw_name_counts_index(path)?,
+                                    None => match paths.name_counts_arrow_path.as_ref() {
+                                        Some(path) => {
+                                            return Err(pyo3::exceptions::PyValueError::new_err(
+                                                format!(
+                                                    "name_counts Arrow path '{path}' requires name_counts_index; refusing slow Arrow fallback"
+                                                ),
+                                            ));
+                                        }
+                                        None => RawNameCountMaps::default(),
+                                    },
+                                };
+                                Ok((loaded, start.elapsed().as_secs_f64()))
+                            },
+                        )
+                    },
+                )
+            };
+            install_with_optional_rayon_pool(num_threads, compute)
+        });
+        let (papers, paper_index_stats, read_papers_secs) = papers_result?;
+        let (paper_authors, paper_author_index_stats, read_paper_authors_secs) =
+            paper_authors_result?;
+        let (raw_specter_by_paper_id, specter_index_stats, read_specter_secs) =
+            raw_specter_by_paper_id_result?;
+        let (raw_name_counts, read_name_counts_secs) = raw_name_counts_result?;
+        let specter_by_paper_id = raw_specter_by_paper_id.map(|values| {
+            values
+                .into_iter()
+                .map(|(paper_id, vector)| (paper_id, Arc::new(vector)))
+                .collect::<HashMap<_, _>>()
+        });
+
+        let text_context_start = Instant::now();
+        let text_module = py.import("s2and.text")?;
+        let unidecode = text_module.getattr("unidecode")?;
+        let name_prefixes = extract_required_string_set(&text_module.getattr("NAME_PREFIXES")?)?;
+        let affiliation_stopwords = extract_affiliation_stopwords(py)?;
+        let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
+        ensure_unidecode_for_raw_arrow_inputs(
+            &unidecode,
+            &signatures,
+            &papers,
+            &paper_authors,
+            &mut unidecode_char_map,
+        )?;
+        let text_context_secs = text_context_start.elapsed().as_secs_f64();
+
+        let feature_start = Instant::now();
+        let raw_feature_results: Vec<Result<(String, RawArrowFeature), String>> =
+            py.allow_threads(|| {
+                let compute = || {
+                    seed_signature_ids
+                        .par_iter()
+                        .map(|signature_id| {
+                            let signature = signatures.get(signature_id).ok_or_else(|| {
+                                format!(
+                                    "signature_id '{}' is missing from signatures",
+                                    signature_id
+                                )
+                            })?;
+                            let paper = papers.get(&signature.paper_id);
+                            let authors = paper_authors.get(&signature.paper_id);
+                            Ok((
+                                signature_id.clone(),
+                                build_raw_arrow_feature(
+                                    signature,
+                                    paper,
+                                    authors,
+                                    specter_by_paper_id.as_ref(),
+                                    &raw_name_counts,
+                                    &name_prefixes,
+                                    &affiliation_stopwords,
+                                    &unidecode_char_map,
+                                    orcid_enabled,
+                                ),
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                install_with_optional_rayon_pool(num_threads, compute)
+            });
+        let mut features_by_signature_id = HashMap::with_capacity(raw_feature_results.len());
+        for result in raw_feature_results {
+            let (signature_id, feature) = result.map_err(pyo3::exceptions::PyKeyError::new_err)?;
+            features_by_signature_id.insert(signature_id, feature);
+        }
+        let feature_secs = feature_start.elapsed().as_secs_f64();
+
+        let summary_start = Instant::now();
+        let retriever = build_retriever_from_raw_arrow_components(
+            py,
+            &component_order,
+            &members_by_component,
+            &features_by_signature_id,
+            max_exemplars,
+            num_threads,
+        )?;
+        let summary_secs = summary_start.elapsed().as_secs_f64();
+
+        let component_members_start = Instant::now();
+        let (_component_member_indices, flat_seed_signature_ids, _seed_component_keys) =
+            raw_arrow_component_member_indices_for_batch(
+                &component_order,
+                &members_by_component,
+                0,
+            )?;
+        let component_members_secs = component_members_start.elapsed().as_secs_f64();
+
+        let indexed_arrow_candidate_plan = paths.signatures_batch_index_path.is_some()
+            || paths.papers_batch_index_path.is_some()
+            || paths.paper_authors_batch_index_path.is_some()
+            || paths.specter_batch_index_path.is_some();
+
+        Ok(Self {
+            paths,
+            state: ReusableRawArrowCandidatePlanState {
+                features_by_signature_id,
+                signatures,
+                paper_authors,
+                raw_name_counts,
+                members_by_component,
+                component_keys_by_member,
+                summary_signals_by_component: HashMap::new(),
+                retriever,
+                component_order,
+                seed_signature_ids: flat_seed_signature_ids,
+                seed_signature_id_set,
+                cluster_seed_disallows,
+                unidecode_char_map,
+                name_prefixes,
+                affiliation_stopwords,
+                seed_paper_count: needed_paper_ids.len(),
+                seed_specter_count: specter_by_paper_id.as_ref().map_or(0usize, HashMap::len),
+                build_telemetry: RawArrowPlannerBuildTelemetry {
+                    read_cluster_seeds_secs,
+                    read_signatures_secs,
+                    read_papers_secs,
+                    read_paper_authors_secs,
+                    read_specter_secs,
+                    read_name_counts_secs,
+                    metadata_reads_parallel_secs: metadata_reads_parallel_start
+                        .elapsed()
+                        .as_secs_f64(),
+                    text_context_secs,
+                    feature_secs,
+                    summary_secs,
+                    component_members_secs,
+                    signature_index_stats,
+                    paper_index_stats,
+                    paper_author_index_stats,
+                    specter_index_stats,
+                    indexed_arrow_candidate_plan,
+                },
+            },
+            planner_query_signature_count: query_signature_ids.len(),
+            planner_query_signature_id_set,
+            top_k,
+            query_view: query_view.to_string(),
+            orcid_enabled,
+            num_threads,
+            max_exemplars,
+            include_pair_signature_ids,
+            include_component_members,
+            full_scan_without_index,
+        })
+    }
+
+    fn build_telemetry(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let timings = PyDict::new(py);
+        let telemetry = &self.state.build_telemetry;
+        timings.set_item("read_cluster_seeds_secs", telemetry.read_cluster_seeds_secs)?;
+        timings.set_item("read_signatures_secs", telemetry.read_signatures_secs)?;
+        timings.set_item("read_papers_secs", telemetry.read_papers_secs)?;
+        timings.set_item("read_paper_authors_secs", telemetry.read_paper_authors_secs)?;
+        timings.set_item("read_specter_secs", telemetry.read_specter_secs)?;
+        timings.set_item("read_name_counts_secs", telemetry.read_name_counts_secs)?;
+        timings.set_item(
+            "metadata_reads_parallel_secs",
+            telemetry.metadata_reads_parallel_secs,
+        )?;
+        timings.set_item("text_context_secs", telemetry.text_context_secs)?;
+        timings.set_item("feature_secs", telemetry.feature_secs)?;
+        timings.set_item("summary_secs", telemetry.summary_secs)?;
+        timings.set_item("component_members_secs", telemetry.component_members_secs)?;
+
+        let payload = PyDict::new(py);
+        payload.set_item("signature_count", self.state.signatures.len())?;
+        payload.set_item("paper_count", self.state.seed_paper_count)?;
+        payload.set_item("paper_author_paper_count", self.state.paper_authors.len())?;
+        payload.set_item("cluster_count", self.state.component_order.len())?;
+        payload.set_item("seed_signature_count", self.state.seed_signature_ids.len())?;
+        payload.set_item("query_signature_count", self.planner_query_signature_count)?;
+        payload.set_item(
+            "cluster_seed_disallow_pair_count",
+            self.state.cluster_seed_disallows.len(),
+        )?;
+        payload.set_item("specter_count", self.state.seed_specter_count)?;
+        payload.set_item(
+            "indexed_arrow_candidate_plan",
+            telemetry.indexed_arrow_candidate_plan,
+        )?;
+        payload.set_item(
+            "signature_batches_read",
+            telemetry.signature_index_stats.batches_read,
+        )?;
+        payload.set_item(
+            "signature_rows_scanned",
+            telemetry.signature_index_stats.rows_scanned,
+        )?;
+        payload.set_item(
+            "paper_batches_read",
+            telemetry.paper_index_stats.batches_read,
+        )?;
+        payload.set_item(
+            "paper_rows_scanned",
+            telemetry.paper_index_stats.rows_scanned,
+        )?;
+        payload.set_item(
+            "paper_author_batches_read",
+            telemetry.paper_author_index_stats.batches_read,
+        )?;
+        payload.set_item(
+            "paper_author_rows_scanned",
+            telemetry.paper_author_index_stats.rows_scanned,
+        )?;
+        payload.set_item(
+            "specter_batches_read",
+            telemetry.specter_index_stats.batches_read,
+        )?;
+        payload.set_item(
+            "specter_rows_scanned",
+            telemetry.specter_index_stats.rows_scanned,
+        )?;
+        payload.set_item("unidecode_char_count", self.state.unidecode_char_map.len())?;
+        payload.set_item("planner_seed_state", 1)?;
+        payload.set_item("timings", timings)?;
+        Ok(payload.unbind())
+    }
+
+    #[pyo3(signature = (
+        query_signature_ids,
+        top_k = None,
+        query_view = None,
+        include_pair_signature_ids = None,
+        include_component_members = None
+    ))]
+    fn plan(
+        &mut self,
+        py: Python<'_>,
+        query_signature_ids: Vec<String>,
+        top_k: Option<usize>,
+        query_view: Option<String>,
+        include_pair_signature_ids: Option<bool>,
+        include_component_members: Option<bool>,
+    ) -> PyResult<Py<PyDict>> {
+        validate_raw_arrow_query_signature_ids(&query_signature_ids)?;
+        if let Some(value) = top_k {
+            if value != self.top_k {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "RawBlockQueryCandidatePlanner was built with top_k={}, got plan top_k={value}",
+                    self.top_k
+                )));
+            }
+        }
+        if let Some(value) = query_view.as_ref() {
+            if value != &self.query_view {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "RawBlockQueryCandidatePlanner was built with query_view={:?}, got plan query_view={value:?}",
+                    self.query_view
+                )));
+            }
+        }
+        if let Some(value) = include_pair_signature_ids {
+            if value != self.include_pair_signature_ids {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "RawBlockQueryCandidatePlanner was built with include_pair_signature_ids={}, got {value}",
+                    self.include_pair_signature_ids
+                )));
+            }
+        }
+        if let Some(value) = include_component_members {
+            if value != self.include_component_members {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "RawBlockQueryCandidatePlanner was built with include_component_members={}, got {value}",
+                    self.include_component_members
+                )));
+            }
+        }
+        let missing: Vec<&String> = query_signature_ids
+            .iter()
+            .filter(|signature_id| !self.planner_query_signature_id_set.contains(*signature_id))
+            .collect();
+        if !missing.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "RawBlockQueryCandidatePlanner plan requested query_signature_ids outside the planner query set: {:?}",
+                missing.into_iter().take(10).collect::<Vec<_>>()
+            )));
+        }
+
+        let total_start = Instant::now();
+        let query_inputs = read_reusable_raw_arrow_query_inputs(
+            py,
+            &self.paths,
+            &query_signature_ids,
+            self.num_threads,
+            self.full_scan_without_index,
+        )?;
+
+        let text_context_start = Instant::now();
+        let text_module = py.import("s2and.text")?;
+        let unidecode = text_module.getattr("unidecode")?;
+        ensure_unidecode_for_raw_arrow_inputs(
+            &unidecode,
+            &query_inputs.signatures,
+            &query_inputs.papers,
+            &query_inputs.paper_authors,
+            &mut self.state.unidecode_char_map,
+        )?;
+        let text_context_secs = text_context_start.elapsed().as_secs_f64();
+
+        let feature_start = Instant::now();
+        let raw_feature_results: Vec<Result<(String, RawArrowFeature), String>> =
+            py.allow_threads(|| {
+                let compute = || {
+                    query_signature_ids
+                        .par_iter()
+                        .map(|signature_id| {
+                            let signature =
+                                query_inputs.signatures.get(signature_id).ok_or_else(|| {
+                                    format!(
+                                        "signature_id '{}' is missing from signatures",
+                                        signature_id
+                                    )
+                                })?;
+                            let paper = query_inputs.papers.get(&signature.paper_id);
+                            let authors = query_inputs.paper_authors.get(&signature.paper_id);
+                            Ok((
+                                signature_id.clone(),
+                                build_raw_arrow_feature(
+                                    signature,
+                                    paper,
+                                    authors,
+                                    query_inputs.specter_by_paper_id.as_ref(),
+                                    &self.state.raw_name_counts,
+                                    &self.state.name_prefixes,
+                                    &self.state.affiliation_stopwords,
+                                    &self.state.unidecode_char_map,
+                                    self.orcid_enabled,
+                                ),
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                install_with_optional_rayon_pool(self.num_threads, compute)
+            });
+        let mut query_features_by_signature_id = HashMap::with_capacity(raw_feature_results.len());
+        for result in raw_feature_results {
+            let (signature_id, feature) = result.map_err(pyo3::exceptions::PyKeyError::new_err)?;
+            query_features_by_signature_id.insert(signature_id, feature);
+        }
+        let feature_secs = feature_start.elapsed().as_secs_f64();
+
+        let query_start = Instant::now();
+        let mut queries = Vec::<RetrievalQueryData>::with_capacity(query_signature_ids.len());
+        let mut query_views = Vec::<String>::with_capacity(query_signature_ids.len());
+        let mut query_authors = Vec::<String>::with_capacity(query_signature_ids.len());
+        for signature_id in query_signature_ids.iter() {
+            let base_feature = &query_features_by_signature_id[signature_id];
+            let base = &base_feature.query;
+            let (masked, resolved_view) = mask_raw_arrow_query(base, &self.query_view)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            queries.push(masked);
+            query_views.push(resolved_view);
+            query_authors.push(base_feature.query_author.clone());
+        }
+        let query_secs = query_start.elapsed().as_secs_f64();
+
+        let query_signature_id_set: HashSet<&str> =
+            query_signature_ids.iter().map(String::as_str).collect();
+        let mut excluded_query_seed_count = 0usize;
+        let mut filtered_component_order = Vec::<String>::new();
+        let mut filtered_members_by_component = HashMap::<String, Vec<String>>::new();
+        let mut needs_filtered_retriever = false;
+        for signature_id in query_signature_ids.iter() {
+            if self.state.seed_signature_id_set.contains(signature_id) {
+                needs_filtered_retriever = true;
+                break;
+            }
+        }
+        let summary_start = Instant::now();
+        let filtered_retriever = if needs_filtered_retriever {
+            for component_key in self.state.component_order.iter() {
+                let members = self
+                    .state
                     .members_by_component
+                    .get(component_key)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyKeyError::new_err(format!(
+                            "component_key '{}' disappeared while filtering query seeds",
+                            component_key
+                        ))
+                    })?;
+                let mut filtered_members = Vec::with_capacity(members.len());
+                for signature_id in members {
+                    if query_signature_id_set.contains(signature_id.as_str()) {
+                        excluded_query_seed_count += 1;
+                    } else {
+                        filtered_members.push(signature_id.clone());
+                    }
+                }
+                if !filtered_members.is_empty() {
+                    filtered_component_order.push(component_key.clone());
+                    filtered_members_by_component.insert(component_key.clone(), filtered_members);
+                }
+            }
+            Some(build_retriever_from_raw_arrow_components(
+                py,
+                &filtered_component_order,
+                &filtered_members_by_component,
+                &self.state.features_by_signature_id,
+                self.max_exemplars,
+                self.num_threads,
+            )?)
+        } else {
+            None
+        };
+        let summary_secs = summary_start.elapsed().as_secs_f64();
+        let (component_order, members_by_component, retriever) =
+            if let Some(retriever) = filtered_retriever.as_ref() {
+                (
+                    &filtered_component_order,
+                    &filtered_members_by_component,
+                    retriever,
+                )
+            } else {
+                (
+                    &self.state.component_order,
+                    &self.state.members_by_component,
+                    &self.state.retriever,
+                )
+            };
+
+        let component_members_start = Instant::now();
+        let (component_member_indices, seed_signature_ids, _seed_component_keys) =
+            raw_arrow_component_member_indices_for_batch(
+                component_order,
+                members_by_component,
+                query_signature_ids.len(),
+            )?;
+        let component_members_secs = component_members_start.elapsed().as_secs_f64();
+
+        let (excluded_candidate_indices_by_query, cluster_seed_disallowed_candidate_count) =
+            raw_arrow_excluded_candidate_indices_by_query(
+                &query_signature_ids,
+                component_order,
+                &self.state.component_keys_by_member,
+                &self.state.cluster_seed_disallows,
+            );
+
+        let retrieval_start = Instant::now();
+        let query_results: Vec<Result<RetrievalPairPlanQueryResult, String>> =
+            py.allow_threads(|| {
+                let compute = || {
+                    queries
+                        .par_iter()
+                        .enumerate()
+                        .map(|(query_offset, current_query)| {
+                            let query_index = u32::try_from(query_offset)
+                                .map_err(|_| "query index exceeds u32".to_string())?;
+                            let excluded_candidate_indices = excluded_candidate_indices_by_query
+                                .as_ref()
+                                .and_then(|values| values[query_offset].as_ref());
+                            retriever.build_pair_plan_query_result(
+                                current_query,
+                                query_index,
+                                None,
+                                excluded_candidate_indices,
+                                Some(query_signature_ids[query_offset].as_str()),
+                                &component_member_indices,
+                                self.top_k,
+                                None,
+                                0,
+                                true,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                install_with_optional_rayon_pool(self.num_threads, compute)
+            });
+
+        let mut row_query_signature_indices = Vec::<u32>::new();
+        let mut row_component_keys = Vec::<String>::new();
+        let mut row_retrieval_scores = Vec::<f32>::new();
+        let mut row_retrieval_ranks = Vec::<u16>::new();
+        let mut row_component_sizes = Vec::<u32>::new();
+        let mut row_named_signature_counts = Vec::<u32>::new();
+        let mut row_dominant_first_names = Vec::<String>::new();
+        let mut row_candidate_year_min = Vec::<i32>::new();
+        let mut row_candidate_year_max = Vec::<i32>::new();
+        let mut row_candidate_year_range_missing = Vec::<u8>::new();
+        let mut row_query_first_tokens = Vec::<String>::new();
+        let mut row_query_years = Vec::<i32>::new();
+        let mut row_query_year_missing = Vec::<u8>::new();
+        let mut row_query_has_affiliations = Vec::<u8>::new();
+        let mut row_query_has_coauthors = Vec::<u8>::new();
+        let mut row_orcid_match = Vec::<u8>::new();
+        let mut row_middle_initial_compatibility = Vec::<f32>::new();
+        let mut row_affiliation_overlap = Vec::<f32>::new();
+        let mut row_coauthor_overlap = Vec::<f32>::new();
+        let mut row_venue_overlap = Vec::<f32>::new();
+        let mut row_year_compatibility = Vec::<f32>::new();
+        let mut row_title_overlap = Vec::<f32>::new();
+        let mut row_specter_centroid_similarity = Vec::<f32>::new();
+        let mut row_specter_exemplar_similarity = Vec::<f32>::new();
+        let mut row_last_name_count_min_rarity = Vec::<f32>::new();
+        let mut row_candidate_last_name_count_min_rarity = Vec::<f32>::new();
+        let mut row_candidate_last_first_name_count_min_rarity = Vec::<f32>::new();
+        let mut row_last_first_name_count_min_rarity = Vec::<f32>::new();
+        let mut row_first_prefix_x_last_first_name_count_min_rarity = Vec::<f32>::new();
+        let mut row_candidate_cluster_max_paper_author_count = Vec::<f32>::new();
+        let mut row_paper_author_list_max_jaccard = Vec::<f32>::new();
+        let mut row_paper_author_list_max_containment = Vec::<f32>::new();
+        let mut row_paper_author_list_max_overlap_count = Vec::<f32>::new();
+        let mut row_local_author_window10_jaccard_max = Vec::<f32>::new();
+        let mut row_local_author_window10_overlap_count_max = Vec::<f32>::new();
+        let mut row_best_author_count_log_absdiff = Vec::<f32>::new();
+        let mut left_signature_indices = Vec::<u32>::new();
+        let mut right_signature_indices = Vec::<u32>::new();
+        let mut pair_row_indices = Vec::<u32>::new();
+        let mut filtered_summary_signals_by_component =
+            HashMap::<String, RawArrowSummarySignalData>::new();
+        let mut author_signals_by_query_signature_id =
+            HashMap::<String, RawArrowAuthorSignalData>::new();
+        for query_result in query_results {
+            let mut query_result = query_result.map_err(pyo3::exceptions::PyKeyError::new_err)?;
+            let base_row_index = u32::try_from(row_component_keys.len()).map_err(|_| {
+                pyo3::exceptions::PyOverflowError::new_err(
+                    "retrieved candidate row count exceeds u32",
+                )
+            })?;
+            for (local_row_index, member_indices) in query_result
+                .right_signature_indices_by_row
+                .iter()
+                .enumerate()
+            {
+                let row_index = checked_retrieved_row_index(base_row_index, local_row_index)?;
+                let query_signature_index =
+                    query_result.row_query_signature_indices[local_row_index];
+                for member_index in member_indices.iter() {
+                    left_signature_indices.push(query_signature_index);
+                    right_signature_indices.push(*member_index);
+                    pair_row_indices.push(row_index);
+                }
+            }
+            for (local_row_index, component_key) in
+                query_result.row_component_keys.iter().enumerate()
+            {
+                let query_offset =
+                    query_result.row_query_signature_indices[local_row_index] as usize;
+                let query_signature_id =
+                    query_signature_ids.get(query_offset).ok_or_else(|| {
+                        pyo3::exceptions::PyIndexError::new_err(format!(
+                            "row query signature offset {} is outside query_signature_ids",
+                            query_offset
+                        ))
+                    })?;
+                let query_feature = query_features_by_signature_id
+                    .get(query_signature_id)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyKeyError::new_err(format!(
+                            "query signature_id '{}' is missing from computed raw Arrow features",
+                            query_signature_id
+                        ))
+                    })?;
+                let query = queries.get(query_offset).ok_or_else(|| {
+                    pyo3::exceptions::PyIndexError::new_err(format!(
+                        "row query signature offset {} is outside query feature table",
+                        query_offset
+                    ))
+                })?;
+                let component_index = retriever
+                    .component_index_by_key
                     .get(component_key)
                     .ok_or_else(|| {
                         pyo3::exceptions::PyKeyError::new_err(format!(
@@ -14451,362 +15013,498 @@ fn raw_block_query_candidate_plan_arrow<'py>(
                             component_key
                         ))
                     })?;
-                let summary_signals = build_raw_arrow_summary_signals(
-                    members,
-                    &state.features_by_signature_id,
-                    &state.signatures,
-                    &state.paper_authors,
-                    &unidecode_char_map,
-                )
-                .map_err(pyo3::exceptions::PyKeyError::new_err)?;
-                entry.insert(summary_signals);
-            }
-            let summary_signals = state
-                .summary_signals_by_component
-                .get(component_key)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyKeyError::new_err(format!(
-                        "component_key '{}' is missing raw row signal summary",
-                        component_key
+                let summary = retriever.summaries.get(*component_index).ok_or_else(|| {
+                    pyo3::exceptions::PyIndexError::new_err(format!(
+                        "component index {} is outside summary table",
+                        component_index
                     ))
                 })?;
-            let rarity = raw_arrow_name_count_rarity_row(
-                query,
-                &query_feature.name_counts,
-                summary,
-                summary_signals,
-            );
-            if let Entry::Vacant(entry) = state
-                .author_signals_by_query_signature_id
-                .entry(query_signature_id.clone())
-            {
-                let query_signature =
-                    state.signatures.get(query_signature_id).ok_or_else(|| {
+                let summary_signals = if needs_filtered_retriever {
+                    raw_arrow_summary_signals_cached(
+                        &mut filtered_summary_signals_by_component,
+                        component_key,
+                        members_by_component,
+                        &self.state.features_by_signature_id,
+                        &self.state.signatures,
+                        &self.state.paper_authors,
+                        &self.state.unidecode_char_map,
+                    )?
+                } else {
+                    raw_arrow_summary_signals_cached(
+                        &mut self.state.summary_signals_by_component,
+                        component_key,
+                        members_by_component,
+                        &self.state.features_by_signature_id,
+                        &self.state.signatures,
+                        &self.state.paper_authors,
+                        &self.state.unidecode_char_map,
+                    )?
+                };
+                let rarity = raw_arrow_name_count_rarity_row(
+                    query,
+                    &query_feature.name_counts,
+                    summary,
+                    summary_signals,
+                );
+                if let Entry::Vacant(entry) =
+                    author_signals_by_query_signature_id.entry(query_signature_id.clone())
+                {
+                    let query_signature = query_inputs
+                        .signatures
+                        .get(query_signature_id)
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyKeyError::new_err(format!(
+                                "query signature_id '{}' is missing from signatures",
+                                query_signature_id
+                            ))
+                        })?;
+                    let author_signals = build_raw_arrow_author_signal_data(
+                        query_signature,
+                        query_inputs.paper_authors.get(&query_signature.paper_id),
+                        &self.state.unidecode_char_map,
+                    );
+                    entry.insert(author_signals);
+                }
+                let query_author_signals = author_signals_by_query_signature_id
+                    .get(query_signature_id)
+                    .ok_or_else(|| {
                         pyo3::exceptions::PyKeyError::new_err(format!(
-                            "query signature_id '{}' is missing from signatures",
+                            "query signature_id '{}' is missing raw author signals",
                             query_signature_id
                         ))
                     })?;
-                let author_signals = build_raw_arrow_author_signal_data(
-                    query_signature,
-                    state.paper_authors.get(&query_signature.paper_id),
-                    &unidecode_char_map,
+                let evidence = raw_arrow_paper_evidence_row(
+                    query_signature_id,
+                    query_feature.paper_author_count,
+                    query_author_signals,
+                    summary_signals,
                 );
-                entry.insert(author_signals);
+                row_last_name_count_min_rarity.push(rarity.last_name_count_min_rarity);
+                row_candidate_last_name_count_min_rarity
+                    .push(rarity.candidate_last_name_count_min_rarity);
+                row_candidate_last_first_name_count_min_rarity
+                    .push(rarity.candidate_last_first_name_count_min_rarity);
+                row_last_first_name_count_min_rarity.push(rarity.last_first_name_count_min_rarity);
+                row_first_prefix_x_last_first_name_count_min_rarity
+                    .push(rarity.first_prefix_x_last_first_name_count_min_rarity);
+                row_candidate_cluster_max_paper_author_count
+                    .push(summary.max_paper_author_count as f32);
+                row_paper_author_list_max_jaccard.push(evidence.paper_author_list_max_jaccard);
+                row_paper_author_list_max_containment
+                    .push(evidence.paper_author_list_max_containment);
+                row_paper_author_list_max_overlap_count
+                    .push(evidence.paper_author_list_max_overlap_count);
+                row_local_author_window10_jaccard_max
+                    .push(evidence.local_author_window10_jaccard_max);
+                row_local_author_window10_overlap_count_max
+                    .push(evidence.local_author_window10_overlap_count_max);
+                row_best_author_count_log_absdiff.push(evidence.best_author_count_log_absdiff);
             }
-            let query_author_signals = state
-                .author_signals_by_query_signature_id
-                .get(query_signature_id)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyKeyError::new_err(format!(
-                        "query signature_id '{}' is missing raw author signals",
-                        query_signature_id
-                    ))
-                })?;
-            let evidence = raw_arrow_paper_evidence_row(
-                query_signature_id,
-                query_feature.paper_author_count,
-                query_author_signals,
-                summary_signals,
-            );
-            row_last_name_count_min_rarity.push(rarity.last_name_count_min_rarity);
-            row_candidate_last_name_count_min_rarity
-                .push(rarity.candidate_last_name_count_min_rarity);
-            row_candidate_last_first_name_count_min_rarity
-                .push(rarity.candidate_last_first_name_count_min_rarity);
-            row_last_first_name_count_min_rarity.push(rarity.last_first_name_count_min_rarity);
-            row_first_prefix_x_last_first_name_count_min_rarity
-                .push(rarity.first_prefix_x_last_first_name_count_min_rarity);
-            row_candidate_cluster_max_paper_author_count
-                .push(summary.max_paper_author_count as f32);
-            row_paper_author_list_max_jaccard.push(evidence.paper_author_list_max_jaccard);
-            row_paper_author_list_max_containment.push(evidence.paper_author_list_max_containment);
-            row_paper_author_list_max_overlap_count
-                .push(evidence.paper_author_list_max_overlap_count);
-            row_local_author_window10_jaccard_max.push(evidence.local_author_window10_jaccard_max);
-            row_local_author_window10_overlap_count_max
-                .push(evidence.local_author_window10_overlap_count_max);
-            row_best_author_count_log_absdiff.push(evidence.best_author_count_log_absdiff);
+            row_query_signature_indices.append(&mut query_result.row_query_signature_indices);
+            row_component_keys.append(&mut query_result.row_component_keys);
+            row_retrieval_scores.append(&mut query_result.row_retrieval_scores);
+            row_retrieval_ranks.append(&mut query_result.row_retrieval_ranks);
+            row_component_sizes.append(&mut query_result.row_component_sizes);
+            row_named_signature_counts.append(&mut query_result.row_named_signature_counts);
+            row_dominant_first_names.append(&mut query_result.row_dominant_first_names);
+            row_candidate_year_min.append(&mut query_result.row_candidate_year_min);
+            row_candidate_year_max.append(&mut query_result.row_candidate_year_max);
+            row_candidate_year_range_missing
+                .append(&mut query_result.row_candidate_year_range_missing);
+            row_query_first_tokens.append(&mut query_result.row_query_first_tokens);
+            row_query_years.append(&mut query_result.row_query_years);
+            row_query_year_missing.append(&mut query_result.row_query_year_missing);
+            row_query_has_affiliations.append(&mut query_result.row_query_has_affiliations);
+            row_query_has_coauthors.append(&mut query_result.row_query_has_coauthors);
+            row_orcid_match.append(&mut query_result.row_orcid_match);
+            row_middle_initial_compatibility
+                .append(&mut query_result.row_middle_initial_compatibility);
+            row_affiliation_overlap.append(&mut query_result.row_affiliation_overlap);
+            row_coauthor_overlap.append(&mut query_result.row_coauthor_overlap);
+            row_venue_overlap.append(&mut query_result.row_venue_overlap);
+            row_year_compatibility.append(&mut query_result.row_year_compatibility);
+            row_title_overlap.append(&mut query_result.row_title_overlap);
+            row_specter_centroid_similarity
+                .append(&mut query_result.row_specter_centroid_similarity);
+            row_specter_exemplar_similarity
+                .append(&mut query_result.row_specter_exemplar_similarity);
         }
-        row_query_signature_indices.append(&mut query_result.row_query_signature_indices);
-        row_component_keys.append(&mut query_result.row_component_keys);
-        row_retrieval_scores.append(&mut query_result.row_retrieval_scores);
-        row_retrieval_ranks.append(&mut query_result.row_retrieval_ranks);
-        row_component_sizes.append(&mut query_result.row_component_sizes);
-        row_named_signature_counts.append(&mut query_result.row_named_signature_counts);
-        row_dominant_first_names.append(&mut query_result.row_dominant_first_names);
-        row_candidate_year_min.append(&mut query_result.row_candidate_year_min);
-        row_candidate_year_max.append(&mut query_result.row_candidate_year_max);
-        row_candidate_year_range_missing.append(&mut query_result.row_candidate_year_range_missing);
-        row_query_first_tokens.append(&mut query_result.row_query_first_tokens);
-        row_query_years.append(&mut query_result.row_query_years);
-        row_query_year_missing.append(&mut query_result.row_query_year_missing);
-        row_query_has_affiliations.append(&mut query_result.row_query_has_affiliations);
-        row_query_has_coauthors.append(&mut query_result.row_query_has_coauthors);
-        row_orcid_match.append(&mut query_result.row_orcid_match);
-        row_middle_initial_compatibility.append(&mut query_result.row_middle_initial_compatibility);
-        row_affiliation_overlap.append(&mut query_result.row_affiliation_overlap);
-        row_coauthor_overlap.append(&mut query_result.row_coauthor_overlap);
-        row_venue_overlap.append(&mut query_result.row_venue_overlap);
-        row_year_compatibility.append(&mut query_result.row_year_compatibility);
-        row_title_overlap.append(&mut query_result.row_title_overlap);
-        row_specter_centroid_similarity.append(&mut query_result.row_specter_centroid_similarity);
-        row_specter_exemplar_similarity.append(&mut query_result.row_specter_exemplar_similarity);
-    }
-    let retrieval_secs = retrieval_start.elapsed().as_secs_f64();
+        let retrieval_secs = retrieval_start.elapsed().as_secs_f64();
 
-    let pair_signature_ids_start = Instant::now();
-    let mut left_signature_ids = Vec::<String>::with_capacity(left_signature_indices.len());
-    let mut right_signature_ids = Vec::<String>::with_capacity(right_signature_indices.len());
-    let signature_index_count = query_signature_ids.len() + state.seed_signature_ids.len();
-    let signature_id_for_index = |index: u32| -> Option<&String> {
-        let offset = index as usize;
-        if offset < query_signature_ids.len() {
-            query_signature_ids.get(offset)
+        let pair_signature_ids_start = Instant::now();
+        let mut left_signature_ids: Option<Vec<String>> = None;
+        let mut right_signature_ids: Option<Vec<String>> = None;
+        if self.include_pair_signature_ids {
+            let mut left_ids = Vec::<String>::with_capacity(left_signature_indices.len());
+            let mut right_ids = Vec::<String>::with_capacity(right_signature_indices.len());
+            let signature_index_count = query_signature_ids.len() + seed_signature_ids.len();
+            let signature_id_for_index = |index: u32| -> Option<&String> {
+                let offset = index as usize;
+                if offset < query_signature_ids.len() {
+                    query_signature_ids.get(offset)
+                } else {
+                    seed_signature_ids.get(offset - query_signature_ids.len())
+                }
+            };
+            for index in left_signature_indices.iter() {
+                let Some(signature_id) = signature_id_for_index(*index) else {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                        "left signature index {} is outside signature id table of length {}",
+                        index, signature_index_count
+                    )));
+                };
+                left_ids.push(signature_id.clone());
+            }
+            for index in right_signature_indices.iter() {
+                let Some(signature_id) = signature_id_for_index(*index) else {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                        "right signature index {} is outside signature id table of length {}",
+                        index, signature_index_count
+                    )));
+                };
+                right_ids.push(signature_id.clone());
+            }
+            left_signature_ids = Some(left_ids);
+            right_signature_ids = Some(right_ids);
+        }
+        let pair_signature_ids_secs = pair_signature_ids_start.elapsed().as_secs_f64();
+
+        let mut payload_seed_signature_ids = if self.include_pair_signature_ids {
+            Vec::new()
         } else {
-            state
-                .seed_signature_ids
-                .get(offset - query_signature_ids.len())
+            seed_signature_ids.clone()
+        };
+        if !self.include_pair_signature_ids {
+            let query_signature_count = query_signature_ids.len();
+            let mut compact_seed_signature_ids = Vec::<String>::new();
+            let mut seed_index_remap = HashMap::<usize, u32>::new();
+            for signature_index in left_signature_indices
+                .iter_mut()
+                .chain(right_signature_indices.iter_mut())
+            {
+                let old_offset = *signature_index as usize;
+                if old_offset < query_signature_count {
+                    continue;
+                }
+                let old_seed_offset = old_offset - query_signature_count;
+                if old_seed_offset >= seed_signature_ids.len() {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                        "signature index {} is outside signature id table of length {}",
+                        old_offset,
+                        query_signature_count + seed_signature_ids.len()
+                    )));
+                }
+                let new_offset = match seed_index_remap.entry(old_seed_offset) {
+                    Entry::Occupied(entry) => *entry.get(),
+                    Entry::Vacant(entry) => {
+                        let new_offset =
+                            u32::try_from(query_signature_count + compact_seed_signature_ids.len())
+                                .map_err(|_| {
+                                    pyo3::exceptions::PyOverflowError::new_err(
+                                        "compact raw Arrow signature index exceeds u32",
+                                    )
+                                })?;
+                        compact_seed_signature_ids
+                            .push(seed_signature_ids[old_seed_offset].clone());
+                        *entry.insert(new_offset)
+                    }
+                };
+                *signature_index = new_offset;
+            }
+            payload_seed_signature_ids = compact_seed_signature_ids;
         }
-    };
-    for index in left_signature_indices.iter() {
-        let Some(signature_id) = signature_id_for_index(*index) else {
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "left signature index {} is outside signature id table of length {}",
-                index, signature_index_count
-            )));
+
+        let component_members_payload_start = Instant::now();
+        let component_members = if self.include_component_members {
+            let component_members = PyDict::new(py);
+            for component_key in component_order.iter() {
+                component_members.set_item(
+                    component_key,
+                    members_by_component
+                        .get(component_key)
+                        .cloned()
+                        .unwrap_or_default(),
+                )?;
+            }
+            Some(component_members)
+        } else {
+            None
         };
-        left_signature_ids.push(signature_id.clone());
+        let component_members_payload_secs =
+            component_members_payload_start.elapsed().as_secs_f64();
+
+        let timings = PyDict::new(py);
+        timings.set_item("read_cluster_seeds_secs", 0.0)?;
+        timings.set_item("read_signatures_secs", query_inputs.read_signatures_secs)?;
+        timings.set_item("read_papers_secs", query_inputs.read_papers_secs)?;
+        timings.set_item(
+            "read_paper_authors_secs",
+            query_inputs.read_paper_authors_secs,
+        )?;
+        timings.set_item("read_specter_secs", query_inputs.read_specter_secs)?;
+        timings.set_item("read_name_counts_secs", 0.0)?;
+        timings.set_item(
+            "metadata_reads_parallel_secs",
+            query_inputs.metadata_reads_parallel_secs,
+        )?;
+        timings.set_item("text_context_secs", text_context_secs)?;
+        timings.set_item("feature_secs", feature_secs)?;
+        timings.set_item("query_secs", query_secs)?;
+        timings.set_item("summary_secs", summary_secs)?;
+        timings.set_item("component_members_secs", component_members_secs)?;
+        timings.set_item("retrieval_secs", retrieval_secs)?;
+        timings.set_item("pair_signature_ids_secs", pair_signature_ids_secs)?;
+        timings.set_item(
+            "component_members_payload_secs",
+            component_members_payload_secs,
+        )?;
+
+        let telemetry = PyDict::new(py);
+        telemetry.set_item(
+            "signature_count",
+            query_signature_ids.len() + seed_signature_ids.len(),
+        )?;
+        let mut telemetry_paper_ids = HashSet::<String>::new();
+        for signature_id in query_signature_ids.iter() {
+            if let Some(signature) = query_inputs.signatures.get(signature_id) {
+                telemetry_paper_ids.insert(signature.paper_id.clone());
+            }
+        }
+        for signature_id in seed_signature_ids.iter() {
+            if let Some(signature) = self.state.signatures.get(signature_id) {
+                telemetry_paper_ids.insert(signature.paper_id.clone());
+            }
+        }
+        telemetry.set_item("paper_count", telemetry_paper_ids.len())?;
+        let mut telemetry_paper_author_ids = HashSet::<String>::new();
+        for paper_id in telemetry_paper_ids.iter() {
+            if self.state.paper_authors.contains_key(paper_id)
+                || query_inputs.paper_authors.contains_key(paper_id)
+            {
+                telemetry_paper_author_ids.insert(paper_id.clone());
+            }
+        }
+        telemetry.set_item("paper_author_paper_count", telemetry_paper_author_ids.len())?;
+        telemetry.set_item("cluster_count", component_order.len())?;
+        telemetry.set_item("seed_signature_count", seed_signature_ids.len())?;
+        telemetry.set_item("query_signature_count", query_signature_ids.len())?;
+        telemetry.set_item("excluded_query_seed_count", excluded_query_seed_count)?;
+        telemetry.set_item(
+            "cluster_seed_disallow_pair_count",
+            self.state.cluster_seed_disallows.len(),
+        )?;
+        telemetry.set_item(
+            "cluster_seed_disallowed_candidate_count",
+            cluster_seed_disallowed_candidate_count,
+        )?;
+        let mut telemetry_specter_ids = HashSet::<String>::new();
+        for signature_id in seed_signature_ids.iter() {
+            if self
+                .state
+                .features_by_signature_id
+                .get(signature_id)
+                .and_then(|feature| feature.query.specter.as_ref())
+                .is_some()
+            {
+                if let Some(signature) = self.state.signatures.get(signature_id) {
+                    telemetry_specter_ids.insert(signature.paper_id.clone());
+                }
+            }
+        }
+        if let Some(query_specter) = query_inputs.specter_by_paper_id.as_ref() {
+            for paper_id in telemetry_paper_ids.iter() {
+                if query_specter.contains_key(paper_id) {
+                    telemetry_specter_ids.insert(paper_id.clone());
+                }
+            }
+        }
+        telemetry.set_item("specter_count", telemetry_specter_ids.len())?;
+        telemetry.set_item(
+            "indexed_arrow_candidate_plan",
+            self.state.build_telemetry.indexed_arrow_candidate_plan,
+        )?;
+        telemetry.set_item(
+            "signature_batches_read",
+            query_inputs.signature_index_stats.batches_read,
+        )?;
+        telemetry.set_item(
+            "signature_rows_scanned",
+            query_inputs.signature_index_stats.rows_scanned,
+        )?;
+        telemetry.set_item(
+            "paper_batches_read",
+            query_inputs.paper_index_stats.batches_read,
+        )?;
+        telemetry.set_item(
+            "paper_rows_scanned",
+            query_inputs.paper_index_stats.rows_scanned,
+        )?;
+        telemetry.set_item(
+            "paper_author_batches_read",
+            query_inputs.paper_author_index_stats.batches_read,
+        )?;
+        telemetry.set_item(
+            "paper_author_rows_scanned",
+            query_inputs.paper_author_index_stats.rows_scanned,
+        )?;
+        telemetry.set_item(
+            "specter_batches_read",
+            query_inputs.specter_index_stats.batches_read,
+        )?;
+        telemetry.set_item(
+            "specter_rows_scanned",
+            query_inputs.specter_index_stats.rows_scanned,
+        )?;
+        telemetry.set_item("unidecode_char_count", self.state.unidecode_char_map.len())?;
+        telemetry.set_item(
+            "payload_seed_signature_count",
+            payload_seed_signature_ids.len(),
+        )?;
+        telemetry.set_item("planner_seed_state_reused", 1)?;
+        telemetry.set_item("timings", &timings)?;
+
+        let payload_start = Instant::now();
+        let payload = PyDict::new(py);
+        payload.set_item("schema_version", "raw_arrow_candidate_plan_v1")?;
+        payload.set_item("row_count", row_component_keys.len())?;
+        payload.set_item("pair_count", left_signature_indices.len())?;
+        payload.set_item("query_signature_ids", query_signature_ids)?;
+        payload.set_item("query_views", query_views)?;
+        payload.set_item("query_authors", query_authors)?;
+        payload.set_item("seed_signature_ids", payload_seed_signature_ids)?;
+        if let Some(component_members) = component_members {
+            payload.set_item("component_members", component_members)?;
+        }
+        payload.set_item(
+            "left_signature_indices",
+            left_signature_indices.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "right_signature_indices",
+            right_signature_indices.to_pyarray(py),
+        )?;
+        if let Some(left_signature_ids) = left_signature_ids {
+            payload.set_item("left_signature_ids", left_signature_ids)?;
+        }
+        if let Some(right_signature_ids) = right_signature_ids {
+            payload.set_item("right_signature_ids", right_signature_ids)?;
+        }
+        payload.set_item("pair_row_indices", pair_row_indices.to_pyarray(py))?;
+        payload.set_item(
+            "row_query_signature_indices",
+            row_query_signature_indices.to_pyarray(py),
+        )?;
+        payload.set_item("row_component_keys", row_component_keys)?;
+        payload.set_item("retrieval_scores", row_retrieval_scores.to_pyarray(py))?;
+        payload.set_item("retrieval_ranks", row_retrieval_ranks.to_pyarray(py))?;
+        payload.set_item("row_component_sizes", row_component_sizes.to_pyarray(py))?;
+        payload.set_item(
+            "row_named_signature_counts",
+            row_named_signature_counts.to_pyarray(py),
+        )?;
+        payload.set_item("row_dominant_first_names", row_dominant_first_names)?;
+        payload.set_item(
+            "row_candidate_year_min",
+            row_candidate_year_min.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_candidate_year_max",
+            row_candidate_year_max.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_candidate_year_range_missing",
+            row_candidate_year_range_missing.to_pyarray(py),
+        )?;
+        payload.set_item("row_query_first_tokens", row_query_first_tokens)?;
+        payload.set_item("row_query_years", row_query_years.to_pyarray(py))?;
+        payload.set_item(
+            "row_query_year_missing",
+            row_query_year_missing.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_query_has_affiliations",
+            row_query_has_affiliations.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_query_has_coauthors",
+            row_query_has_coauthors.to_pyarray(py),
+        )?;
+        payload.set_item("row_orcid_match", row_orcid_match.to_pyarray(py))?;
+        payload.set_item(
+            "middle_initial_compatibility",
+            row_middle_initial_compatibility.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "affiliation_overlap",
+            row_affiliation_overlap.to_pyarray(py),
+        )?;
+        payload.set_item("coauthor_overlap", row_coauthor_overlap.to_pyarray(py))?;
+        payload.set_item("venue_overlap", row_venue_overlap.to_pyarray(py))?;
+        payload.set_item("year_compatibility", row_year_compatibility.to_pyarray(py))?;
+        payload.set_item("title_overlap", row_title_overlap.to_pyarray(py))?;
+        payload.set_item(
+            "specter_centroid_similarity",
+            row_specter_centroid_similarity.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "specter_exemplar_similarity",
+            row_specter_exemplar_similarity.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_last_name_count_min_rarity",
+            row_last_name_count_min_rarity.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_candidate_last_name_count_min_rarity",
+            row_candidate_last_name_count_min_rarity.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_candidate_last_first_name_count_min_rarity",
+            row_candidate_last_first_name_count_min_rarity.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_last_first_name_count_min_rarity",
+            row_last_first_name_count_min_rarity.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_first_prefix_x_last_first_name_count_min_rarity",
+            row_first_prefix_x_last_first_name_count_min_rarity.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_candidate_cluster_max_paper_author_count",
+            row_candidate_cluster_max_paper_author_count.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_paper_author_list_max_jaccard",
+            row_paper_author_list_max_jaccard.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_paper_author_list_max_containment",
+            row_paper_author_list_max_containment.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_paper_author_list_max_overlap_count",
+            row_paper_author_list_max_overlap_count.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_local_author_window10_jaccard_max",
+            row_local_author_window10_jaccard_max.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_local_author_window10_overlap_count_max",
+            row_local_author_window10_overlap_count_max.to_pyarray(py),
+        )?;
+        payload.set_item(
+            "row_best_author_count_log_absdiff",
+            row_best_author_count_log_absdiff.to_pyarray(py),
+        )?;
+        payload.set_item("telemetry", telemetry)?;
+        timings.set_item("payload_secs", payload_start.elapsed().as_secs_f64())?;
+        timings.set_item("total_secs", total_start.elapsed().as_secs_f64())?;
+        timings.set_item("drop_secs", 0.0)?;
+        timings.set_item("wall_secs", total_start.elapsed().as_secs_f64())?;
+        Ok(payload.unbind())
     }
-    for index in right_signature_indices.iter() {
-        let Some(signature_id) = signature_id_for_index(*index) else {
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "right signature index {} is outside signature id table of length {}",
-                index, signature_index_count
-            )));
-        };
-        right_signature_ids.push(signature_id.clone());
-    }
-    let pair_signature_ids_secs = pair_signature_ids_start.elapsed().as_secs_f64();
-
-    let component_members_payload_start = Instant::now();
-    let component_members = PyDict::new(py);
-    for component_key in state.component_order.iter() {
-        component_members
-            .set_item(
-                component_key,
-                state
-                    .members_by_component
-                    .get(component_key)
-                    .cloned()
-                    .unwrap_or_default(),
-            )
-            .map_err(|err| {
-                log_raw_arrow_candidate_plan_state_error("component_members_payload", total_start);
-                err
-            })?;
-    }
-    let component_members_payload_secs = component_members_payload_start.elapsed().as_secs_f64();
-
-    let timings = PyDict::new(py);
-    timings.set_item("read_signatures_secs", read_signatures_secs)?;
-    timings.set_item("read_papers_secs", read_papers_secs)?;
-    timings.set_item("read_paper_authors_secs", read_paper_authors_secs)?;
-    timings.set_item("read_cluster_seeds_secs", read_cluster_seeds_secs)?;
-    timings.set_item("read_specter_secs", read_specter_secs)?;
-    timings.set_item("read_name_counts_secs", read_name_counts_secs)?;
-    timings.set_item("metadata_reads_parallel_secs", metadata_reads_parallel_secs)?;
-    timings.set_item("text_context_secs", text_context_secs)?;
-    timings.set_item("feature_secs", feature_secs)?;
-    timings.set_item("query_secs", query_secs)?;
-    timings.set_item("summary_secs", summary_secs)?;
-    timings.set_item("component_members_secs", component_members_secs)?;
-    timings.set_item("retrieval_secs", retrieval_secs)?;
-    timings.set_item("pair_signature_ids_secs", pair_signature_ids_secs)?;
-    timings.set_item(
-        "component_members_payload_secs",
-        component_members_payload_secs,
-    )?;
-
-    let telemetry = PyDict::new(py);
-    telemetry.set_item("signature_count", state.signatures.len())?;
-    telemetry.set_item("paper_count", state.papers.len())?;
-    telemetry.set_item("paper_author_paper_count", state.paper_authors.len())?;
-    telemetry.set_item("cluster_count", state.component_order.len())?;
-    telemetry.set_item("seed_signature_count", state.seed_signature_ids.len())?;
-    telemetry.set_item("query_signature_count", query_signature_ids.len())?;
-    telemetry.set_item("excluded_query_seed_count", excluded_query_seed_count)?;
-    telemetry.set_item(
-        "specter_count",
-        state
-            .specter_by_paper_id
-            .as_ref()
-            .map_or(0usize, HashMap::len),
-    )?;
-    telemetry.set_item(
-        "indexed_arrow_candidate_plan",
-        signatures_batch_index_path.is_some()
-            || papers_batch_index_path.is_some()
-            || paper_authors_batch_index_path.is_some()
-            || specter_batch_index_path.is_some(),
-    )?;
-    telemetry.set_item("signature_batches_read", signature_index_stats.batches_read)?;
-    telemetry.set_item("signature_rows_scanned", signature_index_stats.rows_scanned)?;
-    telemetry.set_item("paper_batches_read", paper_index_stats.batches_read)?;
-    telemetry.set_item("paper_rows_scanned", paper_index_stats.rows_scanned)?;
-    telemetry.set_item(
-        "paper_author_batches_read",
-        paper_author_index_stats.batches_read,
-    )?;
-    telemetry.set_item(
-        "paper_author_rows_scanned",
-        paper_author_index_stats.rows_scanned,
-    )?;
-    telemetry.set_item("specter_batches_read", specter_index_stats.batches_read)?;
-    telemetry.set_item("specter_rows_scanned", specter_index_stats.rows_scanned)?;
-    telemetry.set_item("unidecode_char_count", unidecode_char_map.len())?;
-    telemetry.set_item("timings", &timings)?;
-
-    let payload_start = Instant::now();
-    let payload = PyDict::new(py);
-    payload.set_item("schema_version", "raw_arrow_candidate_plan_v1")?;
-    payload.set_item("row_count", row_component_keys.len())?;
-    payload.set_item("pair_count", left_signature_indices.len())?;
-    payload.set_item("query_signature_ids", query_signature_ids)?;
-    payload.set_item("query_views", query_views)?;
-    payload.set_item("query_authors", query_authors)?;
-    payload.set_item("component_members", component_members)?;
-    payload.set_item(
-        "left_signature_indices",
-        left_signature_indices.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "right_signature_indices",
-        right_signature_indices.to_pyarray(py),
-    )?;
-    payload.set_item("left_signature_ids", left_signature_ids)?;
-    payload.set_item("right_signature_ids", right_signature_ids)?;
-    payload.set_item("pair_row_indices", pair_row_indices.to_pyarray(py))?;
-    payload.set_item(
-        "row_query_signature_indices",
-        row_query_signature_indices.to_pyarray(py),
-    )?;
-    payload.set_item("row_component_keys", row_component_keys)?;
-    payload.set_item("retrieval_scores", row_retrieval_scores.to_pyarray(py))?;
-    payload.set_item("retrieval_ranks", row_retrieval_ranks.to_pyarray(py))?;
-    payload.set_item("row_component_sizes", row_component_sizes.to_pyarray(py))?;
-    payload.set_item(
-        "row_named_signature_counts",
-        row_named_signature_counts.to_pyarray(py),
-    )?;
-    payload.set_item("row_dominant_first_names", row_dominant_first_names)?;
-    payload.set_item(
-        "row_candidate_year_min",
-        row_candidate_year_min.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_candidate_year_max",
-        row_candidate_year_max.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_candidate_year_range_missing",
-        row_candidate_year_range_missing.to_pyarray(py),
-    )?;
-    payload.set_item("row_query_first_tokens", row_query_first_tokens)?;
-    payload.set_item("row_query_years", row_query_years.to_pyarray(py))?;
-    payload.set_item(
-        "row_query_year_missing",
-        row_query_year_missing.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_query_has_affiliations",
-        row_query_has_affiliations.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_query_has_coauthors",
-        row_query_has_coauthors.to_pyarray(py),
-    )?;
-    payload.set_item("row_orcid_match", row_orcid_match.to_pyarray(py))?;
-    payload.set_item(
-        "middle_initial_compatibility",
-        row_middle_initial_compatibility.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "affiliation_overlap",
-        row_affiliation_overlap.to_pyarray(py),
-    )?;
-    payload.set_item("coauthor_overlap", row_coauthor_overlap.to_pyarray(py))?;
-    payload.set_item("venue_overlap", row_venue_overlap.to_pyarray(py))?;
-    payload.set_item("year_compatibility", row_year_compatibility.to_pyarray(py))?;
-    payload.set_item("title_overlap", row_title_overlap.to_pyarray(py))?;
-    payload.set_item(
-        "specter_centroid_similarity",
-        row_specter_centroid_similarity.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "specter_exemplar_similarity",
-        row_specter_exemplar_similarity.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_last_name_count_min_rarity",
-        row_last_name_count_min_rarity.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_candidate_last_name_count_min_rarity",
-        row_candidate_last_name_count_min_rarity.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_candidate_last_first_name_count_min_rarity",
-        row_candidate_last_first_name_count_min_rarity.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_last_first_name_count_min_rarity",
-        row_last_first_name_count_min_rarity.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_first_prefix_x_last_first_name_count_min_rarity",
-        row_first_prefix_x_last_first_name_count_min_rarity.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_candidate_cluster_max_paper_author_count",
-        row_candidate_cluster_max_paper_author_count.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_paper_author_list_max_jaccard",
-        row_paper_author_list_max_jaccard.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_paper_author_list_max_containment",
-        row_paper_author_list_max_containment.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_paper_author_list_max_overlap_count",
-        row_paper_author_list_max_overlap_count.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_local_author_window10_jaccard_max",
-        row_local_author_window10_jaccard_max.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_local_author_window10_overlap_count_max",
-        row_local_author_window10_overlap_count_max.to_pyarray(py),
-    )?;
-    payload.set_item(
-        "row_best_author_count_log_absdiff",
-        row_best_author_count_log_absdiff.to_pyarray(py),
-    )?;
-    payload.set_item("telemetry", telemetry)?;
-    timings.set_item("payload_secs", payload_start.elapsed().as_secs_f64())?;
-    timings.set_item("total_secs", total_start.elapsed().as_secs_f64())?;
-    let output = payload.unbind();
-    let drop_start = Instant::now();
-    py.allow_threads(|| {
-        let compute = || state.cleanup_success();
-        install_with_optional_rayon_pool(num_threads, compute)
-    });
-    timings.set_item("drop_secs", drop_start.elapsed().as_secs_f64())?;
-    timings.set_item("wall_secs", total_start.elapsed().as_secs_f64())?;
-    Ok(output)
 }
 
 #[cfg(test)]
@@ -14824,6 +15522,25 @@ mod tests {
                 .expect("test error messages are ASCII")
                 .to_string()
         })
+    }
+
+    #[test]
+    fn json_value_to_i64_rejects_lossy_numbers() {
+        let float_value = serde_json::json!(1.5);
+        let float_error =
+            json_value_to_i64(&float_value, "signature author_info.position").unwrap_err();
+        assert!(py_err_message(float_error).contains("must be an integer"));
+
+        let overflow_value = serde_json::json!(u64::MAX);
+        let overflow_error =
+            json_value_to_i64(&overflow_value, "signature author_info.position").unwrap_err();
+        assert!(py_err_message(overflow_error).contains("outside i64 range"));
+    }
+
+    #[test]
+    fn validate_retrieval_top_k_rejects_uint16_rank_overflow() {
+        let error = validate_retrieval_rank_top_k((u16::MAX as usize) + 1).unwrap_err();
+        assert!(py_err_message(error).contains("retrieval_ranks are stored as uint16"));
     }
 
     #[test]
@@ -14859,7 +15576,7 @@ mod tests {
     }
 
     #[test]
-    fn sorted_subblock_merge_candidates_rejects_nan_scores() {
+    fn sorted_subblock_merge_candidates_allows_nan_scores() {
         let mut output = OrderedSubblocks::default();
         output.insert("alice".to_string(), vec!["s1".to_string()]);
         output.insert("bob".to_string(), vec!["s2".to_string()]);
@@ -14871,11 +15588,11 @@ mod tests {
 
         let result = sorted_subblock_merge_candidates(&output, 3, &counts);
 
-        assert!(result.is_err());
-        let message = py_err_message(result.err().expect("error was asserted"));
-        assert!(message.contains("first_k_letter_counts_sorted contains NaN score"));
-        assert!(message.contains("\"alice\""));
-        assert!(message.contains("\"bob\""));
+        assert!(result.is_ok());
+        let candidates = result.expect("NaN scores should sort without raising");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, ("alice".to_string(), "bob".to_string()));
+        assert!(candidates[0].1.is_nan());
     }
 
     #[test]
@@ -14902,6 +15619,25 @@ mod tests {
             normalize_orcid_owned("ORCID: 000000021825009x"),
             Some("0000-0002-1825-009X".to_string())
         );
+        assert_eq!(
+            normalize_orcid_owned("https://orcid.org/0000\u{2010}0002\u{2010}1825\u{2010}0097"),
+            Some("0000-0002-1825-0097".to_string())
+        );
+        for dash in [
+            '-', '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2212}',
+            '\u{FE58}', '\u{FE63}', '\u{FF0D}',
+        ] {
+            let value = format!("0000{dash}0002{dash}1825{dash}0097");
+            assert_eq!(
+                normalize_orcid_owned(&value),
+                Some("0000-0002-1825-0097".to_string())
+            );
+        }
+        assert_eq!(
+            normalize_orcid_compact_owned("ORCID: 000000021825009x"),
+            Some("000000021825009X".to_string())
+        );
+        assert_eq!(normalize_orcid_owned("s000-0000-1879-1075X"), None);
         assert_eq!(normalize_orcid_owned("0000-0002-1825"), None);
     }
 
@@ -14946,9 +15682,15 @@ mod tests {
                 middle: "A.".to_string(),
                 orcid: None,
             },
+            SubblockingSignatureRow {
+                signature_id: "s4".to_string(),
+                first: "Arif\u{2010}ullah".to_string(),
+                middle: String::new(),
+                orcid: None,
+            },
         ];
         let prefixes = HashSet::new();
-        let unidecode_char_map = HashMap::new();
+        let unidecode_char_map = HashMap::from([('\u{2010}', "-".to_string())]);
 
         normalize_subblocking_signature_rows(&mut rows, &prefixes, &unidecode_char_map);
 
@@ -14956,6 +15698,8 @@ mod tests {
         assert_eq!(rows[1].first, "alice");
         assert_eq!(rows[2].first, "qi xin");
         assert_eq!(rows[2].middle, "a");
+        assert_eq!(rows[3].first, "arif ullah");
+        assert_eq!(rows[3].middle, "");
     }
 
     #[test]
@@ -14969,6 +15713,91 @@ mod tests {
         assert_eq!(
             normalize_text_compat_from_map("O'Neil2", true, &unidecode_char_map),
             "oneil"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "missing unidecode mapping")]
+    fn normalize_text_compat_requires_mapping_for_non_ascii() {
+        let unidecode_char_map = HashMap::new();
+        let _ = normalize_text_compat_from_map("\u{00C9}lodie", false, &unidecode_char_map);
+    }
+
+    #[test]
+    fn first_normalized_token_uses_python_space_split() {
+        let prefixes = HashSet::new();
+        assert_eq!(
+            first_normalized_token_python_compat("", "alan", &prefixes),
+            ""
+        );
+
+        let prefixes = HashSet::from(["dr".to_string()]);
+        assert_eq!(
+            first_normalized_token_python_compat("dr", "alice", &prefixes),
+            "alice"
+        );
+    }
+
+    #[test]
+    fn stage_papers_normalize_title_and_authors_without_full_preprocess() {
+        let input = StagePaperInput {
+            paper_id: "p1".to_string(),
+            raw_title: "Some Title".to_string(),
+            raw_venue: "My Venue".to_string(),
+            raw_journal: "My Journal".to_string(),
+            raw_authors: vec![(0, "ALICE-1".to_string()), (1, "Bob O'Neil".to_string())],
+            year: Some(2024),
+            has_abstract: false,
+            predicted_language: None,
+            is_reliable: false,
+        };
+
+        let papers = preprocess_stage_papers(
+            &[input],
+            false,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        let paper = &papers[0].1;
+        assert_eq!(
+            paper.authors,
+            vec![(0, "alice".to_string()), (1, "bob o neil".to_string())]
+        );
+        assert!(paper.title_words.is_some());
+        assert!(paper.title_chars.is_none());
+        assert!(paper.venue_ngrams.is_none());
+        assert!(paper.journal_ngrams.is_none());
+    }
+
+    #[test]
+    fn name_tuple_compatibility_does_not_apply_extra_case_normalization() {
+        let mut name_tuples = HashMap::new();
+        insert_name_tuple_alias(&mut name_tuples, "Bill".to_string(), "William".to_string());
+
+        assert!(first_names_name_compatible("Bill", "William", &name_tuples));
+        assert!(!first_names_name_compatible(
+            "bill",
+            "william",
+            &name_tuples
+        ));
+    }
+
+    #[test]
+    fn subblock_token_fallback_matches_python_case_preserving_parse() {
+        assert_eq!(
+            subblock_tokens_from_key("Ali|3,bob|2,a|1"),
+            vec!["Ali".to_string(), "bob".to_string()]
+        );
+    }
+
+    #[test]
+    fn linker_alpha_normalization_uses_text_normalization() {
+        let unidecode_char_map = HashMap::from([('É', "E".to_string())]);
+        assert_eq!(
+            linker_normalize_alpha("Élodie-2", &unidecode_char_map),
+            "elodie"
         );
     }
 }
@@ -15025,5 +15854,6 @@ fn _s2and_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustFeaturizer>()?;
     m.add_class::<RustHybridCentroidRetriever>()?;
     m.add_class::<RustNameCompatibleSubblockSelector>()?;
+    m.add_class::<RawBlockQueryCandidatePlanner>()?;
     Ok(())
 }

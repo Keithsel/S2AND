@@ -282,6 +282,17 @@ def test_prepare_prod_training_data_weights_calibration_rows_and_leaves_test_for
                 "label": 1,
                 "f0": 0.3,
             },
+            {
+                "query_group_id": "q_unlabeled",
+                "base_group_id": "b_unlabeled",
+                "candidate_component_key": "c_unlabeled",
+                "dataset": "unit",
+                "query_view": "full",
+                "retrieval_rank": 1,
+                "label": 0,
+                "supervision_type": "unlabeled_singleton_orcid",
+                "f0": 0.9,
+            },
         ],
     )
     _write_candidate_rows(
@@ -399,6 +410,7 @@ def test_prepare_prod_training_data_weights_calibration_rows_and_leaves_test_for
     assert summaries["stratified_calibration_calibration_fit"]["splits"] == ["calibration_fit"]
     assert summaries["stratified_calibration_calibration_fit"]["source_keys"] == ["s2and_eval"]
     assert prod_data.train_holdout_filter_summary["rows_removed"] == 1
+    assert "q_unlabeled" not in set(prod_data.rows["query_group_id"].astype(str))
 
 
 def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(

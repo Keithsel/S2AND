@@ -1,4 +1,5 @@
-from typing import TYPE_CHECKING
+import os
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from s2and.data import NameCounts
@@ -60,6 +61,11 @@ def _get_fasttext_model():
 
     global _FASTTEXT_MODEL
     global _FASTTEXT_MODEL_INITIALIZED
+    if os.environ.get("S2AND_SKIP_FASTTEXT", "").lower() in {"1", "true", "yes"}:
+        with _FASTTEXT_MODEL_LOCK:
+            _FASTTEXT_MODEL = None
+            _FASTTEXT_MODEL_INITIALIZED = True
+        return None
     with _FASTTEXT_MODEL_LOCK:
         if not _FASTTEXT_LOADING_ENABLED:
             _FASTTEXT_MODEL = None
@@ -78,7 +84,16 @@ def _get_fasttext_model():
 
 RE_NORMALIZE_WHOLE_NAME = re.compile(r"[^a-zA-Z\s]+")
 
-ORCID_PATTERN = re.compile(r"\d{4}-?\d{4}-?\d{4}-?\d{3}[0-9X]")
+DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212\ufe58\ufe63\uff0d"
+NAME_DASH_CHARS = frozenset(DASH_CHARS)
+ORCID_DASH_CLASS = re.escape(DASH_CHARS)
+ORCID_PATTERN = re.compile(
+    rf"(?i)(?<![0-9x])"
+    rf"\d{{4}}[{ORCID_DASH_CLASS}]?"
+    rf"\d{{4}}[{ORCID_DASH_CLASS}]?"
+    rf"\d{{4}}[{ORCID_DASH_CLASS}]?"
+    rf"\d{{3}}[0-9x](?![0-9x])"
+)
 
 DROPPED_AFFIXES = {
     "ab",
@@ -398,6 +413,31 @@ def normalize_text(text: str | None, special_case_apostrophes: bool = False) -> 
     return norm_text
 
 
+def normalize_orcid(value: Any) -> str | None:
+    """Return a canonical hyphenated ORCID, or None when no valid ORCID is present."""
+
+    if value is None:
+        return None
+    match = ORCID_PATTERN.search(str(value).strip())
+    if match is None:
+        return None
+    compact = "".join(character for character in match.group(0) if character not in NAME_DASH_CHARS).upper()
+    return f"{compact[0:4]}-{compact[4:8]}-{compact[8:12]}-{compact[12:16]}"
+
+
+def normalize_orcid_compact(value: Any) -> str | None:
+    """Return a compact legacy ORCID key, or None when no valid ORCID is present."""
+
+    normalized = normalize_orcid(value)
+    return None if normalized is None else normalized.replace("-", "")
+
+
+def has_name_dash(value: str | None) -> bool:
+    """Return whether a raw name contains a dash-like character."""
+
+    return any(character in NAME_DASH_CHARS for character in value or "")
+
+
 def split_first_middle_hyphen_aware(first_raw: str | None, middle_raw: str | None) -> tuple[str, str]:
     """Normalize and split first/middle with hyphen awareness for canonical fields.
 
@@ -412,7 +452,7 @@ def split_first_middle_hyphen_aware(first_raw: str | None, middle_raw: str | Non
     first_raw = first_raw or ""
     middle_raw = middle_raw or ""
 
-    has_dash_in_first = "-" in first_raw
+    has_dash_in_first = has_name_dash(first_raw)
     first_noapos = normalize_text(first_raw, special_case_apostrophes=True)
     middle_norm = normalize_text(middle_raw)
 

@@ -26,6 +26,9 @@ from s2and.text import (
 from s2and.text import (
     name_counts as pairwise_name_counts,
 )
+from s2and.text import (
+    normalize_orcid as normalize_orcid_text,
+)
 
 EMPTY_STRING_SET: frozenset[str] = frozenset()
 PAIRWISE_NAME_COUNT_FEATURE_NAMES: tuple[str, ...] = (
@@ -52,12 +55,9 @@ NAME_COUNT_RARITY_FEATURE_COLUMNS: tuple[str, ...] = (
 
 
 def normalize_orcid(value: Any) -> str | None:
-    """Return a non-empty stripped ORCID value, or None."""
+    """Return a canonical ORCID value, or None."""
 
-    if value is None:
-        return None
-    orcid = str(value).strip()
-    return orcid or None
+    return normalize_orcid_text(value)
 
 
 @dataclass(frozen=True)
@@ -218,22 +218,19 @@ def _safe_compute_block(name: str) -> str:
 
 
 def _signature_coauthor_blocks(signature: Any, dataset: ANDData) -> frozenset[str]:
-    author_position = _signature_author_position(signature)
-    if author_position is None:
-        return EMPTY_STRING_SET
-
     coauthor_blocks = signature.author_info_coauthor_blocks
     if coauthor_blocks is not None:
         return _nonempty_feature_values(coauthor_blocks)
 
     coauthors = signature.author_info_coauthors
     if coauthors is None:
+        author_position = _signature_author_position(signature)
+        if author_position is None:
+            return EMPTY_STRING_SET
         paper = dataset.papers.get(str(signature.paper_id))
         if paper is None:
             return EMPTY_STRING_SET
-        coauthors = [
-            author.author_name for author in paper.authors if int(author.position) != author_position
-        ]
+        coauthors = [author.author_name for author in paper.authors if int(author.position) != author_position]
     return _nonempty_feature_values([_safe_compute_block(str(author or "")) for author in coauthors])
 
 
@@ -253,15 +250,18 @@ def _get_specter_vector(dataset: ANDData, paper_id: Any) -> np.ndarray | None:
 
 
 def _signature_query_author(signature: Any) -> str:
-    """Return normalized author text for query-level gate features."""
+    """Return raw author text for query-level gate features."""
 
+    full_name = getattr(signature, "author_info_full_name", None)
+    if full_name is not None and str(full_name).strip():
+        return str(full_name).strip()
     parts = [
         getattr(signature, "author_info_first", None),
         getattr(signature, "author_info_middle", None),
         getattr(signature, "author_info_last", None),
         getattr(signature, "author_info_suffix", None),
     ]
-    return normalize_text(" ".join(str(part).strip() for part in parts if part is not None and str(part).strip()))
+    return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
 
 
 def _feature_block_paper_by_id(feature_block: FeatureBlock) -> dict[str, Any]:
@@ -346,7 +346,7 @@ def _feature_block_query_author(signature: Any) -> str:
         signature.author_last,
         signature.author_suffix,
     ]
-    return normalize_text(" ".join(str(part).strip() for part in parts if part is not None and str(part).strip()))
+    return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
 
 
 def _apply_orcid_feature_policy(features: QueryFeatures, *, orcid_enabled: bool) -> QueryFeatures:
@@ -794,6 +794,8 @@ def raw_paper_evidence_features(query: QueryFeatures, summary: ClusterSummary) -
         strict=True,
     ):
         same_signature = query_signature_id and query_signature_id == str(candidate_signature_id)
+        if same_signature:
+            continue
         intersection = len(query_author_names & candidate_names)
         union = len(query_author_names | candidate_names)
         jaccard = float(intersection / union) if union else 0.0
@@ -803,12 +805,11 @@ def raw_paper_evidence_features(query: QueryFeatures, summary: ClusterSummary) -
         best_author_containment = max(best_author_containment, containment)
         best_author_overlap = max(best_author_overlap, float(intersection))
 
-        if not same_signature:
-            local10_intersection = len(query_local10_names & candidate_local10_names)
-            local10_union = len(query_local10_names | candidate_local10_names)
-            if local10_union:
-                best_local10_jaccard = max(best_local10_jaccard, float(local10_intersection / local10_union))
-            best_local10_overlap_count = max(best_local10_overlap_count, float(local10_intersection))
+        local10_intersection = len(query_local10_names & candidate_local10_names)
+        local10_union = len(query_local10_names | candidate_local10_names)
+        if local10_union:
+            best_local10_jaccard = max(best_local10_jaccard, float(local10_intersection / local10_union))
+        best_local10_overlap_count = max(best_local10_overlap_count, float(local10_intersection))
 
         count_delta = abs(math.log1p(query_author_count) - math.log1p(int(candidate_count)))
         best_author_count_log_absdiff = (

@@ -23,6 +23,8 @@ from s2and.text import (
     AFFILIATIONS_STOP_WORDS,
     compute_block,
     get_text_ngrams_words,
+    normalize_orcid,
+    normalize_text,
     same_prefix_tokens,
     split_first_middle_hyphen_aware,
 )
@@ -37,27 +39,11 @@ with open(os.path.join(_PACKAGE_DATA_DIR, "first_k_letter_counts_from_orcid.json
 def normalize_orcid_for_subblocking(value: Any) -> str | None:
     """Return the canonical ORCID key used by Rust Arrow subblocking inputs.
 
-    This mirrors Rust's `normalize_orcid_owned(...)`: keep digits and `X`/`x`,
-    require exactly 16 ORCID characters, uppercase the check digit, and format
-    the result with hyphens.
+    This mirrors Rust's `normalize_orcid_owned(...)`: find one ORCID-shaped
+    token, uppercase the check digit, and format the result with hyphens.
     """
 
-    if value is None:
-        return None
-    compact = []
-    for char in str(value).strip():
-        if char.isascii() and char.isdigit():
-            compact.append(char)
-        elif char in {"X", "x"}:
-            compact.append("X")
-    if len(compact) != 16:
-        return None
-    if any(not char.isdigit() for char in compact[:15]):
-        return None
-    if not (compact[15].isdigit() or compact[15] == "X"):
-        return None
-    normalized = "".join(compact)
-    return f"{normalized[0:4]}-{normalized[4:8]}-{normalized[8:12]}-{normalized[12:16]}"
+    return normalize_orcid(value)
 
 
 @dataclass(frozen=True)
@@ -129,14 +115,13 @@ class _SignatureEvidence:
 def signature_affiliation_feature_keys(signature) -> list[str]:
     if signature.author_info_affiliations_n_grams is not None:
         return list(signature.author_info_affiliations_n_grams.keys())
-    affiliations = list(signature.author_info_affiliations or [])
-    if not affiliations:
-        return []
-    tokens = [word for word in " ".join(affiliations).split() if word not in AFFILIATIONS_STOP_WORDS and len(word) > 1]
-    if not tokens:
-        return []
-    ngrams = get_text_ngrams_words(" ".join(tokens), stopwords=set())
-    return list(ngrams.keys())
+    return list(_affiliation_ngrams_from_raw_affiliations(signature.author_info_affiliations).keys())
+
+
+def _affiliation_ngrams_from_raw_affiliations(affiliations: Iterable[Any] | None) -> Counter:
+    values = [normalize_text(str(value)) for value in affiliations or () if value is not None]
+    text = " ".join(value for value in values if value)
+    return get_text_ngrams_words(text, stopwords=AFFILIATIONS_STOP_WORDS) if text else Counter()
 
 
 def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
@@ -190,7 +175,7 @@ def _weighted_edge_score(
 def _prune_edge_scores(edge_scores: dict[tuple[int, int], float], max_candidate_edges: int) -> None:
     if max_candidate_edges <= 0 or len(edge_scores) <= max_candidate_edges:
         return
-    strongest = sorted(edge_scores.items(), key=lambda item: item[1], reverse=True)[:max_candidate_edges]
+    strongest = sorted(edge_scores.items(), key=lambda item: (-item[1], item[0]))[:max_candidate_edges]
     edge_scores.clear()
     edge_scores.update(strongest)
 
@@ -387,7 +372,7 @@ def _add_sparse_evidence_edge_scores(
     return {
         "sparse_evidence_feature_count": int(features_considered),
         "sparse_evidence_skipped_feature_count": int(features_skipped),
-        "sparse_evidence_added_edge_count": int(len(edge_scores) - edge_count_before),
+        "sparse_evidence_added_edge_count": max(0, int(len(edge_scores) - edge_count_before)),
         "sparse_evidence_neighbors": int(config.sparse_evidence_neighbors),
     }
 
@@ -1061,20 +1046,25 @@ def _load_arrow_graph_subblocking_dataset(
         row = signatures_by_id[signature_id]
         paper_id = str(row["paper_id"])
         position = None if row.get("author_position") is None else int(row["author_position"])
-        coauthor_blocks = tuple(
-            block
-            for author_position, block in coauthors_by_paper.get(paper_id, ())
-            if position is None or int(author_position) != position
+        affiliations = _string_tuple(row.get("author_affiliations"))
+        coauthor_blocks = (
+            ()
+            if position is None
+            else tuple(
+                block
+                for author_position, block in coauthors_by_paper.get(paper_id, ())
+                if int(author_position) != position
+            )
         )
         signature_objects[signature_id] = SimpleNamespace(
             signature_id=signature_id,
             paper_id=paper_id,
             author_info_first=_optional_str(row.get("author_first")),
             author_info_middle=_optional_str(row.get("author_middle")),
-            author_info_first_normalized_without_apostrophe=_optional_str(row.get("author_first")),
-            author_info_middle_normalized_without_apostrophe=_optional_str(row.get("author_middle")),
-            author_info_affiliations=_string_tuple(row.get("author_affiliations")),
-            author_info_affiliations_n_grams=None,
+            author_info_first_normalized_without_apostrophe=None,
+            author_info_middle_normalized_without_apostrophe=None,
+            author_info_affiliations=affiliations,
+            author_info_affiliations_n_grams=_affiliation_ngrams_from_raw_affiliations(affiliations),
             author_info_coauthor_blocks=coauthor_blocks,
             author_info_coauthors=None,
             author_info_orcid=_optional_str(row.get("author_orcid")),
@@ -1103,6 +1093,13 @@ def _read_full_arrow_table(path: Any, *, required_columns: set[str], table_name:
     load_metrics[f"{table_name}_rows_scanned"] = int(table.num_rows)
     load_metrics[f"{table_name}_rows_loaded"] = int(table.num_rows)
     return table.select([name for name in table.column_names if name in required_columns])
+
+
+def _coauthor_block_from_arrow_author_name(author_name_value: Any) -> str:
+    normalized_name = normalize_text(str(author_name_value or "").strip())
+    if not normalized_name:
+        return ""
+    return compute_block(normalized_name)
 
 
 def _filter_arrow_table_by_values(table, key_column: str, values: Sequence[str]):
@@ -1141,13 +1138,10 @@ def _coauthor_blocks_by_paper_from_full_arrow(
         paper_id = str(paper_id_value)
         if position is None:
             raise ValueError("paper_authors Arrow cannot contain null position values")
-        author_name = str(author_name_value or "").strip()
-        if not author_name:
+        block = _coauthor_block_from_arrow_author_name(author_name_value)
+        if not block:
             continue
-        name_parts = author_name.split()
-        block = name_parts[0] if len(name_parts) == 1 else name_parts[0][0] + " " + name_parts[-1]
-        if block:
-            out[paper_id].append((int(position), block))
+        out[paper_id].append((int(position), block))
     return out
 
 
@@ -1268,20 +1262,25 @@ def _load_columnar_arrow_graph_subblocking_dataset(
     for signature_id in target_signature_ids:
         paper_id, first_name, middle_name, affiliation_values, orcid, position_value = signature_rows[signature_id]
         position = None if position_value is None else int(position_value)
-        coauthor_blocks = tuple(
-            block
-            for author_position, block in coauthors_by_paper.get(paper_id, ())
-            if position is None or int(author_position) != position
+        affiliations = _string_tuple(affiliation_values)
+        coauthor_blocks = (
+            ()
+            if position is None
+            else tuple(
+                block
+                for author_position, block in coauthors_by_paper.get(paper_id, ())
+                if int(author_position) != position
+            )
         )
         signature_objects[signature_id] = SimpleNamespace(
             signature_id=signature_id,
             paper_id=paper_id,
             author_info_first=_optional_str(first_name),
             author_info_middle=_optional_str(middle_name),
-            author_info_first_normalized_without_apostrophe=_optional_str(first_name),
-            author_info_middle_normalized_without_apostrophe=_optional_str(middle_name),
-            author_info_affiliations=_string_tuple(affiliation_values),
-            author_info_affiliations_n_grams=None,
+            author_info_first_normalized_without_apostrophe=None,
+            author_info_middle_normalized_without_apostrophe=None,
+            author_info_affiliations=affiliations,
+            author_info_affiliations_n_grams=_affiliation_ngrams_from_raw_affiliations(affiliations),
             author_info_coauthor_blocks=coauthor_blocks,
             author_info_coauthors=None,
             author_info_orcid=_optional_str(orcid),
@@ -1448,6 +1447,8 @@ def _signature_coauthor_blocks_for_specter(signature, anddata, compute_block_fn=
 
     coauthors = signature.author_info_coauthors
     if coauthors is None:
+        if signature.author_info_position is None:
+            return []
         paper = anddata.papers.get(str(signature.paper_id))
         if paper is None:
             paper = anddata.papers.get(signature.paper_id)
@@ -1623,7 +1624,7 @@ def _specter_labeled_subblock_stats(subblocks: dict[str, list[str]]) -> tuple[in
 def _subblock_merge_candidate_metadata(key: str, size: int) -> tuple[int, str, str | None, str | None, str | None]:
     key_parts = key.split("|")
     first_name = key_parts[0]
-    middle_name = key_parts[1].split("=")[1] if len(key_parts) > 1 else None
+    middle_name = key_parts[1].partition("=")[2] if len(key_parts) > 1 and "=" in key_parts[1] else None
     if len(first_name) > 1:
         name_for_splits = first_name
     elif len(first_name) == 1 and middle_name is not None:
@@ -1710,6 +1711,7 @@ def _make_subblocks_with_telemetry_arrow_rust(
     compute_block_fn=compute_block,
     specter_cluster_fn=None,
     use_orcid_subblocking: bool = True,
+    full_scan_without_index: bool = False,
 ):
     """Run experimental Rust subblocking with signature rows loaded from Arrow."""
 
@@ -1731,6 +1733,7 @@ def _make_subblocks_with_telemetry_arrow_rust(
         anddata,
         compute_block_fn,
         bool(use_orcid_subblocking),
+        bool(full_scan_without_index),
     )
     return {str(key): list(values) for key, values in dict(subblocks).items()}, dict(telemetry)
 
@@ -1744,6 +1747,7 @@ def make_subblocks_arrow_rust(
     compute_block_fn=compute_block,
     specter_cluster_fn=None,
     use_orcid_subblocking: bool = True,
+    full_scan_without_index: bool = False,
 ):
     """Return Rust Arrow-backed subblocks without telemetry."""
 
@@ -1756,6 +1760,7 @@ def make_subblocks_arrow_rust(
         compute_block_fn=compute_block_fn,
         specter_cluster_fn=specter_cluster_fn,
         use_orcid_subblocking=use_orcid_subblocking,
+        full_scan_without_index=full_scan_without_index,
     )
     return output
 

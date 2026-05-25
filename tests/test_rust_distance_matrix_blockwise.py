@@ -681,6 +681,85 @@ def test_predict_from_rust_featurizer_rejects_disallows_with_precomputed_dists()
         )
 
 
+def test_predict_from_rust_featurizer_rejects_require_overrides_with_precomputed_dists() -> None:
+    class _FakeFeaturizer:
+        def signature_rule_metadata(self):
+            return [("0", "First0", None), ("1", "First1", None)]
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+
+    with pytest.raises(ValueError, match="precomputed dists"):
+        clusterer.predict_from_rust_featurizer(
+            {"block": ["0", "1"]},
+            _FakeFeaturizer(),
+            dists={"block": np.zeros((2, 2), dtype=np.float64)},
+            cluster_seeds_require={"0": "c0", "1": "c0"},
+        )
+
+
+def test_predict_from_rust_featurizer_injects_seed_overrides_into_distance_build(monkeypatch):
+    captured_partial_supervision: list[dict[tuple[str, str], int | float]] = []
+    captured_incremental_flags: list[bool] = []
+
+    class _FakeFeaturizer:
+        def signature_rule_metadata(self):
+            return [(str(index), f"First{index}", None) for index in range(4)]
+
+    def fake_make_dists(self, block_dict, _rust_featurizer, **kwargs):
+        block_key, signatures = next(iter(block_dict.items()))
+        captured_partial_supervision.append(dict(kwargs["partial_supervision"]))
+        captured_incremental_flags.append(bool(kwargs["incremental_dont_use_cluster_seeds"]))
+        return {block_key: np.zeros((len(signatures), len(signatures)), dtype=np.float64)}
+
+    def fake_cluster_one_block(
+        self,
+        signatures,
+        pairwise_proba,
+        effective_cluster_model_params,
+        dataset,
+        all_disallow_signature_ids,
+        *,
+        block_key,
+    ):
+        del self, pairwise_proba, effective_cluster_model_params, dataset, all_disallow_signature_ids, block_key
+        return [0 for _signature in signatures]
+
+    monkeypatch.setattr(Clusterer, "make_distance_matrices_from_rust_featurizer", fake_make_dists)
+    monkeypatch.setattr(Clusterer, "_cluster_one_block_with_logging", fake_cluster_one_block)
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+    clusterer.predict_from_rust_featurizer(
+        {"block": ["0", "1", "2", "3"]},
+        _FakeFeaturizer(),
+        partial_supervision={("0", "2"): 0},
+        cluster_seeds_require={"0": "c0", "1": "c0", "2": "c1", "3": "c1"},
+        cluster_seeds_disallow={("1", "2")},
+    )
+
+    assert captured_partial_supervision == [
+        {
+            ("0", "2"): 0,
+            ("0", "3"): LARGE_DISTANCE,
+            ("0", "1"): 0,
+            ("1", "2"): LARGE_DISTANCE,
+            ("1", "3"): LARGE_DISTANCE,
+            ("2", "3"): 0,
+        }
+    ]
+    assert captured_incremental_flags == [True]
+
+
+def test_seed_override_partial_supervision_respects_existing_reverse_pair() -> None:
+    merged = model_module._partial_supervision_with_cluster_seed_overrides(
+        ["0", "1"],
+        {("1", "0"): 42.0},
+        cluster_seeds_require={"0": "c0", "1": "c1"},
+        cluster_seeds_disallow={("0", "1")},
+    )
+
+    assert merged == {("1", "0"): 42.0}
+
+
 def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, tmp_path):
     import pyarrow as pa
 

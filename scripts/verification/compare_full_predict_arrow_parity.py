@@ -15,7 +15,7 @@ import os
 import pickle
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,18 @@ if str(_PROJECT_ROOT) not in sys.path:
 def _load_json(path: str | Path) -> Any:
     with open(path, encoding="utf-8") as infile:
         return json.load(infile)
+
+
+def _resolve_fixture_path(fixture_dir: Path, path_value: str | Path) -> Path:
+    path = Path(path_value)
+    return path if path.is_absolute() else fixture_dir / path
+
+
+def _fixture_meta_path(meta: dict[str, Any], fixture_dir: Path, key: str) -> Path:
+    path_value = meta.get("paths", {}).get(key)
+    if path_value is None:
+        raise KeyError(f"fixture meta is missing paths.{key}")
+    return _resolve_fixture_path(fixture_dir, path_value)
 
 
 def _jsonable(value: Any) -> Any:
@@ -89,6 +101,7 @@ def _filter_payloads(
 
 def _load_cluster_seeds_require(
     meta: dict[str, Any],
+    fixture_dir: Path,
     selected_signature_ids: Sequence[str],
     *,
     enabled: bool,
@@ -99,7 +112,7 @@ def _load_cluster_seeds_require(
     if path is None:
         raise ValueError("Requested --use-cluster-seeds but fixture meta has no paths.cluster_seeds_require")
     selected_ids = {str(signature_id) for signature_id in selected_signature_ids}
-    payload = _load_json(path)
+    payload = _load_json(_resolve_fixture_path(fixture_dir, path))
     if not isinstance(payload, dict):
         raise TypeError(f"cluster_seeds_require must be a JSON object, got {type(payload).__name__}")
     return {
@@ -265,6 +278,10 @@ def _assert_exact(report: dict[str, Any]) -> None:
         raise AssertionError("cluster outputs differ")
 
 
+def _cluster_partition(clusters: Mapping[Any, Sequence[Any]]) -> frozenset[frozenset[str]]:
+    return frozenset(frozenset(str(signature_id) for signature_id in members) for members in clusters.values())
+
+
 def _write_raw_planner_indexes_and_layout(
     arrow_paths: dict[str, str],
     output_dir: Path,
@@ -307,16 +324,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     block_name = str(meta["block"])
 
     start = time.perf_counter()
-    signatures = _load_json(meta["paths"]["signatures"])
+    signatures = _load_json(_fixture_meta_path(meta, args.fixture_dir, "signatures"))
     selected_signature_ids = _select_block_signature_ids(signatures, block_name, int(args.block_size))
     timings["load_signatures_and_select_seconds"] = time.perf_counter() - start
 
     start = time.perf_counter()
-    papers = _load_json(meta["paths"]["papers"])
+    papers = _load_json(_fixture_meta_path(meta, args.fixture_dir, "papers"))
     if args.no_specter:
         specter_embeddings = None
     else:
-        with open(meta["paths"]["specter"], "rb") as infile:
+        with open(_fixture_meta_path(meta, args.fixture_dir, "specter"), "rb") as infile:
             specter_embeddings = pickle.load(infile)
     filtered_signatures, filtered_papers, filtered_specter = _filter_payloads(
         signatures,
@@ -329,6 +346,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     cluster_seeds_require = _load_cluster_seeds_require(
         meta,
+        args.fixture_dir,
         selected_signature_ids,
         enabled=bool(args.use_cluster_seeds),
     )
@@ -477,6 +495,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         for block_key in block_dict
     }
+    incumbent_partition = _cluster_partition(incumbent_clusters)
+    arrow_partition = _cluster_partition(arrow_clusters)
+    clusters_exact_match = incumbent_partition == arrow_partition
     report = {
         "fixture_dir": str(args.fixture_dir),
         "output_dir": str(args.output_dir),
@@ -498,19 +519,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "timings_seconds": {key: float(value) for key, value in timings.items()},
         "distance_comparison": distance_comparison,
         "feature_constraint_comparison": feature_constraint_comparison,
-        "clusters_exact_match": incumbent_clusters == arrow_clusters,
+        "clusters_exact_match": clusters_exact_match,
         "incumbent_cluster_count": int(len(incumbent_clusters)),
         "arrow_cluster_count": int(len(arrow_clusters)),
         "incumbent_cluster_sizes_top10": sorted((len(v) for v in incumbent_clusters.values()), reverse=True)[:10],
         "arrow_cluster_sizes_top10": sorted((len(v) for v in arrow_clusters.values()), reverse=True)[:10],
     }
-    if incumbent_clusters != arrow_clusters:
+    if not clusters_exact_match:
         report["incumbent_clusters"] = _jsonable(incumbent_clusters)
         report["arrow_clusters"] = _jsonable(arrow_clusters)
     return report
 
 
-def main() -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -520,10 +541,27 @@ def main() -> None:
     parser.add_argument("--block-size", type=int, required=True)
     parser.add_argument("--n-jobs", type=int, default=20)
     parser.add_argument("--total-ram-bytes", type=int, default=1_000_000_000_000)
-    parser.add_argument("--compare-features", action="store_true")
+    parser.add_argument(
+        "--compare-features",
+        dest="compare_features",
+        action="store_true",
+        default=True,
+        help="Compare feature matrices and constraints. This is the default parity gate.",
+    )
+    parser.add_argument(
+        "--no-compare-features",
+        dest="compare_features",
+        action="store_false",
+        help="Only compare distances and clusters.",
+    )
     parser.add_argument("--use-cluster-seeds", action="store_true")
     parser.add_argument("--no-specter", action="store_true")
     parser.add_argument("--allow-mismatch", action="store_true")
+    return parser
+
+
+def main() -> None:
+    parser = _build_arg_parser()
     args = parser.parse_args()
 
     report = run(args)

@@ -24,7 +24,10 @@ from s2and.text import (
     jaccard,
     name_counts,
     name_text_features,
+    normalize_orcid,
+    normalize_orcid_compact,
     normalize_text,
+    split_first_middle_hyphen_aware,
 )
 
 
@@ -36,6 +39,21 @@ class TestClusterer(unittest.TestCase):
         assert "te han zi xt" == normalize_text("te'漢字xt")
         assert "text" == normalize_text("te'xt", True)
         assert "a b" == normalize_text("A1 B-2")
+
+    def test_normalize_orcid_canonicalizes_common_forms(self):
+        assert normalize_orcid(" https://orcid.org/0000-0002-1825-0097 ") == "0000-0002-1825-0097"
+        assert normalize_orcid("ORCID: 000000021825009x") == "0000-0002-1825-009X"
+        assert normalize_orcid_compact("ORCID: 000000021825009x") == "000000021825009X"
+        for dash in "-\u2010\u2011\u2012\u2013\u2014\u2212\ufe58\ufe63\uff0d":
+            assert normalize_orcid(dash.join(["0000", "0002", "1825", "0097"])) == "0000-0002-1825-0097"
+        assert normalize_orcid("https://orcid.org/0000\u20100002\u20101825\u20100097") == "0000-0002-1825-0097"
+        assert normalize_orcid("s000-0000-1879-1075X") is None
+        assert normalize_orcid("0000-0002-1825") is None
+
+    def test_split_first_middle_treats_unicode_dashes_as_hyphens(self):
+        assert split_first_middle_hyphen_aware("Amin-ul-Haq", None) == ("amin ul haq", "")
+        assert split_first_middle_hyphen_aware("Arif\u2010ullah", None) == ("arif ullah", "")
+        assert split_first_middle_hyphen_aware("Hua\uff0dli", None) == ("hua li", "")
 
     def test_name_similarity_features(self):
         assert [NUMPY_NAN] * 4 == name_text_features("", cast(Any, None))
@@ -220,6 +238,28 @@ def test_fasttext_skip_overrides_cached_model():
 
     assert text_module_any._get_fasttext_model() is None
     assert text_module_any._FASTTEXT_MODEL is None
+
+
+def test_fasttext_skip_env_prevents_loading(monkeypatch):
+    import s2and.text as text_module
+
+    text_module_any = cast(Any, text_module)
+    load_calls = {"count": 0}
+
+    def _fake_load_model(_path: str):
+        load_calls["count"] += 1
+        return object()
+
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+    monkeypatch.setattr(text_module.fasttext, "load_model", _fake_load_model)
+    monkeypatch.setattr(text_module, "cached_path", lambda path: path)
+    text_module_any.set_fasttext_loading_enabled(True)
+    text_module_any._FASTTEXT_MODEL = object()
+    text_module_any._FASTTEXT_MODEL_INITIALIZED = True
+
+    assert text_module_any._get_fasttext_model() is None
+    assert text_module_any._FASTTEXT_MODEL is None
+    assert load_calls["count"] == 0
 
 
 def test_fasttext_enable_preserves_loaded_model(monkeypatch):

@@ -39,6 +39,8 @@ _PROMOTED_INCREMENTAL_TELEMETRY_MERGE_POLICY = {
     "seed_component_count": "constant",
     "raw_arrow_seed_signature_count": "constant",
     "raw_arrow_seed_component_count": "constant",
+    "raw_arrow_plan_seed_signature_count": "constant",
+    "raw_arrow_plan_cluster_count": "constant",
     "memory_total_ram_bytes": "first",
     "memory_available_bytes": "first",
     "memory_stage_budget_bytes": "first",
@@ -65,11 +67,11 @@ def _raw_arrow_plan_window_size(
     query_batch_size: int,
     plan_window_multiplier: int,
 ) -> int:
-    """Return the query count covered by each raw Arrow planner call."""
+    """Return a positive window step for raw Arrow planning loops."""
 
     resolved_query_count = max(0, int(query_count))
     resolved_query_batch_size = max(1, int(query_batch_size))
-    return min(resolved_query_count, resolved_query_batch_size * max(1, int(plan_window_multiplier)))
+    return max(1, min(resolved_query_count, resolved_query_batch_size * max(1, int(plan_window_multiplier))))
 
 
 def _raw_window_plan_telemetry_fields(raw_candidate_plan: Mapping[str, Any]) -> dict[str, int | float | str]:
@@ -958,80 +960,101 @@ def predict_incremental_promoted_linker_from_arrow_paths(
         )
     with arrow_path_context as arrow_path_payload:
         seed_arrow_assignment_seconds = time.perf_counter() - seed_arrow_start
-        # Explicit caller batching thresholds are hard runtime caps. When the
-        # memory model chooses the batch size, preplan a slightly larger raw
-        # Arrow window to amortize retrieval/featurizer setup while still
-        # scoring in budget-sized batches.
-        plan_window_multiplier = 1 if batching_threshold is not None else _RAW_ARROW_PLAN_WINDOW_MULTIPLIER
-        plan_window_size = _raw_arrow_plan_window_size(
-            query_count=len(unassigned_signature_ids),
-            query_batch_size=query_batch_size,
-            plan_window_multiplier=plan_window_multiplier,
-        )
-        use_windowed_raw_plan = plan_window_size > query_batch_size
         raw_window_plan_count = 0
         raw_window_plan_seconds = 0.0
         raw_window_plan_query_count = 0
         raw_window_featurizer_count = 0
         raw_window_featurizer_seconds = 0.0
         raw_window_featurizer_signature_count = 0
+        raw_window_featurizer_reused_batch_count = 0
         raw_window_subset_seconds = 0.0
         raw_window_plan_telemetry: dict[str, int | float | str] = {}
 
-        rust_module = feature_port._require_rust_runtime() if use_windowed_raw_plan else None
-        for plan_start_index in range(0, len(unassigned_signature_ids), plan_window_size):
-            query_plan_window = unassigned_signature_ids[plan_start_index : plan_start_index + plan_window_size]
-            raw_candidate_plan: Mapping[str, Any] | None = None
-            raw_window_featurizer: Any | None = None
-            if use_windowed_raw_plan:
-                raw_window_start = time.perf_counter()
-                assert rust_module is not None
-                raw_candidate_plan = rust_module.raw_block_query_candidate_plan_arrow(
-                    arrow_path_payload,
-                    list(query_plan_window),
-                    top_k=retrieval_top_k,
-                    query_view="auto",
-                    orcid_enabled=bool(orcid_enabled),
-                    num_threads=clusterer.n_jobs,
-                    max_exemplars=4,
+        rust_module = feature_port._require_rust_runtime() if unassigned_signature_ids else None
+        raw_window_planner_count = 0
+        raw_window_planner_batch_plan_count = 0
+        raw_window_planner_plan_call_count = 0
+        raw_window_planner_plan_seconds = 0.0
+        raw_request_planner: Any | None = None
+        if unassigned_signature_ids:
+            raw_planner_cls = getattr(rust_module, "RawBlockQueryCandidatePlanner", None)
+            if raw_planner_cls is None:
+                raise RuntimeError(
+                    "raw Arrow promoted incremental linking requires "
+                    "s2and_rust.RawBlockQueryCandidatePlanner; rebuild the Rust extension"
                 )
-                raw_window_plan_seconds += time.perf_counter() - raw_window_start
-                raw_window_plan_count += 1
-                raw_window_plan_query_count += len(query_plan_window)
+            raw_window_start = time.perf_counter()
+            raw_request_planner = raw_planner_cls(
+                arrow_path_payload,
+                list(unassigned_signature_ids),
+                top_k=retrieval_top_k,
+                query_view="auto",
+                orcid_enabled=bool(orcid_enabled),
+                num_threads=clusterer.n_jobs,
+                max_exemplars=4,
+                include_pair_signature_ids=False,
+                include_component_members=False,
+            )
+            raw_window_plan_seconds += time.perf_counter() - raw_window_start
+            raw_window_plan_count += 1
+            raw_window_plan_query_count += len(unassigned_signature_ids)
+            raw_window_planner_count += 1
+            build_telemetry = getattr(raw_request_planner, "build_telemetry", None)
+            if callable(build_telemetry):
                 _merge_raw_window_plan_telemetry(
                     raw_window_plan_telemetry,
-                    _raw_window_plan_telemetry_fields(raw_candidate_plan),
+                    _raw_window_plan_telemetry_fields({"telemetry": build_telemetry()}),
                 )
-                raw_window_featurizer_start = time.perf_counter()
-                signature_order = runtime_module.feature_block_signature_order_from_raw_candidate_plan(
-                    raw_candidate_plan
-                )
-                raw_window_featurizer = feature_port.build_rust_featurizer_from_arrow_paths(
-                    arrow_path_payload,
-                    signature_ids=signature_order.signature_ids,
-                    name_tuples=name_tuples,
-                    load_name_counts=clusterer_uses_name_count_features(clusterer),
-                    preprocess=True,
-                    compute_reference_features=False,
-                    num_threads=clusterer.n_jobs,
-                )
-                raw_window_featurizer_seconds += time.perf_counter() - raw_window_featurizer_start
-                raw_window_featurizer_count += 1
-                raw_window_featurizer_signature_count += len(signature_order.signature_ids)
+        featurizer_window_multiplier = _RAW_ARROW_PLAN_WINDOW_MULTIPLIER if unassigned_signature_ids else 1
+        featurizer_window_size = _raw_arrow_plan_window_size(
+            query_count=len(unassigned_signature_ids),
+            query_batch_size=query_batch_size,
+            plan_window_multiplier=featurizer_window_multiplier,
+        )
+        for plan_start_index in range(0, len(unassigned_signature_ids), featurizer_window_size):
+            query_plan_window = unassigned_signature_ids[plan_start_index : plan_start_index + featurizer_window_size]
+            if raw_request_planner is None:
+                raise RuntimeError("reusable raw Arrow planner was not initialized")
+            raw_window_planner_plan_start = time.perf_counter()
+            raw_candidate_plan = raw_request_planner.plan(
+                list(query_plan_window),
+                top_k=retrieval_top_k,
+                query_view="auto",
+                include_pair_signature_ids=False,
+                include_component_members=False,
+            )
+            raw_window_planner_plan_call_count += 1
+            raw_window_planner_plan_seconds += time.perf_counter() - raw_window_planner_plan_start
+            raw_window_featurizer_start = time.perf_counter()
+            signature_order = runtime_module.feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
+            signature_ids = signature_order.signature_ids
+            raw_window_featurizer = feature_port.build_rust_featurizer_from_arrow_paths(
+                arrow_path_payload,
+                signature_ids=signature_ids,
+                name_tuples=name_tuples,
+                load_name_counts=clusterer_uses_name_count_features(clusterer),
+                preprocess=True,
+                compute_reference_features=False,
+                num_threads=clusterer.n_jobs,
+            )
+            raw_window_featurizer_seconds += time.perf_counter() - raw_window_featurizer_start
+            raw_window_featurizer_count += 1
+            raw_window_featurizer_signature_count += len(signature_ids)
 
             for local_start_index in range(0, len(query_plan_window), query_batch_size):
                 query_batch = query_plan_window[local_start_index : local_start_index + query_batch_size]
-                batch_raw_candidate_plan = None
-                batch_raw_window_featurizer = None
-                if raw_candidate_plan is not None:
-                    raw_window_subset_start = time.perf_counter()
+                raw_window_subset_start = time.perf_counter()
+                if len(query_batch) == len(query_plan_window):
+                    batch_raw_candidate_plan = raw_candidate_plan
+                else:
                     batch_raw_candidate_plan = runtime_module.subset_raw_candidate_plan_for_query_ids(
                         raw_candidate_plan,
                         query_batch,
                         zero_plan_timings=True,
                     )
-                    raw_window_subset_seconds += time.perf_counter() - raw_window_subset_start
-                    batch_raw_window_featurizer = raw_window_featurizer
+                raw_window_planner_batch_plan_count += 1
+                raw_window_subset_seconds += time.perf_counter() - raw_window_subset_start
+                raw_window_featurizer_reused_batch_count += int(raw_window_featurizer is not None)
                 result = runtime_module.predict_incremental_link_or_abstain_from_raw_arrow_paths(
                     clusterer,
                     artifact,
@@ -1046,7 +1069,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                     name_tuples=name_tuples,
                     orcid_enabled=orcid_enabled,
                     raw_candidate_plan=batch_raw_candidate_plan,
-                    rust_featurizer=batch_raw_window_featurizer,
+                    rust_featurizer=raw_window_featurizer,
                     partial_supervision_seed_signature_to_component=cluster_seeds_require,
                 )
                 linked_signature_clusters.update(dict(result.linked_signature_clusters))
@@ -1108,13 +1131,21 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             "arrow_path_count": len(arrow_path_payload),
             "raw_arrow_window_plan_count": int(raw_window_plan_count),
             "raw_arrow_window_plan_query_count": int(raw_window_plan_query_count),
-            "raw_arrow_window_plan_enabled": int(bool(use_windowed_raw_plan)),
-            "raw_arrow_window_plan_size": int(plan_window_size),
-            "raw_arrow_window_plan_multiplier": int(plan_window_multiplier),
+            "raw_arrow_window_plan_enabled": int(raw_request_planner is not None),
+            "raw_arrow_window_plan_size": int(featurizer_window_size),
+            "raw_arrow_window_plan_multiplier": int(featurizer_window_multiplier),
             "raw_arrow_window_plan_seconds": float(raw_window_plan_seconds),
+            "raw_arrow_window_featurizer_query_window_size": int(featurizer_window_size),
+            "raw_arrow_window_featurizer_window_multiplier": int(featurizer_window_multiplier),
             "raw_arrow_window_featurizer_count": int(raw_window_featurizer_count),
             "raw_arrow_window_featurizer_signature_count": int(raw_window_featurizer_signature_count),
+            "raw_arrow_window_featurizer_reused_batch_count": int(raw_window_featurizer_reused_batch_count),
             "raw_arrow_window_featurizer_seconds": float(raw_window_featurizer_seconds),
             "raw_arrow_window_subset_seconds": float(raw_window_subset_seconds),
+            "raw_arrow_window_planner_count": int(raw_window_planner_count),
+            "raw_arrow_window_planner_batch_plan_count": int(raw_window_planner_batch_plan_count),
+            "raw_arrow_window_planner_plan_call_count": int(raw_window_planner_plan_call_count),
+            "raw_arrow_window_planner_plan_seconds": float(raw_window_planner_plan_seconds),
+            "raw_arrow_reusable_planner_enabled": int(raw_request_planner is not None),
         }
         return payload

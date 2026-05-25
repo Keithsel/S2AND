@@ -289,7 +289,9 @@ def split_blocks_like_anddata(
 
     block_ids = []
     block_sizes = []
-    for block_id in sorted(blocks_dict):
+    # Match ANDData.split_blocks_helper exactly. This seeded stratified split is
+    # order-sensitive; sorting changes pinned production-eval test sets.
+    for block_id in blocks_dict:
         signatures = blocks_dict[block_id]
         block_ids.append(block_id)
         block_sizes.append(len(signatures))

@@ -68,6 +68,7 @@ from s2and.incremental_linking_training.classic import (  # noqa: E402
     _apply_classic_train_row_cap,
     _build_classic_classifier,
     _classic_feature_matrix,
+    _drop_unlabeled_singleton_orcid_rows,
     _fit_promoted_logistic_gate,
     _load_classic_stratified_eval_rows,
     _promoted_stratified_gate_spec,
@@ -175,6 +176,7 @@ class MinimalRawTablePlan:
     partial_dir: Path
     partial_paths: list[Path]
     dataset_summaries: list[dict[str, Any]]
+    label_filtering_summary: dict[str, Any]
     structural_cleaning_summary: dict[str, Any]
     started: float
 
@@ -2305,6 +2307,7 @@ def _finalize_minimal_raw_table_plan(
         "output_path": str(plan.output_path),
         "rows": int(len(plan.labels)),
         "datasets": plan.dataset_summaries,
+        "label_filtering": plan.label_filtering_summary,
         "structural_cleaning": plan.structural_cleaning_summary,
         "seconds": round(float(time.perf_counter() - plan.started), 3),
         "mode": "minimal-raw-rust",
@@ -2409,6 +2412,10 @@ def _materialize_minimal_raw_feature_bundle(
         labels = pd.read_parquet(labels_path)
         positions = _selected_row_positions(labels, datasets, limit_rows)
         labels = labels.iloc[positions].reset_index(drop=True)
+        labels, label_filtering_summary = _drop_unlabeled_singleton_orcid_rows(
+            labels,
+            context=f"minimal_raw:{table_key}",
+        )
         labels, structural_cleaning_summary = _clean_minimal_raw_structural_rows(
             source_bundle=source_bundle,
             table_key=table_key,
@@ -2426,6 +2433,7 @@ def _materialize_minimal_raw_feature_bundle(
                 "seconds": 0.0,
                 "mode": "minimal-raw-rust",
                 "skipped": "empty_selection",
+                "label_filtering": label_filtering_summary,
                 "structural_cleaning": structural_cleaning_summary,
             }
             summaries.append(summary)
@@ -2447,6 +2455,7 @@ def _materialize_minimal_raw_feature_bundle(
                 "seconds": 0.0,
                 "mode": "minimal-raw-rust",
                 "reused": True,
+                "label_filtering": label_filtering_summary,
                 "structural_cleaning": structural_cleaning_summary,
             }
             summaries.append(summary)
@@ -2467,6 +2476,7 @@ def _materialize_minimal_raw_feature_bundle(
             partial_dir=partial_dir,
             partial_paths=[],
             dataset_summaries=[],
+            label_filtering_summary=label_filtering_summary,
             structural_cleaning_summary=structural_cleaning_summary,
             started=time.perf_counter(),
         )
@@ -2620,7 +2630,10 @@ def _classic_candidate_training_rows(rows: pd.DataFrame, *, retrieval_rank_limit
     missing = sorted(required - set(rows.columns))
     if missing:
         raise ValueError(f"Classic training rows are missing required columns: {missing}")
-    out = rows.copy()
+    out, _filter_summary = _drop_unlabeled_singleton_orcid_rows(
+        rows,
+        context="prod_training_rows",
+    )
     out["retrieval_rank"] = pd.to_numeric(out["retrieval_rank"], errors="coerce")
     out = out[out["retrieval_rank"] <= int(retrieval_rank_limit)].copy()
     out["label"] = pd.to_numeric(out["label"], errors="coerce").fillna(0).astype(np.int8)

@@ -15,6 +15,7 @@ from s2and import feature_port
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
+from s2and.incremental_linking.array_validation import as_uint32_1d
 from s2and.incremental_linking.artifact import IncrementalLinkingArtifact
 from s2and.incremental_linking.feature_block import (
     FeatureBlock,
@@ -46,11 +47,13 @@ from s2and.incremental_linking.policy import (
     resolve_load_name_counts_policy as _resolve_load_name_counts_policy,
 )
 from s2and.incremental_linking.retrieval import (
-    RAW_CANDIDATE_PLAN_PAIR_KEYS,
+    RAW_CANDIDATE_PLAN_PAIR_ID_KEYS,
+    RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS,
     RAW_CANDIDATE_PLAN_ROW_KEYS,
     LinkerRetrievalBatch,
     build_linker_retrieval_batch_from_raw_candidate_plan,
     build_linker_retrieval_batch_rust,
+    validate_raw_candidate_plan_schema,
 )
 from s2and.incremental_linking.row_features import build_promoted_non_pairwise_row_features_with_telemetry
 from s2and.runtime import build_runtime_context
@@ -75,6 +78,22 @@ SeedSetup = (
 # NaNs internally; only the exported pw_* aggregate features are zero-filled.
 _PAIRWISE_MODEL_NAN_VALUE: float = float("nan")
 _PAIRWISE_AGGREGATE_NAN_VALUE: float = 0.0
+
+
+def _unpack_seed_setup(
+    seed_setup: SeedSetup,
+) -> tuple[
+    Mapping[str, int | str],
+    Mapping[int | str, int | str],
+    Mapping[int | str, Sequence[str]],
+    Mapping[int | str, Sequence[str]] | None,
+]:
+    seed_setup_values: Sequence[Any] = list(seed_setup)
+    if len(seed_setup_values) == 3:
+        return seed_setup_values[0], seed_setup_values[1], seed_setup_values[2], None
+    if len(seed_setup_values) == 4:
+        return seed_setup_values[0], seed_setup_values[1], seed_setup_values[2], seed_setup_values[3]
+    raise ValueError(f"seed_setup must have 3 or 4 elements, got {len(seed_setup_values)}")
 
 
 @dataclass(frozen=True)
@@ -467,7 +486,7 @@ def _pairwise_model_feature_indices(featurizer_info: FeaturizationInfo) -> tuple
                 continue
             seen.add(normalized_index)
             selected.append(normalized_index)
-    return tuple(selected)
+    return tuple(sorted(selected))
 
 
 def _matrix_positions(matrix_indices: Sequence[int], selected_indices: Sequence[int]) -> tuple[int, ...]:
@@ -1264,7 +1283,15 @@ def _predict_incremental_link_or_abstain_production_private(
         (str(left), str(right)): value for (left, right), value in (partial_supervision or {}).items()
     }
     n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
-    retrieval_top_k = int(artifact.metadata.retrieval_top_k if top_k is None else top_k)
+    if retrieval_top_k is not None and top_k is not None and int(retrieval_top_k) != int(top_k):
+        raise ValueError("top_k and retrieval_top_k must match when both are provided")
+    retrieval_top_k = int(
+        retrieval_top_k
+        if retrieval_top_k is not None
+        else artifact.metadata.retrieval_top_k
+        if top_k is None
+        else top_k
+    )
 
     if seed_setup is None:
         build_seed_setup = getattr(clusterer, "_build_incremental_seed_setup", None)
@@ -1277,7 +1304,9 @@ def _predict_incremental_link_or_abstain_production_private(
         )
     else:
         resolved_seed_setup = seed_setup
-    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = resolved_seed_setup[:3]
+    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse, _split_cluster_seeds_require_inverse = (
+        _unpack_seed_setup(resolved_seed_setup)
+    )
     cluster_seeds_require = dict(cluster_seeds_require)
     recluster_map = dict(recluster_map)
 
@@ -1315,7 +1344,7 @@ def _predict_incremental_link_or_abstain_production_private(
         constraint_backend=constraint_backend,
         extra_row_signals=extra_row_signals,
         extra_row_signal_builder=extra_row_signal_builder,
-        seed_setup=(cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse),
+        seed_setup=resolved_seed_setup,
         runtime_context=resolved_runtime_context,
         n_jobs=n_jobs_resolved,
         total_ram_bytes=total_ram_bytes,
@@ -1368,7 +1397,9 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
         )
     else:
         resolved_seed_setup = seed_setup
-    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse = resolved_seed_setup[:3]
+    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse, _split_cluster_seeds_require_inverse = (
+        _unpack_seed_setup(resolved_seed_setup)
+    )
     cluster_seeds_require = dict(cluster_seeds_require)
     recluster_map = dict(recluster_map)
 
@@ -1648,6 +1679,7 @@ def subset_raw_candidate_plan_for_query_ids(
     raw-plan contract.
     """
 
+    validate_raw_candidate_plan_schema(raw_candidate_plan)
     requested_query_ids = tuple(str(signature_id) for signature_id in query_signature_ids)
     plan_query_ids = tuple(str(signature_id) for signature_id in raw_candidate_plan["query_signature_ids"])
 
@@ -1676,8 +1708,11 @@ def subset_raw_candidate_plan_for_query_ids(
         int(old_query_offset): int(new_query_offset)
         for new_query_offset, old_query_offset in enumerate(old_query_offsets)
     }
-    row_query_offsets = np.asarray(raw_candidate_plan["row_query_signature_indices"], dtype=np.uint32)
-    pair_row_indices = np.asarray(raw_candidate_plan["pair_row_indices"], dtype=np.uint32)
+    row_query_offsets = as_uint32_1d(
+        "row_query_signature_indices",
+        raw_candidate_plan["row_query_signature_indices"],
+    )
+    pair_row_indices = as_uint32_1d("pair_row_indices", raw_candidate_plan["pair_row_indices"])
     contiguous_query_offsets = len(old_query_offsets) > 0 and np.array_equal(
         old_query_offsets,
         np.arange(
@@ -1709,8 +1744,6 @@ def subset_raw_candidate_plan_for_query_ids(
         out["pair_count"] = int(pair_stop - pair_start)
 
         for key in RAW_CANDIDATE_PLAN_ROW_KEYS:
-            if key not in raw_candidate_plan:
-                continue
             if key == "row_query_signature_indices":
                 out[key] = (row_query_offsets[row_start:row_stop] - old_query_start).astype(np.uint32, copy=False)
             else:
@@ -1720,7 +1753,7 @@ def subset_raw_candidate_plan_for_query_ids(
         new_query_count = len(requested_query_ids)
 
         def remap_contiguous_signature_indices(values: Any) -> np.ndarray:
-            raw_values = np.asarray(values, dtype=np.uint32)[pair_start:pair_stop]
+            raw_values = as_uint32_1d("signature_indices", values)[pair_start:pair_stop]
             remapped = np.empty(len(raw_values), dtype=np.uint32)
             query_mask = raw_values < old_query_count
             if np.any(query_mask):
@@ -1737,14 +1770,13 @@ def subset_raw_candidate_plan_for_query_ids(
                 remapped[~query_mask] = new_query_count + (raw_values[~query_mask] - old_query_count)
             return remapped
 
-        for key in RAW_CANDIDATE_PLAN_PAIR_KEYS:
-            if key not in raw_candidate_plan:
-                continue
+        for key in RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS:
             if key in {"left_signature_indices", "right_signature_indices"}:
                 out[key] = remap_contiguous_signature_indices(raw_candidate_plan[key])
-            elif key == "pair_row_indices":
-                out[key] = (pair_row_indices[pair_start:pair_stop] - row_start).astype(np.uint32, copy=False)
             else:
+                out[key] = (pair_row_indices[pair_start:pair_stop] - row_start).astype(np.uint32, copy=False)
+        for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS:
+            if key in raw_candidate_plan:
                 out[key] = _slice_sequence_or_array(raw_candidate_plan[key], pair_start, pair_stop)
 
         component_members = raw_candidate_plan.get("component_members")
@@ -1780,8 +1812,6 @@ def subset_raw_candidate_plan_for_query_ids(
     out["pair_count"] = int(np.count_nonzero(pair_mask))
 
     for key in RAW_CANDIDATE_PLAN_ROW_KEYS:
-        if key not in raw_candidate_plan:
-            continue
         if key == "row_query_signature_indices":
             out[key] = np.asarray(
                 [old_to_new_query_offset[int(value)] for value in row_query_offsets[row_mask]],
@@ -1797,7 +1827,7 @@ def subset_raw_candidate_plan_for_query_ids(
         old_to_new_query_lookup[int(old_offset)] = int(new_offset)
 
     def remap_signature_indices(values: Any) -> np.ndarray:
-        raw_values = np.asarray(values, dtype=np.uint32)[pair_mask]
+        raw_values = as_uint32_1d("signature_indices", values)[pair_mask]
         remapped = np.empty(len(raw_values), dtype=np.uint32)
         query_mask = raw_values < old_query_count
         if np.any(query_mask):
@@ -1817,14 +1847,13 @@ def subset_raw_candidate_plan_for_query_ids(
             )
         return remapped
 
-    for key in RAW_CANDIDATE_PLAN_PAIR_KEYS:
-        if key not in raw_candidate_plan:
-            continue
+    for key in RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS:
         if key in {"left_signature_indices", "right_signature_indices"}:
             out[key] = remap_signature_indices(raw_candidate_plan[key])
-        elif key == "pair_row_indices":
-            out[key] = old_row_to_new[pair_row_indices[pair_mask]].astype(np.uint32, copy=False)
         else:
+            out[key] = old_row_to_new[pair_row_indices[pair_mask]].astype(np.uint32, copy=False)
+    for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS:
+        if key in raw_candidate_plan:
             out[key] = _subset_sequence_or_array(raw_candidate_plan[key], pair_mask)
 
     component_members = raw_candidate_plan.get("component_members")
@@ -1847,7 +1876,8 @@ def _raw_candidate_plan_seed_setup(
 ) -> tuple[dict[str, int | str], dict[int | str, int | str], dict[int | str, list[str]]]:
     component_members = raw_candidate_plan.get("component_members")
     if not isinstance(component_members, Mapping):
-        raise ValueError("raw candidate plan must include component_members for scoring")
+        component_keys = sorted({str(value) for value in raw_candidate_plan.get("row_component_keys", ())})
+        return {}, {component_key: component_key for component_key in component_keys}, {}
     cluster_seeds_require: dict[str, str] = {}
     for component_key, members in component_members.items():
         for signature_id in members:
@@ -2022,6 +2052,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
             orcid_enabled=resolved_orcid_enabled,
             num_threads=n_jobs_resolved,
             max_exemplars=int(max_exemplars),
+            full_scan_without_index=False,
         )
         raw_arrow_retrieval_seconds = time.perf_counter() - stage_start
     else:

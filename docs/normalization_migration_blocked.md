@@ -1,6 +1,6 @@
 # Normalization Unification Migration Plan
 
-Execution status (last reconfirmed 2026-05-22; originally entered blocked state 2026-03-02)
+Execution status (last reconfirmed 2026-05-24; originally entered blocked state 2026-03-02)
 - Blocked: normalization work is on hold until the required data/artifacts are ready.
 - Keep this plan separate from the active execution plan in `docs/work_plan.md`.
 
@@ -69,12 +69,73 @@ Current State (post-Sinonym hyphen pass)
   - Sinonym overwrite block recomputation preserves spaced compound surnames for blocking (`q ou yang`) when overwriting
     blocks.
 
+Fix during the blocked canonical migration (real-data findings)
+- These are intentionally deferred from `legacy_compat` unless called out elsewhere as a compatibility repair. Fix them
+  when artifacts, caches, and production models can move together under a versioned normalization contract.
+- Title/text feature normalization is too destructive for some paper fields:
+  - Real titles with formulas, identifiers, and enumerated parts collapse because `normalize_text(...)` drops digits and
+    punctuation (`Co3O4`, `H2O2`, `CCDC 619488`, `Part 1`/`Part 2`).
+  - Python locations to audit/change under a versioned feature contract:
+    - Generic normalizer: `s2and/text.py::normalize_text`.
+    - Paper preprocessing: `s2and/data.py::preprocess_paper_1`.
+    - Incremental query/summary title and venue terms:
+      `s2and/incremental_linking/query_adapter.py::_normalize_term_set`.
+    - Any training/reference feature code that consumes normalized titles or title n-grams.
+  - Rust locations to audit/change in the same release:
+    - Generic compatibility normalizer: `s2and_rust/src/lib.rs::normalize_text_compat_from_map`.
+    - Paper preprocessing and raw Arrow/JSON feature extraction paths that normalize titles, venues, journals,
+      paper authors, or reference details before hashing/feature construction.
+  - Do not change global `normalize_text(...)` in legacy mode. Introduce field-specific canonical title/venue
+    normalization only with cache/version bumps and production-model validation.
+- Name canonicalization needs a single versioned first/middle/last policy:
+  - Python locations:
+    - `s2and/text.py::split_first_middle_hyphen_aware` or its canonical replacement.
+    - `s2and/data.py::ANDData.preprocess_signatures` and `ANDData._compute_signature_name_counts`.
+    - `s2and/data.py::_canonicalize_last_for_counts` and `_lasts_equivalent_for_constraint`.
+    - `s2and/text.py::first_names_name_compatible`.
+    - `s2and/subblocking.py::signature_name_parts_for_subblocking`.
+    - Pairwise/incremental consumers of `author_info_first_normalized`,
+      `author_info_first_normalized_without_apostrophe`, and middle/last normalized fields.
+  - Rust locations:
+    - `s2and_rust/src/lib.rs::split_first_middle_hyphen_aware_compat`.
+    - `s2and_rust/src/lib.rs::build_name_counts_data_from_artifact`.
+    - `s2and_rust/src/lib.rs::canonical_last_for_counts`.
+    - Rust constraint/name-tuple helpers and pairwise/incremental feature extraction paths that consume normalized
+      first/middle/last values.
+  - Compatibility repairs inside `legacy_compat` may keep current behavior correct, but canonical-only semantics must
+    wait for regenerated name counts, name tuples, and ORCID prefix counts.
+- `preprocess=False` is semantically misleading:
+  - Today Python `s2and/data.py::preprocess_paper_1(..., preprocess=False)` still normalizes titles and authors,
+    builds title word n-grams, and computes language for signature papers, while leaving venue/journal and some
+    character n-gram fields raw/unset.
+  - Rust stage/from-JSON paths intentionally mirror that behavior for parity.
+  - During migration, replace the boolean with explicit modes such as `raw`, `minimal_legacy`, and `full`, or keep the
+    legacy mode name explicit. Tests should assert exactly which fields are normalized in each mode.
+- Subblock-token fallback parsing is case/punctuation preserving:
+  - Python: `s2and/incremental_linking_training/query_support.py::_subblock_tokens`.
+  - Rust: `s2and_rust/src/lib.rs::subblock_tokens_from_key`.
+  - Generated current indexes appear to feed normalized keys, so this is not an observed generated-data failure.
+    Canonical migration should either normalize parsed fallback tokens in both languages or fail fast on raw keys.
+- Missing/non-informative text values collapse to empty strings:
+  - `normalize_text(None)`, empty strings, digit-only strings, and punctuation-only strings can all become `""`.
+  - During canonical migration, distinguish true missingness from normalized-empty nonmissing values where that matters
+    for paper titles, venues, journals, and affiliation evidence. Any schema/cache change must be versioned.
+- Source identifiers are not text:
+  - `source_author_ids`, MAG IDs, DBLP suffixes, ACM IDs, and ORCIDs must never use `normalize_text(...)`.
+  - Python locations carrying source IDs: `s2and/incremental_linking/feature_block_contract.py`,
+    `s2and/incremental_linking/feature_block_bridges.py`, and
+    `s2and/incremental_linking/feature_block_arrow.py`.
+  - Rust raw Arrow/JSON contracts should preserve source IDs verbatim unless an identifier-specific canonicalizer is
+    explicitly selected.
+
 Target End State
 - One canonical normalization path for first/middle/last consumed by all codepaths.
 - No semantic distinction between `author_info_first_normalized` and `author_info_first_normalized_without_apostrophe`.
 - Canonical last names are stored in spaced normalized form, with compact projections derived only for specific downstream keys.
 - No runtime compatibility shims for legacy artifacts.
 - All generated artifacts are built from the same canonical normalization logic.
+- Field-specific text canonicalizers are explicit; title/venue/journal/source-ID behavior is not implicitly inherited
+  from person-name normalization.
 
 Migration Plan (phased, verifiable)
 1) Lock policy and examples

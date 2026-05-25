@@ -30,6 +30,8 @@ from s2and.incremental_linking.feature_block_contract import (
 )
 
 NAME_COUNTS_INDEX_SCHEMA_VERSION = "name_counts_index_v1"
+NAME_COUNTS_ARROW_MANIFEST_SCHEMA_VERSION = "name_counts_arrow_v1"
+NAME_PAIRS_ARROW_MANIFEST_SCHEMA_VERSION = "name_pairs_arrow_v1"
 ARROW_PHYSICAL_LAYOUT_SCHEMA_VERSION = "s2and_arrow_physical_v1"
 ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION = "arrow_batch_lookup_index"
 _NAME_COUNTS_INDEX_MAGIC = b"S2NCI001"
@@ -383,6 +385,12 @@ def write_arrow_batch_lookup_index(
             batch_rows=layout["actual_max_batch_rows"],
             max_record_batch_rows=max_record_batch_rows,
         )
+        if int(index_header["record_count"]) != int(layout["row_count"]):
+            raise ValueError(
+                f"Arrow batch lookup index row count mismatch for {arrow_path_obj!s}: "
+                f"index has {int(index_header['record_count'])} records, "
+                f"Arrow file has {int(layout['row_count'])} rows. Rebuild it with overwrite=True."
+            )
         return str(output_path), {
             "reused": True,
             "schema_version": ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION,
@@ -569,10 +577,22 @@ def write_name_counts_arrow(output_dir: str | Path, *, overwrite: bool = False) 
     from s2and.data import _load_name_counts_cached
 
     output_path = Path(output_dir) / "name_counts.arrow"
-    if output_path.exists() and not overwrite:
+    first_dict, last_dict, first_last_dict, last_first_initial_dict = _load_name_counts_cached()
+    fingerprint = _name_counts_arrow_fingerprint(
+        {
+            "first": first_dict,
+            "last": last_dict,
+            "first_last": first_last_dict,
+            "last_first_initial": last_first_initial_dict,
+        }
+    )
+    expected_manifest = {
+        "schema_version": NAME_COUNTS_ARROW_MANIFEST_SCHEMA_VERSION,
+        "fingerprint": fingerprint,
+    }
+    if output_path.exists() and not overwrite and _name_artifact_manifest_matches(output_path, expected_manifest):
         return str(output_path), {"reused": True}
 
-    first_dict, last_dict, first_last_dict, last_first_initial_dict = _load_name_counts_cached()
     kinds: list[str] = []
     names: list[str] = []
     counts: list[float] = []
@@ -598,7 +618,59 @@ def write_name_counts_arrow(output_dir: str | Path, *, overwrite: bool = False) 
     )
     write_arrow_ipc_table(table, output_path)
     metrics["row_count"] = table.num_rows
+    _write_name_artifact_manifest(
+        output_path,
+        {
+            **expected_manifest,
+            "row_count": table.num_rows,
+        },
+    )
     return str(output_path), metrics
+
+
+def _name_artifact_manifest_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.name}.manifest.json")
+
+
+def _name_artifact_manifest_matches(output_path: Path, expected: Mapping[str, Any]) -> bool:
+    manifest_path = _name_artifact_manifest_path(output_path)
+    if not manifest_path.exists():
+        return False
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, Mapping):
+        return False
+    return all(manifest.get(key) == value for key, value in expected.items())
+
+
+def _write_name_artifact_manifest(output_path: Path, manifest: Mapping[str, Any]) -> None:
+    manifest_path = _name_artifact_manifest_path(output_path)
+    tmp_path = manifest_path.with_name(f".{manifest_path.name}.{uuid.uuid4().hex}.tmp")
+    tmp_path.write_text(json.dumps(dict(manifest), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(manifest_path)
+
+
+def _fnv64_text(digest: int, value: str) -> int:
+    raw = value.encode("utf-8")
+    digest = _fnv64_update(digest, len(raw).to_bytes(8, "little", signed=False))
+    return _fnv64_update(digest, raw)
+
+
+def _name_counts_arrow_fingerprint(mappings: Mapping[str, Mapping[Any, Any]]) -> int:
+    digest = _fnv64_bytes(b"s2and-name-counts-arrow-v1\x00")
+    for kind, mapping in sorted(mappings.items()):
+        for name, count in sorted((str(name), float(count)) for name, count in mapping.items()):
+            digest = _fnv64_text(digest, kind)
+            digest = _fnv64_text(digest, name)
+            digest = _fnv64_text(digest, float(count).hex())
+    return digest
+
+
+def _name_pairs_arrow_fingerprint(pairs: Iterable[tuple[str, str]]) -> int:
+    digest = _fnv64_bytes(b"s2and-name-pairs-arrow-v1\x00")
+    for left, right in sorted((str(left), str(right)) for left, right in pairs):
+        digest = _fnv64_text(digest, left)
+        digest = _fnv64_text(digest, right)
+    return digest
 
 
 def _fnv64_update(digest: int, value: bytes) -> int:
@@ -810,10 +882,15 @@ def write_name_pairs_arrow(
     import pyarrow as pa
 
     output_path = Path(output_dir) / "name_pairs.arrow"
-    if output_path.exists() and not overwrite:
+    pairs = sorted((str(left), str(right)) for left, right in _resolve_name_pairs(name_tuples))
+    fingerprint = _name_pairs_arrow_fingerprint(pairs)
+    expected_manifest = {
+        "schema_version": NAME_PAIRS_ARROW_MANIFEST_SCHEMA_VERSION,
+        "fingerprint": fingerprint,
+    }
+    if output_path.exists() and not overwrite and _name_artifact_manifest_matches(output_path, expected_manifest):
         return str(output_path), {"reused": True}
 
-    pairs = sorted((str(left), str(right)) for left, right in _resolve_name_pairs(name_tuples))
     table = pa.table(
         {
             "name_1": pa.array([left for left, _right in pairs], type=pa.string()),
@@ -821,6 +898,13 @@ def write_name_pairs_arrow(
         }
     )
     write_arrow_ipc_table(table, output_path)
+    _write_name_artifact_manifest(
+        output_path,
+        {
+            **expected_manifest,
+            "row_count": table.num_rows,
+        },
+    )
     return str(output_path), {"reused": False, "row_count": table.num_rows}
 
 
@@ -844,6 +928,12 @@ def _arrow_rows_by_unique_key(
     return rows_by_key
 
 
+def _require_arrow_columns(table: Any, table_name: str, required_columns: set[str]) -> None:
+    missing_columns = sorted(required_columns.difference(table.column_names))
+    if missing_columns:
+        raise ValueError(f"{table_name} Arrow is missing required columns: {missing_columns}")
+
+
 def feature_block_from_arrow_paths(
     paths: Mapping[str, Any],
     *,
@@ -854,12 +944,15 @@ def feature_block_from_arrow_paths(
 
     pa = __import__("pyarrow")
     pc = __import__("pyarrow.compute").compute
+    from s2and.incremental_linking.retrieval import validate_raw_candidate_plan_schema
 
+    validate_raw_candidate_plan_schema(raw_candidate_plan)
     signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
     selected_signature_ids = tuple(signature_order.signature_ids)
     selected_signature_id_set = set(selected_signature_ids)
 
     signatures_table = _read_arrow_ipc_table(pa, paths["signatures"])
+    _require_arrow_columns(signatures_table, "signatures", {"signature_id", "paper_id"})
     signatures_table = _filter_arrow_table_by_values(pa, pc, signatures_table, "signature_id", selected_signature_ids)
     signatures_by_id = _arrow_rows_by_unique_key(
         signatures_table.to_pylist(),
@@ -878,6 +971,7 @@ def feature_block_from_arrow_paths(
 
     paper_ids = tuple(dict.fromkeys(row.paper_id for row in signature_rows))
     papers_table = _read_arrow_ipc_table(pa, paths["papers"])
+    _require_arrow_columns(papers_table, "papers", {"paper_id"})
     papers_table = _filter_arrow_table_by_values(pa, pc, papers_table, "paper_id", paper_ids)
     papers_by_id = _arrow_rows_by_unique_key(
         papers_table.to_pylist(),
@@ -893,6 +987,7 @@ def feature_block_from_arrow_paths(
     paper_authors_path = paths.get("paper_authors")
     if paper_authors_path is not None:
         paper_authors_table = _read_arrow_ipc_table(pa, paper_authors_path)
+        _require_arrow_columns(paper_authors_table, "paper_authors", {"paper_id", "position"})
         paper_authors_table = _filter_arrow_table_by_values(pa, pc, paper_authors_table, "paper_id", paper_ids)
         paper_author_row_list: list[FeatureBlockPaperAuthor] = []
         seen_paper_author_positions: set[tuple[str, int]] = set()
@@ -954,6 +1049,7 @@ def feature_block_from_arrow_paths(
     specter_path = paths.get("specter")
     if include_specter and specter_path is not None:
         specter_table = _read_arrow_ipc_table(pa, specter_path)
+        _require_arrow_columns(specter_table, "specter", {"paper_id", "embedding"})
         specter_table = _filter_arrow_table_by_values(pa, pc, specter_table, "paper_id", paper_ids)
         specter_by_id = _arrow_rows_by_unique_key(
             specter_table.to_pylist(),

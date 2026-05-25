@@ -18,6 +18,40 @@ from tests.linker_row_feature_reference import build_promoted_non_pairwise_row_f
 s2and_rust = pytest.importorskip("s2and_rust", reason="s2and_rust is unavailable")
 
 
+def test_rust_retrieval_public_exports_are_available() -> None:
+    assert s2and_rust.DEFAULT_HYBRID_EXEMPLAR_4_WEIGHTS == [0.40, 0.23, 0.12, 0.05, 0.07]
+
+    selector = s2and_rust.RustNameCompatibleSubblockSelector(
+        {
+            "signature_to_subblock": {"q": "a"},
+            "subblock_to_components": {"a": ["c1"], "b": ["c2"]},
+            "subblock_tokens_by_subblock": {"a": ["alice"], "b": ["bob"]},
+        }
+    )
+
+    assert selector.select("q", "alice", ["c2", "c1"]) == ["c1"]
+
+
+def test_direct_top_k_retrieval_allows_values_above_uint16_rank_limit() -> None:
+    query = build_query_features(first="alice")
+    retriever = s2and_rust.RustHybridCentroidRetriever(
+        [build_cluster_summary(component_key="c1", first_name_counts=Counter({"alice": 1}))],
+        include_exemplars=True,
+    )
+
+    keys, _scores = retriever.top_k_hybrid_centroid(query, np.iinfo(np.uint16).max + 1, 1)
+
+    assert keys == ["c1"]
+    with pytest.raises(ValueError, match="retrieval_ranks"):
+        retriever.top_k_hybrid_centroid_pair_plan(
+            [query],
+            np.asarray([0], dtype=np.uint32),
+            {"c1": np.asarray([1], dtype=np.uint32)},
+            np.iinfo(np.uint16).max + 1,
+            1,
+        )
+
+
 def _base_row_signals(row_count: int) -> dict[str, object]:
     return {
         "candidate_component_key": np.asarray([f"c{index}" for index in range(row_count)], dtype=object),
@@ -570,6 +604,8 @@ def test_rust_promoted_non_pairwise_row_features_match_python_reference() -> Non
     row_signals["retrieval_score"] = np.asarray([0.9, 0.8, 0.7], dtype=np.float32)
     row_signals["retrieval_rank"] = np.asarray([1, 2, 1], dtype=np.float32)
     row_signals["family_id"] = np.asarray(["alice", "alice", "alice"], dtype=object)
+    row_signals["query_first_token"] = np.asarray(["Él", "El", "Zoë"], dtype=object)
+    row_signals["dominant_first_name"] = np.asarray(["Élodie", "Elodie", "Zoe"], dtype=object)
 
     rust_features = build_promoted_non_pairwise_row_features(candidate_batch, row_signals)
     python_features = build_promoted_non_pairwise_row_features_python_reference(candidate_batch, row_signals)
@@ -618,3 +654,22 @@ def test_promoted_non_pairwise_row_features_reports_generated_family_ids() -> No
 
     assert telemetry["generated_family_id_count"] == 3
     assert telemetry["generic_family_override_count"] == 3
+
+
+def test_promoted_non_pairwise_row_features_treats_family_id_none_as_missing() -> None:
+    candidate_batch = LinkerCandidateBatch(
+        row_count=3,
+        left_signature_indices=np.asarray([10, 10, 11], dtype=np.uint32),
+        right_signature_indices=np.asarray([1, 2, 3], dtype=np.uint32),
+        pair_row_indices=np.asarray([0, 1, 2], dtype=np.uint32),
+        row_query_signature_indices=np.asarray([10, 10, 11], dtype=np.uint32),
+        row_component_keys=("c0", "c1", "c2"),
+    )
+    row_signals = _base_row_signals(3)
+    row_signals["retrieval_score"] = np.asarray([0.9, 0.8, 0.7], dtype=np.float32)
+    row_signals["retrieval_rank"] = np.asarray([1, 2, 1], dtype=np.float32)
+    row_signals["family_id"] = None
+
+    _features, telemetry = build_promoted_non_pairwise_row_features_with_telemetry(candidate_batch, row_signals)
+
+    assert telemetry["generated_family_id_count"] == 3

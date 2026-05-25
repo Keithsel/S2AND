@@ -1,10 +1,17 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pyarrow as pa
 import pytest
 
 import s2and.subblocking as subblocking
 from s2and.data import Signature
+
+
+def _write_ipc(path, table: pa.Table) -> str:
+    with pa.OSFile(str(path), "wb") as sink, pa.ipc.new_file(sink, table.schema) as writer:
+        writer.write_table(table)
+    return str(path)
 
 
 def _signature(signature_id: str, *, first: str, middle: str | None = None, orcid: str | None = None) -> Signature:
@@ -140,9 +147,57 @@ def test_normalize_orcid_for_subblocking_matches_rust_arrow_canonical_form() -> 
     assert (
         subblocking.normalize_orcid_for_subblocking(" https://orcid.org/0000-0002-1825-0097 ") == "0000-0002-1825-0097"
     )
+    assert subblocking.normalize_orcid_for_subblocking("0000\u20110002\u20111825\u20110097") == "0000-0002-1825-0097"
     assert subblocking.normalize_orcid_for_subblocking("ORCID: 000000021825009x") == "0000-0002-1825-009X"
+    assert subblocking.normalize_orcid_for_subblocking("https://example.org/0000-0002-1825-0097") == (
+        "0000-0002-1825-0097"
+    )
+    assert subblocking.normalize_orcid_for_subblocking("0000-0002-1825-009 https://example.org") is None
     assert subblocking.normalize_orcid_for_subblocking("0000-0002-1825") is None
     assert subblocking.normalize_orcid_for_subblocking("   ") is None
+
+
+def test_signature_name_parts_for_subblocking_recomputes_deferred_normalized_fields() -> None:
+    signature = SimpleNamespace(
+        author_info_first="Arif\u2010ullah",
+        author_info_middle=None,
+        author_info_first_normalized_without_apostrophe=None,
+        author_info_middle_normalized_without_apostrophe=None,
+    )
+
+    assert subblocking.signature_name_parts_for_subblocking(signature) == ("arif ullah", "")
+
+
+def test_coauthor_blocks_from_full_arrow_normalizes_author_names(tmp_path) -> None:
+    paper_authors = pa.table(
+        {
+            "paper_id": pa.array(["p1", "p1", "p1", "p1"], type=pa.string()),
+            "position": pa.array([0, 1, 2, 3], type=pa.int64()),
+            "author_name": pa.array(
+                ["Ali Khan", "Waseeq-Ur-Rehamn", "Mariarosaria D'Alfonso", "Maciej G\u00f3rski"],
+                type=pa.string(),
+            ),
+        }
+    )
+
+    out = subblocking._coauthor_blocks_by_paper_from_full_arrow(  # noqa: SLF001
+        {"paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors)},
+        ["p1"],
+        {},
+    )
+
+    assert out == {
+        "p1": [
+            (0, "a khan"),
+            (1, "w rehamn"),
+            (2, "m alfonso"),
+            (3, "m gorski"),
+        ]
+    }
+
+
+def test_subblock_merge_candidate_metadata_preserves_middle_values_with_equals() -> None:
+    assert subblocking._subblock_merge_candidate_metadata("a|middle=b=c", 2) == (2, "a", "b=c", "b=c", "b=c")
 
 
 def test_make_subblocks_merges_normalized_orcid_components_when_enabled(monkeypatch):
@@ -336,6 +391,7 @@ def test_rust_arrow_make_subblocks_matches_python_fallback_path(tmp_path):
         maximum_size=2,
         first_k_letter_counts_sorted={},
         specter_cluster_fn=fallback,
+        full_scan_without_index=True,
     )
 
     assert rust_subblocks == python_subblocks
@@ -376,6 +432,7 @@ def test_rust_arrow_make_subblocks_matches_python_orcid_repair(tmp_path):
         dataset,
         maximum_size=3,
         first_k_letter_counts_sorted={},
+        full_scan_without_index=True,
     )
 
     assert sorted(sorted(signature_ids) for signature_ids in rust_subblocks.values()) == sorted(

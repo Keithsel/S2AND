@@ -212,8 +212,17 @@ def test_rust_featurizer_cache_keeps_distinct_build_options(monkeypatch):
     dataset = DummyDataset("option_cache_dataset", mode="train")
     build_calls: list[tuple[str, bool]] = []
 
-    def _build_stub(dataset_arg, *, requested_build_path, allow_normalization_version_mismatch, name_counts_path=None):
+    def _build_stub(
+        dataset_arg,
+        *,
+        requested_build_path,
+        allow_normalization_version_mismatch,
+        name_counts_path=None,
+        expected_normalization_version=None,
+    ):
         assert name_counts_path is None
+        if requested_build_path == "from_dataset":
+            assert expected_normalization_version is None
         build_calls.append((requested_build_path, bool(allow_normalization_version_mismatch)))
         return (
             DummyRustFeaturizer(f"{dataset_arg.name}:{requested_build_path}:{allow_normalization_version_mismatch}"),
@@ -250,7 +259,7 @@ def test_rust_featurizer_cache_key_normalizes_blank_name_counts_path():
     configured_key = feature_port._rust_featurizer_cache_key("from_json_paths", False, 0, " names.json ")
 
     assert blank_key == none_key
-    assert configured_key[-1] == "names.json"
+    assert configured_key[-2] == "names.json"
 
 
 def test_rust_featurizer_cache_tracks_cluster_seed_version():
@@ -320,6 +329,27 @@ def test_update_rust_cluster_seeds_reuses_cached_featurizer_after_version_bump()
     ]
 
 
+def test_update_rust_cluster_seeds_leaves_version_unchanged_on_ffi_failure():
+    from s2and.rust_calls import update_rust_cluster_seeds
+
+    dataset = DummyDataset("failed_seed_update_dataset", mode="train")
+    dataset._cluster_seeds_version = 1
+    featurizer = feature_port._get_rust_featurizer(dataset)
+
+    def fail_update(_require_map, _disallow_set):
+        raise RuntimeError("ffi failed")
+
+    featurizer.update_cluster_seeds = fail_update
+
+    with pytest.raises(RuntimeError, match="ffi failed"):
+        update_rust_cluster_seeds(dataset)
+
+    assert int(dataset._cluster_seeds_version) == 1
+    assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
+        feature_port._rust_featurizer_cache_key("from_dataset", False, 1)
+    ]
+
+
 def test_update_rust_cluster_seeds_promotes_externally_bumped_cache_key():
     from s2and.rust_calls import update_rust_cluster_seeds
 
@@ -336,6 +366,51 @@ def test_update_rust_cluster_seeds_promotes_externally_bumped_cache_key():
     assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
         feature_port._rust_featurizer_cache_key("from_dataset", False, 1)
     ]
+
+
+def test_promote_cluster_seed_version_preserves_unrelated_cache_families(monkeypatch):
+    dataset = DummyDataset("seed_update_cache_family_dataset", mode="train")
+    build_calls: list[tuple[str, bool]] = []
+
+    def _build_stub(
+        dataset_arg,
+        *,
+        requested_build_path,
+        allow_normalization_version_mismatch,
+        name_counts_path=None,
+        expected_normalization_version=None,
+    ):
+        assert name_counts_path is None
+        if requested_build_path == "from_dataset":
+            assert expected_normalization_version is None
+        build_calls.append((requested_build_path, bool(allow_normalization_version_mismatch)))
+        return (
+            DummyRustFeaturizer(f"{dataset_arg.name}:{requested_build_path}:{allow_normalization_version_mismatch}"),
+            requested_build_path,
+            {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
+            1,
+            0.0,
+        )
+
+    monkeypatch.setattr(feature_port, "_build_rust_featurizer_strict", _build_stub)
+
+    primary = feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
+    other_family = feature_port._get_rust_featurizer(
+        dataset,
+        rust_build_path="from_json_paths",
+        allow_normalization_version_mismatch=True,
+    )
+
+    assert feature_port._promote_cached_rust_featurizer_cluster_seed_version(  # noqa: SLF001
+        dataset,
+        primary,
+        target_seed_version=1,
+    )
+
+    entries = feature_port._RUST_FEATURIZER_CACHE[dataset]
+    assert entries[feature_port._rust_featurizer_cache_key("from_dataset", False, 1)].featurizer is primary
+    assert entries[feature_port._rust_featurizer_cache_key("from_json_paths", True, 0)].featurizer is other_family
+    assert build_calls == [("from_dataset", False), ("from_json_paths", True)]
 
 
 def test_rust_featurizer_cache_rejects_invalid_cluster_seed_version():
@@ -387,6 +462,47 @@ def test_build_rust_featurizer_from_arrow_paths_rejects_none_path(monkeypatch):
         )
 
 
+def test_build_rust_featurizer_from_arrow_paths_requires_index_for_name_counts(monkeypatch, tmp_path):
+    calls: list[dict[str, Any]] = []
+
+    class ArrowRustFeaturizer(DummyRustFeaturizer):
+        @classmethod
+        def from_arrow_paths(cls, paths, _signature_ids, _name_tuples, name_counts_path, *_args):
+            calls.append({"paths": dict(paths), "name_counts_path": name_counts_path})
+            return cls("arrow")
+
+    class ArrowRustModule:
+        __version__ = "0.51.0"
+        RustFeaturizer = ArrowRustFeaturizer
+
+    monkeypatch.setattr(feature_port, "s2and_rust", ArrowRustModule)
+    paths = {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+    }
+
+    with pytest.raises(ValueError, match="requires name_counts_index"):
+        feature_port.build_rust_featurizer_from_arrow_paths(paths, load_name_counts=True)
+
+    with pytest.raises(ValueError, match="does not accept name_counts_path"):
+        feature_port.build_rust_featurizer_from_arrow_paths(paths, name_counts_path="name_counts.json")
+
+    index_path = tmp_path / "name_counts_index"
+    index_path.mkdir()
+    result = feature_port.build_rust_featurizer_from_arrow_paths(
+        {**paths, "name_counts_index": str(index_path)},
+        load_name_counts=True,
+    )
+
+    assert result.dataset_name == "arrow"
+    assert calls == [
+        {
+            "paths": {**paths, "name_counts_index": str(index_path)},
+            "name_counts_path": None,
+        }
+    ]
+
+
 def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
     d1 = DummyDataset("parallel_d1", mode="train")
     d2 = DummyDataset("parallel_d2", mode="train")
@@ -394,9 +510,17 @@ def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
     build_windows: dict[str, tuple[float, float]] = {}
     window_lock = threading.Lock()
 
-    def _build_stub(dataset, *, requested_build_path, allow_normalization_version_mismatch, name_counts_path=None):
+    def _build_stub(
+        dataset,
+        *,
+        requested_build_path,
+        allow_normalization_version_mismatch,
+        name_counts_path=None,
+        expected_normalization_version=None,
+    ):
         assert allow_normalization_version_mismatch is False
         assert name_counts_path is None
+        assert expected_normalization_version is None
         ready.wait(timeout=2)
         build_start = time.perf_counter()
         time.sleep(0.25)
@@ -445,9 +569,17 @@ def test_concurrent_builds_for_same_dataset_share_single_inflight_build(monkeypa
     ready = threading.Event()
     build_calls = {"count": 0}
 
-    def _build_stub(dataset_arg, *, requested_build_path, allow_normalization_version_mismatch, name_counts_path=None):
+    def _build_stub(
+        dataset_arg,
+        *,
+        requested_build_path,
+        allow_normalization_version_mismatch,
+        name_counts_path=None,
+        expected_normalization_version=None,
+    ):
         assert allow_normalization_version_mismatch is False
         assert name_counts_path is None
+        assert expected_normalization_version is None
         build_calls["count"] += 1
         ready.wait(timeout=2)
         time.sleep(0.25)
@@ -744,6 +876,49 @@ def test_json_ingest_uses_name_counts_artifact_when_dataset_has_no_counts(tmp_pa
     args, _kwargs = DummyRustFeaturizer.from_json_created[0]
     assert args[5] == str(artifact_path)
     assert args[12] is False
+
+
+def test_json_ingest_uses_env_name_counts_artifact_when_no_dataset_counts(tmp_path, monkeypatch):
+    artifact_path = tmp_path / "name_counts_env.json"
+    artifact_path.write_text('{"normalization_version":"legacy_compat","counts":{}}', encoding="utf-8")
+    monkeypatch.setenv("S2AND_RUST_NAME_COUNTS_JSON", str(artifact_path))
+
+    dataset = DummyDataset("telemetry_json_dataset", mode="inference")
+    dataset.signatures_path = "signatures.json"
+    dataset.papers_path = "papers.json"
+    dataset.signatures = {"s1": type("Sig", (), {"author_info_name_counts": None})()}
+
+    feature_port._get_rust_featurizer(dataset)
+
+    args, _kwargs = DummyRustFeaturizer.from_json_created[0]
+    assert args[5] == str(artifact_path)
+    assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
+        feature_port._rust_featurizer_cache_key(
+            "from_json_paths",
+            False,
+            0,
+            str(artifact_path),
+            feature_port.DEFAULT_NORMALIZATION_VERSION,
+        )
+    ]
+
+
+def test_json_ingest_env_normalization_version_is_delegated_to_rust(tmp_path, monkeypatch):
+    artifact_path = tmp_path / "name_counts_env.json"
+    artifact_path.write_text('{"normalization_version":"canonical_v2","counts":{}}', encoding="utf-8")
+    monkeypatch.setenv("S2AND_RUST_NAME_COUNTS_JSON", str(artifact_path))
+    monkeypatch.setenv("S2AND_NORMALIZATION_VERSION", "canonical_v2")
+
+    dataset = DummyDataset("telemetry_json_dataset", mode="inference")
+    dataset.signatures_path = "signatures.json"
+    dataset.papers_path = "papers.json"
+    dataset.signatures = {"s1": type("Sig", (), {"author_info_name_counts": None})()}
+
+    feature_port._get_rust_featurizer(dataset)
+
+    args, _kwargs = DummyRustFeaturizer.from_json_created[0]
+    assert args[5] == str(artifact_path)
+    assert args[11] == "canonical_v2"
 
 
 def test_json_ingest_cache_key_includes_name_counts_artifact_path(tmp_path):

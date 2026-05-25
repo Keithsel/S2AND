@@ -14,3 +14,14 @@ def test_raw_arrow_plan_window_enabled_when_query_batch_is_smaller_than_query_co
     assert production_module._RAW_ARROW_PLAN_WINDOW_MULTIPLIER > 1  # noqa: SLF001
     assert plan_window_size > query_batch_size
     assert int(plan_window_size > query_batch_size) == 1
+
+
+def test_raw_arrow_plan_window_size_is_positive_for_empty_query_set() -> None:
+    assert (
+        production_module._raw_arrow_plan_window_size(  # noqa: SLF001
+            query_count=0,
+            query_batch_size=10,
+            plan_window_multiplier=production_module._RAW_ARROW_PLAN_WINDOW_MULTIPLIER,  # noqa: SLF001
+        )
+        == 1
+    )

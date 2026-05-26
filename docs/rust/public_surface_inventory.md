@@ -58,7 +58,6 @@ cleanup risk, not a user-facing API promise.
 | `top_k_experimental_weighted_hybrid_centroid_subset(...)` | `s2and/incremental_linking_training/query_support.py`, tests | Training/query-support scoring surface. |
 | `top_k_hybrid_centroid(...)` | capability probes and tests | Direct debug/capability surface; remove only after probes/tests stop requiring it. |
 | `chooser_feature_rows_subset(...)` | tests only in current repo | Candidate for deletion after tests move to pair-plan or training support APIs. |
-| `summary_count(...)` | no repo call sites found | Lowest-risk deletion candidate, subject to the public-API removal policy. |
 | `RustNameCompatibleSubblockSelector.select(...)` | tests only; internal Rust helper trio used by pair-plan | Keep while pair-plan subblock filtering depends on the selector internals. |
 | `RawBlockQueryCandidatePlanner.__new__(...)`, `build_telemetry(...)`, `plan(...)` | `s2and/incremental_linking/production.py`; tests | Reusable production raw Arrow planner. |
 
@@ -82,8 +81,8 @@ cleanup risk, not a user-facing API promise.
   planning API is decided and all runtime callers use it.
 - Do not delete `RustNameCompatibleSubblockSelector` internals; the pair-plan
   route still uses them for retrieval subblock filtering.
-- The smallest observed no-caller candidate is
-  `RustHybridCentroidRetriever.summary_count(...)`.
+- Status 2026-05-25: `RustHybridCentroidRetriever.summary_count(...)` was
+  removed after a repo-local no-caller scan.
 - The first larger consolidation target is the linker pair aggregate family:
   migrate off `linker_pair_features_and_aggregate_stats_indexed(...)`, then
   decide whether aggregate-only should be a mode of

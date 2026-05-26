@@ -517,9 +517,9 @@ to maintain without changing runtime behavior.
     `select_candidate_indices_for_summaries`). They are live internal helpers
     used by `top_k_hybrid_centroid_pair_plan(...)` when retrieval subblock
     filtering is enabled.
-  - `RustHybridCentroidRetriever.summary_count(...)` appears to be a trivial
-    unused public getter and can be removed with its tests if no external
-    compatibility promise exists.
+  - Status 2026-05-25: `RustHybridCentroidRetriever.summary_count(...)` was
+    removed after a repo-local no-caller scan found no maintained consumer and
+    no external compatibility promise.
 - Use the Rust public-surface inventory to choose one good API per behavior
   before moving code:
   - Status 2026-05-25: the current inventory is checked in at

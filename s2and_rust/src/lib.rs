@@ -12477,10 +12477,6 @@ impl RustHybridCentroidRetriever {
         })
     }
 
-    fn summary_count(&self) -> usize {
-        self.summaries.len()
-    }
-
     #[pyo3(signature = (query, top_k, num_threads = None))]
     fn top_k_hybrid_centroid(
         &self,

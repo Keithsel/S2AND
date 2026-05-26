@@ -317,6 +317,24 @@ production inference.
     tested directly, not a production route.
   - Status 2026-05-25: production Rust full-block `Clusterer.predict(...)`
     no longer silently falls back when Arrow artifacts are incomplete.
+  - Intended end state: production Rust subblocked `Clusterer.predict(...)`
+    also fails closed on missing Arrow artifacts. Do not leave subblocked
+    large-block prediction as the permanent exception to Arrow-only production
+    routing.
+  - Staged subblocked rollout:
+    - First, separate production subblocked routing from compatibility tests and
+      reference workflows. The production route should require Arrow paths and
+      emit `MissingArrowArtifactError`; compatibility tests should select the
+      Python route or call legacy helpers directly.
+    - Next, require Arrow paths before `_predict_subblocked(...)` builds graph
+      subblocking, altered-profile pre-split, single-letter incremental, or
+      residual reclustering state for Rust production.
+    - Then remove the production route's dependence on graph/legacy `ANDData`
+      fallback by verifying Arrow graph subblocking, Arrow featurizer reuse, and
+      promoted incremental completion on bounded large-block fixtures.
+    - Finally, keep graph/legacy fallbacks only behind explicit compatibility,
+      parity, training, or test paths, not behind `backend="rust"` production
+      inference.
   - Preserve fallback only through approved compatibility/test routes.
   - Ensure errors name the missing Arrow artifact keys and the caller/script
     that should generate them.
@@ -348,10 +366,12 @@ production inference.
       `None` for incomplete auto-discovered Arrow artifacts and for missing
       required artifacts such as `cluster_seeds` or `name_counts_index`.
     - Full-block `Clusterer.predict(...)` now fails closed in Rust mode when
-      Arrow paths are unavailable. Subblocked `predict(...)` still has
-      graph/legacy fallback questions tracked separately.
-    - `_predict_subblocked(...)` accepts `arrow_paths=None` and can use
-      graph/legacy `ANDData` fallbacks.
+      Arrow paths are unavailable.
+    - `_predict_subblocked(...)` still accepts `arrow_paths=None` and can use
+      graph/legacy `ANDData` fallbacks. This is temporary: the intended
+      production end state is fail-closed subblocked Rust prediction with
+      compatibility fallback available only through explicit non-production
+      routes.
     - `_predict_incremental_promoted_linker(...)` no longer falls back to the
       non-Arrow promoted linker. That legacy function remains callable as a
       compatibility/test surface.
@@ -386,7 +406,9 @@ production inference.
       request/dataset seed mapping, and production code may convert that mapping
       into request-local Arrow for Rust.
     - `predict(...)` validates required Arrow artifacts before selecting the
-      Arrow route.
+      Arrow route. Full-block prediction does this now; subblocked prediction is
+      the remaining staged migration and is intended to reach the same
+      fail-closed contract.
     - `predict_incremental(...)` requires base Arrow artifacts plus an
       incremental seed source before seed sync or helper fallback. Accepted seed
       sources are a valid `cluster_seeds.arrow` sidecar or a request/dataset seed
@@ -427,6 +449,11 @@ production inference.
       conditionally `cluster_seed_disallows`, and conditionally
       `altered_cluster_signatures`, using the approved production call site or
       refactored resolver as the authority.
+    - Add subblocked strict-routing tests before flipping the route: missing
+      base Arrow artifacts fail before graph/legacy fallback; valid Arrow paths
+      still exercise Arrow graph subblocking and Arrow featurizer construction;
+      explicit Python/compatibility routes continue to cover state restoration
+      and fallback invariants.
 - Clean up after migration.
   - Update `docs/production_inference.md` to state that production Rust
     inference requires Arrow artifacts.
@@ -453,8 +480,9 @@ production inference.
 - Done when: with `backend="rust"` or `S2AND_BACKEND=rust` and the approved
   strict production authority enabled, missing production artifacts raise
   `MissingArrowArtifactError`; the approved compatibility path preserves the old
-  fallback behavior for legacy/parity callers; Arrow full-predict and promoted
-  incremental smoke tests run without `ANDData` fallback; and
+  fallback behavior for legacy/parity callers; Arrow full-predict, subblocked
+  predict, and promoted incremental smoke tests run without `ANDData` fallback;
+  and
   `scripts/eval_prod_models.py --use-arrow` runs end-to-end on at least three
   benchmark datasets without `ANDData` fallback telemetry.
 

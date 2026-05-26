@@ -131,20 +131,43 @@ class MissingArrowArtifactError(ValueError):
         super().__init__(". ".join(details))
 
 
-def normalize_arrow_paths(paths: Mapping[Any, Any]) -> dict[str, str]:
-    """Return Arrow path mappings with explicit rejection of missing path values."""
-
-    stringified: dict[str, str] = {}
+def _normalize_arrow_path_values(
+    paths: Mapping[Any, Any],
+    *,
+    omit_none: bool = False,
+) -> tuple[dict[str, str], dict[str, str]]:
+    normalized: dict[str, str] = {}
+    invalid: dict[str, str] = {}
     for key, value in paths.items():
+        key_text = str(key)
         if value is None:
-            raise ValueError(f"Arrow path for {key!r} is None")
+            if omit_none:
+                continue
+            invalid[key_text] = "<None>"
+            continue
         path_text = os.fspath(value) if isinstance(value, os.PathLike) else str(value)
         if not path_text.strip():
-            raise ValueError(f"Arrow path for {key!r} is empty")
+            invalid[key_text] = "<empty>"
+            continue
         if path_text == ".":
-            raise ValueError(f"Arrow path for {key!r} resolves to the current directory")
-        stringified[str(key)] = path_text
-    return stringified
+            invalid[key_text] = "."
+            continue
+        normalized[key_text] = path_text
+    return normalized, invalid
+
+
+def normalize_arrow_paths(paths: Mapping[Any, Any], *, omit_none: bool = False) -> dict[str, str]:
+    """Return Arrow path mappings with explicit rejection of missing path values."""
+
+    normalized, invalid = _normalize_arrow_path_values(paths, omit_none=omit_none)
+    if invalid:
+        key, reason = next(iter(invalid.items()))
+        if reason == "<None>":
+            raise ValueError(f"Arrow path for {key!r} is None")
+        if reason == "<empty>":
+            raise ValueError(f"Arrow path for {key!r} is empty")
+        raise ValueError(f"Arrow path for {key!r} resolves to the current directory")
+    return normalized
 
 
 def required_filtered_read_batch_index_keys(paths: Mapping[str, str]) -> tuple[str, ...]:
@@ -188,21 +211,7 @@ def require_arrow_artifacts(
 
     required = tuple(str(key) for key in required_keys)
     missing_keys = [key for key in required if key not in arrow_paths]
-    normalized: dict[str, str] = {}
-    invalid_paths: dict[str, str] = {}
-    for key, value in arrow_paths.items():
-        key_text = str(key)
-        if value is None:
-            invalid_paths[key_text] = "<None>"
-            continue
-        path_text = os.fspath(value) if isinstance(value, os.PathLike) else str(value)
-        if not path_text.strip():
-            invalid_paths[key_text] = "<empty>"
-            continue
-        if path_text == ".":
-            invalid_paths[key_text] = "."
-            continue
-        normalized[key_text] = path_text
+    normalized, invalid_paths = _normalize_arrow_path_values(arrow_paths)
     missing_files = _missing_or_wrong_kind_artifacts(normalized, required)
     missing_files.update({key: invalid_paths[key] for key in required if key in invalid_paths})
     if missing_keys or missing_files:
@@ -240,21 +249,7 @@ def validate_arrow_prediction_artifacts(
         required.add("cluster_seeds")
 
     missing_keys = sorted(key for key in required if key not in arrow_paths)
-    normalized: dict[str, str] = {}
-    invalid_paths: dict[str, str] = {}
-    for key, value in arrow_paths.items():
-        key_text = str(key)
-        if value is None:
-            invalid_paths[key_text] = "<None>"
-            continue
-        path_text = os.fspath(value) if isinstance(value, os.PathLike) else str(value)
-        if not path_text.strip():
-            invalid_paths[key_text] = "<empty>"
-            continue
-        if path_text == ".":
-            invalid_paths[key_text] = "."
-            continue
-        normalized[key_text] = path_text
+    normalized, invalid_paths = _normalize_arrow_path_values(arrow_paths)
 
     if require_specter and "specter" not in normalized and "specter2" in normalized:
         normalized["specter"] = normalized["specter2"]

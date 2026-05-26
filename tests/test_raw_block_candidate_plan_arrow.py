@@ -344,8 +344,6 @@ def _raw_plan_for_base_paths(paths: dict[str, str]) -> dict[str, Any]:
 
 
 def test_raw_arrow_candidate_plan_matches_existing_rust_retriever(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     raw_plan = _raw_candidate_plan_arrow(
@@ -411,8 +409,6 @@ def test_raw_arrow_candidate_plan_matches_existing_rust_retriever(tmp_path: Path
 
 
 def test_raw_arrow_candidate_planner_matches_one_shot_plan(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     one_shot = _raw_candidate_plan_arrow(
@@ -454,8 +450,6 @@ def test_raw_arrow_candidate_planner_matches_one_shot_plan(tmp_path: Path) -> No
 
 
 def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["cluster_seeds"] = _write_ipc(
         tmp_path / "cluster_seeds_with_query.arrow",
@@ -502,8 +496,6 @@ def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: 
 
 
 def test_raw_arrow_candidate_planner_rejects_multi_query_seed_overlap(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     planner = s2and_rust.RawBlockQueryCandidatePlanner(
         paths,
@@ -538,8 +530,6 @@ def test_raw_arrow_candidate_planner_rejects_multi_query_seed_overlap(tmp_path: 
 
 
 def test_raw_arrow_candidate_planner_requires_indexes_without_explicit_full_scan(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     with pytest.raises(ValueError, match="batch lookup index"):
@@ -554,8 +544,6 @@ def test_raw_arrow_candidate_planner_requires_indexes_without_explicit_full_scan
 
 
 def test_raw_arrow_candidate_plan_filters_cluster_seed_disallows(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["cluster_seed_disallows"] = _write_ipc(
         tmp_path / "cluster_seed_disallows.arrow",
@@ -607,8 +595,6 @@ def test_raw_arrow_candidate_plan_rejects_disallow_with_unknown_seed_endpoint(tm
 
 
 def test_raw_arrow_candidate_plan_keeps_zero_specter_vectors(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["specter"] = _write_ipc(
         tmp_path / "specter.arrow",
@@ -637,8 +623,6 @@ def test_raw_arrow_candidate_plan_keeps_zero_specter_vectors(tmp_path: Path) -> 
 
 
 def test_raw_arrow_candidate_plan_rejects_hidden_query_view(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     with pytest.raises(ValueError, match="Unknown query view"):
@@ -653,8 +637,6 @@ def test_raw_arrow_candidate_plan_rejects_hidden_query_view(tmp_path: Path) -> N
 
 
 def test_raw_arrow_candidate_plan_rejects_duplicate_query_signature_ids(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     with pytest.raises(ValueError, match="query_signature_ids must be unique"):
@@ -669,8 +651,6 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_query_signature_ids(tmp_path
 
 
 def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     irrelevant_count = 24
     signature_ids = ["q1", "s1", "s2"] + [f"junk_sig_{index}" for index in range(irrelevant_count)]
     paper_ids = ["p_q", "p1", "p2"] + [f"junk_paper_{index}" for index in range(irrelevant_count)]
@@ -785,8 +765,6 @@ def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(t
 
 
 def test_raw_arrow_candidate_plan_extra_hash_selected_batch_is_exact_filtered(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s1", "s2", "bad"], type=pa.string()),
@@ -846,8 +824,6 @@ def test_raw_arrow_candidate_plan_extra_hash_selected_batch_is_exact_filtered(tm
 
 
 def test_rust_featurizer_from_arrow_paths_empty_indexed_keep_set_skips_stale_validation(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
     for key in ("signatures", "papers", "paper_authors"):
@@ -869,8 +845,6 @@ def test_rust_featurizer_from_arrow_paths_empty_indexed_keep_set_skips_stale_val
 
 
 def test_raw_arrow_candidate_plan_rejects_stale_batch_index(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
     with Path(paths["signatures"]).open("ab") as outfile:
@@ -887,22 +861,31 @@ def test_raw_arrow_candidate_plan_rejects_stale_batch_index(tmp_path: Path) -> N
         )
 
 
-def test_arrow_batch_lookup_index_reuses_current_format_after_mtime_only_change(tmp_path: Path) -> None:
+def test_arrow_batch_lookup_index_rejects_mtime_only_change(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
     signatures_path = Path(paths["signatures"])
     stat = signatures_path.stat()
     os.utime(signatures_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
 
-    _index_path, metrics = write_arrow_batch_lookup_index(
-        signatures_path,
-        indexed_paths["signatures_batch_index"],
-        key_column="signature_id",
-        table_name="signatures",
-        overwrite=False,
-    )
+    with pytest.raises(ValueError, match="stale"):
+        _raw_candidate_plan_arrow(
+            indexed_paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
 
-    assert metrics["reused"] is True
+    with pytest.raises(ValueError, match="stale"):
+        write_arrow_batch_lookup_index(
+            signatures_path,
+            indexed_paths["signatures_batch_index"],
+            key_column="signature_id",
+            table_name="signatures",
+            overwrite=False,
+        )
 
 
 def test_arrow_batch_lookup_index_rejects_wrong_key_column_reuse(tmp_path: Path) -> None:
@@ -978,8 +961,6 @@ def test_arrow_batch_lookup_index_rejects_same_size_same_mtime_sampled_source_ch
 
 
 def test_raw_arrow_candidate_plan_rejects_duplicate_signature_ids(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     duplicate_signatures = pa.table(
         {
@@ -1004,8 +985,6 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_signature_ids(tmp_path: Path
 
 
 def test_raw_arrow_candidate_plan_rejects_integer_signature_id_column(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     integer_id_signatures = pa.table(
         {
@@ -1030,8 +1009,6 @@ def test_raw_arrow_candidate_plan_rejects_integer_signature_id_column(tmp_path: 
 
 
 def test_raw_arrow_candidate_plan_rejects_duplicate_paper_ids(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     duplicate_papers = pa.table(
         {
@@ -1049,8 +1026,6 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_paper_ids(tmp_path: Path) ->
 
 
 def test_raw_arrow_candidate_plan_rejects_integer_predicted_language_column(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     malformed_papers = pa.table(
         {
@@ -1069,8 +1044,6 @@ def test_raw_arrow_candidate_plan_rejects_integer_predicted_language_column(tmp_
 
 
 def test_raw_arrow_candidate_plan_rejects_duplicate_paper_author_positions(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     duplicate_authors = pa.table(
         {
@@ -1086,8 +1059,6 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_paper_author_positions(tmp_p
 
 
 def test_raw_arrow_candidate_plan_rejects_null_paper_author_name(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     null_author_name = pa.table(
         {
@@ -1103,8 +1074,6 @@ def test_raw_arrow_candidate_plan_rejects_null_paper_author_name(tmp_path: Path)
 
 
 def test_raw_arrow_candidate_plan_rejects_string_paper_author_position(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     string_position = pa.table(
         {
@@ -1120,8 +1089,6 @@ def test_raw_arrow_candidate_plan_rejects_string_paper_author_position(tmp_path:
 
 
 def test_raw_arrow_candidate_plan_rejects_invalid_cluster_seed_rows(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     idempotent_duplicate_seeds = pa.table(
         {
@@ -1165,8 +1132,6 @@ def test_raw_arrow_candidate_plan_rejects_invalid_cluster_seed_rows(tmp_path: Pa
 
 
 def test_raw_arrow_candidate_plan_rejects_integer_is_reliable_column(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     malformed_papers = pa.table(
         {
@@ -1185,8 +1150,6 @@ def test_raw_arrow_candidate_plan_rejects_integer_is_reliable_column(tmp_path: P
 
 
 def test_raw_arrow_candidate_plan_rejects_duplicate_cluster_seed_disallows(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     duplicate_disallows = pa.table(
         {
@@ -1201,8 +1164,6 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_cluster_seed_disallows(tmp_p
 
 
 def test_raw_arrow_candidate_plan_rejects_empty_cluster_seed_disallow_endpoint(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     empty_endpoint = pa.table(
         {
@@ -1217,8 +1178,6 @@ def test_raw_arrow_candidate_plan_rejects_empty_cluster_seed_disallow_endpoint(t
 
 
 def test_raw_arrow_candidate_plan_rejects_duplicate_specter_paper_ids(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     specter = pa.table(
         {
@@ -1236,8 +1195,6 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_specter_paper_ids(tmp_path: 
 
 
 def test_raw_arrow_candidate_plan_rejects_null_specter_embedding(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     specter = pa.table(
         {
@@ -1255,8 +1212,6 @@ def test_raw_arrow_candidate_plan_rejects_null_specter_embedding(tmp_path: Path)
 
 
 def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     with pytest.raises(ValueError, match="filtered full scan"):
@@ -1287,8 +1242,6 @@ def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tm
 
 
 def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
@@ -1338,8 +1291,6 @@ def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> 
 
 
 def test_raw_arrow_candidate_plan_orcid_override_returns_all_matches(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s_good", "s_middle", "s_year", "s_none"], type=pa.string()),
@@ -1406,8 +1357,6 @@ def test_raw_arrow_candidate_plan_orcid_override_returns_all_matches(tmp_path: P
 
 
 def test_raw_arrow_candidate_plan_orcid_override_is_exempt_from_seed_disallows(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s_good", "s_other"], type=pa.string()),
@@ -1479,8 +1428,6 @@ def test_raw_arrow_candidate_plan_orcid_override_is_exempt_from_seed_disallows(t
 def test_raw_arrow_candidate_plan_missing_query_position_has_no_coauthor_overlap(
     tmp_path: Path,
 ) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s_self", "s_real"], type=pa.string()),
@@ -1541,8 +1488,6 @@ def test_raw_arrow_candidate_plan_missing_query_position_has_no_coauthor_overlap
 
 
 def test_raw_arrow_candidate_plan_matches_multi_query_auto_views_and_specter(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q_full", "q_initial", "s_full", "s_initial", "s_other"], type=pa.string()),
@@ -1765,8 +1710,6 @@ def test_raw_arrow_candidate_plan_matches_multi_query_auto_views_and_specter(tmp
 
 
 def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metadata(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s1", "s2"], type=pa.string()),
@@ -1843,8 +1786,6 @@ def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metada
 
 
 def test_raw_arrow_candidate_plan_rejects_null_paper_author_position(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paper_authors = pa.table(
         {
@@ -1867,8 +1808,6 @@ def test_raw_arrow_candidate_plan_rejects_null_paper_author_position(tmp_path: P
 
 
 def test_raw_arrow_candidate_plan_rejects_null_string_list_elements(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     signatures = pa.table(
         {
@@ -1897,8 +1836,6 @@ def test_raw_arrow_candidate_plan_rejects_null_string_list_elements(tmp_path: Pa
 
 
 def test_raw_arrow_candidate_plan_rejects_nonempty_null_list_child(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     signatures = pa.table(
         {
@@ -1927,8 +1864,6 @@ def test_raw_arrow_candidate_plan_rejects_nonempty_null_list_child(tmp_path: Pat
 
 
 def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     raw_plan = _raw_candidate_plan_arrow(
@@ -2077,8 +2012,6 @@ def test_raw_arrow_labeled_candidate_plan_initial_view_keeps_full_first_token(tm
 
 
 def test_raw_arrow_candidate_plan_initial_view_keeps_full_first_token(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     raw_plan = _raw_candidate_plan_arrow(
@@ -2136,8 +2069,6 @@ def test_raw_arrow_labeled_candidate_plan_applies_block_local_members(tmp_path: 
 
 
 def test_raw_arrow_candidate_plan_bridge_maps_compact_numeric_indices(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
 
     raw_plan = _raw_candidate_plan_arrow(
@@ -2173,8 +2104,6 @@ def test_raw_arrow_candidate_plan_bridge_maps_compact_numeric_indices(tmp_path: 
 
 
 def test_raw_arrow_candidate_plan_rejects_name_counts_arrow_without_index(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["name_counts"] = _write_ipc(
         tmp_path / "name_counts.arrow",
@@ -2217,8 +2146,6 @@ def test_raw_arrow_candidate_plan_rejects_name_counts_index_dir_alias(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["name_counts"] = _write_ipc(
         tmp_path / "name_counts.arrow",
@@ -2247,8 +2174,6 @@ def test_raw_arrow_candidate_plan_emits_native_row_signals_from_name_counts_inde
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
-        raise pytest.skip.Exception("RawBlockQueryCandidatePlanner is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index", monkeypatch)
 
@@ -2294,8 +2219,6 @@ def test_raw_arrow_candidate_plan_emits_native_row_signals_from_name_counts_inde
 
 
 def test_rust_featurizer_from_arrow_paths_applies_cluster_seed_disallows(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     raw_plan = _raw_candidate_plan_arrow(
         paths,
@@ -2339,8 +2262,6 @@ def test_rust_featurizer_missing_name_counts_presence_is_consistent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     signature_ids = ["q1", "s1", "s2"]
 
@@ -2378,8 +2299,6 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     index_paths = _base_arrow_paths(tmp_path / "index")
     index_paths["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index_artifact", monkeypatch)
     arrow_paths = _base_arrow_paths(tmp_path / "arrow")
@@ -2476,8 +2395,6 @@ def test_rust_featurizer_rejects_unsorted_name_counts_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index_artifact", monkeypatch)
     _swap_first_two_name_count_records(paths["name_counts_index"], "first")
@@ -2497,8 +2414,6 @@ def test_rust_featurizer_rejects_unsorted_name_counts_index(
 
 
 def test_rust_featurizer_from_arrow_paths_uses_arrow_name_pairs(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s1"], type=pa.string()),
@@ -2571,8 +2486,6 @@ def test_rust_featurizer_from_arrow_paths_uses_arrow_name_pairs(tmp_path: Path) 
 
 
 def test_rust_featurizer_from_arrow_paths_rejects_integer_name_pairs(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
-        raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
     paths["name_pairs"] = _write_ipc(
         tmp_path / "name_pairs.arrow",

@@ -1373,7 +1373,6 @@ def test_arrow_path_discovery_uses_original_signature_path_after_filtering(tmp_p
     resolved = model_module._resolve_dataset_arrow_paths(
         dataset,
         require_specter=True,
-        require_cluster_seeds=False,
     )
 
     assert resolved == {

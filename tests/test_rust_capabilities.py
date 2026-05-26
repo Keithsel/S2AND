@@ -5,7 +5,7 @@ from typing import Any, cast
 import numpy as np
 import pytest
 
-import s2and.rust_capabilities as rust_capabilities
+import s2and.runtime as rust_capabilities
 
 
 def _missing_module(name: str) -> ModuleNotFoundError:
@@ -23,13 +23,6 @@ def _make_core_rust_featurizer(*, supports_from_dataset_paper_preprocess: bool =
         @staticmethod
         def from_dataset(*args, **kwargs):
             return None
-
-        @staticmethod
-        def from_json_paths(*args, **kwargs):
-            return None
-
-        def json_ingest_telemetry(self):
-            return {}
 
         def signature_ids(self):
             return []
@@ -130,10 +123,6 @@ def test_detect_rust_runtime_capabilities_requires_core_markers():
     class MissingMarkerRustFeaturizer:
         @staticmethod
         def from_dataset(*args, **kwargs):
-            return None
-
-        @staticmethod
-        def from_json_paths(*args, **kwargs):
             return None
 
     class Module:

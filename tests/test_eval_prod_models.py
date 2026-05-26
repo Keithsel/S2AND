@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -310,6 +311,35 @@ def test_resolve_arrow_dataset_paths_rejects_bad_manifest_name_counts_index(tmp_
         eval_prod_models.resolve_arrow_dataset_paths(str(tmp_path / "arrow"), "dummy", "_specter.pickle")
 
 
+def test_resolve_arrow_dataset_paths_supports_repo_relative_manifest_name_counts_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset_root = tmp_path / "arrow" / "dummy"
+    dataset_root.mkdir(parents=True)
+    index_root = tmp_path / "repo" / "s2and" / "data" / "name_counts_index"
+    patch_tiny_name_counts_loader(monkeypatch)
+    write_name_counts_index(index_root.parent)
+    for filename in (
+        "signatures.arrow",
+        "papers.arrow",
+        "paper_authors.arrow",
+        "specter.arrow",
+        "dummy_clusters.json",
+    ):
+        (dataset_root / filename).touch()
+    _touch_eval_batch_indexes(dataset_root)
+    (dataset_root / "manifest.json").write_text(
+        json.dumps({"paths": {"name_counts_index": "s2and/data/name_counts_index"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path / "repo")
+
+    resolved = eval_prod_models.resolve_arrow_dataset_paths(str(tmp_path / "arrow"), "dummy", "_specter.pickle")
+
+    assert resolved["name_counts_index"] == str(index_root.resolve())
+
+
 def test_cluster_eval_arrow_passes_name_counts_index_and_batch_indexes(monkeypatch) -> None:
     captured: dict[str, Any] = {}
 
@@ -349,6 +379,84 @@ def test_cluster_eval_arrow_passes_name_counts_index_and_batch_indexes(monkeypat
     assert captured["arrow_paths"]["name_counts_index"] == "name_counts_index"
     assert captured["arrow_paths"]["signatures_batch_index"] == "signatures.signatures_batch_index.bin"
     assert "clusters" not in captured["arrow_paths"]
+
+
+def test_eval_main_use_arrow_calls_arrow_eval_without_anddata(monkeypatch: pytest.MonkeyPatch) -> None:
+    import s2and.data as data_module
+    import s2and.production_model as production_model
+
+    captured: dict[str, Any] = {}
+
+    class RaisingANDData:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("ANDData should not be constructed for --use-arrow eval")
+
+    def fake_cluster_eval_arrow(arrow_paths: dict[str, str], clusterer: Any, **kwargs: Any):
+        captured["arrow_paths"] = dict(arrow_paths)
+        captured["clusterer"] = clusterer
+        captured["kwargs"] = dict(kwargs)
+        return {"B3 (P, R, F1)": (1.0, 1.0, 1.0)}, {}
+
+    monkeypatch.setattr(data_module, "ANDData", RaisingANDData)
+    monkeypatch.setattr(eval_prod_models, "first_missing_arrow_dataset_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        eval_prod_models,
+        "resolve_arrow_dataset_paths",
+        lambda arrow_root, dataset_name, specter_suffix: {
+            "dataset": dataset_name,
+            "specter_suffix": specter_suffix,
+            "root": arrow_root,
+        },
+    )
+    monkeypatch.setattr(eval_prod_models, "cluster_eval_arrow", fake_cluster_eval_arrow)
+    monkeypatch.setattr(
+        production_model,
+        "load_production_model",
+        lambda model_path: SimpleNamespace(model_path=model_path),
+    )
+    monkeypatch.setattr(eval_prod_models.os.path, "exists", lambda _path: True)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_prod_models.py",
+            "--dataset",
+            "mini",
+            "--datasets",
+            "pubmed",
+            "--specter-suffixes",
+            "_specter2.pkl",
+            "--use-arrow",
+            "--arrow-data-root",
+            "arrow-root",
+            "--n_jobs",
+            "1",
+        ],
+    )
+
+    eval_prod_models.main()
+
+    assert captured["arrow_paths"] == {
+        "dataset": "pubmed",
+        "specter_suffix": "_specter2.pkl",
+        "root": "arrow-root",
+    }
+    assert captured["kwargs"]["n_jobs"] == 1
+    assert captured["kwargs"]["random_seed"] == 1
+
+
+def test_eval_main_use_arrow_rejects_train(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["eval_prod_models.py", "--dataset", "mini", "--use-arrow", "--train"])
+
+    with pytest.raises(ValueError, match="cannot be combined with --train"):
+        eval_prod_models.main()
+
+
+def test_eval_main_use_arrow_rejects_unsupported_dataset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["eval_prod_models.py", "--dataset", "inventors_s2and", "--use-arrow"])
+
+    with pytest.raises(ValueError, match="supports --dataset mini and --dataset full only"):
+        eval_prod_models.main()
 
 
 def test_construct_cluster_to_signatures_reports_missing_assignments() -> None:

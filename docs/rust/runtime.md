@@ -48,8 +48,7 @@ Python path remains available via explicit backend and stage overrides at any ti
   - If Rust core capability is unavailable: resolve to Python.
   - If Rust core capability is available: resolve to Rust.
 - Invalid values raise `ValueError`.
-- Capability detection is centralized in `s2and/runtime.py`; `s2and/rust_capabilities.py`
-  is a compatibility delegation layer.
+- Capability detection is centralized in `s2and/runtime.py`.
 - Core runtime capability requires extension importability plus the current
   Rust markers used by production Arrow paths: direct Arrow ingest, indexed
   featurization, constraints, seed updates, and name-count index support.

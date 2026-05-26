@@ -1598,7 +1598,7 @@ def _sorted_subblock_merge_candidates(
 
 
 def _rust_arrow_subblocking_callable():
-    from s2and.rust_capabilities import load_s2and_rust_extension
+    from s2and.runtime import load_s2and_rust_extension
 
     rust_module = load_s2and_rust_extension()
     return None if rust_module is None else getattr(rust_module, "make_subblocks_with_telemetry_arrow", None)

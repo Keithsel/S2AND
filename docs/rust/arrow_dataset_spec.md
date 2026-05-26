@@ -88,16 +88,16 @@ Notes:
   Hand-authored artifacts can omit it when the request has no seed disallows;
   converters may emit an empty table instead. An explicit path must exist when
   present.
-- When using `write_feature_block_arrow_from_anddata(...)` to publish physical
+- When using `scripts.arrow_conversion_helpers.write_feature_block_arrow_from_anddata(...)` to publish physical
   seeded/incremental seed sidecars, pass `include_empty_cluster_seeds=True` so
   empty seed/disallow tables are still emitted.
 - `altered_cluster_signatures.arrow` is required for incremental datasets whose
   seed clusters include altered claimed profiles. When an in-memory
   `ANDData.altered_cluster_signatures` request value is present it is
   authoritative; otherwise the Arrow file is the producer-owned request
-  artifact for this condition. `altered_cluster_signatures.txt` is still
-  supported as a compatibility fallback for older fixtures and ANDData-compatible
-  tooling.
+  artifact for this condition. `altered_cluster_signatures.txt` is not a valid
+  production Arrow sidecar; it remains only for older fixtures and
+  ANDData-compatible training tooling.
 - `<dataset>_clusters.json` is ground truth for offline evaluation only. It is
   not part of production inference scoring.
 - `specter.arrow` is the SPECTER v1 embedding table. `specter2.arrow` is the
@@ -119,7 +119,7 @@ the path mapping should use these keys:
 | `specter` | Path to the embedding table selected for the current model, even if the file is physically named `specter2.arrow` |
 | `cluster_seeds` | Optional path to `cluster_seeds.arrow` for incremental/seeded prediction; required only when this sidecar is the seed source |
 | `cluster_seed_disallows` | Optional path to `cluster_seed_disallows.arrow` for pairwise seed disallow constraints |
-| `altered_cluster_signatures` | Path to `altered_cluster_signatures.arrow` when altered claimed profiles are present; text fallback is accepted for legacy callers |
+| `altered_cluster_signatures` | Path to `altered_cluster_signatures.arrow` when altered claimed profiles are present |
 | `clusters` | Path to eval-only ground-truth clusters JSON |
 | `name_counts_index` | Required manifest-declared shared/global name-count index directory when the selected model uses `name_counts` |
 | `name_counts` | Optional long-form Arrow name-count table for generation/inspection/parity, not preferred on the hot path |
@@ -188,7 +188,7 @@ serving location.
 Every script that produces S2AND runtime Arrow artifacts should use the shared
 writers instead of open-coding the table or sidecar formats:
 
-- `write_feature_block_arrow_from_anddata(...)` or
+- `scripts.arrow_conversion_helpers.write_feature_block_arrow_from_anddata(...)` or
   `write_feature_block_arrow_tables(...)` for semantic Arrow IPC tables.
 - `write_raw_arrow_batch_lookup_indexes(...)` after the final table write for
   raw-planner sidecars.
@@ -234,9 +234,9 @@ Rows must match the values that S2AND would expose after normal preprocessing:
 - `name_counts_last_first_initial_semantics="initial_char"`
 - `name_counts_index/` available when the selected model uses name-count features
 
-Use the existing `FeatureBlock` writer as the reference implementation for table
-values and Arrow physical layout:
-`s2and.incremental_linking.feature_block.write_feature_block_arrow_from_anddata`.
+Use the script-only `FeatureBlock` conversion writer as the reference
+implementation for table values and Arrow physical layout:
+`scripts.arrow_conversion_helpers.write_feature_block_arrow_from_anddata`.
 That writer returns table paths and does not write `manifest.json`; manifests
 are producer-owned. `scripts/convert_to_arrow.py` is the reference producer for
 deployable manifest shape and current batch-index sidecars.
@@ -383,8 +383,8 @@ the claimed seed components that need altered-profile pre-splitting.
 `signature_id` values must be unique.
 
 `altered_cluster_signatures.txt` with one signature id per line is still
-supported by the Python runtime for older fixtures and ANDData-compatible
-tooling, but new production Arrow producers should emit the Arrow table.
+supported by the Python runtime only through legacy ANDData/training inputs.
+Production Arrow path mappings must point at the Arrow table.
 
 ### `<dataset>_clusters.json`
 

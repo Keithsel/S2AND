@@ -58,7 +58,7 @@ _DEFER_RUST_JSON_INGEST_WRITE_MODES: frozenset[RustLifecycleMode] = frozenset(
 
 @dataclass(frozen=True)
 class RustJsonIngestContract:
-    """Canonical inference ingest contract for RustFeaturizer.from_json_paths."""
+    """Compatibility JSON ingest contract for RustFeaturizer.from_json_paths."""
 
     signatures_path: str
     papers_path: str
@@ -116,7 +116,7 @@ def build_rust_json_ingest_contract(
 
 @dataclass(frozen=True)
 class RustLifecyclePolicy:
-    """Frozen canonical Rust lifecycle decision for a dataset."""
+    """Frozen compatibility/training Rust lifecycle decision for a dataset."""
 
     mode: RustLifecycleMode
 

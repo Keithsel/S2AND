@@ -15,6 +15,7 @@ from typing import Any, cast
 
 import numpy as np
 
+from s2and.arrow_inputs import normalize_arrow_paths
 from s2and.incremental_linking.feature_block_contract import (
     FeatureBlock,
     FeatureBlockPaper,
@@ -199,17 +200,6 @@ def cluster_seed_disallows_from_arrow_paths(arrow_paths: Mapping[str, Any] | Non
     return set(read_cluster_seed_disallows_arrow(path))
 
 
-def _stringified_arrow_paths(paths: Mapping[Any, Any], *, omit_none: bool = False) -> dict[str, str]:
-    stringified: dict[str, str] = {}
-    for key, value in paths.items():
-        if value is None:
-            if omit_none:
-                continue
-            raise ValueError(f"Arrow path for {key!r} is None")
-        stringified[str(key)] = str(value)
-    return stringified
-
-
 @contextmanager
 def temporary_arrow_paths_with_cluster_seeds(
     arrow_paths: Mapping[str, Any],
@@ -221,7 +211,7 @@ def temporary_arrow_paths_with_cluster_seeds(
 ) -> Iterator[dict[str, str]]:
     """Yield Arrow paths with request-scoped cluster-seed sidecars."""
 
-    paths = _stringified_arrow_paths(arrow_paths)
+    paths = normalize_arrow_paths(arrow_paths)
     if (
         reuse_existing_cluster_seeds_when_empty
         and not cluster_seeds_require
@@ -401,11 +391,17 @@ def read_arrow_batch_lookup_index_batch_indices(
             f"key_column={key_column!r}"
         )
     source_fingerprint = _source_file_sample_fingerprint(arrow_path_obj)
-    if int(header["source_size"]) != source_stat.st_size or int(header["source_fingerprint"]) != source_fingerprint:
+    if (
+        int(header["source_size"]) != source_stat.st_size
+        or int(header["source_mtime_ns"]) != source_stat.st_mtime_ns
+        or int(header["source_fingerprint"]) != source_fingerprint
+    ):
         raise ValueError(
             f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': "
-            f"indexed size/fingerprint=({int(header['source_size'])}, {int(header['source_fingerprint'])}) "
-            f"current size/fingerprint=({source_stat.st_size}, {source_fingerprint})"
+            "indexed size/mtime/fingerprint="
+            f"({int(header['source_size'])}, {int(header['source_mtime_ns'])}, "
+            f"{int(header['source_fingerprint'])}) current size/mtime/fingerprint="
+            f"({source_stat.st_size}, {source_stat.st_mtime_ns}, {source_fingerprint})"
         )
     record_count = int(header["record_count"])
     expected_len = (
@@ -430,6 +426,56 @@ def read_arrow_batch_lookup_index_batch_indices(
     return batch_indices
 
 
+def validate_arrow_batch_lookup_index(
+    arrow_path: str | Path,
+    index_path: str | Path,
+    *,
+    key_column: str,
+    expected_row_count: int | None = None,
+) -> dict[str, int | str]:
+    """Validate an existing batch lookup index without scanning Arrow record batches."""
+
+    arrow_path_obj = Path(arrow_path)
+    index_path_obj = Path(index_path)
+    header = _read_arrow_batch_lookup_index_header(index_path_obj)
+    source_stat = arrow_path_obj.stat()
+    key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
+    source_fingerprint = _source_file_sample_fingerprint(arrow_path_obj)
+    if int(header["key_column_hash"]) != key_column_hash:
+        raise ValueError(
+            f"Arrow batch lookup index '{index_path_obj!s}' was built for a different key column: "
+            f"indexed hash={int(header['key_column_hash'])} expected hash={key_column_hash} "
+            f"key_column={key_column!r}"
+        )
+    if (
+        int(header["source_size"]) != source_stat.st_size
+        or int(header["source_mtime_ns"]) != source_stat.st_mtime_ns
+        or int(header["source_fingerprint"]) != source_fingerprint
+    ):
+        raise ValueError(
+            f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': "
+            "indexed size/mtime/fingerprint="
+            f"({int(header['source_size'])}, {int(header['source_mtime_ns'])}, "
+            f"{int(header['source_fingerprint'])}) current size/mtime/fingerprint="
+            f"({source_stat.st_size}, {source_stat.st_mtime_ns}, {source_fingerprint})"
+        )
+    if expected_row_count is not None and int(header["record_count"]) != int(expected_row_count):
+        raise ValueError(
+            f"Arrow batch lookup index row count mismatch for {arrow_path_obj!s}: "
+            f"index has {int(header['record_count'])} records, expected {int(expected_row_count)}. "
+            "Rebuild it with overwrite=True."
+        )
+    return {
+        "schema_version": ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION,
+        "magic": str(header["magic"]),
+        "record_count": int(header["record_count"]),
+        "source_size": int(header["source_size"]),
+        "source_mtime_ns": int(header["source_mtime_ns"]),
+        "key_column_hash": int(header["key_column_hash"]),
+        "source_fingerprint": int(header["source_fingerprint"]),
+    }
+
+
 def write_arrow_batch_lookup_index(
     arrow_path: str | Path,
     index_path: str | Path,
@@ -451,6 +497,7 @@ def write_arrow_batch_lookup_index(
         key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
         if (
             int(index_header["source_size"]) != source_stat.st_size
+            or int(index_header["source_mtime_ns"]) != source_stat.st_mtime_ns
             or int(index_header["key_column_hash"]) != key_column_hash
             or int(index_header["source_fingerprint"]) != _source_file_sample_fingerprint(arrow_path_obj)
         ):
@@ -555,7 +602,7 @@ def write_raw_arrow_batch_lookup_indexes(
     """Write optional batch lookup indexes for raw Arrow planner inputs."""
 
     output_path = Path(output_dir) if output_dir is not None else None
-    indexed_paths = _stringified_arrow_paths(paths, omit_none=True)
+    indexed_paths = normalize_arrow_paths(paths, omit_none=True)
     metrics: dict[str, dict[str, int | str | bool]] = {}
     for arrow_key, key_column in RAW_PLANNER_ARROW_KEY_COLUMNS.items():
         arrow_value = paths.get(arrow_key)

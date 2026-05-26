@@ -7,16 +7,19 @@ current S2AND raw-planner batch-index sidecars (S2ABI001).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import pickle
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +28,8 @@ import numpy as np
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+from s2and.arrow_inputs import require_name_counts_index_artifact  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +100,37 @@ def _manifest_relative_path(path_value: Any, manifest_dir: Path) -> str:
 
 def _portable_manifest_paths(paths: Mapping[str, Any], manifest_dir: Path) -> dict[str, str]:
     return {str(key): _manifest_relative_path(value, manifest_dir) for key, value in paths.items()}
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as infile:
+        for chunk in iter(lambda: infile.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_output(args: Sequence[str]) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=_PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
+            timeout=5,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    return completed.stdout.strip()
+
+
+def _git_commit_metadata() -> dict[str, Any]:
+    status = _git_output(["status", "--porcelain"])
+    return {
+        "git_commit": _git_output(["rev-parse", "HEAD"]),
+        "git_dirty": None if status is None else bool(status),
+    }
 
 
 class _RootManifestLock:
@@ -223,7 +259,7 @@ def _remove_dead_pid_lock(path: Path) -> bool:
     return True
 
 
-def _root_manifest_entries(root_manifest_path: Path, dataset_name: str) -> list[dict[str, str]]:
+def _root_manifest_entries(root_manifest_path: Path, dataset_name: str) -> list[dict[str, Any]]:
     if not root_manifest_path.exists():
         return []
     try:
@@ -252,7 +288,7 @@ def _validate_existing_root_manifest(root_manifest_path: Path) -> None:
 def _root_manifest_entries_from_manifest(
     root_manifest: Mapping[str, Any],
     root_manifest_path: Path,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     if root_manifest.get("schema") == ROOT_MANIFEST_SCHEMA:
         raw_entries = root_manifest.get("dataset_manifests")
         if not isinstance(raw_entries, Sequence) or isinstance(raw_entries, str | bytes):
@@ -266,8 +302,8 @@ def _root_manifest_entries_from_manifest(
     return entries
 
 
-def _validated_root_manifest_entries(raw_entries: Any, root_manifest_path: Path) -> list[dict[str, str]]:
-    entries: list[dict[str, str]] = []
+def _validated_root_manifest_entries(raw_entries: Any, root_manifest_path: Path) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
     for index, raw_entry in enumerate(raw_entries):
         if not isinstance(raw_entry, Mapping):
             raise ValueError(
@@ -281,14 +317,178 @@ def _validated_root_manifest_entries(raw_entries: Any, root_manifest_path: Path)
             raise ValueError(
                 f"existing root manifest dataset_manifests[{index}] is missing manifest_path: {root_manifest_path}"
             )
-        entries.append(
-            {
-                "dataset": str(raw_entry["dataset"]),
-                "dataset_dir": str(raw_entry.get("dataset_dir", "")),
-                "manifest_path": str(raw_entry["manifest_path"]),
-            }
-        )
+        entry = dict(raw_entry)
+        entry["dataset"] = str(raw_entry["dataset"])
+        entry["dataset_dir"] = str(raw_entry.get("dataset_dir", ""))
+        entry["manifest_path"] = str(raw_entry["manifest_path"])
+        entries.append(entry)
     return entries
+
+
+def _entry_manifest_path(output_root: Path, entry: Mapping[str, Any]) -> Path:
+    return _resolve_manifest_path(entry["manifest_path"], output_root)
+
+
+def _int_manifest_value(manifest: Mapping[str, Any], key: str) -> int:
+    value = manifest.get(key, 0)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _optional_int_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_int_value(*values: Any) -> int:
+    for value in values:
+        parsed = _optional_int_value(value)
+        if parsed is not None:
+            return parsed
+    return 0
+
+
+def _specter_report_row_count(manifest: Mapping[str, Any]) -> int | None:
+    reports = manifest.get("specter")
+    if not isinstance(reports, Mapping):
+        return None
+    preferred_keys = ("specter2", "specter")
+    for key in preferred_keys:
+        report = reports.get(key)
+        if isinstance(report, Mapping):
+            row_count = _optional_int_value(report.get("row_count"))
+            if row_count is not None:
+                return row_count
+    for report in reports.values():
+        if isinstance(report, Mapping):
+            row_count = _optional_int_value(report.get("row_count"))
+            if row_count is not None:
+                return row_count
+    return None
+
+
+def _validation_requirements_from_manifest(manifest: Mapping[str, Any]) -> dict[str, bool]:
+    paths = manifest.get("paths", {})
+    path_map = paths if isinstance(paths, Mapping) else {}
+    return {
+        "require_embeddings": bool(path_map.get("specter") or path_map.get("specter2")),
+        "require_name_counts_index": bool(path_map.get("name_counts_index")),
+    }
+
+
+def _dataset_manifest_audit(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    paths = manifest.get("paths", {})
+    path_keys = set(paths) if isinstance(paths, Mapping) else set()
+    validation = manifest.get("validation", {})
+    validation_map = validation if isinstance(validation, Mapping) else {}
+    physical_layout = manifest.get("physical_layout", {})
+    physical_tables = physical_layout.get("tables", {}) if isinstance(physical_layout, Mapping) else {}
+    batch_index_count = sum(1 for key in path_keys if str(key).endswith("_batch_index"))
+    if isinstance(physical_tables, Mapping):
+        batch_index_count = max(
+            batch_index_count,
+            sum(
+                1
+                for layout in physical_tables.values()
+                if isinstance(layout, Mapping) and layout.get("batch_index_present")
+            ),
+        )
+    sidecar_keys = sorted(
+        key
+        for key in path_keys
+        if str(key).endswith("_batch_index")
+        or str(key) in {"cluster_seeds", "cluster_seed_disallows", "altered_cluster_signatures", "name_counts_index"}
+    )
+    return {
+        "conversion_kind": manifest.get("conversion_kind"),
+        "source_id": manifest.get("source_path") or manifest.get("source_dir"),
+        "signature_count": _int_manifest_value(manifest, "signature_count"),
+        "paper_count": _int_manifest_value(manifest, "paper_count"),
+        "embedding_row_count": _first_int_value(
+            validation_map.get("specter_count"),
+            manifest.get("paper_embedding_count"),
+            _specter_report_row_count(manifest),
+        ),
+        "cluster_seed_count": _first_int_value(
+            validation_map.get("cluster_seed_count"),
+            manifest.get("cluster_seeds_require_count"),
+        ),
+        "cluster_seed_disallow_count": _first_int_value(
+            validation_map.get("cluster_seed_disallow_count"),
+            manifest.get("cluster_seeds_disallow_count"),
+        ),
+        "altered_cluster_signature_count": _first_int_value(
+            validation_map.get("altered_cluster_signature_count"),
+            manifest.get("altered_cluster_signature_count"),
+        ),
+        "missing_embedding_count": _first_int_value(validation_map.get("missing_specter_paper_count")),
+        "batch_index_count": int(batch_index_count),
+        "sidecar_keys": sidecar_keys,
+        "validation_present": bool(validation_map),
+    }
+
+
+def _enrich_root_manifest_entry(output_root: Path, entry: Mapping[str, Any]) -> dict[str, Any]:
+    enriched = dict(entry)
+    manifest_path = _entry_manifest_path(output_root, entry)
+    if not manifest_path.exists():
+        enriched["manifest_exists"] = False
+        return enriched
+    enriched["manifest_exists"] = True
+    manifest_stat = manifest_path.stat()
+    enriched["manifest_size_bytes"] = int(manifest_stat.st_size)
+    enriched["manifest_sha256"] = _file_sha256(manifest_path)
+    manifest = _load_json(manifest_path)
+    if not isinstance(manifest, Mapping):
+        raise TypeError(f"dataset manifest must contain an object: {manifest_path}")
+    enriched["audit"] = _dataset_manifest_audit(manifest)
+    enriched["validation_requirements"] = _validation_requirements_from_manifest(manifest)
+    return enriched
+
+
+def _root_manifest_audit(dataset_manifests: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    datasets_with_missing_manifests = [
+        str(entry["dataset"]) for entry in dataset_manifests if not bool(entry.get("manifest_exists", False))
+    ]
+    audits: list[Mapping[str, Any]] = []
+    for entry in dataset_manifests:
+        audit = entry.get("audit")
+        if isinstance(audit, Mapping):
+            audits.append(audit)
+    return {
+        "dataset_count": len(dataset_manifests),
+        "datasets_with_missing_manifests": datasets_with_missing_manifests,
+        "total_signature_count": sum(int(audit.get("signature_count", 0) or 0) for audit in audits),
+        "total_paper_count": sum(int(audit.get("paper_count", 0) or 0) for audit in audits),
+        "total_embedding_row_count": sum(int(audit.get("embedding_row_count", 0) or 0) for audit in audits),
+        "total_missing_embedding_count": sum(int(audit.get("missing_embedding_count", 0) or 0) for audit in audits),
+        "total_batch_index_count": sum(int(audit.get("batch_index_count", 0) or 0) for audit in audits),
+    }
+
+
+def _root_manifest_validation_commands(dataset_manifests: Sequence[Mapping[str, Any]]) -> list[str]:
+    commands = []
+    for entry in dataset_manifests:
+        if not bool(entry.get("manifest_exists", False)):
+            continue
+        dataset_dir = str(entry.get("dataset_dir") or "").replace("\\", "/")
+        if not dataset_dir:
+            continue
+        command_parts = ["uv run python scripts/convert_to_arrow.py validate", f"--dataset-dir {dataset_dir}"]
+        requirements = entry.get("validation_requirements")
+        if isinstance(requirements, Mapping):
+            if requirements.get("require_embeddings"):
+                command_parts.append("--require-embeddings")
+            if requirements.get("require_name_counts_index"):
+                command_parts.append("--require-name-counts-index")
+        commands.append(" ".join(command_parts))
+    return commands
 
 
 def _upsert_root_manifest(output_root: Path, *, dataset_name: str, dataset_dir: Path) -> None:
@@ -304,13 +504,22 @@ def _upsert_root_manifest(output_root: Path, *, dataset_name: str, dataset_dir: 
             }
         )
         dataset_manifests.sort(key=lambda entry: entry["dataset"])
+        enriched_dataset_manifests = [_enrich_root_manifest_entry(output_root, entry) for entry in dataset_manifests]
         _replace_json(
             root_manifest_path,
             {
                 "schema": ROOT_MANIFEST_SCHEMA,
                 "output_root": str(output_root),
-                "datasets": [entry["dataset"] for entry in dataset_manifests],
-                "dataset_manifests": dataset_manifests,
+                "generated_at_utc": datetime.now(UTC).isoformat(),
+                "generator": {
+                    "script": "scripts/convert_to_arrow.py",
+                    **_git_commit_metadata(),
+                },
+                "datasets": [entry["dataset"] for entry in enriched_dataset_manifests],
+                "dataset_manifests": enriched_dataset_manifests,
+                "audit": _root_manifest_audit(enriched_dataset_manifests),
+                "validation_command_cwd": str(output_root),
+                "validation_commands": _root_manifest_validation_commands(enriched_dataset_manifests),
             },
         )
 
@@ -630,10 +839,10 @@ def convert_service_json_to_arrow(
         FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION,
         raw_planner_arrow_physical_layout,
         write_arrow_ipc_table,
-        write_feature_block_arrow_from_anddata,
         write_name_counts_index,
         write_raw_arrow_batch_lookup_indexes,
     )
+    from scripts.arrow_conversion_helpers import write_feature_block_arrow_from_anddata
 
     output_dir = output_root / dataset_name
     if output_dir.exists() and any(output_dir.iterdir()) and not overwrite:
@@ -797,10 +1006,10 @@ def convert_runtime_dataset_to_arrow(
     from s2and.incremental_linking.feature_block import (
         FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION,
         raw_planner_arrow_physical_layout,
-        write_feature_block_arrow_from_anddata,
         write_name_counts_index,
         write_raw_arrow_batch_lookup_indexes,
     )
+    from scripts.arrow_conversion_helpers import write_feature_block_arrow_from_anddata
 
     dataset_name = sources.dataset
     if output_dir.exists() and any(output_dir.iterdir()) and not overwrite:
@@ -1135,16 +1344,18 @@ def validate_arrow_dataset_manifest(
         metrics["altered_cluster_signature_count"] = int(altered.num_rows)
 
     if require_name_counts_index:
-        name_counts_manifest = Path(paths["name_counts_index"]) / "manifest.json"
-        if not name_counts_manifest.exists():
-            raise FileNotFoundError(f"name_counts_index manifest is missing: {name_counts_manifest}")
+        require_name_counts_index_artifact(
+            paths["name_counts_index"],
+            context="convert_to_arrow dataset validation",
+            producer_hint="rerun scripts/convert_to_arrow.py name-counts-index or rebuild the release bundle",
+        )
         metrics["name_counts_index_present"] = True
 
     physical_layout = manifest.get("physical_layout")
     if isinstance(physical_layout, Mapping):
         from s2and.incremental_linking.feature_block import (
             RAW_PLANNER_ARROW_KEY_COLUMNS,
-            write_arrow_batch_lookup_index,
+            validate_arrow_batch_lookup_index,
         )
 
         tables = physical_layout.get("tables", {})
@@ -1179,13 +1390,11 @@ def validate_arrow_dataset_manifest(
                     key_column = str(raw_layout.get("key") or RAW_PLANNER_ARROW_KEY_COLUMNS.get(table_key, ""))
                     if not key_column:
                         raise ValueError(f"physical_layout.tables.{table_name} is missing key for batch index")
-                    write_arrow_batch_lookup_index(
+                    validate_arrow_batch_lookup_index(
                         paths[table_key],
                         paths[index_key],
                         key_column=key_column,
-                        table_name=table_key,
-                        max_record_batch_rows=max_rows if max_rows > 0 else None,
-                        overwrite=False,
+                        expected_row_count=int(raw_layout["row_count"]) if "row_count" in raw_layout else None,
                     )
     return metrics
 

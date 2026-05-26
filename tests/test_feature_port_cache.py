@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 
 import s2and.feature_port as feature_port
-import s2and.rust_capabilities as rust_capabilities
+import s2and.runtime as runtime
 from s2and.arrow_inputs import MissingArrowArtifactError
 from s2and.data import ANDData, NameCounts
 from s2and.incremental_linking.feature_block import write_name_counts_index
@@ -794,7 +794,7 @@ def test_inference_without_json_paths_uses_from_dataset():
     assert DummyRustFeaturizer.from_json_created == []
 
 
-def test_json_ingest_routes_canonical_payload():
+def test_json_ingest_routes_compat_contract_payload():
     dataset = DummyDataset("inference_dataset", mode="inference")
     dataset.signatures_path = "signatures.json"
     dataset.papers_path = "papers.json"
@@ -1077,9 +1077,9 @@ def test_load_s2and_rust_extension_falls_back_from_namespace_package(monkeypatch
             return NativeExtension
         raise _missing_module(name)
 
-    monkeypatch.setattr(rust_capabilities.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(runtime.importlib, "import_module", fake_import_module)
 
-    loaded = rust_capabilities.load_s2and_rust_extension()
+    loaded = runtime.load_s2and_rust_extension()
     assert loaded is NativeExtension
 
 
@@ -1104,7 +1104,7 @@ def test_load_s2and_rust_extension_returns_first_valid_module(monkeypatch):
             return TopLevelModule
         raise _missing_module(name)
 
-    monkeypatch.setattr(rust_capabilities.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(runtime.importlib, "import_module", fake_import_module)
 
-    loaded = rust_capabilities.load_s2and_rust_extension()
+    loaded = runtime.load_s2and_rust_extension()
     assert loaded is TopLevelModule

@@ -57,6 +57,44 @@ def _resolve_dataset_file(data_root: str, dataset_name: str, preferred_name: str
     )
 
 
+def _select_input_route(
+    *,
+    requested_input_format: str,
+    dataset_name: str,
+    arrow_data_root: str,
+    specter_suffix: str,
+    batching_threshold: int | None,
+    desired_memory_use: int | None,
+    warm_rust_featurizer_before_predict: int,
+    resolve_arrow_dataset_paths,
+) -> tuple[str, dict[str, str] | None]:
+    """Resolve tutorial input routing without loading models or ANDData."""
+
+    input_format = requested_input_format
+    arrow_paths = None
+    if input_format in {"auto", "arrow"}:
+        try:
+            arrow_paths = resolve_arrow_dataset_paths(arrow_data_root, dataset_name, specter_suffix)
+        except FileNotFoundError:
+            if input_format == "arrow":
+                raise
+            input_format = "json"
+        else:
+            if input_format == "auto" and (batching_threshold is not None or desired_memory_use is not None):
+                input_format = "json"
+            else:
+                input_format = "arrow"
+
+    if input_format == "arrow":
+        if batching_threshold is not None or desired_memory_use is not None:
+            raise ValueError("--batching-threshold and --desired-memory-use are JSON/ANDData tutorial knobs")
+        if warm_rust_featurizer_before_predict:
+            raise ValueError("--warm-rust-featurizer-before-predict is only valid for JSON/ANDData input")
+        if arrow_paths is None:
+            raise RuntimeError("Arrow input selected without resolved Arrow paths")
+    return input_format, arrow_paths
+
+
 def _cluster_eval_with_predict_options(
     dataset,
     clusterer,
@@ -317,28 +355,18 @@ def main() -> None:
 
     cluster_metrics_all = []
     for dataset_name in datasets:
-        arrow_paths = None
-        input_format = args.input_format
-        if input_format in {"auto", "arrow"}:
-            try:
-                arrow_paths = resolve_arrow_dataset_paths(arrow_data_root, dataset_name, args.specter_suffix)
-            except FileNotFoundError:
-                if input_format == "arrow":
-                    raise
-                input_format = "json"
-            else:
-                if input_format == "auto" and (
-                    args.batching_threshold is not None or args.desired_memory_use is not None
-                ):
-                    input_format = "json"
-                else:
-                    input_format = "arrow"
+        input_format, arrow_paths = _select_input_route(
+            requested_input_format=args.input_format,
+            dataset_name=dataset_name,
+            arrow_data_root=arrow_data_root,
+            specter_suffix=args.specter_suffix,
+            batching_threshold=args.batching_threshold,
+            desired_memory_use=args.desired_memory_use,
+            warm_rust_featurizer_before_predict=args.warm_rust_featurizer_before_predict,
+            resolve_arrow_dataset_paths=resolve_arrow_dataset_paths,
+        )
 
         if input_format == "arrow":
-            if args.batching_threshold is not None or args.desired_memory_use is not None:
-                raise ValueError("--batching-threshold and --desired-memory-use are JSON/ANDData tutorial knobs")
-            if args.warm_rust_featurizer_before_predict:
-                raise ValueError("--warm-rust-featurizer-before-predict is only valid for JSON/ANDData input")
             if arrow_paths is None:
                 raise RuntimeError("Arrow input selected without resolved Arrow paths")
             cluster_metrics, _b3_metrics_per_signature = cluster_eval_arrow(

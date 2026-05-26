@@ -120,10 +120,10 @@ Fix during the blocked canonical migration (real-data findings)
   - `normalize_text(None)`, empty strings, digit-only strings, and punctuation-only strings can all become `""`.
   - During canonical migration, distinguish true missingness from normalized-empty nonmissing values where that matters
     for paper titles, venues, journals, and affiliation evidence. Any schema/cache change must be versioned.
-- Source identifiers are not text:
+  - Source identifiers are not text:
   - `source_author_ids`, MAG IDs, DBLP suffixes, ACM IDs, and ORCIDs must never use `normalize_text(...)`.
   - Python locations carrying source IDs: `s2and/incremental_linking/feature_block_contract.py`,
-    `s2and/incremental_linking/feature_block_bridges.py`, and
+    `scripts/arrow_conversion_helpers.py`, and
     `s2and/incremental_linking/feature_block_arrow.py`.
   - Rust raw Arrow/JSON contracts should preserve source IDs verbatim unless an identifier-specific canonicalizer is
     explicitly selected.

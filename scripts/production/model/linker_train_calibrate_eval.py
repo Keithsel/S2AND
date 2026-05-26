@@ -4043,7 +4043,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("from_json_paths", "from_dataset"),
         default=None,
         help=(
-            "Optional RustFeaturizer constructor override for minimal-raw-rust materialization. "
+            "Optional compatibility RustFeaturizer constructor override for minimal-raw-rust materialization. "
             "Defaults to the normal dataset lifecycle policy."
         ),
     )

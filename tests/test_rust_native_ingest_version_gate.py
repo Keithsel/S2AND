@@ -5,7 +5,7 @@ import json
 import pytest
 
 import s2and.feature_port as feature_port
-from s2and.rust_capabilities import detect_rust_runtime_capabilities
+from s2and.runtime import detect_rust_runtime_capabilities
 
 _capabilities = detect_rust_runtime_capabilities(extension_module=feature_port.s2and_rust)
 _skip_no_rust = pytest.mark.skipif(

@@ -82,8 +82,8 @@ is the reference bounded parity writer and follows the same table and sidecar
 helpers for temporary verification artifacts.
 
 New scripts that create S2AND runtime Arrow files should use
-`write_feature_block_arrow_from_anddata(...)` or
-`write_feature_block_arrow_tables(...)`, then call
+`scripts.arrow_conversion_helpers.write_feature_block_arrow_from_anddata(...)`
+or `write_feature_block_arrow_tables(...)`, then call
 `write_raw_arrow_batch_lookup_indexes(...)` when the artifact may be used by raw
 planning. Do not hand-write the batch-index binary format.
 

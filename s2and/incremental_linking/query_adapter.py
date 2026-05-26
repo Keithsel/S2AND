@@ -11,17 +11,13 @@ from typing import Any
 import numpy as np
 
 from s2and.data import ANDData
-from s2and.incremental_linking.feature_block import FeatureBlock
 from s2and.incremental_linking.gate_buckets import QueryView, normalize_query_views
 from s2and.incremental_linking.retrieval import LinkerRetrievalBatch
 from s2and.subblocking import signature_affiliation_feature_keys, signature_name_parts_for_subblocking
 from s2and.text import (
-    AFFILIATIONS_STOP_WORDS,
     compute_block,
-    get_text_ngrams_words,
     normalize_text,
     same_prefix_tokens,
-    split_first_middle_hyphen_aware,
 )
 from s2and.text import (
     name_counts as pairwise_name_counts,
@@ -127,17 +123,6 @@ class RustHybridCentroidRetrieverHandle:
 
     retriever: Any
     summary_by_component: dict[str, ClusterSummary]
-
-
-@dataclass(frozen=True)
-class FeatureBlockQueryContext:
-    """Precomputed lookup tables for repeated `FeatureBlock` query extraction."""
-
-    signatures_by_id: Mapping[str, Any]
-    papers_by_id: Mapping[str, Any]
-    author_records_by_paper: Mapping[str, tuple[tuple[int, str], ...]]
-    specter_by_paper: Mapping[str, np.ndarray]
-    feature_cache: dict[str, QueryFeatures]
 
 
 @dataclass(frozen=True)
@@ -264,173 +249,10 @@ def _signature_query_author(signature: Any) -> str:
     return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
 
 
-def _feature_block_paper_by_id(feature_block: FeatureBlock) -> dict[str, Any]:
-    return {paper.paper_id: paper for paper in feature_block.papers}
-
-
-def _feature_block_signature_by_id(feature_block: FeatureBlock) -> dict[str, Any]:
-    return {signature.signature_id: signature for signature in feature_block.signatures}
-
-
-def _feature_block_author_records_by_paper(feature_block: FeatureBlock) -> dict[str, tuple[tuple[int, str], ...]]:
-    rows: dict[str, list[tuple[int, str]]] = {}
-    for author in feature_block.paper_authors:
-        rows.setdefault(author.paper_id, []).append((int(author.position), normalize_text(author.author_name)))
-    return {paper_id: tuple(sorted(authors, key=lambda item: item[0])) for paper_id, authors in rows.items()}
-
-
-def _feature_block_specter_by_paper(feature_block: FeatureBlock) -> dict[str, np.ndarray]:
-    if feature_block.specter_embeddings is None:
-        return {}
-    return {
-        paper_id: np.ascontiguousarray(feature_block.specter_embeddings[index], dtype=np.float32)
-        for index, paper_id in enumerate(feature_block.specter_paper_ids)
-    }
-
-
-def build_feature_block_query_context(
-    feature_block: FeatureBlock,
-    *,
-    feature_cache: dict[str, QueryFeatures] | None = None,
-) -> FeatureBlockQueryContext:
-    """Build reusable lookup tables for repeated query extraction."""
-
-    return FeatureBlockQueryContext(
-        signatures_by_id=_feature_block_signature_by_id(feature_block),
-        papers_by_id=_feature_block_paper_by_id(feature_block),
-        author_records_by_paper=_feature_block_author_records_by_paper(feature_block),
-        specter_by_paper=_feature_block_specter_by_paper(feature_block),
-        feature_cache={} if feature_cache is None else feature_cache,
-    )
-
-
-def _feature_block_affiliation_terms(signature: Any) -> frozenset[str]:
-    if not signature.author_affiliations:
-        return EMPTY_STRING_SET
-    normalized = " ".join(normalize_text(value) for value in signature.author_affiliations)
-    tokens = [word for word in normalized.split() if word not in AFFILIATIONS_STOP_WORDS and len(word) > 1]
-    if not tokens:
-        return EMPTY_STRING_SET
-    return frozenset(get_text_ngrams_words(" ".join(tokens), stopwords=set()).keys())
-
-
-def _feature_block_author_records(
-    author_records_by_paper: Mapping[str, tuple[tuple[int, str], ...]],
-    paper_id: str,
-) -> tuple[tuple[int, str], ...]:
-    return author_records_by_paper.get(str(paper_id), ())
-
-
-def _feature_block_coauthor_blocks(
-    author_records_by_paper: Mapping[str, tuple[tuple[int, str], ...]],
-    *,
-    paper_id: str,
-    author_position: int | None,
-) -> frozenset[str]:
-    if author_position is None:
-        return EMPTY_STRING_SET
-    resolved_author_position = int(author_position)
-    return frozenset(
-        block
-        for position, author_name in _feature_block_author_records(author_records_by_paper, paper_id)
-        for block in (_safe_compute_block(author_name),)
-        if author_name and int(position) != resolved_author_position
-        if block
-    )
-
-
-def _feature_block_query_author(signature: Any) -> str:
-    parts = [
-        signature.author_first,
-        signature.author_middle,
-        signature.author_last,
-        signature.author_suffix,
-    ]
-    return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
-
-
 def _apply_orcid_feature_policy(features: QueryFeatures, *, orcid_enabled: bool) -> QueryFeatures:
     if orcid_enabled or features.orcid is None:
         return features
     return replace(features, orcid=None)
-
-
-def extract_query_features_from_feature_block(
-    feature_block: FeatureBlock,
-    signature_id: str,
-    *,
-    feature_cache: dict[str, QueryFeatures] | None = None,
-    query_context: FeatureBlockQueryContext | None = None,
-    orcid_enabled: bool = False,
-) -> QueryFeatures:
-    """Extract production query features directly from a `FeatureBlock`."""
-
-    signature_key = str(signature_id)
-    if query_context is None and feature_cache is not None and signature_key in feature_cache:
-        features = feature_cache[signature_key]
-    else:
-        context = query_context or build_feature_block_query_context(feature_block, feature_cache=feature_cache)
-        if signature_key in context.feature_cache:
-            features = context.feature_cache[signature_key]
-        else:
-            signature = context.signatures_by_id[signature_key]
-            paper = context.papers_by_id.get(signature.paper_id)
-            first, middle = split_first_middle_hyphen_aware(signature.author_first or "", signature.author_middle or "")
-            author_position = None if signature.author_position is None else int(signature.author_position)
-            author_records = _feature_block_author_records(context.author_records_by_paper, signature.paper_id)
-            paper_author_names = frozenset(name for _position, name in author_records if name)
-            local10_author_names = (
-                EMPTY_STRING_SET
-                if author_position is None
-                else frozenset(
-                    name
-                    for position, name in author_records
-                    if name and int(position) != author_position and abs(int(position) - author_position) <= 10
-                )
-            )
-            venue_terms = EMPTY_STRING_SET
-            title_terms = EMPTY_STRING_SET
-            year = None
-            if paper is not None:
-                venue_terms = _normalize_term_set(" ".join(part for part in [paper.venue, paper.journal_name] if part))
-                title_terms = _normalize_term_set(paper.title)
-                year = paper.year
-            specter = context.specter_by_paper.get(signature.paper_id)
-            middle_tokens = [token for token in middle.split() if token]
-            coauthor_blocks = _feature_block_coauthor_blocks(
-                context.author_records_by_paper,
-                paper_id=signature.paper_id,
-                author_position=author_position,
-            )
-            affiliation_terms = _feature_block_affiliation_terms(signature)
-            features = QueryFeatures(
-                first=first,
-                middle=middle,
-                first_initial=first[:1],
-                middle_initials=frozenset(token[0] for token in middle_tokens),
-                coauthor_blocks=coauthor_blocks,
-                affiliation_terms=affiliation_terms,
-                venue_terms=venue_terms,
-                year=year,
-                orcid=normalize_orcid(signature.author_orcid),
-                specter=specter,
-                has_specter=specter is not None,
-                has_coauthors=bool(coauthor_blocks),
-                has_affiliations=bool(affiliation_terms),
-                has_full_first=len(first) > 1,
-                has_middle=bool(middle_tokens),
-                title_terms=title_terms,
-                name_counts=None,
-                paper_author_count=len(author_records),
-                paper_author_names=paper_author_names,
-                author_position=author_position,
-                local10_author_names=local10_author_names,
-                signature_id=signature_key,
-                query_author=_feature_block_query_author(signature),
-            )
-            context.feature_cache[signature_key] = features
-
-    return _apply_orcid_feature_policy(features, orcid_enabled=orcid_enabled)
 
 
 def extract_query_features(
@@ -713,42 +535,6 @@ def build_cluster_summary(
                 str(signature_id),
                 feature_cache=feature_cache,
                 paper_author_name_cache=paper_author_name_cache,
-                orcid_enabled=orcid_enabled,
-            ),
-        )
-        for signature_id in signature_ids
-    )
-    return _cluster_summary_from_feature_rows(
-        cluster_id=cluster_id,
-        component_key=component_key,
-        feature_rows=feature_rows,
-        max_exemplars=max_exemplars,
-        block_key=block_key,
-    )
-
-
-def build_cluster_summary_from_feature_block(
-    feature_block: FeatureBlock,
-    *,
-    cluster_id: str,
-    component_key: str,
-    signature_ids: Sequence[str],
-    max_exemplars: int,
-    feature_cache: dict[str, QueryFeatures] | None = None,
-    query_context: FeatureBlockQueryContext | None = None,
-    orcid_enabled: bool = False,
-    block_key: str = "incremental",
-) -> ClusterSummary:
-    """Build one seed-cluster summary directly from a `FeatureBlock`."""
-
-    context = query_context or build_feature_block_query_context(feature_block, feature_cache=feature_cache)
-    feature_rows = (
-        (
-            str(signature_id),
-            extract_query_features_from_feature_block(
-                feature_block,
-                str(signature_id),
-                query_context=context,
                 orcid_enabled=orcid_enabled,
             ),
         )

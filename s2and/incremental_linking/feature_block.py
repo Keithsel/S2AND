@@ -1,8 +1,6 @@
-"""Public FeatureBlock compatibility module.
+"""Public FeatureBlock Arrow module.
 
-Implementation is split across feature_block_contract, feature_block_arrow, and
-feature_block_bridges. Keep importing public names from this module until callers
-have migrated intentionally.
+Implementation is split across feature_block_contract and feature_block_arrow.
 """
 
 from __future__ import annotations
@@ -17,12 +15,12 @@ from s2and.incremental_linking.feature_block_arrow import (
     arrow_ipc_physical_layout,
     cluster_seed_disallows_from_arrow_paths,
     cluster_seed_disallows_path_from_arrow_paths,
-    feature_block_from_arrow_paths,
     raw_planner_arrow_physical_layout,
     read_arrow_batch_lookup_index_batch_indices,
     read_cluster_seed_disallows_arrow,
     read_cluster_seeds_arrow,
     temporary_arrow_paths_with_cluster_seeds,
+    validate_arrow_batch_lookup_index,
     write_arrow_batch_lookup_index,
     write_arrow_ipc_table,
     write_cluster_seed_disallows_arrow,
@@ -32,12 +30,6 @@ from s2and.incremental_linking.feature_block_arrow import (
     write_name_counts_index,
     write_name_pairs_arrow,
     write_raw_arrow_batch_lookup_indexes,
-)
-from s2and.incremental_linking.feature_block_bridges import (
-    feature_block_from_anddata,
-    feature_block_from_raw_payloads,
-    feature_block_to_mini_anddata,
-    write_feature_block_arrow_from_anddata,
 )
 from s2and.incremental_linking.feature_block_contract import (
     FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION,
@@ -70,22 +62,18 @@ __all__ = [
     "cluster_seed_disallows_from_arrow_paths",
     "cluster_seed_disallows_path_from_arrow_paths",
     "feature_block_for_signature_order",
-    "feature_block_from_anddata",
-    "feature_block_from_arrow_paths",
-    "feature_block_from_raw_payloads",
     "feature_block_signature_order_from_raw_candidate_plan",
-    "feature_block_to_mini_anddata",
     "normalize_cluster_seed_disallow_pairs",
     "raw_planner_arrow_physical_layout",
     "read_arrow_batch_lookup_index_batch_indices",
     "read_cluster_seed_disallows_arrow",
     "read_cluster_seeds_arrow",
     "temporary_arrow_paths_with_cluster_seeds",
+    "validate_arrow_batch_lookup_index",
     "write_arrow_batch_lookup_index",
     "write_arrow_ipc_table",
     "write_cluster_seed_disallows_arrow",
     "write_cluster_seeds_arrow",
-    "write_feature_block_arrow_from_anddata",
     "write_feature_block_arrow_tables",
     "write_name_counts_arrow",
     "write_name_counts_index",

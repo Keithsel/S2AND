@@ -613,62 +613,6 @@ def test_localize_row_indices_handles_ungrouped_chunks() -> None:
     not HAS_LINKER_ARRAY_FEATURE_AGG_RUST,
     reason=f"s2and_rust linker array feature aggregate API unavailable: {LINKER_ARRAY_FEATURE_AGG_RUST_IMPORT_ERROR}",
 )
-def test_candidate_batch_pairwise_aggregates_match_existing_rust_matrix_path() -> None:
-    dataset = build_dummy_dataset("dummy_linker_pairwise_real", load_name_counts=True)
-    pairs = [("0", "1"), ("0", "2"), ("3", "4"), ("0", "3"), ("1", "4")]
-    row_indices = [0, 0, 1, 1, 1]
-    feature_names = ("first_names_equal", "affiliation_overlap", "title_overlap_words")
-    feature_indices = [
-        linker_pairwise.PROD_PAIRWISE_FEATURE_INDICES[linker_pairwise.PROD_PAIRWISE_FEATURE_NAMES.index(feature_name)]
-        for feature_name in feature_names
-    ]
-
-    matrix = build_pair_feature_matrix_rust(
-        dataset,
-        pairs,
-        selected_indices=feature_indices,
-        num_threads=2,
-        nan_value=0.0,
-    )
-    expected_counts = np.zeros(2, dtype=np.uint64)
-    expected_sums = np.zeros((2, len(feature_indices)), dtype=np.float64)
-    expected_mins = np.full((2, len(feature_indices)), np.inf, dtype=np.float64)
-    expected_maxs = np.full((2, len(feature_indices)), -np.inf, dtype=np.float64)
-    for pair_offset, row_index in enumerate(row_indices):
-        expected_counts[row_index] += 1
-        expected_sums[row_index] += matrix[pair_offset]
-        expected_mins[row_index] = np.minimum(expected_mins[row_index], matrix[pair_offset])
-        expected_maxs[row_index] = np.maximum(expected_maxs[row_index], matrix[pair_offset])
-
-    rust_featurizer = feature_port._get_rust_featurizer(dataset)  # noqa: SLF001
-    signature_id_to_index = {
-        str(signature_id): index for index, signature_id in enumerate(rust_featurizer.signature_ids())
-    }
-    candidate_batch = _candidate_batch_from_index_arrays(
-        left_signature_indices=[signature_id_to_index[left] for left, _right in pairs],
-        right_signature_indices=[signature_id_to_index[right] for _left, right in pairs],
-        row_indices=row_indices,
-        row_count=2,
-    )
-    stats = linker_pairwise.compute_candidate_batch_pairwise_aggregate_stats_rust(
-        dataset,
-        candidate_batch,
-        aggregate_feature_names=feature_names,
-        n_jobs=2,
-        nan_value=0.0,
-        featurizer=rust_featurizer,
-    )
-
-    np.testing.assert_array_equal(stats.counts, expected_counts)
-    np.testing.assert_allclose(stats.sums, expected_sums, rtol=1e-9, atol=1e-9)
-    np.testing.assert_allclose(stats.mins, expected_mins, rtol=1e-9, atol=1e-9)
-    np.testing.assert_allclose(stats.maxs, expected_maxs, rtol=1e-9, atol=1e-9)
-
-
-@pytest.mark.skipif(
-    not HAS_LINKER_ARRAY_FEATURE_AGG_RUST,
-    reason=f"s2and_rust linker array feature aggregate API unavailable: {LINKER_ARRAY_FEATURE_AGG_RUST_IMPORT_ERROR}",
-)
 def test_candidate_batch_aggregates_match_existing_rust_matrix_path() -> None:
     dataset = build_dummy_dataset("dummy_linker_candidate_batch_real", load_name_counts=True)
     pairs = [("0", "1"), ("0", "2"), ("3", "4"), ("0", "3"), ("1", "4")]

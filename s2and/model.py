@@ -305,6 +305,15 @@ def _partial_supervision_cache_fingerprint(
     return tuple(sorted((str(left), str(right), float(value)) for (left, right), value in partial_supervision.items()))
 
 
+@dataclass(frozen=True)
+class _AlteredPresplitJob:
+    block_key: str
+    altered_cluster_num: int | str
+    signature_ids: list[str]
+    partial_supervision: dict[tuple[str, str], int | float]
+    cache_key: tuple[Any, ...] | None
+
+
 def _model_presplit_cache_fingerprint(clusterer: Any) -> tuple[Any, ...]:
     cluster_model = getattr(clusterer, "cluster_model", None)
     get_params = getattr(cluster_model, "get_params", None)
@@ -441,19 +450,10 @@ def _uses_reference_features(featurizer_info: FeaturizationInfo | None) -> bool:
     return featurizer_info is not None and "reference_features" in featurizer_info.features_to_use
 
 
-def _uses_embedding_features(clusterer: Any) -> bool:
-    return clusterer_uses_embedding_features(clusterer)
-
-
-def _uses_name_count_features(clusterer: Any) -> bool:
-    return clusterer_uses_name_count_features(clusterer)
-
-
 def _coerce_existing_arrow_paths(
     value: Any,
     *,
     require_specter: bool,
-    require_cluster_seeds: bool,
     strict: bool,
 ) -> dict[str, str] | None:
     if value is None:
@@ -465,14 +465,11 @@ def _coerce_existing_arrow_paths(
     required = {"signatures", "papers", "paper_authors"}
     if require_specter:
         required.add("specter")
-    if require_cluster_seeds:
-        required.add("cluster_seeds")
     if strict:
         return validate_arrow_prediction_artifacts(
             value,
             require_specter=require_specter,
             require_name_counts_index="name_counts_index" in value,
-            require_cluster_seeds=require_cluster_seeds,
             require_batch_indexes=False,
             context="Dataset Arrow paths",
             producer_hint="fix dataset.arrow_paths or regenerate the Arrow bundle",
@@ -581,7 +578,6 @@ def _resolve_dataset_arrow_paths(
     dataset: Any,
     *,
     require_specter: bool,
-    require_cluster_seeds: bool = False,
     require_name_counts_index: bool = False,
 ) -> dict[str, str] | None:
     for attr_name in ("arrow_paths", "feature_block_arrow_paths", "rust_arrow_paths"):
@@ -591,7 +587,6 @@ def _resolve_dataset_arrow_paths(
         explicit = _coerce_existing_arrow_paths(
             explicit_value,
             require_specter=require_specter,
-            require_cluster_seeds=False,
             strict=True,
         )
         if explicit is not None:
@@ -602,10 +597,6 @@ def _resolve_dataset_arrow_paths(
                 _add_optional_arrow_sidecar_paths(explicit, arrow_dataset_dir)
                 if require_name_counts_index:
                     _add_name_counts_index_path(explicit, arrow_dataset_dir)
-            if require_cluster_seeds:
-                cluster_seeds_path = explicit.get("cluster_seeds")
-                if cluster_seeds_path is None or not Path(cluster_seeds_path).exists():
-                    return None
             if require_name_counts_index and not _arrow_paths_have_name_counts_index(explicit):
                 return None
             return explicit
@@ -655,7 +646,6 @@ def _resolve_dataset_arrow_paths(
             resolved = _coerce_existing_arrow_paths(
                 paths,
                 require_specter=require_specter,
-                require_cluster_seeds=require_cluster_seeds,
                 strict=False,
             )
             if resolved is not None and require_name_counts_index and not _arrow_paths_have_name_counts_index(resolved):
@@ -743,16 +733,16 @@ def _missing_arrow_prediction_artifacts_error(
     arrow_paths: Mapping[str, Any] | None = None,
 ) -> MissingArrowArtifactError:
     required = ["signatures", "papers", "paper_authors"]
-    if _uses_embedding_features(clusterer):
+    if clusterer_uses_embedding_features(clusterer):
         required.append("specter")
-    if _uses_name_count_features(clusterer):
+    if clusterer_uses_name_count_features(clusterer):
         required.append("name_counts_index")
     if arrow_paths is not None:
         try:
             validate_arrow_prediction_artifacts(
                 arrow_paths,
-                require_specter=_uses_embedding_features(clusterer),
-                require_name_counts_index=_uses_name_count_features(clusterer),
+                require_specter=clusterer_uses_embedding_features(clusterer),
+                require_name_counts_index=clusterer_uses_name_count_features(clusterer),
                 require_batch_indexes=True,
                 context=context,
                 producer_hint=producer_hint,
@@ -967,6 +957,8 @@ def _read_altered_cluster_signatures_arrow(path: Path) -> list[str]:
 
 
 def _read_altered_cluster_signatures_file(path: Path) -> list[str]:
+    """Read legacy text or Arrow altered-profile sidecars for non-production callers."""
+
     if path.suffix.lower() == ".arrow":
         return _read_altered_cluster_signatures_arrow(path)
     return _read_nonempty_text_lines(path)
@@ -983,6 +975,11 @@ def _dataset_altered_cluster_signatures(
         path_value = arrow_paths.get("altered_cluster_signatures")
         if path_value is not None:
             path = Path(str(path_value))
+            if path.suffix.lower() != ".arrow":
+                raise ValueError(
+                    "Arrow production altered_cluster_signatures sidecars must use "
+                    "altered_cluster_signatures.arrow; text files are only supported by legacy ANDData/training inputs"
+                )
             if not path.exists():
                 raise MissingArrowArtifactError(
                     context="altered cluster signatures",
@@ -3575,10 +3572,10 @@ class Clusterer:
                 "use the ANDData predict path until Arrow reference-feature artifacts are available."
             )
 
-        require_name_counts_index = _uses_name_count_features(self) or load_name_counts is True
+        require_name_counts_index = clusterer_uses_name_count_features(self) or load_name_counts is True
         arrow_path_payload = validate_arrow_prediction_artifacts(
             arrow_paths,
-            require_specter=_uses_embedding_features(self),
+            require_specter=clusterer_uses_embedding_features(self),
             require_name_counts_index=require_name_counts_index,
             require_batch_indexes=True,
             context="Clusterer.predict_from_arrow_paths",
@@ -3605,7 +3602,9 @@ class Clusterer:
             arrow_path_payload,
             signature_ids=signature_ids,
             name_tuples=name_tuples,
-            load_name_counts=bool(_uses_name_count_features(self) if load_name_counts is None else load_name_counts),
+            load_name_counts=bool(
+                clusterer_uses_name_count_features(self) if load_name_counts is None else load_name_counts
+            ),
             name_counts_path=name_counts_path,
             preprocess=True,
             compute_reference_features=False,
@@ -4034,9 +4033,8 @@ class Clusterer:
                 and not _uses_reference_features(self.nameless_featurizer_info)
                 and _resolve_dataset_arrow_paths(
                     dataset,
-                    require_specter=_uses_embedding_features(self),
-                    require_cluster_seeds=False,
-                    require_name_counts_index=_uses_name_count_features(self),
+                    require_specter=clusterer_uses_embedding_features(self),
+                    require_name_counts_index=clusterer_uses_name_count_features(self),
                 )
                 is not None
             )
@@ -4318,8 +4316,8 @@ class Clusterer:
                 ):
                     arrow_path_payload = validate_arrow_prediction_artifacts(
                         arrow_paths_for_predict,
-                        require_specter=_uses_embedding_features(self),
-                        require_name_counts_index=_uses_name_count_features(self),
+                        require_specter=clusterer_uses_embedding_features(self),
+                        require_name_counts_index=clusterer_uses_name_count_features(self),
                         require_batch_indexes=True,
                         context="Clusterer.predict subblocked Arrow prediction",
                         producer_hint=(
@@ -4349,7 +4347,7 @@ class Clusterer:
                         arrow_path_payload,
                         signature_ids=signature_ids,
                         name_tuples=getattr(dataset, "name_tuples", "filtered"),
-                        load_name_counts=_uses_name_count_features(self),
+                        load_name_counts=clusterer_uses_name_count_features(self),
                         preprocess=True,
                         compute_reference_features=False,
                         num_threads=self.n_jobs,
@@ -4474,9 +4472,8 @@ class Clusterer:
         if rust_prediction_can_use_arrow:
             arrow_paths = _resolve_dataset_arrow_paths(
                 dataset,
-                require_specter=_uses_embedding_features(self),
-                require_cluster_seeds=False,
-                require_name_counts_index=_uses_name_count_features(self),
+                require_specter=clusterer_uses_embedding_features(self),
+                require_name_counts_index=clusterer_uses_name_count_features(self),
             )
             if arrow_paths is None:
                 raise _missing_arrow_prediction_artifacts_error(
@@ -4508,7 +4505,7 @@ class Clusterer:
                     incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
                     runtime_context=runtime_context,
                     total_ram_bytes=total_ram_bytes,
-                    load_name_counts=_uses_name_count_features(self),
+                    load_name_counts=clusterer_uses_name_count_features(self),
                     name_tuples=getattr(dataset, "name_tuples", "filtered"),
                     cluster_seeds_disallow=_cluster_seed_disallows_for_request(dataset, arrow_paths_for_predict),
                 )
@@ -4983,38 +4980,40 @@ class Clusterer:
             altered_cluster_count = len(sorted_altered_cluster_nums)
             model_cache_fingerprint = _model_presplit_cache_fingerprint(self)
             name_tuples = getattr(dataset, "name_tuples", "filtered")
-            if arrow_paths is not None:
-                presplit_arrow_paths = normalize_arrow_paths(
-                    {key: value for key, value in arrow_paths.items() if str(key) != "cluster_seeds"}
+            presplit_arrow_paths = (
+                normalize_arrow_paths({key: value for key, value in arrow_paths.items() if str(key) != "cluster_seeds"})
+                if arrow_paths is not None
+                else None
+            )
+            reclustered_by_cluster_num: dict[int | str, list[list[str]]] = defaultdict(list)
+            presplit_jobs: list[_AlteredPresplitJob] = []
+            for altered_index, altered_cluster_num in enumerate(sorted_altered_cluster_nums):
+                signature_ids_for_cluster_num = cluster_seeds_require_inverse.get(altered_cluster_num, [])
+                if len(signature_ids_for_cluster_num) <= 1:
+                    continue
+                altered_presplit_block_count += 1
+                altered_presplit_signature_count += len(signature_ids_for_cluster_num)
+                if _can_skip_orcid_homogeneous_altered_presplit(
+                    self,
+                    dataset,
+                    signature_ids_for_cluster_num,
+                    partial_supervision,
+                    cluster_seed_disallows=request_cluster_seed_disallows,
+                ):
+                    altered_presplit_orcid_skip_count += 1
+                    continue
+
+                # During this pre-split, do not apply incoming cluster seeds as constraints.
+                # At this stage we are splitting claimed profiles to match S2AND predictions,
+                # so claimed-profile seeds should not bias the split.
+                effective_partial_supervision = _partial_supervision_with_cluster_seed_disallows(
+                    signature_ids_for_cluster_num,
+                    dataset,
+                    partial_supervision,
+                    cluster_seed_disallows=request_cluster_seed_disallows,
                 )
-                presplit_block_dict: dict[str, list[str]] = {}
-                block_key_to_cluster_num: dict[str, int | str] = {}
-                signature_to_cluster_num: dict[str, int | str] = {}
-                reclustered_by_cluster_num: dict[int | str, list[list[str]]] = defaultdict(list)
-                presplit_partial_supervision_by_block: dict[str, dict[tuple[str, str], int | float]] = {}
-                for altered_index, altered_cluster_num in enumerate(sorted_altered_cluster_nums):
-                    signature_ids_for_cluster_num = cluster_seeds_require_inverse.get(altered_cluster_num, [])
-                    if len(signature_ids_for_cluster_num) <= 1:
-                        continue
-                    altered_presplit_block_count += 1
-                    altered_presplit_signature_count += len(signature_ids_for_cluster_num)
-                    if _can_skip_orcid_homogeneous_altered_presplit(
-                        self,
-                        dataset,
-                        signature_ids_for_cluster_num,
-                        partial_supervision,
-                        cluster_seed_disallows=request_cluster_seed_disallows,
-                    ):
-                        altered_presplit_orcid_skip_count += 1
-                        reclustered_by_cluster_num[altered_cluster_num].append(list(signature_ids_for_cluster_num))
-                        continue
-                    effective_partial_supervision = _partial_supervision_with_cluster_seed_disallows(
-                        signature_ids_for_cluster_num,
-                        dataset,
-                        partial_supervision,
-                        cluster_seed_disallows=request_cluster_seed_disallows,
-                    )
-                    cache_key = _altered_presplit_cache_key(
+                cache_key = (
+                    _altered_presplit_cache_key(
                         mode="arrow",
                         altered_cluster_num=altered_cluster_num,
                         signature_ids=signature_ids_for_cluster_num,
@@ -5023,6 +5022,10 @@ class Clusterer:
                         name_tuples=name_tuples,
                         model_fingerprint=model_cache_fingerprint,
                     )
+                    if presplit_arrow_paths is not None
+                    else None
+                )
+                if cache_key is not None:
                     cached_clusters = _get_altered_presplit_cache_entry(self, cache_key)
                     if cached_clusters is not None:
                         altered_presplit_cache_hit_count += 1
@@ -5031,116 +5034,83 @@ class Clusterer:
                         )
                         continue
                     altered_presplit_cache_miss_count += 1
-                    block_key = f"altered_profile_{altered_index}"
-                    presplit_block_dict[block_key] = signature_ids_for_cluster_num
-                    block_key_to_cluster_num[block_key] = altered_cluster_num
-                    presplit_partial_supervision_by_block[block_key] = effective_partial_supervision
-                    for signature_id in signature_ids_for_cluster_num:
-                        signature_to_cluster_num[str(signature_id)] = altered_cluster_num
-
-                if presplit_block_dict:
-                    presplit_partial_supervision: dict[tuple[str, str], int | float] = {}
-                    for block_partial_supervision in presplit_partial_supervision_by_block.values():
-                        presplit_partial_supervision.update(block_partial_supervision)
-                    presplit_start = time.perf_counter()
-                    reclustered_output, _ = self.predict_from_arrow_paths(
-                        presplit_block_dict,
-                        presplit_arrow_paths,
-                        incremental_dont_use_cluster_seeds=True,
-                        partial_supervision=presplit_partial_supervision,
-                        runtime_context=runtime_context,
-                        total_ram_bytes=total_ram_bytes,
-                        load_name_counts=_uses_name_count_features(self),
-                        name_tuples=getattr(dataset, "name_tuples", "filtered"),
+                presplit_jobs.append(
+                    _AlteredPresplitJob(
+                        block_key=f"altered_profile_{altered_index}",
+                        altered_cluster_num=altered_cluster_num,
+                        signature_ids=list(signature_ids_for_cluster_num),
+                        partial_supervision=effective_partial_supervision,
+                        cache_key=cache_key,
                     )
-                    altered_presplit_predict_seconds += time.perf_counter() - presplit_start
-                    for new_cluster_of_signatures in reclustered_output.values():
-                        if len(new_cluster_of_signatures) == 0:
-                            continue
-                        output_cluster_nums = {
-                            signature_to_cluster_num[str(signature_id)] for signature_id in new_cluster_of_signatures
-                        }
-                        if len(output_cluster_nums) != 1:
-                            raise ValueError(
-                                "Altered profile pre-split produced a cluster spanning claimed profiles: "
-                                f"{sorted(str(cluster_num) for cluster_num in output_cluster_nums)}"
-                            )
-                        altered_cluster_num = next(iter(output_cluster_nums))
-                        reclustered_by_cluster_num[altered_cluster_num].append(new_cluster_of_signatures)
+                )
 
-                    for block_key, altered_cluster_num in block_key_to_cluster_num.items():
-                        signature_ids_for_cluster_num = presplit_block_dict[block_key]
-                        effective_partial_supervision = presplit_partial_supervision_by_block[block_key]
-                        cache_key = _altered_presplit_cache_key(
-                            mode="arrow",
-                            altered_cluster_num=altered_cluster_num,
-                            signature_ids=signature_ids_for_cluster_num,
-                            effective_partial_supervision=effective_partial_supervision,
-                            arrow_paths=presplit_arrow_paths,
-                            name_tuples=name_tuples,
-                            model_fingerprint=model_cache_fingerprint,
+            if presplit_jobs and presplit_arrow_paths is not None:
+                presplit_block_dict = {job.block_key: job.signature_ids for job in presplit_jobs}
+                signature_to_cluster_num = {
+                    str(signature_id): job.altered_cluster_num
+                    for job in presplit_jobs
+                    for signature_id in job.signature_ids
+                }
+                presplit_partial_supervision: dict[tuple[str, str], int | float] = {}
+                for job in presplit_jobs:
+                    presplit_partial_supervision.update(job.partial_supervision)
+                presplit_start = time.perf_counter()
+                reclustered_output, _ = self.predict_from_arrow_paths(
+                    presplit_block_dict,
+                    presplit_arrow_paths,
+                    incremental_dont_use_cluster_seeds=True,
+                    partial_supervision=presplit_partial_supervision,
+                    runtime_context=runtime_context,
+                    total_ram_bytes=total_ram_bytes,
+                    load_name_counts=clusterer_uses_name_count_features(self),
+                    name_tuples=name_tuples,
+                )
+                altered_presplit_predict_seconds += time.perf_counter() - presplit_start
+                for new_cluster_of_signatures in reclustered_output.values():
+                    if len(new_cluster_of_signatures) == 0:
+                        continue
+                    output_cluster_nums = {
+                        signature_to_cluster_num[str(signature_id)] for signature_id in new_cluster_of_signatures
+                    }
+                    if len(output_cluster_nums) != 1:
+                        raise ValueError(
+                            "Altered profile pre-split produced a cluster spanning claimed profiles: "
+                            f"{sorted(str(cluster_num) for cluster_num in output_cluster_nums)}"
                         )
+                    altered_cluster_num = next(iter(output_cluster_nums))
+                    reclustered_by_cluster_num[altered_cluster_num].append(list(new_cluster_of_signatures))
+                for job in presplit_jobs:
+                    if job.cache_key is not None:
                         _put_altered_presplit_cache_entry(
                             self,
-                            cache_key,
-                            reclustered_by_cluster_num.get(altered_cluster_num, []),
+                            job.cache_key,
+                            reclustered_by_cluster_num.get(job.altered_cluster_num, []),
                         )
-
-                for altered_cluster_num in sorted_altered_cluster_nums:
-                    new_clusters = reclustered_by_cluster_num.get(altered_cluster_num, [])
-                    if len(new_clusters) <= 1:
-                        continue
-                    for i, new_cluster_of_signatures in enumerate(new_clusters):
-                        new_cluster_num = str(altered_cluster_num) + f"_{i}"
-                        recluster_map[new_cluster_num] = altered_cluster_num
-                        for reclustered_signature_id in new_cluster_of_signatures:
-                            cluster_seeds_require[reclustered_signature_id] = new_cluster_num
-            else:
-                for altered_cluster_num in sorted_altered_cluster_nums:
-                    signature_ids_for_cluster_num = cluster_seeds_require_inverse.get(altered_cluster_num, [])
-                    if len(signature_ids_for_cluster_num) <= 1:
-                        continue
-
-                    altered_presplit_block_count += 1
-                    altered_presplit_signature_count += len(signature_ids_for_cluster_num)
-                    if _can_skip_orcid_homogeneous_altered_presplit(
-                        self,
-                        dataset,
-                        signature_ids_for_cluster_num,
-                        partial_supervision,
-                        cluster_seed_disallows=request_cluster_seed_disallows,
-                    ):
-                        altered_presplit_orcid_skip_count += 1
-                        continue
-
-                    # During this pre-split, do not apply incoming cluster seeds as constraints.
-                    # At this stage we are splitting claimed profiles to match S2AND predictions,
-                    # so claimed-profile seeds should not bias the split.
-                    effective_partial_supervision = _partial_supervision_with_cluster_seed_disallows(
-                        signature_ids_for_cluster_num,
-                        dataset,
-                        partial_supervision,
-                        cluster_seed_disallows=request_cluster_seed_disallows,
-                    )
+            elif presplit_jobs:
+                for job in presplit_jobs:
                     presplit_start = time.perf_counter()
                     reclustered_output, _ = self.predict_helper(
-                        {"block": signature_ids_for_cluster_num},
+                        {"block": job.signature_ids},
                         dataset,
                         incremental_dont_use_cluster_seeds=True,
-                        partial_supervision=effective_partial_supervision,
+                        partial_supervision=job.partial_supervision,
                         runtime_context=runtime_context,
                         total_ram_bytes=total_ram_bytes,
                     )
                     altered_presplit_predict_seconds += time.perf_counter() - presplit_start
-                    new_clusters = [list(new_cluster) for new_cluster in reclustered_output.values()]
+                    reclustered_by_cluster_num[job.altered_cluster_num].extend(
+                        [list(new_cluster) for new_cluster in reclustered_output.values()]
+                    )
 
-                    if len(new_clusters) <= 1:
-                        continue
-                    for i, new_cluster_of_signatures in enumerate(new_clusters):
-                        new_cluster_num = str(altered_cluster_num) + f"_{i}"
-                        recluster_map[new_cluster_num] = altered_cluster_num
-                        for reclustered_signature_id in new_cluster_of_signatures:
-                            cluster_seeds_require[reclustered_signature_id] = new_cluster_num
+            for altered_cluster_num in sorted_altered_cluster_nums:
+                new_clusters = reclustered_by_cluster_num.get(altered_cluster_num, [])
+                if len(new_clusters) <= 1:
+                    continue
+                for i, new_cluster_of_signatures in enumerate(new_clusters):
+                    new_cluster_num = str(altered_cluster_num) + f"_{i}"
+                    recluster_map[new_cluster_num] = altered_cluster_num
+                    for reclustered_signature_id in new_cluster_of_signatures:
+                        cluster_seeds_require[reclustered_signature_id] = new_cluster_num
 
         self._last_incremental_seed_setup_telemetry = {
             "seed_setup_seconds": float(time.perf_counter() - seed_setup_start),
@@ -5317,7 +5287,7 @@ class Clusterer:
                             partial_supervision=residual_partial_supervision,
                             runtime_context=runtime_context,
                             total_ram_bytes=total_ram_bytes,
-                            load_name_counts=_uses_name_count_features(self),
+                            load_name_counts=clusterer_uses_name_count_features(self),
                             name_tuples=getattr(dataset, "name_tuples", "filtered"),
                         )
                 for new_cluster in reclustered_output.values():
@@ -5461,9 +5431,8 @@ class Clusterer:
         ):
             resolved_arrow_paths = _resolve_dataset_arrow_paths(
                 dataset,
-                require_specter=_uses_embedding_features(self),
-                require_cluster_seeds=False,
-                require_name_counts_index=_uses_name_count_features(self),
+                require_specter=clusterer_uses_embedding_features(self),
+                require_name_counts_index=clusterer_uses_name_count_features(self),
             )
         if resolved_arrow_paths is None:
             raise _missing_arrow_prediction_artifacts_error(
@@ -5562,9 +5531,8 @@ class Clusterer:
         ):
             resolved_arrow_paths_for_incremental = _resolve_dataset_arrow_paths(
                 dataset,
-                require_specter=_uses_embedding_features(self),
-                require_cluster_seeds=False,
-                require_name_counts_index=_uses_name_count_features(self),
+                require_specter=clusterer_uses_embedding_features(self),
+                require_name_counts_index=clusterer_uses_name_count_features(self),
             )
         arrow_paths_available = resolved_arrow_paths_for_incremental is not None
         if use_rust_backend and not arrow_paths_available:

@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import numpy as np
 
-from s2and.arrow_inputs import normalize_arrow_paths, validate_arrow_prediction_artifacts
+from s2and.arrow_inputs import validate_arrow_prediction_artifacts
 from s2and.consts import CLUSTER_SEEDS_LOOKUP
 from s2and.data import ANDData
 from s2and.runtime import (
@@ -733,10 +733,6 @@ def _resolve_direct_name_counts_path(load_name_counts: bool, name_counts_path: s
     return os.path.join(_PACKAGE_DATA_DIR, "name_counts_rust.json")
 
 
-def _stringified_arrow_paths(paths: Mapping[Any, Any]) -> dict[str, str]:
-    return normalize_arrow_paths(paths)
-
-
 def build_rust_featurizer_from_arrow_paths(
     paths: Mapping[str, Any],
     *,
@@ -760,10 +756,10 @@ def build_rust_featurizer_from_arrow_paths(
             "RustFeaturizer.from_arrow_paths does not accept name_counts_path; "
             "pass the Arrow name-count index directory in paths['name_counts_index']."
         )
-    normalized_paths = normalize_arrow_paths(paths)
+    path_keys = {str(key) for key in paths}
     normalized_paths = validate_arrow_prediction_artifacts(
-        normalized_paths,
-        require_specter="specter" in normalized_paths or "specter2" in normalized_paths,
+        paths,
+        require_specter="specter" in path_keys or "specter2" in path_keys,
         require_name_counts_index=bool(load_name_counts),
         require_batch_indexes=not full_scan_without_index,
         context="RustFeaturizer.from_arrow_paths production build",

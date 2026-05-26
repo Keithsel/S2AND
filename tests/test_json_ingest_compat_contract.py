@@ -14,7 +14,7 @@ class DummyDataset:
     compute_reference_features = True
 
 
-def test_build_rust_json_ingest_contract_collects_canonical_fields():
+def test_build_rust_json_ingest_contract_collects_compat_fields():
     contract = build_rust_json_ingest_contract(
         DummyDataset(),
         name_counts_path="name_counts.json",

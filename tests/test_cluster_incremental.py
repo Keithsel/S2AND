@@ -1384,7 +1384,6 @@ def test_resolve_dataset_arrow_paths_discovers_raw_planner_batch_indexes(tmp_pat
     resolved = model_module._resolve_dataset_arrow_paths(
         dataset,
         require_specter=False,
-        require_cluster_seeds=True,
     )
 
     assert resolved is not None
@@ -1460,7 +1459,6 @@ def test_resolve_dataset_arrow_paths_discovers_name_counts_index_from_manifest(
     resolved = model_module._resolve_dataset_arrow_paths(
         dataset,
         require_specter=False,
-        require_cluster_seeds=False,
         require_name_counts_index=True,
     )
 
@@ -1481,7 +1479,6 @@ def test_resolve_dataset_arrow_paths_rejects_bad_manifest_name_counts_index(tmp_
         model_module._resolve_dataset_arrow_paths(
             dataset,
             require_specter=False,
-            require_cluster_seeds=False,
             require_name_counts_index=True,
         )
 
@@ -1507,7 +1504,6 @@ def test_resolve_dataset_arrow_paths_declines_missing_required_name_counts_index
     resolved = model_module._resolve_dataset_arrow_paths(
         dataset,
         require_specter=False,
-        require_cluster_seeds=False,
         require_name_counts_index=True,
     )
 
@@ -1532,7 +1528,6 @@ def test_resolve_dataset_arrow_paths_reports_explicit_missing_file_with_structur
         model_module._resolve_dataset_arrow_paths(
             dataset,
             require_specter=False,
-            require_cluster_seeds=False,
             require_name_counts_index=False,
         )
 
@@ -4549,6 +4544,29 @@ def test_build_incremental_seed_setup_rejects_missing_declared_altered_arrow_pat
         )
 
     assert exc_info.value.missing_files == {"altered_cluster_signatures": str(missing_path)}
+
+
+def test_arrow_altered_cluster_signatures_rejects_legacy_text_sidecar(tmp_path: Path):
+    clusterer = _build_minimal_incremental_clusterer()
+    altered_text_path = tmp_path / "altered_cluster_signatures.txt"
+    altered_text_path.write_text("seed0\n", encoding="utf-8")
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            cluster_seeds_require={"seed0": "7"},
+            cluster_seeds_disallow=set(),
+            altered_cluster_signatures=None,
+            name_tuples="filtered",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="text files are only supported by legacy ANDData/training inputs"):
+        clusterer._build_incremental_seed_setup(
+            dataset,
+            {},
+            runtime_context=cast(Any, object()),
+            arrow_paths={"altered_cluster_signatures": str(altered_text_path)},
+        )
 
 
 def test_read_altered_cluster_signatures_arrow_rejects_null_and_duplicates(tmp_path: Path):

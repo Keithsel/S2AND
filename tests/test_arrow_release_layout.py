@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+
+import pytest
+
+from s2and.arrow_inputs import require_name_counts_index_artifact
+from s2and.incremental_linking.feature_block import write_arrow_batch_lookup_index, write_arrow_ipc_table
 
 
 def _touch_json(path: Path, payload: dict | None = None) -> None:
@@ -15,10 +21,20 @@ def _touch_file(path: Path) -> None:
 
 
 def _validate_required_release_files(release_root: Path, dataset_name: str) -> None:
+    pa = pytest.importorskip("pyarrow")
+    root_manifest = json.loads((release_root / "manifest.json").read_text(encoding="utf-8"))
     dataset_manifest_path = release_root / dataset_name / "manifest.json"
     dataset_manifest = json.loads(dataset_manifest_path.read_text(encoding="utf-8"))
     manifest_paths = dataset_manifest.get("paths", {}) if isinstance(dataset_manifest, dict) else {}
     embedding_path = manifest_paths.get("specter") or manifest_paths.get("specter2") or "specter.arrow"
+    dataset_entries = {
+        entry["dataset"]: entry for entry in root_manifest.get("dataset_manifests", []) if isinstance(entry, dict)
+    }
+    dataset_entry = dataset_entries[dataset_name]
+    assert dataset_entry["manifest_sha256"] == hashlib.sha256(dataset_manifest_path.read_bytes()).hexdigest()
+    assert dataset_entry["manifest_size_bytes"] == dataset_manifest_path.stat().st_size
+    assert root_manifest["audit"]["dataset_count"] == 1
+    assert root_manifest["audit"]["total_signature_count"] == dataset_manifest["signature_count"]
     required_paths = [
         release_root / "manifest.json",
         release_root / "LICENSE.txt",
@@ -35,26 +51,34 @@ def _validate_required_release_files(release_root: Path, dataset_name: str) -> N
 
     missing_paths = [path.relative_to(release_root) for path in required_paths if not path.exists()]
     assert missing_paths == []
+    require_name_counts_index_artifact(
+        release_root / "name_counts_index",
+        context="release layout test",
+        producer_hint="test fixture must include complete name_counts_index",
+    )
+    for key in ("signatures", "papers", "paper_authors", "specter2"):
+        path = release_root / dataset_name / manifest_paths[key]
+        with pa.memory_map(str(path), "r") as source:
+            assert pa.ipc.open_file(source).read_all().num_rows >= 1
 
 
 def test_docs_work_plan_arrow_release_layout_required_files(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
     release_root = tmp_path / "release"
     dataset_name = "s2and_mini"
 
-    for manifest_path in (
-        release_root / "manifest.json",
-        release_root / "production_model_v1.21" / "manifest.json",
-        release_root / "name_counts_index" / "manifest.json",
-    ):
-        _touch_json(manifest_path)
+    _touch_json(release_root / "production_model_v1.21" / "manifest.json")
+    name_counts_index = release_root / "name_counts_index"
+    for file_name in ("first.bin", "last.bin", "first_last.bin", "last_first_initial.bin"):
+        _touch_file(name_counts_index / file_name)
     _touch_json(
-        release_root / dataset_name / "manifest.json",
+        name_counts_index / "manifest.json",
         {
-            "paths": {
-                "signatures": "signatures.arrow",
-                "papers": "papers.arrow",
-                "paper_authors": "paper_authors.arrow",
-                "specter2": "specter2.arrow",
+            "files": {
+                "first": {"path": "first.bin"},
+                "last": {"path": "last.bin"},
+                "first_last": {"path": "first_last.bin"},
+                "last_first_initial": {"path": "last_first_initial.bin"},
             }
         },
     )
@@ -62,12 +86,69 @@ def test_docs_work_plan_arrow_release_layout_required_files(tmp_path: Path) -> N
     for file_path in (
         release_root / "LICENSE.txt",
         release_root / "lid.176.bin",
-        release_root / dataset_name / "signatures.arrow",
-        release_root / dataset_name / "papers.arrow",
-        release_root / dataset_name / "paper_authors.arrow",
-        release_root / dataset_name / "specter2.arrow",
-        release_root / dataset_name / "signatures.signatures_batch_index.bin",
     ):
         _touch_file(file_path)
+    dataset_root = release_root / dataset_name
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1"], type=pa.string()),
+                "paper_id": pa.array(["p1"], type=pa.string()),
+            }
+        ),
+        dataset_root / "signatures.arrow",
+    )
+    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), dataset_root / "papers.arrow")
+    write_arrow_ipc_table(
+        pa.table({"paper_id": pa.array(["p1"], type=pa.string()), "position": pa.array([0], type=pa.int64())}),
+        dataset_root / "paper_authors.arrow",
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([1.0, 0.0], type=pa.float32()), 2),
+            }
+        ),
+        dataset_root / "specter2.arrow",
+    )
+    write_arrow_batch_lookup_index(
+        dataset_root / "signatures.arrow",
+        dataset_root / "signatures.signatures_batch_index.bin",
+        key_column="signature_id",
+    )
+    dataset_manifest = {
+        "signature_count": 1,
+        "paper_count": 1,
+        "paths": {
+            "signatures": "signatures.arrow",
+            "papers": "papers.arrow",
+            "paper_authors": "paper_authors.arrow",
+            "specter2": "specter2.arrow",
+            "signatures_batch_index": "signatures.signatures_batch_index.bin",
+        },
+    }
+    _touch_json(dataset_root / "manifest.json", dataset_manifest)
+    dataset_manifest_bytes = (dataset_root / "manifest.json").read_bytes()
+    _touch_json(
+        release_root / "manifest.json",
+        {
+            "schema": "inference_arrow_bundle_v1",
+            "datasets": [dataset_name],
+            "dataset_manifests": [
+                {
+                    "dataset": dataset_name,
+                    "dataset_dir": dataset_name,
+                    "manifest_path": f"{dataset_name}/manifest.json",
+                    "manifest_size_bytes": len(dataset_manifest_bytes),
+                    "manifest_sha256": hashlib.sha256(dataset_manifest_bytes).hexdigest(),
+                }
+            ],
+            "audit": {
+                "dataset_count": 1,
+                "total_signature_count": 1,
+            },
+        },
+    )
 
     _validate_required_release_files(release_root, dataset_name)

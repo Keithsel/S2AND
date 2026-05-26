@@ -23,32 +23,21 @@ from s2and.incremental_linking.feature_block import (
     arrow_ipc_physical_layout,
     cluster_seed_disallows_from_arrow_paths,
     feature_block_for_signature_order,
-    feature_block_from_anddata,
-    feature_block_from_arrow_paths,
-    feature_block_from_raw_payloads,
     feature_block_signature_order_from_raw_candidate_plan,
-    feature_block_to_mini_anddata,
     raw_planner_arrow_physical_layout,
     read_cluster_seed_disallows_arrow,
     read_cluster_seeds_arrow,
     temporary_arrow_paths_with_cluster_seeds,
     write_arrow_batch_lookup_index,
     write_arrow_ipc_table,
-    write_feature_block_arrow_from_anddata,
     write_feature_block_arrow_tables,
     write_name_counts_arrow,
     write_name_counts_index,
     write_name_pairs_arrow,
     write_raw_arrow_batch_lookup_indexes,
 )
+from s2and.incremental_linking.feature_block_arrow import feature_block_from_arrow_paths
 from s2and.incremental_linking.features import LinkerFeatureMatrix
-from s2and.incremental_linking.query_adapter import (
-    build_cluster_summary,
-    build_cluster_summary_from_feature_block,
-    build_name_count_rarity_row_signals,
-    extract_query_features,
-    extract_query_features_from_feature_block,
-)
 from s2and.incremental_linking.retrieval import (
     RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
     build_linker_retrieval_batch_from_raw_candidate_plan,
@@ -61,6 +50,7 @@ from s2and.incremental_linking.runtime import (
     predict_incremental_link_or_abstain_from_raw_arrow_paths,
 )
 from s2and.model import Clusterer
+from scripts.arrow_conversion_helpers import feature_block_from_anddata, write_feature_block_arrow_from_anddata
 
 
 def _raw_test_clusterer(
@@ -219,41 +209,125 @@ def _raw_plan() -> dict[str, Any]:
     return plan
 
 
-def _raw_payloads_for_plan() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, str]]:
-    signatures = {
-        "q": _signature_payload(
-            "q",
-            "p_q",
-            first="Ada",
-            last="Lovelace",
-            position=0,
-            orcid="0000-0000-0000-0001",
+def _feature_block_for_plan(
+    *,
+    cluster_seeds_disallow: tuple[tuple[str, str], ...] = (("q", "s2"),),
+    specter_embeddings: np.ndarray | None = None,
+    specter_paper_ids: tuple[str, ...] = (),
+) -> FeatureBlock:
+    return FeatureBlock(
+        signatures=(
+            FeatureBlockSignature(
+                signature_id="q",
+                paper_id="p_q",
+                author_first="Ada",
+                author_middle="",
+                author_last="Lovelace",
+                author_suffix="",
+                author_affiliations=("Analytical Engine Lab",),
+                author_orcid="0000-0000-0000-0001",
+                author_position=0,
+                author_block="a lovelace",
+                author_email="",
+                source_author_ids=("source-q",),
+            ),
+            FeatureBlockSignature(
+                signature_id="s1",
+                paper_id="p1",
+                author_first="Ada",
+                author_middle="",
+                author_last="Lovelace",
+                author_suffix="",
+                author_affiliations=("Analytical Engine Lab",),
+                author_orcid=None,
+                author_position=0,
+                author_block="a lovelace",
+                author_email="",
+                source_author_ids=("source-s1",),
+            ),
+            FeatureBlockSignature(
+                signature_id="s2",
+                paper_id="p2",
+                author_first="Grace",
+                author_middle="",
+                author_last="Hopper",
+                author_suffix="",
+                author_affiliations=("Analytical Engine Lab",),
+                author_orcid=None,
+                author_position=0,
+                author_block="g hopper",
+                author_email="",
+                source_author_ids=("source-s2",),
+            ),
+            FeatureBlockSignature(
+                signature_id="s3",
+                paper_id="p3",
+                author_first="Grace",
+                author_middle="",
+                author_last="Hopper",
+                author_suffix="",
+                author_affiliations=("Analytical Engine Lab",),
+                author_orcid=None,
+                author_position=1,
+                author_block="g hopper",
+                author_email="",
+                source_author_ids=("source-s3",),
+            ),
         ),
-        "s1": _signature_payload("s1", "p1", first="Ada", last="Lovelace", position=0),
-        "s2": _signature_payload("s2", "p2", first="Grace", last="Hopper", position=0),
-        "s3": _signature_payload("s3", "p3", first="Grace", last="Hopper", position=1),
-        "unused": _signature_payload("unused", "p_unused", first="Unused", last="Person", position=0),
-    }
-    papers = {
-        "p_q": _paper_payload("p_q", title="Notes", year=1843, authors=["Ada Lovelace", "Charles Babbage"]),
-        "p1": _paper_payload("p1", title="Notes", year=1843, authors=["Ada Lovelace", "Charles Babbage"]),
-        "p2": _paper_payload("p2", title="Compiler", year=1952, authors=["Grace Hopper", "Jane Doe"]),
-        "p3": _paper_payload("p3", title="Compiler", year=1952, authors=["Jane Doe", "Grace Hopper"]),
-        "p_unused": _paper_payload("p_unused", title="Unused", year=2000, authors=["Unused Person"]),
-    }
-    cluster_seeds_require = {"s1": "c_ada", "s2": "c_other", "s3": "c_other", "unused": "c_unused"}
-    return signatures, papers, cluster_seeds_require
+        papers=(
+            FeatureBlockPaper(
+                paper_id="p_q",
+                title="Notes",
+                abstract="",
+                venue="Royal Society",
+                journal_name="",
+                year=1843,
+            ),
+            FeatureBlockPaper(
+                paper_id="p1",
+                title="Notes",
+                abstract="",
+                venue="Royal Society",
+                journal_name="",
+                year=1843,
+            ),
+            FeatureBlockPaper(
+                paper_id="p2",
+                title="Compiler",
+                abstract="",
+                venue="Royal Society",
+                journal_name="",
+                year=1952,
+            ),
+            FeatureBlockPaper(
+                paper_id="p3",
+                title="Compiler",
+                abstract="",
+                venue="Royal Society",
+                journal_name="",
+                year=1952,
+            ),
+        ),
+        paper_authors=(
+            FeatureBlockPaperAuthor(paper_id="p_q", position=0, author_name="Ada Lovelace"),
+            FeatureBlockPaperAuthor(paper_id="p_q", position=1, author_name="Charles Babbage"),
+            FeatureBlockPaperAuthor(paper_id="p1", position=0, author_name="Ada Lovelace"),
+            FeatureBlockPaperAuthor(paper_id="p1", position=1, author_name="Charles Babbage"),
+            FeatureBlockPaperAuthor(paper_id="p2", position=0, author_name="Grace Hopper"),
+            FeatureBlockPaperAuthor(paper_id="p2", position=1, author_name="Jane Doe"),
+            FeatureBlockPaperAuthor(paper_id="p3", position=0, author_name="Jane Doe"),
+            FeatureBlockPaperAuthor(paper_id="p3", position=1, author_name="Grace Hopper"),
+        ),
+        cluster_seeds_require=(("s1", "c_ada"), ("s2", "c_other"), ("s3", "c_other")),
+        cluster_seeds_disallow=cluster_seeds_disallow,
+        query_signature_ids=("q",),
+        specter_paper_ids=specter_paper_ids,
+        specter_embeddings=specter_embeddings,
+    )
 
 
 def _write_feature_block_arrow_paths(tmp_path: Path) -> dict[str, str]:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-        cluster_seeds_disallow=[("q", "s2")],
-    )
+    feature_block = _feature_block_for_plan()
     return write_feature_block_arrow_tables(feature_block, tmp_path, include_empty_cluster_seeds=True)
 
 
@@ -373,24 +447,31 @@ def test_feature_block_to_arrow_tables_matches_raw_schema() -> None:
 def test_feature_block_to_arrow_tables_keeps_all_null_optional_columns_typed() -> None:
     pa = pytest.importorskip("pyarrow")
 
-    tables = feature_block_from_raw_payloads(
-        signatures={
-            "q": {
-                "signature_id": "q",
-                "paper_id": "p_q",
-                "author_info": {
-                    "first": "Ada",
-                    "middle": None,
-                    "last": "Lovelace",
-                    "suffix": None,
-                    "affiliations": [],
-                    "position": 0,
-                },
-            }
-        },
-        papers={"p_q": _paper_payload("p_q", title="", year=1843, authors=["Ada Lovelace"])},
-        raw_candidate_plan={**_raw_plan(), "left_signature_ids": ["q"], "right_signature_ids": ["q"]},
-        cluster_seeds_require={},
+    tables = FeatureBlock(
+        signatures=(
+            FeatureBlockSignature(
+                signature_id="q",
+                paper_id="p_q",
+                author_first="Ada",
+                author_middle=None,
+                author_last="Lovelace",
+                author_suffix=None,
+                author_affiliations=(),
+                author_orcid=None,
+                author_position=0,
+            ),
+        ),
+        papers=(
+            FeatureBlockPaper(
+                paper_id="p_q",
+                title="",
+                abstract=None,
+                venue=None,
+                journal_name=None,
+                year=1843,
+            ),
+        ),
+        paper_authors=(FeatureBlockPaperAuthor(paper_id="p_q", position=0, author_name="Ada Lovelace"),),
     ).to_arrow_tables()
 
     assert tables["signatures"].schema.field("author_suffix").type == pa.string()
@@ -513,12 +594,24 @@ def test_read_cluster_seed_disallows_arrow_rejects_integer_id_columns(tmp_path: 
         read_cluster_seed_disallows_arrow(path)
 
 
-def test_temporary_arrow_paths_with_cluster_seeds_rejects_none_path(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="papers.*None"):
+@pytest.mark.parametrize(
+    ("bad_path", "match"),
+    [
+        (None, "papers.*None"),
+        (" ", "papers.*empty"),
+        (".", "papers.*current directory"),
+    ],
+)
+def test_temporary_arrow_paths_with_cluster_seeds_rejects_invalid_paths(
+    tmp_path: Path,
+    bad_path: object,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
         with temporary_arrow_paths_with_cluster_seeds(
             {
                 "signatures": tmp_path / "signatures.arrow",
-                "papers": None,
+                "papers": bad_path,
             },
             {},
             prefix="test-arrow-paths-",
@@ -830,17 +923,15 @@ def test_feature_block_from_arrow_paths_rejects_integer_paper_text_columns(tmp_p
 
 
 def test_feature_block_from_arrow_paths_reads_specter_when_requested(tmp_path: Path) -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-        specter_embeddings={
-            "p_q": np.asarray([1.0, 0.0], dtype=np.float32),
-            "p1": np.asarray([0.5, 0.5], dtype=np.float32),
-            "p_unused": np.asarray([0.0, 1.0], dtype=np.float32),
-        },
+    feature_block = _feature_block_for_plan(
+        specter_paper_ids=("p_q", "p1"),
+        specter_embeddings=np.asarray(
+            [
+                [1.0, 0.0],
+                [0.5, 0.5],
+            ],
+            dtype=np.float32,
+        ),
     )
     arrow_paths = write_feature_block_arrow_tables(feature_block, tmp_path, include_empty_cluster_seeds=True)
 
@@ -1284,67 +1375,6 @@ def test_write_name_counts_index_overwrite_removes_stale_generations(
     assert generations[0] != first_generation
 
 
-def test_feature_block_to_mini_anddata_materializes_only_requested_rows() -> None:
-    dataset = _tiny_anddata()
-    dataset.cluster_seeds_disallow = set()
-    feature_block = feature_block_from_anddata(
-        dataset,
-        signature_ids=["q", "s1"],
-        query_signature_ids=["q"],
-    )
-
-    mini = feature_block_to_mini_anddata(
-        feature_block,
-        name="mini_feature_block_test",
-        name_tuples=set(),
-    )
-
-    assert tuple(mini.signatures) == ("q", "s1")
-    assert set(mini.papers) == {"p_q", "p1"}
-    assert mini.cluster_seeds_require == {"s1": "c_ada"}
-    assert mini.cluster_seeds_disallow == set()
-    assert mini.signatures["q"].author_info_orcid == "0000000000000001"
-    np.testing.assert_allclose(mini.specter_embeddings["p1"], [1.0, 0.1])
-
-
-def test_feature_block_from_raw_payloads_uses_raw_plan_mini_order() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-        cluster_seeds_disallow=[("q", "s2")],
-        specter_embeddings={
-            "p_q": np.asarray([1.0, 0.0], dtype=np.float32),
-            "p1": np.asarray([1.0, 0.1], dtype=np.float32),
-            "p_unused": np.asarray([0.0, 1.0], dtype=np.float32),
-        },
-    )
-
-    assert feature_block.signature_ids == ("q", "s1", "s2", "s3")
-    assert feature_block.query_signature_ids == ("q",)
-    assert feature_block.cluster_seeds_require == (("s1", "c_ada"), ("s2", "c_other"), ("s3", "c_other"))
-    assert feature_block.cluster_seeds_disallow == (("q", "s2"),)
-    assert [paper.paper_id for paper in feature_block.papers] == ["p_q", "p1", "p2", "p3"]
-    assert feature_block.specter_paper_ids == ("p_q", "p1")
-
-
-def test_feature_block_from_raw_payloads_filters_one_sided_disallow_pair() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-        cluster_seeds_disallow=[("q", "unused")],
-    )
-
-    assert feature_block.cluster_seeds_disallow == ()
-
-
 def test_feature_block_from_anddata_filters_one_sided_disallow_pair() -> None:
     feature_block = feature_block_from_anddata(
         _tiny_anddata(),
@@ -1386,77 +1416,7 @@ def test_feature_block_contract_rejects_out_of_block_disallow_pair() -> None:
         )
 
 
-def test_feature_block_from_raw_payloads_rejects_missing_papers() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    del papers["p3"]
-
-    with pytest.raises(ValueError, match="missing signature paper_ids"):
-        feature_block_from_raw_payloads(
-            signatures=signatures,
-            papers=papers,
-            raw_candidate_plan=_raw_plan(),
-            cluster_seeds_require=cluster_seeds_require,
-        )
-
-
-def test_feature_block_from_raw_payloads_rejects_malformed_optional_scalars() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    signatures["s3"]["author_info"]["position"] = "later"
-
-    with pytest.raises(ValueError, match="signatures.author_info.position"):
-        feature_block_from_raw_payloads(
-            signatures=signatures,
-            papers=papers,
-            raw_candidate_plan=_raw_plan(),
-            cluster_seeds_require=cluster_seeds_require,
-        )
-
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    papers["p1"]["is_reliable"] = "maybe"
-
-    with pytest.raises(ValueError, match="papers.is_reliable"):
-        feature_block_from_raw_payloads(
-            signatures=signatures,
-            papers=papers,
-            raw_candidate_plan=_raw_plan(),
-            cluster_seeds_require=cluster_seeds_require,
-        )
-
-
-def test_feature_block_rejects_scalar_sequence_fields_and_malformed_authors() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    signatures["q"]["author_info"]["affiliations"] = "Analytical Engine Lab"
-
-    with pytest.raises(ValueError, match="author_info.affiliations"):
-        feature_block_from_raw_payloads(
-            signatures=signatures,
-            papers=papers,
-            raw_candidate_plan=_raw_plan(),
-            cluster_seeds_require=cluster_seeds_require,
-        )
-
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    signatures["q"]["sourced_author_ids"] = "SID"
-
-    with pytest.raises(ValueError, match="sourced_author_ids"):
-        feature_block_from_raw_payloads(
-            signatures=signatures,
-            papers=papers,
-            raw_candidate_plan=_raw_plan(),
-            cluster_seeds_require=cluster_seeds_require,
-        )
-
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    papers["p_q"]["authors"] = ["Ada Lovelace"]
-
-    with pytest.raises(ValueError, match="papers.authors entries"):
-        feature_block_from_raw_payloads(
-            signatures=signatures,
-            papers=papers,
-            raw_candidate_plan=_raw_plan(),
-            cluster_seeds_require=cluster_seeds_require,
-        )
-
+def test_feature_block_signature_rejects_scalar_sequence_fields() -> None:
     with pytest.raises(ValueError, match="FeatureBlockSignature.author_affiliations"):
         FeatureBlockSignature(
             signature_id="q",
@@ -1469,66 +1429,6 @@ def test_feature_block_rejects_scalar_sequence_fields_and_malformed_authors() ->
             author_orcid=None,
             author_position=0,
         )
-
-
-def test_feature_block_preserves_source_author_ids_verbatim() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    signatures["q"]["sourced_author_ids"] = ["2784918883", "Asif Khan 0003", "P2776598"]
-
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-    )
-
-    query_signature = next(signature for signature in feature_block.signatures if signature.signature_id == "q")
-    assert query_signature.source_author_ids == ("2784918883", "Asif Khan 0003", "P2776598")
-
-
-def test_feature_block_from_raw_payloads_accepts_anddata_specter_tuple_payload() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    specter_matrix = np.asarray(
-        [
-            [1.0, 0.0],
-            [1.0, 0.1],
-            [0.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    specter_keys = ["p_q", "p1", "p_unused"]
-
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-        specter_embeddings=(specter_matrix, specter_keys),
-    )
-
-    assert feature_block.specter_paper_ids == ("p_q", "p1")
-    assert feature_block.specter_embeddings is not None
-    np.testing.assert_allclose(feature_block.specter_embeddings, [[1.0, 0.0], [1.0, 0.1]])
-
-
-def test_feature_block_to_mini_anddata_preserves_abstract_presence_for_scoring() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    papers["p1"]["abstract"] = "Has Abstract"
-
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-    )
-    mini = feature_block_to_mini_anddata(
-        feature_block,
-        name="mini_feature_block_abstract_test",
-        load_name_counts=False,
-        name_tuples=set(),
-    )
-
-    assert mini.papers["p1"].has_abstract is True
 
 
 def test_feature_block_for_signature_order_rejects_missing_plan_signature() -> None:
@@ -1658,144 +1558,6 @@ def test_raw_candidate_plan_bridge_reports_missing_signature_id() -> None:
             _raw_plan(),
             signature_id_to_index={"q": 0, "s1": 1, "s2": 2},
         )
-
-
-def test_feature_block_query_and_summary_helpers_match_mini_anddata_row_signals_except_raw_query_author() -> None:
-    feature_block = feature_block_from_raw_payloads(
-        signatures=_raw_payloads_for_plan()[0],
-        papers=_raw_payloads_for_plan()[1],
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=_raw_payloads_for_plan()[2],
-    )
-    mini = feature_block_to_mini_anddata(
-        feature_block,
-        name="mini_feature_block_query_parity",
-        load_name_counts=False,
-        name_tuples=set(),
-    )
-    order = feature_block_signature_order_from_raw_candidate_plan(_raw_plan())
-    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
-        _raw_plan(),
-        feature_block_signature_order=order,
-    )
-
-    mini_query = extract_query_features(mini, "q", orcid_enabled=True)
-    direct_query = extract_query_features_from_feature_block(feature_block, "q", orcid_enabled=True)
-    assert direct_query.first == mini_query.first
-    assert direct_query.middle == mini_query.middle
-    assert direct_query.paper_author_names == mini_query.paper_author_names
-    assert direct_query.local10_author_names == mini_query.local10_author_names
-    assert direct_query.query_author == "Ada Lovelace"
-    assert mini_query.query_author == "ada lovelace"
-    assert direct_query.affiliation_terms == mini_query.affiliation_terms
-    assert direct_query.has_affiliations == mini_query.has_affiliations
-
-    mini_summary = build_cluster_summary(
-        mini,
-        cluster_id="c_other",
-        component_key="c_other",
-        signature_ids=["s2", "s3"],
-        max_exemplars=4,
-        orcid_enabled=True,
-    )
-    direct_summary = build_cluster_summary_from_feature_block(
-        feature_block,
-        cluster_id="c_other",
-        component_key="c_other",
-        signature_ids=["s2", "s3"],
-        max_exemplars=4,
-        orcid_enabled=True,
-    )
-    assert direct_summary.max_paper_author_count == mini_summary.max_paper_author_count
-    assert direct_summary.member_paper_author_names == mini_summary.member_paper_author_names
-    assert direct_summary.member_local10_author_names == mini_summary.member_local10_author_names
-
-    row_query_map = {0: "q"}
-    np.testing.assert_allclose(
-        build_name_count_rarity_row_signals(
-            retrieval_batch,
-            query_signature_id_by_index=row_query_map,
-            query_by_signature_id={"q": direct_query},
-            summary_by_component={
-                "c_ada": build_cluster_summary_from_feature_block(
-                    feature_block,
-                    cluster_id="c_ada",
-                    component_key="c_ada",
-                    signature_ids=["s1"],
-                    max_exemplars=4,
-                    orcid_enabled=True,
-                ),
-                "c_other": direct_summary,
-            },
-        )["paper_author_list_max_overlap_count"],
-        build_name_count_rarity_row_signals(
-            retrieval_batch,
-            query_signature_id_by_index=row_query_map,
-            query_by_signature_id={"q": mini_query},
-            summary_by_component={
-                "c_ada": build_cluster_summary(
-                    mini,
-                    cluster_id="c_ada",
-                    component_key="c_ada",
-                    signature_ids=["s1"],
-                    max_exemplars=4,
-                    orcid_enabled=True,
-                ),
-                "c_other": mini_summary,
-            },
-        )["paper_author_list_max_overlap_count"],
-    )
-
-
-def test_feature_block_query_has_affiliations_uses_normalized_terms() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    signatures["q"]["author_info"]["affiliations"] = ["University"]
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-    )
-    mini = feature_block_to_mini_anddata(
-        feature_block,
-        name="mini_feature_block_empty_affiliation_terms",
-        load_name_counts=False,
-        name_tuples=set(),
-    )
-
-    mini_query = extract_query_features(mini, "q", orcid_enabled=True)
-    direct_query = extract_query_features_from_feature_block(feature_block, "q", orcid_enabled=True)
-
-    assert direct_query.affiliation_terms == frozenset()
-    assert direct_query.has_affiliations is False
-    assert direct_query.has_affiliations == mini_query.has_affiliations
-
-
-def test_feature_block_query_none_author_position_stays_unknown() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    signatures["q"]["author_info"]["position"] = None
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-    )
-    mini = feature_block_to_mini_anddata(
-        feature_block,
-        name="mini_feature_block_none_author_position",
-        load_name_counts=False,
-        name_tuples=set(),
-    )
-
-    direct_query = extract_query_features_from_feature_block(feature_block, "q", orcid_enabled=True)
-    mini_query = extract_query_features(mini, "q", orcid_enabled=True)
-
-    assert direct_query.author_position is None
-    assert mini_query.author_position is None
-    assert direct_query.coauthor_blocks == mini_query.coauthor_blocks
-    assert direct_query.coauthor_blocks == frozenset()
-    assert direct_query.local10_author_names == mini_query.local10_author_names
-    assert direct_query.local10_author_names == frozenset()
 
 
 def test_feature_block_rejects_duplicate_paper_author_positions() -> None:

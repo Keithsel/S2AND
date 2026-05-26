@@ -81,24 +81,6 @@ def test_signature_query_author_prefers_raw_full_name() -> None:
     assert query_adapter_module._signature_query_author(signature) == "Ada B. Lovelace, PhD"
 
 
-def test_feature_block_coauthor_blocks_filters_blocks_after_compute() -> None:
-    context = {
-        "paper": (
-            (0, "Ada Lovelace"),
-            (1, "   "),
-        )
-    }
-
-    assert (
-        query_adapter_module._feature_block_coauthor_blocks(
-            context,
-            paper_id="paper",
-            author_position=0,
-        )
-        == frozenset()
-    )
-
-
 def test_signature_coauthor_blocks_uses_precomputed_blocks_without_position() -> None:
     signature = _signature("paper")
     signature.author_info_position = None

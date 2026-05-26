@@ -12,7 +12,7 @@ from typing import Any, Literal
 import numpy as np
 
 from s2and import feature_port
-from s2and.arrow_inputs import validate_arrow_prediction_artifacts
+from s2and.arrow_inputs import normalize_arrow_paths, validate_arrow_prediction_artifacts
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
@@ -20,6 +20,7 @@ from s2and.incremental_linking.array_validation import as_uint32_1d
 from s2and.incremental_linking.artifact import IncrementalLinkingArtifact
 from s2and.incremental_linking.feature_block import feature_block_signature_order_from_raw_candidate_plan
 from s2and.incremental_linking.features import LinkerFeatureMatrix, assemble_linker_feature_matrix
+from s2and.incremental_linking.gate_buckets import validate_query_view
 from s2and.incremental_linking.linker_pairwise import (
     PROMOTED_PAIRWISE_AGG_BASE_FEATURE_NAMES,
     PROMOTED_PAIRWISE_AGG_FEATURE_COLUMNS,
@@ -1560,7 +1561,7 @@ def _raw_plan_query_view_values(raw_candidate_plan: Mapping[str, Any]) -> Any:
 
 def _raw_plan_query_views(raw_candidate_plan: Mapping[str, Any], query_count: int) -> tuple[str, ...]:
     raw_views = _raw_plan_query_view_values(raw_candidate_plan)
-    views = tuple(str(value) for value in raw_views)
+    views = tuple(validate_query_view(value) for value in raw_views)
     if len(views) != int(query_count):
         raise ValueError(f"raw candidate plan query_views length must match query count: {len(views)} != {query_count}")
     return views
@@ -1982,7 +1983,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     top_k_resolved = int(artifact.metadata.retrieval_top_k if top_k is None else top_k)
     provided_raw_candidate_plan = raw_candidate_plan is not None
     if provided_raw_candidate_plan:
-        arrow_path_payload = feature_port.normalize_arrow_paths(arrow_paths)
+        arrow_path_payload = normalize_arrow_paths(arrow_paths)
     else:
         arrow_path_payload = validate_arrow_prediction_artifacts(
             arrow_paths,

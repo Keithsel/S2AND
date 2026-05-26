@@ -12,7 +12,7 @@ from s2and.file_cache import cached_path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export Python name-count pickle into Rust-ingest JSON artifact format."
+        description="Export Python name-count pickle into the legacy Rust JSON-ingest artifact format."
     )
     parser.add_argument(
         "--input",
@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=str(Path(PROJECT_ROOT_PATH) / "scratch" / "name_counts_rust.json"),
         help=(
-            "Path to output JSON artifact for Rust from_json_paths ingest "
+            "Path to output JSON artifact for compatibility Rust from_json_paths ingest "
             "(use --output s2and/data/... explicitly if desired)."
         ),
     )

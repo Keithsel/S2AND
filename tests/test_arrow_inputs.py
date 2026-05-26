@@ -15,6 +15,15 @@ from s2and.incremental_linking.feature_block import write_name_counts_index
 from tests.helpers import patch_tiny_name_counts_loader
 
 
+def _touch_paths(tmp_path: Path, keys: tuple[str, ...], *, suffix: str = ".arrow") -> dict[str, str]:
+    paths = {}
+    for key in keys:
+        path = tmp_path / f"{key}{suffix}"
+        path.touch()
+        paths[key] = str(path)
+    return paths
+
+
 def test_require_arrow_artifacts_reports_missing_keys_and_files(tmp_path: Path) -> None:
     signatures_path = tmp_path / "signatures.arrow"
     signatures_path.touch()
@@ -40,11 +49,7 @@ def test_require_arrow_artifacts_reports_missing_keys_and_files(tmp_path: Path) 
 
 
 def test_validate_arrow_prediction_artifacts_requires_filtered_read_indexes(tmp_path: Path) -> None:
-    paths = {}
-    for key in ("signatures", "papers", "paper_authors", "specter"):
-        path = tmp_path / f"{key}.arrow"
-        path.touch()
-        paths[key] = str(path)
+    paths = _touch_paths(tmp_path, ("signatures", "papers", "paper_authors", "specter"))
 
     with pytest.raises(MissingArrowArtifactError) as exc_info:
         validate_arrow_prediction_artifacts(
@@ -63,11 +68,7 @@ def test_validate_arrow_prediction_artifacts_requires_filtered_read_indexes(tmp_
 
 
 def test_validate_arrow_prediction_artifacts_rejects_missing_declared_seed_sidecar(tmp_path: Path) -> None:
-    paths = {}
-    for key in ("signatures", "papers", "paper_authors"):
-        path = tmp_path / f"{key}.arrow"
-        path.touch()
-        paths[key] = str(path)
+    paths = _touch_paths(tmp_path, ("signatures", "papers", "paper_authors"))
     seed_path = tmp_path / "missing_cluster_seeds.arrow"
     paths["cluster_seeds"] = str(seed_path)
 
@@ -112,11 +113,7 @@ def test_validate_arrow_prediction_artifacts_rejects_wrong_path_kinds(tmp_path: 
 def test_validate_arrow_prediction_artifacts_requires_manifest_backed_name_counts_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    paths = {}
-    for key in ("signatures", "papers", "paper_authors"):
-        path = tmp_path / f"{key}.arrow"
-        path.touch()
-        paths[key] = str(path)
+    paths = _touch_paths(tmp_path, ("signatures", "papers", "paper_authors"))
     empty_index_dir = tmp_path / "empty_name_counts_index"
     empty_index_dir.mkdir()
 
@@ -142,15 +139,12 @@ def test_validate_arrow_prediction_artifacts_requires_manifest_backed_name_count
 
 
 def test_validate_arrow_prediction_artifacts_ignores_unused_specter_path(tmp_path: Path) -> None:
-    paths = {}
-    for key in ("signatures", "papers", "paper_authors", "specter"):
-        path = tmp_path / f"{key}.arrow"
-        path.touch()
-        paths[key] = str(path)
-    for key in ("signatures_batch_index", "papers_batch_index", "paper_authors_batch_index"):
-        path = tmp_path / f"{key}.bin"
-        path.touch()
-        paths[key] = str(path)
+    paths = _touch_paths(tmp_path, ("signatures", "papers", "paper_authors", "specter"))
+    paths.update(
+        _touch_paths(
+            tmp_path, ("signatures_batch_index", "papers_batch_index", "paper_authors_batch_index"), suffix=".bin"
+        )
+    )
 
     normalized = validate_arrow_prediction_artifacts(
         paths,
@@ -164,20 +158,14 @@ def test_validate_arrow_prediction_artifacts_ignores_unused_specter_path(tmp_pat
 
 
 def test_validate_arrow_prediction_artifacts_accepts_selected_specter2_alias(tmp_path: Path) -> None:
-    paths = {}
-    for key in ("signatures", "papers", "paper_authors", "specter2"):
-        path = tmp_path / f"{key}.arrow"
-        path.touch()
-        paths[key] = str(path)
-    for key in (
-        "signatures_batch_index",
-        "papers_batch_index",
-        "paper_authors_batch_index",
-        "specter2_batch_index",
-    ):
-        path = tmp_path / f"{key}.bin"
-        path.touch()
-        paths[key] = str(path)
+    paths = _touch_paths(tmp_path, ("signatures", "papers", "paper_authors", "specter2"))
+    paths.update(
+        _touch_paths(
+            tmp_path,
+            ("signatures_batch_index", "papers_batch_index", "paper_authors_batch_index", "specter2_batch_index"),
+            suffix=".bin",
+        )
+    )
 
     normalized = validate_arrow_prediction_artifacts(
         paths,

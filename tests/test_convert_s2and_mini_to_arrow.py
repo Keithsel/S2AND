@@ -206,7 +206,38 @@ def test_root_manifest_upsert_keeps_dataset_order_stable(tmp_path: Path) -> None
     for dataset_name in ("b", "a"):
         dataset_dir = output_root / dataset_name
         dataset_dir.mkdir()
-        (dataset_dir / "manifest.json").write_text("{}", encoding="utf-8")
+        (dataset_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "dataset": dataset_name,
+                    "conversion_kind": "table-runtime",
+                    "source_dir": str(tmp_path / "source" / dataset_name),
+                    "signature_count": 2,
+                    "paper_count": 3,
+                    "paper_embedding_count": 99,
+                    "cluster_seeds_require_count": 99,
+                    "cluster_seeds_disallow_count": 0,
+                    "altered_cluster_signature_count": 0,
+                    "paths": {
+                        "signatures": "signatures.arrow",
+                        "papers": "papers.arrow",
+                        "paper_authors": "paper_authors.arrow",
+                        "specter": "specter.arrow",
+                        "cluster_seeds": "cluster_seeds.arrow",
+                        "name_counts_index": "../name_counts_index",
+                        "signatures_batch_index": "signatures.signatures_batch_index.bin",
+                    },
+                    "validation": {
+                        "specter_count": 2,
+                        "missing_specter_paper_count": 1,
+                        "cluster_seed_count": 1,
+                        "cluster_seed_disallow_count": 0,
+                        "altered_cluster_signature_count": 0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         convert_to_arrow._upsert_root_manifest(output_root, dataset_name=dataset_name, dataset_dir=dataset_dir)
 
     dataset_dir = output_root / "a"
@@ -215,6 +246,38 @@ def test_root_manifest_upsert_keeps_dataset_order_stable(tmp_path: Path) -> None
     root_manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
     assert root_manifest["datasets"] == ["a", "b"]
     assert [entry["dataset"] for entry in root_manifest["dataset_manifests"]] == ["a", "b"]
+    assert root_manifest["generator"]["script"] == "scripts/convert_to_arrow.py"
+    assert isinstance(root_manifest["generated_at_utc"], str)
+    assert root_manifest["audit"] == {
+        "dataset_count": 2,
+        "datasets_with_missing_manifests": [],
+        "total_signature_count": 4,
+        "total_paper_count": 6,
+        "total_embedding_row_count": 4,
+        "total_missing_embedding_count": 2,
+        "total_batch_index_count": 2,
+    }
+    assert root_manifest["validation_command_cwd"] == str(output_root)
+    first_entry = root_manifest["dataset_manifests"][0]
+    assert first_entry["manifest_exists"] is True
+    assert first_entry["manifest_size_bytes"] > 0
+    assert len(first_entry["manifest_sha256"]) == 64
+    assert str(first_entry["audit"]["source_id"]).replace("\\", "/").endswith("source/a")
+    assert first_entry["audit"]["embedding_row_count"] == 2
+    assert first_entry["audit"]["cluster_seed_count"] == 1
+    assert first_entry["audit"]["sidecar_keys"] == [
+        "cluster_seeds",
+        "name_counts_index",
+        "signatures_batch_index",
+    ]
+    validation_command = (
+        "uv run python scripts/convert_to_arrow.py validate --dataset-dir "
+        "{dataset_dir} --require-embeddings --require-name-counts-index"
+    )
+    assert root_manifest["validation_commands"] == [
+        validation_command.format(dataset_dir="a"),
+        validation_command.format(dataset_dir="b"),
+    ]
 
 
 def test_linker_replay_main_writes_datasets_under_release_root(
@@ -496,6 +559,47 @@ def test_validate_arrow_dataset_dir_resolves_relative_manifest_paths() -> None:
 
     assert metrics["signature_count"] == 2871
     assert metrics["name_counts_index_present"] is True
+
+
+def test_validate_arrow_dataset_manifest_rejects_incomplete_name_counts_index(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    signatures_path = tmp_path / "signatures.arrow"
+    papers_path = tmp_path / "papers.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    name_counts_index = tmp_path / "name_counts_index"
+    name_counts_index.mkdir()
+    (name_counts_index / "manifest.json").write_text(
+        json.dumps({"files": {"first": {"path": "missing-first.bin"}}}),
+        encoding="utf-8",
+    )
+    write_arrow_ipc_table(
+        pa.table({"signature_id": pa.array(["s1"], type=pa.string()), "paper_id": pa.array(["p1"], type=pa.string())}),
+        signatures_path,
+    )
+    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), papers_path)
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "position": pa.array([0], type=pa.int64()),
+            }
+        ),
+        paper_authors_path,
+    )
+
+    with pytest.raises(ValueError, match="missing files.first.path target"):
+        convert_to_arrow.validate_arrow_dataset_manifest(
+            {
+                "paths": {
+                    "signatures": str(signatures_path),
+                    "papers": str(papers_path),
+                    "paper_authors": str(paper_authors_path),
+                    "name_counts_index": str(name_counts_index),
+                }
+            },
+            require_embeddings=False,
+            require_name_counts_index=True,
+        )
 
 
 def test_validate_arrow_dataset_manifest_rejects_integer_id_columns(tmp_path: Path) -> None:

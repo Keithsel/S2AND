@@ -293,11 +293,11 @@ def _resolve_eval_name_counts_index_path(dataset_root: Path) -> str | None:
         if isinstance(manifest_paths, dict):
             path_value = manifest_paths.get("name_counts_index")
             if path_value is not None:
-                resolved = Path(str(path_value))
-                if not resolved.is_absolute():
-                    resolved = dataset_root / resolved
-                if resolved.exists():
-                    return str(resolved.resolve())
+                raw_path = Path(str(path_value))
+                candidates = [raw_path] if raw_path.is_absolute() else [dataset_root / raw_path, Path.cwd() / raw_path]
+                for resolved in candidates:
+                    if resolved.exists():
+                        return str(resolved.resolve())
                 raise FileNotFoundError(
                     f"Arrow manifest {manifest_path} specifies name_counts_index path that does not exist: "
                     f"{path_value}"

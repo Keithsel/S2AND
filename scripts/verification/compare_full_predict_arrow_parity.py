@@ -309,13 +309,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         clear_rust_featurizer_cache,
     )
     from s2and.incremental_linking.feature_block import (
-        write_feature_block_arrow_from_anddata,
         write_name_counts_arrow,
         write_name_counts_index,
         write_name_pairs_arrow,
     )
     from s2and.production_model import load_production_model
     from s2and.text import set_fasttext_loading_enabled
+    from scripts.arrow_conversion_helpers import write_feature_block_arrow_from_anddata
 
     set_fasttext_loading_enabled(False)
 

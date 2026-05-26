@@ -136,11 +136,9 @@ def _resolve_arrow_dataset_paths(arrow_root: Path, dataset: str) -> dict[str, st
         paths["specter"] = paths["specter2"]
     if "specter_batch_index" not in paths and "specter2_batch_index" in paths:
         paths["specter_batch_index"] = paths["specter2_batch_index"]
-    paths["clusters"] = str((dataset_root / f"{dataset}_clusters.json").resolve())
-    if not Path(paths["clusters"]).exists():
-        missing = {"clusters": paths["clusters"]}
-        formatted = ", ".join(f"{key}={value}" for key, value in missing.items())
-        raise FileNotFoundError(f"Missing required Arrow profiling paths for {dataset}: {formatted}")
+    clusters_path = dataset_root / f"{dataset}_clusters.json"
+    if clusters_path.exists():
+        paths["clusters"] = str(clusters_path.resolve())
     try:
         validated = validate_arrow_prediction_artifacts(
             paths,
@@ -155,7 +153,8 @@ def _resolve_arrow_dataset_paths(arrow_root: Path, dataset: str) -> dict[str, st
         )
     except MissingArrowArtifactError as exc:
         raise FileNotFoundError(str(exc)) from exc
-    validated["clusters"] = paths["clusters"]
+    if "clusters" in paths:
+        validated["clusters"] = paths["clusters"]
     return validated
 
 
@@ -221,6 +220,19 @@ def _read_signature_to_cluster_id(clusters_path: Path) -> dict[str, str]:
     return signature_to_cluster
 
 
+def _synthetic_signature_to_cluster_id(
+    blocks: dict[str, list[str]],
+    *,
+    max_seed_clusters: int,
+) -> dict[str, str]:
+    signature_to_cluster: dict[str, str] = {}
+    for block_key, block_signatures in blocks.items():
+        seed_limit = len(block_signatures) if max_seed_clusters <= 0 else min(len(block_signatures), max_seed_clusters)
+        for seed_index, signature_id in enumerate(block_signatures[:seed_limit]):
+            signature_to_cluster[str(signature_id)] = f"synthetic:{block_key}:{seed_index}"
+    return signature_to_cluster
+
+
 def _select_workload(
     *,
     blocks: dict[str, list[str]],
@@ -268,6 +280,32 @@ def _select_workload(
 
 def _summarize_runs(per_run: list[dict[str, Any]]) -> dict[str, Any]:
     predict_seconds = [float(run["predict_seconds"]) for run in per_run]
+    telemetry_values = [dict(run.get("telemetry", {})) for run in per_run]
+
+    def _numeric_telemetry_summary(key: str) -> dict[str, float] | None:
+        values = [float(telemetry[key]) for telemetry in telemetry_values if key in telemetry]
+        if not values:
+            return None
+        return {
+            "min": min(values),
+            "p50": statistics.median(values),
+            "max": max(values),
+        }
+
+    memory_estimates = {
+        key: summary
+        for key, summary in {
+            "memory_final_predicted_peak_delta_bytes": _numeric_telemetry_summary(
+                "memory_final_predicted_peak_delta_bytes"
+            ),
+            "memory_final_predicted_peak_rss_bytes": _numeric_telemetry_summary(
+                "memory_final_predicted_peak_rss_bytes"
+            ),
+            "candidate_row_count": _numeric_telemetry_summary("candidate_row_count"),
+            "query_batch_count": _numeric_telemetry_summary("query_batch_count"),
+        }.items()
+        if summary is not None
+    }
     return {
         "run_count": len(per_run),
         "predict_seconds": {
@@ -278,6 +316,7 @@ def _summarize_runs(per_run: list[dict[str, Any]]) -> dict[str, Any]:
         "peak_rss_gb": {
             "max": max(float(run["peak_rss_gb"]) for run in per_run),
         },
+        "memory_estimates": memory_estimates,
     }
 
 
@@ -311,9 +350,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     arrow_root = Path(args.arrow_root)
     arrow_paths = _resolve_arrow_dataset_paths(arrow_root, args.dataset)
     signature_rows = _read_signature_rows(Path(arrow_paths["signatures"]))
+    blocks = _block_dict(signature_rows)
+    clusters_path = arrow_paths.get("clusters")
+    if clusters_path is None:
+        if not args.synthetic_seeds_when_clusters_missing:
+            raise FileNotFoundError(
+                f"Missing eval clusters for {args.dataset}; pass --synthetic-seeds-when-clusters-missing "
+                "to generate deterministic profiling-only seed clusters"
+            )
+        signature_to_cluster_id = _synthetic_signature_to_cluster_id(
+            blocks,
+            max_seed_clusters=int(args.max_seed_clusters),
+        )
+        seed_source = "synthetic"
+    else:
+        signature_to_cluster_id = _read_signature_to_cluster_id(Path(clusters_path))
+        seed_source = "clusters"
     workload = _select_workload(
-        blocks=_block_dict(signature_rows),
-        signature_to_cluster_id=_read_signature_to_cluster_id(Path(arrow_paths["clusters"])),
+        blocks=blocks,
+        signature_to_cluster_id=signature_to_cluster_id,
         target_block=str(args.target_block or ""),
         query_limit=int(args.query_limit),
         max_seed_clusters=int(args.max_seed_clusters),
@@ -376,6 +431,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "block_signature_count": workload.block_signature_count,
         "profile_signature_count": len(workload.block_signatures),
         "seed_signature_count": len(workload.seed_signature_to_cluster),
+        "seed_source": seed_source,
         "query_signature_count": len(workload.query_signature_ids),
         "runs": per_run,
         "summary": _summarize_runs(per_run),
@@ -399,6 +455,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target-block", default="")
     parser.add_argument("--query-limit", type=int, default=25)
     parser.add_argument("--max-seed-clusters", type=int, default=0)
+    parser.add_argument(
+        "--synthetic-seeds-when-clusters-missing",
+        action="store_true",
+        help="Use deterministic profiling-only seed clusters when the Arrow bundle has no eval clusters JSON.",
+    )
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--n-jobs", type=int, default=4)
     parser.add_argument("--batching-threshold", type=int, default=0)

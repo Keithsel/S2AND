@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -461,6 +462,53 @@ def test_convert_service_json_to_arrow_rejects_stale_output_without_overwrite(tm
         )
 
 
+def test_service_json_main_dispatches_bounded_cli_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_convert_service_json_to_arrow(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {
+            "dataset": kwargs["dataset_name"],
+            "signature_count": 0,
+            "paper_count": 0,
+            "paths": {},
+        }
+
+    monkeypatch.setattr(convert_module, "convert_service_json_to_arrow", fake_convert_service_json_to_arrow)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "convert_to_arrow.py",
+            "service-json",
+            "--input-json",
+            str(tmp_path / "payload.json"),
+            "--output-root",
+            str(tmp_path / "arrow"),
+            "--dataset-name",
+            "service_payload",
+            "--n-jobs",
+            "1",
+            "--skip-name-counts-index",
+            "--skip-validation",
+            "--copy-source-json",
+        ],
+    )
+
+    convert_module.main()
+
+    assert captured["dataset_name"] == "service_payload"
+    assert captured["n_jobs"] == 1
+    assert captured["skip_name_counts_index"] is True
+    assert captured["copy_source_json"] is True
+    assert captured["validate"] is False
+    assert json.loads(capsys.readouterr().out)["dataset"] == "service_payload"
+
+
 def test_convert_service_json_to_arrow_overwrite_preserves_other_root_manifest_entries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -505,6 +553,18 @@ def test_convert_service_json_to_arrow_overwrite_preserves_other_root_manifest_e
     assert [report["dataset"] for report in root_manifest["dataset_manifests"]] == [
         "existing_dataset",
         "new_dataset",
+    ]
+    entries = {entry["dataset"]: entry for entry in root_manifest["dataset_manifests"]}
+    assert entries["existing_dataset"]["manifest_exists"] is False
+    assert entries["new_dataset"]["manifest_exists"] is True
+    assert entries["new_dataset"]["manifest_size_bytes"] > 0
+    assert len(entries["new_dataset"]["manifest_sha256"]) == 64
+    assert entries["new_dataset"]["audit"]["conversion_kind"] == "service-json"
+    assert entries["new_dataset"]["audit"]["signature_count"] == 1
+    assert root_manifest["audit"]["datasets_with_missing_manifests"] == ["existing_dataset"]
+    assert root_manifest["audit"]["total_signature_count"] == 1
+    assert root_manifest["validation_commands"] == [
+        "uv run python scripts/convert_to_arrow.py validate --dataset-dir new_dataset"
     ]
 
 

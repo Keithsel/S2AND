@@ -494,6 +494,34 @@ def test_raw_arrow_runtime_rejects_mismatched_query_view_length_before_featurize
         )
 
 
+def test_raw_arrow_runtime_rejects_unknown_query_view_before_featurizer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_build_rust_featurizer_from_arrow_paths(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("invalid raw candidate plans should fail before featurizer construction")
+
+    monkeypatch.setattr(
+        runtime_module.feature_port,
+        "build_rust_featurizer_from_arrow_paths",
+        fail_build_rust_featurizer_from_arrow_paths,
+    )
+    clusterer = SimpleNamespace(
+        n_jobs=1,
+        featurizer_info=FeaturizationInfo(features_to_use=[]),
+        nameless_featurizer_info=None,
+    )
+
+    with pytest.raises(ValueError, match="Unknown retrieval query_view"):
+        runtime_module.predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            clusterer,
+            _static_artifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0)),
+            arrow_paths={"signatures": tmp_path / "signatures.arrow"},
+            query_signature_ids=["q"],
+            raw_candidate_plan={"query_signature_ids": ["q"], "query_views": ["typo"]},
+        )
+
+
 def _retrieval_batch(
     *,
     row_query_signature_indices: np.ndarray,

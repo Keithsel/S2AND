@@ -655,6 +655,14 @@ recording in `tests/test_cluster_incremental.py`.
   raw single-query or small query-batch prediction against a published
   `s2and_and_big_blocks_linker_dataset_20260525` dataset, after first
   sanity-checking the profiler on the tiny Arrow fixture.
+  - Status 2026-05-25: tiny promoted-incremental Arrow preflight passed via
+    `tests/test_eval_prod_models.py::test_pubmed_specter2_arrow_fixture_incremental_smoke_matches_expected_b3`;
+    see
+    [rust/profiling/2026-05-25-promoted-incremental-preflight.md](rust/profiling/2026-05-25-promoted-incremental-preflight.md).
+    Full profiling is blocked on choosing the local data source/runner because
+    this checkout has `s2and_and_big_blocks_linker_dataset_20260513_arrow`, not
+    a local `s2and_and_big_blocks_linker_dataset_20260525`, and the existing
+    big-block measurement command is still JSON/`ANDData`-based.
 - Primary metrics: p50 wall time over at least five isolated runs, peak RSS, and
   summary-construction allocation volume from a stack-level allocation profiler
   (`heaptrack`/`perf` on Linux or ETW allocation tracing on Windows).

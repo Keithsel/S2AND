@@ -9,5 +9,7 @@ pointers needed to debug or regression-test the issue later.
 
 Current snapshots:
 
+- [2026-05-25-promoted-incremental-preflight.md](2026-05-25-promoted-incremental-preflight.md):
+  Arrow promoted-incremental tiny preflight and full-run data/runner decision.
 - [2026-03-02.md](2026-03-02.md): gate rerun refresh snapshot.
 - [2026-05-23.md](2026-05-23.md): SPECTER/vector clone cleanup priority check.

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import struct
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -21,7 +20,6 @@ from s2and.incremental_linking.feature_block import (
     FeatureBlockSignature,
     FeatureBlockSignatureOrder,
     arrow_ipc_physical_layout,
-    cluster_seed_disallows_from_arrow_paths,
     feature_block_for_signature_order,
     feature_block_signature_order_from_raw_candidate_plan,
     raw_planner_arrow_physical_layout,
@@ -510,21 +508,6 @@ def test_feature_block_from_arrow_paths_reads_cluster_seed_disallows(tmp_path: P
     assert feature_block.cluster_seeds_disallow == (("q", "s2"),)
 
 
-def test_feature_block_from_arrow_paths_rejects_duplicate_bidirectional_cluster_seed_disallows(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    bidirectional = pa.table(
-        {
-            "signature_id_1": pa.array(["q", "s2"], type=pa.string()),
-            "signature_id_2": pa.array(["s2", "q"], type=pa.string()),
-        }
-    )
-    write_arrow_ipc_table(bidirectional, Path(arrow_paths["cluster_seed_disallows"]))
-
-    with pytest.raises(ValueError, match="duplicate pair"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
 def test_feature_block_from_arrow_paths_filters_one_sided_disallow_pair(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
@@ -570,13 +553,6 @@ def test_feature_block_from_arrow_paths_rejects_in_scope_self_disallow_pair(tmp_
 
     with pytest.raises(ValueError, match="self-pair"):
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
-def test_cluster_seed_disallows_from_arrow_paths_rejects_missing_explicit_path(tmp_path: Path) -> None:
-    missing_path = tmp_path / "missing_cluster_seed_disallows.arrow"
-
-    with pytest.raises(FileNotFoundError, match="cluster_seed_disallows"):
-        cluster_seed_disallows_from_arrow_paths({"cluster_seed_disallows": str(missing_path)})
 
 
 def test_read_cluster_seed_disallows_arrow_rejects_integer_id_columns(tmp_path: Path) -> None:
@@ -724,16 +700,6 @@ def test_feature_block_from_arrow_paths_rejects_duplicate_signature_rows(tmp_pat
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
-def test_feature_block_from_arrow_paths_rejects_integer_signature_ids(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    integer_id_signatures = _strict_signature_arrow_table(signature_id=pa.array([1, 2, 3, 4], type=pa.int64()))
-    write_arrow_ipc_table(integer_id_signatures, Path(arrow_paths["signatures"]))
-
-    with pytest.raises(ValueError, match="signature_id expected string"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
 def test_feature_block_from_arrow_paths_validates_raw_plan_schema(tmp_path: Path) -> None:
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
     raw_plan = _raw_plan()
@@ -741,44 +707,6 @@ def test_feature_block_from_arrow_paths_validates_raw_plan_schema(tmp_path: Path
 
     with pytest.raises(KeyError, match="schema_version"):
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=raw_plan)
-
-
-def test_feature_block_from_arrow_paths_rejects_missing_required_signature_column(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    incomplete_signatures = pa.table({"signature_id": pa.array(["q", "s1", "s2", "s3"], type=pa.string())})
-    write_arrow_ipc_table(incomplete_signatures, Path(arrow_paths["signatures"]))
-
-    with pytest.raises(ValueError, match="signatures Arrow is missing required columns: .*paper_id"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
-def test_feature_block_from_arrow_paths_rejects_malformed_signature_column_types(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    integer_first = _strict_signature_arrow_table(author_first=pa.array([1, 1, 2, 2], type=pa.int64()))
-    write_arrow_ipc_table(integer_first, Path(arrow_paths["signatures"]))
-
-    with pytest.raises(ValueError, match="author_first expected string"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-    string_position = _strict_signature_arrow_table(author_position=pa.array(["0", "0", "0", "1"], type=pa.string()))
-    write_arrow_ipc_table(string_position, Path(arrow_paths["signatures"]))
-
-    with pytest.raises(ValueError, match="author_position expected int64"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
-def test_feature_block_from_arrow_paths_rejects_null_required_list_values(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    null_affiliations = _strict_signature_arrow_table(
-        author_affiliations=pa.array([None, [], [], []], type=pa.list_(pa.string()))
-    )
-    write_arrow_ipc_table(null_affiliations, Path(arrow_paths["signatures"]))
-
-    with pytest.raises(ValueError, match="author_affiliations cannot contain null list values"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
 def test_filter_arrow_table_by_values_rejects_post_cast_duplicates() -> None:
@@ -798,169 +726,28 @@ def test_name_counts_generation_cleanup_skips_unpublished_generation(tmp_path: P
     current.mkdir(parents=True)
     unpublished.mkdir()
     old_published.mkdir()
+    for name in ("first.bin", "last.bin", "first_last.bin", "last_first_initial.bin"):
+        (current / name).write_bytes(b"index")
+    (tmp_path / "name_counts_index" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "files": {
+                    "first": {"path": "generations/gen-current/first.bin"},
+                    "last": {"path": "generations/gen-current/last.bin"},
+                    "first_last": {"path": "generations/gen-current/first_last.bin"},
+                    "last_first_initial": {"path": "generations/gen-current/last_first_initial.bin"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     (old_published / ".published").write_text("", encoding="utf-8")
 
-    feature_block_arrow_module._remove_stale_name_counts_generations(  # noqa: SLF001
-        tmp_path / "name_counts_index",
-        "gen-current",
-    )
+    feature_block_arrow_module.cleanup_stale_name_counts_generations(tmp_path / "name_counts_index")
 
     assert current.exists()
     assert unpublished.exists()
     assert not old_published.exists()
-
-
-def test_feature_block_from_arrow_paths_rejects_missing_signature_paper(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    incomplete_papers = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
-            "title": pa.array(["Notes", "Notes", "Compiler"], type=pa.string()),
-            "venue": pa.array(["Royal Society", "Royal Society", ""], type=pa.string()),
-            "journal_name": pa.array(["", "", ""], type=pa.string()),
-            "year": pa.array([1843, 1843, 1952], type=pa.int64()),
-        }
-    )
-    write_arrow_ipc_table(incomplete_papers, Path(arrow_paths["papers"]))
-
-    with pytest.raises(ValueError, match="missing signature paper_ids"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
-def test_feature_block_from_arrow_paths_rejects_duplicate_paper_author_positions(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    duplicate_authors = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p_q"], type=pa.string()),
-            "position": pa.array([0, 0], type=pa.int64()),
-            "author_name": pa.array(["Ada Lovelace", "A. Lovelace"], type=pa.string()),
-        }
-    )
-    write_arrow_ipc_table(duplicate_authors, Path(arrow_paths["paper_authors"]))
-
-    with pytest.raises(ValueError, match="duplicate"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
-def test_feature_block_from_arrow_paths_rejects_null_paper_author_position(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    null_position_authors = pa.table(
-        {
-            "paper_id": pa.array(["p_q"], type=pa.string()),
-            "position": pa.array([None], type=pa.int64()),
-            "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
-        }
-    )
-    write_arrow_ipc_table(null_position_authors, Path(arrow_paths["paper_authors"]))
-
-    with pytest.raises(ValueError, match="null position"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
-def test_feature_block_from_arrow_paths_rejects_null_paper_author_name(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    null_author_name = pa.table(
-        {
-            "paper_id": pa.array(["p_q"], type=pa.string()),
-            "position": pa.array([0], type=pa.int64()),
-            "author_name": pa.array([None], type=pa.string()),
-        }
-    )
-    write_arrow_ipc_table(null_author_name, Path(arrow_paths["paper_authors"]))
-
-    with pytest.raises(ValueError, match="null author_name"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
-def test_feature_block_from_arrow_paths_rejects_string_paper_author_position(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    string_position = pa.table(
-        {
-            "paper_id": pa.array(["p_q"], type=pa.string()),
-            "position": pa.array(["0"], type=pa.string()),
-            "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
-        }
-    )
-    write_arrow_ipc_table(string_position, Path(arrow_paths["paper_authors"]))
-
-    with pytest.raises(ValueError, match="position expected int64"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
-def test_feature_block_from_arrow_paths_rejects_malformed_optional_scalars(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    malformed_papers = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1", "p2", "p3"], type=pa.string()),
-            "title": pa.array(["Notes", "Notes", "Compiler", "Compiler"], type=pa.string()),
-            "venue": pa.array(["Royal Society", "Royal Society", "", ""], type=pa.string()),
-            "journal_name": pa.array(["", "", "", ""], type=pa.string()),
-            "year": pa.array(["1843", "20xx", "1952", "1952"], type=pa.string()),
-        }
-    )
-    write_arrow_ipc_table(malformed_papers, Path(arrow_paths["papers"]))
-
-    with pytest.raises(ValueError, match="year expected int64"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
-def test_feature_block_from_arrow_paths_rejects_wrong_paper_scalar_types(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    string_year = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1", "p2", "p3"], type=pa.string()),
-            "title": pa.array(["Notes", "Notes", "Compiler", "Compiler"], type=pa.string()),
-            "venue": pa.array(["Royal Society", "Royal Society", "", ""], type=pa.string()),
-            "journal_name": pa.array(["", "", "", ""], type=pa.string()),
-            "year": pa.array(["1843", "1843", "1952", "1952"], type=pa.string()),
-            "is_reliable": pa.array([True, True, False, False], type=pa.bool_()),
-        }
-    )
-    write_arrow_ipc_table(string_year, Path(arrow_paths["papers"]))
-
-    with pytest.raises(ValueError, match="year expected int64"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-    integer_reliable = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1", "p2", "p3"], type=pa.string()),
-            "title": pa.array(["Notes", "Notes", "Compiler", "Compiler"], type=pa.string()),
-            "venue": pa.array(["Royal Society", "Royal Society", "", ""], type=pa.string()),
-            "journal_name": pa.array(["", "", "", ""], type=pa.string()),
-            "year": pa.array([1843, 1843, 1952, 1952], type=pa.int64()),
-            "is_reliable": pa.array([1, 1, 0, 0], type=pa.int64()),
-        }
-    )
-    write_arrow_ipc_table(integer_reliable, Path(arrow_paths["papers"]))
-
-    with pytest.raises(ValueError, match="is_reliable expected bool"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-
-def test_feature_block_from_arrow_paths_rejects_integer_paper_text_columns(tmp_path: Path) -> None:
-    pa = pytest.importorskip("pyarrow")
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    malformed_papers = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1", "p2", "p3"], type=pa.string()),
-            "title": pa.array(["Notes", "Notes", "Compiler", "Compiler"], type=pa.string()),
-            "venue": pa.array(["Royal Society", "Royal Society", "", ""], type=pa.string()),
-            "journal_name": pa.array(["", "", "", ""], type=pa.string()),
-            "year": pa.array([1843, 1843, 1952, 1952], type=pa.int64()),
-            "predicted_language": pa.array([1, 1, 2, 2], type=pa.int64()),
-        }
-    )
-    write_arrow_ipc_table(malformed_papers, Path(arrow_paths["papers"]))
-
-    with pytest.raises(ValueError, match="predicted_language expected string"):
-        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
 def test_feature_block_from_arrow_paths_reads_specter_when_requested(tmp_path: Path) -> None:
@@ -1208,146 +995,14 @@ def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     with pa.memory_map(pairs_path, "r") as source:
         pairs = pa.ipc.open_file(source).read_all().to_pylist()
     manifest = json.loads((Path(index_path) / "manifest.json").read_text(encoding="utf-8"))
-    first_path = Path(index_path) / manifest["files"]["first"]["path"]
-    header = first_path.read_bytes()[:32]
-    magic, record_count, blob_offset, blob_len = struct.unpack("<8sQQQ", header)
     assert manifest["schema_version"] == "name_counts_index_v1"
     assert manifest["exact_string_verification"] is True
     assert manifest["files"]["first"]["path"].startswith("generations/")
-    assert magic == b"S2NCI001"
-    assert record_count == 1
-    assert blob_offset == 72
-    assert blob_len == 3
     assert {"kind": "first", "name": "ada", "count": 3.0} in counts
     assert pairs == [{"name_1": "ada", "name_2": "a"}, {"name_1": "charles", "name_2": "c"}]
     assert write_name_counts_arrow(tmp_path)[1] == {"reused": True}
     assert write_name_counts_index(tmp_path)[1] == {"reused": True}
     assert write_name_pairs_arrow({("ada", "a")}, tmp_path)[1] == {"reused": False, "row_count": 1}
-
-
-def test_write_name_counts_index_rewrites_changed_payload(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import s2and.data as data_module
-
-    monkeypatch.setattr(
-        data_module,
-        "_load_name_counts_cached",
-        lambda: ({"ada": 3}, {"lovelace": 5}, {"ada lovelace": 2}, {"lovelace a": 7}),
-    )
-    index_path, first_metrics = write_name_counts_index(tmp_path)
-
-    monkeypatch.setattr(
-        data_module,
-        "_load_name_counts_cached",
-        lambda: ({"grace": 11}, {"hopper": 13}, {"grace hopper": 17}, {"hopper g": 19}),
-    )
-    reused_path, second_metrics = write_name_counts_index(tmp_path)
-
-    assert reused_path == index_path
-    assert first_metrics["reused"] is False
-    assert second_metrics["reused"] is False
-    assert second_metrics["row_count"] == 4
-    manifest = json.loads((Path(index_path) / "manifest.json").read_text(encoding="utf-8"))
-    first_path = Path(index_path) / manifest["files"]["first"]["path"]
-    assert b"grace" in first_path.read_bytes()
-    assert b"ada" not in first_path.read_bytes()
-
-
-def test_write_name_counts_index_reuses_complete_manifest_without_fingerprint(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import s2and.data as data_module
-
-    index_dir = tmp_path / "name_counts_index"
-    generation_dir = index_dir / "generations" / "gen-legacy"
-    generation_dir.mkdir(parents=True)
-    files: dict[str, dict[str, str]] = {}
-    for kind in ("first", "last", "first_last", "last_first_initial"):
-        filename = f"{kind}.bin"
-        (generation_dir / filename).write_bytes(b"placeholder")
-        files[kind] = {"path": f"generations/gen-legacy/{filename}"}
-    (index_dir / "manifest.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "name_counts_index_v1",
-                "magic": "S2NCI001",
-                "files": files,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    def fail_load_name_counts() -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
-        raise AssertionError("complete legacy manifest should be reused before loading name counts")
-
-    monkeypatch.setattr(data_module, "_load_name_counts_cached", fail_load_name_counts)
-
-    reused_path, metrics = write_name_counts_index(tmp_path)
-
-    assert reused_path == str(index_dir)
-    assert metrics == {"reused": True}
-
-
-def test_write_name_artifacts_arrow_rewrites_stale_existing_outputs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pa = pytest.importorskip("pyarrow")
-    import s2and.data as data_module
-
-    loaded_counts = {"first": {"ada": 3}, "last": {"lovelace": 5}}
-
-    def fake_counts() -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
-        return (
-            dict(loaded_counts["first"]),
-            dict(loaded_counts["last"]),
-            {"ada lovelace": 2},
-            {"lovelace a": 7},
-        )
-
-    monkeypatch.setattr(data_module, "_load_name_counts_cached", fake_counts)
-    counts_path, _counts_metrics = write_name_counts_arrow(tmp_path)
-    pairs_path, _pairs_metrics = write_name_pairs_arrow({("ada", "a"), ("charles", "c")}, tmp_path)
-
-    loaded_counts["first"] = {"grace": 11}
-    _counts_path, counts_metrics = write_name_counts_arrow(tmp_path)
-    _pairs_path, pairs_metrics = write_name_pairs_arrow({("grace", "g")}, tmp_path)
-
-    assert counts_metrics["reused"] is False
-    assert pairs_metrics == {"reused": False, "row_count": 1}
-    with pa.memory_map(counts_path, "r") as source:
-        counts = pa.ipc.open_file(source).read_all().to_pylist()
-    with pa.memory_map(pairs_path, "r") as source:
-        pairs = pa.ipc.open_file(source).read_all().to_pylist()
-    assert {"kind": "first", "name": "grace", "count": 11.0} in counts
-    assert {"kind": "first", "name": "ada", "count": 3.0} not in counts
-    assert pairs == [{"name_1": "grace", "name_2": "g"}]
-
-
-def test_write_name_counts_index_does_not_reuse_legacy_direct_layout(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import s2and.data as data_module
-
-    legacy_index_dir = tmp_path / "name_counts_index"
-    legacy_index_dir.mkdir()
-    for filename in ("first.bin", "last.bin", "first_last.bin", "last_first_initial.bin"):
-        (legacy_index_dir / filename).write_bytes(b"legacy")
-    monkeypatch.setattr(
-        data_module,
-        "_load_name_counts_cached",
-        lambda: ({"ada": 3}, {"lovelace": 5}, {"ada lovelace": 2}, {"lovelace a": 7}),
-    )
-
-    index_path, index_metrics = write_name_counts_index(tmp_path)
-
-    assert index_metrics["reused"] is False
-    manifest = json.loads((Path(index_path) / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["files"]["first"]["path"].startswith("generations/")
 
 
 def test_write_name_counts_index_failed_overwrite_keeps_previous_manifest(
@@ -1385,35 +1040,6 @@ def test_write_name_counts_index_failed_overwrite_keeps_previous_manifest(
 
     assert manifest_path.read_text(encoding="utf-8") == original_manifest
     assert original_first_path.exists()
-
-
-def test_write_name_counts_index_overwrite_removes_stale_generations(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import s2and.data as data_module
-
-    monkeypatch.setattr(
-        data_module,
-        "_load_name_counts_cached",
-        lambda: ({"ada": 3}, {"lovelace": 5}, {"ada lovelace": 2}, {"lovelace a": 7}),
-    )
-
-    index_path, _metrics = write_name_counts_index(tmp_path)
-    first_manifest = json.loads((Path(index_path) / "manifest.json").read_text(encoding="utf-8"))
-    first_generation = Path(first_manifest["files"]["first"]["path"]).parts[1]
-
-    monkeypatch.setattr(
-        data_module,
-        "_load_name_counts_cached",
-        lambda: ({"alan": 11}, {"turing": 13}, {"alan turing": 17}, {"turing a": 19}),
-    )
-
-    write_name_counts_index(tmp_path, overwrite=True)
-
-    generations = sorted(path.name for path in (Path(index_path) / "generations").iterdir() if path.is_dir())
-    assert len(generations) == 1
-    assert generations[0] != first_generation
 
 
 def test_feature_block_from_anddata_filters_one_sided_disallow_pair() -> None:

@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
-from scripts.production.model.clean_linker_dataset_bundles import migrate_bundle
+from scripts.production.model.clean_linker_dataset_bundles import _bundle_child_path, migrate_bundle
 
 
 def _write_parquet(path: Path, rows: list[dict[str, object]]) -> None:
@@ -42,6 +43,18 @@ def _label_row(
         "source_kind": "",
         "train_group_id": query_group_id,
     }
+
+
+def test_bundle_child_path_rejects_absolute_paths(tmp_path: Path) -> None:
+    absolute_path = tmp_path / "outside.parquet"
+
+    with pytest.raises(ValueError, match="must be relative"):
+        _bundle_child_path(tmp_path / "bundle", str(absolute_path), context="test path")
+
+
+def test_bundle_child_path_rejects_parent_escapes(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="escapes bundle root"):
+        _bundle_child_path(tmp_path / "bundle", "../outside.parquet", context="test path")
 
 
 def test_migrate_bundle_drops_singleton_orcid_and_refreshes_split_metadata(tmp_path: Path) -> None:

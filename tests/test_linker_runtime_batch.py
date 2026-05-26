@@ -268,6 +268,54 @@ def test_rust_retrieval_batch_rejects_stale_pair_plan_schema() -> None:
         )
 
 
+def test_rust_retrieval_batch_rejects_missing_consumed_row_signal_key() -> None:
+    empty_plan = {
+        "row_count": 0,
+        "left_signature_indices": np.asarray([], dtype=np.uint32),
+        "right_signature_indices": np.asarray([], dtype=np.uint32),
+        "pair_row_indices": np.asarray([], dtype=np.uint32),
+        "row_query_signature_indices": np.asarray([], dtype=np.uint32),
+        "row_component_keys": [],
+        "retrieval_scores": np.asarray([], dtype=np.float32),
+        "retrieval_ranks": np.asarray([], dtype=np.uint16),
+        "row_query_first_tokens": [],
+        "row_component_sizes": np.asarray([], dtype=np.float32),
+        "row_named_signature_counts": np.asarray([], dtype=np.float32),
+        "row_dominant_first_names": [],
+        "row_candidate_year_min": np.asarray([], dtype=np.int32),
+        "row_candidate_year_max": np.asarray([], dtype=np.int32),
+        "row_candidate_year_range_missing": np.asarray([], dtype=np.uint8),
+        "row_query_years": np.asarray([], dtype=np.int32),
+        "row_query_year_missing": np.asarray([], dtype=np.uint8),
+        "row_query_has_affiliations": np.asarray([], dtype=np.uint8),
+        "row_query_has_coauthors": np.asarray([], dtype=np.uint8),
+        "row_orcid_match": np.asarray([], dtype=np.uint8),
+        "middle_initial_compatibility": np.asarray([], dtype=np.float32),
+        "affiliation_overlap": np.asarray([], dtype=np.float32),
+        "coauthor_overlap": np.asarray([], dtype=np.float32),
+        "venue_overlap": np.asarray([], dtype=np.float32),
+        "year_compatibility": np.asarray([], dtype=np.float32),
+        "title_overlap": np.asarray([], dtype=np.float32),
+        "specter_centroid_similarity": np.asarray([], dtype=np.float32),
+    }
+
+    class StaleRetriever:
+        def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):
+            del args, kwargs
+            return dict(empty_plan)
+
+    with pytest.raises(RuntimeError, match="stale pair-plan schema.*specter_exemplar_similarity"):
+        build_linker_retrieval_batch_rust(
+            retriever=StaleRetriever(),
+            queries=[],
+            query_signature_indices=np.asarray([], dtype=np.uint32),
+            component_member_indices_by_key={},
+            top_k=1,
+            query_view="initial_only",
+            n_jobs=1,
+        )
+
+
 def test_full_query_view_changes_same_initial_retrieval_order() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
         raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")

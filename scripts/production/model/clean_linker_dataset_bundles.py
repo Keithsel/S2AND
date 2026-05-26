@@ -67,6 +67,17 @@ def _bundle_payload(bundle_root: Path) -> dict[str, Any]:
     return _read_json(bundle_root / "bundle.json")
 
 
+def _bundle_child_path(bundle_root: Path, relative_path: str, *, context: str) -> Path:
+    raw_path = Path(str(relative_path))
+    if raw_path.is_absolute():
+        raise ValueError(f"{context} must be relative to bundle root, got absolute path: {relative_path!r}")
+    root = bundle_root.resolve()
+    resolved = (root / raw_path).resolve(strict=False)
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"{context} escapes bundle root: {relative_path!r}")
+    return resolved
+
+
 def _featureless_files(payload: dict[str, Any]) -> dict[str, str]:
     return {str(key): str(value) for key, value in payload["assets"]["featureless_rows"]["files"].items()}
 
@@ -124,7 +135,7 @@ def _drop_unlabeled_singleton_orcid_labels(
 ) -> list[dict[str, Any]]:
     reports: list[dict[str, Any]] = []
     for table_key, relative_path in _featureless_files(payload).items():
-        path = bundle_root / relative_path
+        path = _bundle_child_path(bundle_root, relative_path, context=f"featureless_rows.files[{table_key!r}]")
         rows = pd.read_parquet(path)
         if "supervision_type" not in rows.columns:
             reports.append(
@@ -173,7 +184,13 @@ def _active_stratified_rows(bundle_root: Path, payload: dict[str, Any]) -> pd.Da
     files = _featureless_files(payload)
     frames: list[pd.DataFrame] = []
     for source in _stratified_source_specs(payload):
-        rows = pd.read_parquet(bundle_root / files[source.table_key])
+        rows = pd.read_parquet(
+            _bundle_child_path(
+                bundle_root,
+                files[source.table_key],
+                context=f"featureless_rows.files[{source.table_key!r}]",
+            )
+        )
         rows = _without_unlabeled_singleton_orcid(rows)
         if source.source_key == "calibration_source":
             rows["source_key"] = (
@@ -196,7 +213,7 @@ def _refresh_split_assignments(
 ) -> dict[str, Any]:
     split_assets = dict(payload["assets"]["splits"])
     assignments_relative = str(split_assets["assignments_path"])
-    assignments_path = bundle_root / assignments_relative
+    assignments_path = _bundle_child_path(bundle_root, assignments_relative, context="assets.splits.assignments_path")
     assignments = pd.read_csv(assignments_path, low_memory=False)
     original_columns = list(assignments.columns)
     rows = _active_stratified_rows(bundle_root, payload)
@@ -216,7 +233,7 @@ def _refresh_split_assignments(
         _write_csv_atomic(refreshed_assignments, assignments_path)
 
     summary_relative = str(split_assets.get("summary_path", "splits/summary.json"))
-    summary_path = bundle_root / summary_relative
+    summary_path = _bundle_child_path(bundle_root, summary_relative, context="assets.splits.summary_path")
     summary = _read_json(summary_path) if summary_path.exists() else {}
     removed_assignment_rows = int(len(assignments) - len(refreshed_assignments))
     summary["assignment_rows"] = int(len(refreshed_assignments))
@@ -260,7 +277,7 @@ def _refresh_base_group_file(
     active_base_groups: set[str],
     write: bool,
 ) -> dict[str, Any]:
-    path = bundle_root / relative_path
+    path = _bundle_child_path(bundle_root, relative_path, context="classic base-group path")
     rows = pd.read_csv(path, low_memory=False)
     if "base_group_id" not in rows.columns:
         raise ValueError(f"{path} is missing required base_group_id column")
@@ -286,7 +303,9 @@ def _refresh_gate_base_groups(
     gate_key = "classic_gate_source_path"
     if gate_key not in files:
         return []
-    gate_rows = pd.read_parquet(bundle_root / files[gate_key])
+    gate_rows = pd.read_parquet(
+        _bundle_child_path(bundle_root, files[gate_key], context=f"featureless_rows.files[{gate_key!r}]")
+    )
     gate_rows = _without_unlabeled_singleton_orcid(gate_rows)
     active_base_groups = {str(value) for value in gate_rows["base_group_id"].dropna()}
     reports: list[dict[str, Any]] = []
@@ -311,7 +330,7 @@ def _refresh_gate_base_groups(
 def _verify_bundle(bundle_root: Path, payload: dict[str, Any]) -> dict[str, Any]:
     bad_label_counts: dict[str, int] = {}
     for table_key, relative_path in _featureless_files(payload).items():
-        path = bundle_root / relative_path
+        path = _bundle_child_path(bundle_root, relative_path, context=f"featureless_rows.files[{table_key!r}]")
         columns = pd.read_parquet(path, columns=["supervision_type"]) if path.exists() else pd.DataFrame()
         if "supervision_type" not in columns.columns:
             continue

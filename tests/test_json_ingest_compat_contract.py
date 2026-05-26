@@ -37,6 +37,25 @@ def test_build_rust_json_ingest_contract_collects_compat_fields():
     assert contract.allow_normalization_version_mismatch is False
 
 
+def test_build_rust_json_ingest_contract_prefers_explicit_rust_ingest_paths():
+    class DatasetWithFilteredRustIngestPaths(DummyDataset):
+        rust_ingest_signatures_path = "tmp/signatures_filtered.json"
+        rust_ingest_papers_path = "tmp/papers_filtered.json"
+
+    contract = build_rust_json_ingest_contract(
+        DatasetWithFilteredRustIngestPaths(),
+        name_counts_path=None,
+        cluster_seed_require_value=0.0,
+        cluster_seed_disallow_value=10000.0,
+        num_threads=1,
+    )
+
+    assert contract.signatures_path == "tmp/signatures_filtered.json"
+    assert contract.papers_path == "tmp/papers_filtered.json"
+    assert DatasetWithFilteredRustIngestPaths.signatures_path == "signatures.json"
+    assert DatasetWithFilteredRustIngestPaths.papers_path == "papers.json"
+
+
 def test_rust_json_ingest_contract_is_applied_explicitly():
     contract = build_rust_json_ingest_contract(
         DummyDataset(),

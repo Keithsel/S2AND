@@ -37,6 +37,7 @@ from s2and.rust_lifecycle import (
     RustJsonIngestContract,
     RustLifecyclePolicy,
     build_rust_json_ingest_contract,
+    rust_json_ingest_paths,
 )
 from s2and.thread_config import resolve_n_jobs
 
@@ -588,8 +589,7 @@ def _build_rust_featurizer_from_json_paths(
     if rust_featurizer_cls is None or not hasattr(rust_featurizer_cls, "from_json_paths"):
         raise RuntimeError("s2and_rust extension does not expose RustFeaturizer.from_json_paths")
 
-    signatures_path = getattr(dataset, "signatures_path", None)
-    papers_path = getattr(dataset, "papers_path", None)
+    signatures_path, papers_path = rust_json_ingest_paths(dataset)
     if not signatures_path or not papers_path:
         raise RuntimeError("Dataset does not expose signatures_path/papers_path for Rust JSON ingest")
 
@@ -817,8 +817,7 @@ def build_rust_featurizer(
     rust_module = _require_rust_runtime()
     num_threads = resolve_n_jobs(getattr(dataset, "n_jobs", 1))
     selected_build_path = path
-    signatures_path = dataset.signatures_path
-    papers_path = dataset.papers_path
+    signatures_path, papers_path = rust_json_ingest_paths(dataset)
     if selected_build_path == "from_json_paths":
         if not signatures_path or not papers_path:
             raise RuntimeError(

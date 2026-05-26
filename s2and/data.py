@@ -483,6 +483,8 @@ class ANDData:
         self.original_papers_path = papers if isinstance(papers, str) else None
         self.signatures_path = self.original_signatures_path
         self.papers_path = self.original_papers_path
+        self.rust_ingest_signatures_path: str | None = None
+        self.rust_ingest_papers_path: str | None = None
         self._rust_ingest_tmpdir = None  # TemporaryDirectory; prevent leak
         self._s2and_python_pair_ngrams_ready: bool = False
         self._rust_cluster_seeds_require_id: int | None = None
@@ -933,8 +935,8 @@ class ANDData:
             json.dump(raw_signatures_for_json, signatures_file)
         with open(filtered_papers_path, "w", encoding="utf-8") as papers_file:
             json.dump(filtered_papers_for_json, papers_file)
-        self.signatures_path = filtered_signatures_path
-        self.papers_path = filtered_papers_path
+        self.rust_ingest_signatures_path = filtered_signatures_path
+        self.rust_ingest_papers_path = filtered_papers_path
         logger.info(
             "Rust JSON ingest: materialized filtered JSON payloads signatures=%d papers=%d source_papers=%d "
             "seconds=%.3f",
@@ -949,6 +951,8 @@ class ANDData:
 
         tmpdir = self._rust_ingest_tmpdir
         self._rust_ingest_tmpdir = None
+        self.rust_ingest_signatures_path = None
+        self.rust_ingest_papers_path = None
         if tmpdir is not None:
             tmpdir.cleanup()
 

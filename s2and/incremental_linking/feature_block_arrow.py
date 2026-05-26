@@ -15,7 +15,12 @@ from typing import Any, cast
 
 import numpy as np
 
-from s2and.arrow_inputs import normalize_arrow_paths
+from s2and.arrow_inputs import (
+    RAW_PLANNER_ARROW_BATCH_INDEX_KEYS,
+    RAW_PLANNER_ARROW_KEY_COLUMNS,
+    RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS,
+    normalize_arrow_paths,
+)
 from s2and.incremental_linking.feature_block_contract import (
     FeatureBlock,
     FeatureBlockPaper,
@@ -40,32 +45,13 @@ _NAME_COUNTS_INDEX_MAGIC = b"S2NCI001"
 _ARROW_BATCH_LOOKUP_INDEX_MAGIC = b"S2ABI001"
 _NAME_COUNTS_INDEX_HASH_DOMAIN = b"s2and-name-counts-index-v1\x00"
 _ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN = b"s2and-arrow-batch-lookup-index-source\x00"
-_ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES = 65_536
+_ARROW_BATCH_LOOKUP_INDEX_SOURCE_READ_BYTES = 1024 * 1024
 _NAME_COUNTS_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQ")
 _NAME_COUNTS_INDEX_RECORD_STRUCT = struct.Struct("<QQQIId")
 _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQQQ")
 _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT = struct.Struct("<QII")
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
-
-RAW_PLANNER_ARROW_KEY_COLUMNS: dict[str, str] = {
-    "signatures": "signature_id",
-    "papers": "paper_id",
-    "paper_authors": "paper_id",
-    "specter": "paper_id",
-}
-RAW_PLANNER_ARROW_BATCH_INDEX_KEYS: dict[str, str] = {
-    "signatures": "signatures_batch_index",
-    "papers": "papers_batch_index",
-    "paper_authors": "paper_authors_batch_index",
-    "specter": "specter_batch_index",
-}
-RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS: dict[str, int] = {
-    "signatures": 16_384,
-    "papers": 16_384,
-    "paper_authors": 16_384,
-    "specter": 2_048,
-}
 
 
 def write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, Any]) -> None:
@@ -407,7 +393,7 @@ def read_arrow_batch_lookup_index_batch_indices(
             f"indexed hash={int(header['key_column_hash'])} expected hash={expected_key_column_hash} "
             f"key_column={key_column!r}"
         )
-    source_fingerprint = _source_file_sample_fingerprint(arrow_path_obj)
+    source_fingerprint = _source_file_fingerprint(arrow_path_obj)
     source_mismatch = _batch_lookup_index_source_mismatch(
         header,
         source_size=source_stat.st_size,
@@ -454,7 +440,7 @@ def validate_arrow_batch_lookup_index(
     header = _read_arrow_batch_lookup_index_header(index_path_obj)
     source_stat = arrow_path_obj.stat()
     key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
-    source_fingerprint = _source_file_sample_fingerprint(arrow_path_obj)
+    source_fingerprint = _source_file_fingerprint(arrow_path_obj)
     if int(header["key_column_hash"]) != key_column_hash:
         raise ValueError(
             f"Arrow batch lookup index '{index_path_obj!s}' was built for a different key column: "
@@ -509,7 +495,7 @@ def write_arrow_batch_lookup_index(
         source_mismatch = _batch_lookup_index_source_mismatch(
             index_header,
             source_size=source_stat.st_size,
-            source_fingerprint=_source_file_sample_fingerprint(arrow_path_obj),
+            source_fingerprint=_source_file_fingerprint(arrow_path_obj),
         )
         if int(index_header["key_column_hash"]) != key_column_hash or source_mismatch is not None:
             raise ValueError(
@@ -538,6 +524,7 @@ def write_arrow_batch_lookup_index(
             "record_count": int(index_header["record_count"]),
             "key_column_hash": int(index_header["key_column_hash"]),
             "source_fingerprint": int(index_header["source_fingerprint"]),
+            "source_fingerprint_kind": "fnv1a64_full_file",
             "max_record_batch_rows": int(max_record_batch_rows or 0),
         }
 
@@ -575,7 +562,7 @@ def write_arrow_batch_lookup_index(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     source_stat = arrow_path_obj.stat()
     key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
-    source_fingerprint = _source_file_sample_fingerprint(arrow_path_obj)
+    source_fingerprint = _source_file_fingerprint(arrow_path_obj)
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -611,6 +598,7 @@ def write_arrow_batch_lookup_index(
         "record_count": len(records),
         "key_column_hash": key_column_hash,
         "source_fingerprint": source_fingerprint,
+        "source_fingerprint_kind": "fnv1a64_full_file",
         "record_batch_count": record_batch_count,
         "actual_max_batch_rows": max_batch_rows,
         "max_record_batch_rows": int(max_record_batch_rows or 0),
@@ -837,22 +825,16 @@ def _fnv64_bytes(value: bytes) -> int:
     return _fnv64_update(_FNV64_OFFSET, value)
 
 
-def _source_file_sample_fingerprint(path: Path) -> int:
+def _source_file_fingerprint(path: Path) -> int:
     source_size = path.stat().st_size
     digest = _fnv64_bytes(_ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN)
     digest = _fnv64_update(digest, int(source_size).to_bytes(8, "little", signed=False))
     with path.open("rb") as infile:
-        digest = _fnv64_update(
-            digest,
-            infile.read(min(_ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES, source_size)),
-        )
-        if source_size > _ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES:
-            suffix_start = max(
-                _ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES,
-                source_size - _ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES,
-            )
-            infile.seek(suffix_start)
-            digest = _fnv64_update(digest, infile.read(source_size - suffix_start))
+        while True:
+            chunk = infile.read(_ARROW_BATCH_LOOKUP_INDEX_SOURCE_READ_BYTES)
+            if not chunk:
+                break
+            digest = _fnv64_update(digest, chunk)
     return digest
 
 
@@ -938,16 +920,45 @@ def _name_counts_index_complete(index_dir: Path, *, expected_fingerprint: int | 
     return manifest.get("fingerprint") == expected_fingerprint
 
 
-def _remove_stale_name_counts_generations(index_dir: Path, current_generation_name: str) -> None:
-    generations_dir = index_dir / "generations"
+def _current_name_counts_generation_name(index_dir: Path) -> str | None:
+    manifest_paths = _name_counts_index_manifest_paths(index_dir)
+    if manifest_paths is None:
+        return None
+    generation_names: set[str] = set()
+    generations_dir = (index_dir / "generations").resolve()
+    for path in manifest_paths.values():
+        resolved = path.resolve()
+        try:
+            relative = resolved.relative_to(generations_dir)
+        except ValueError:
+            return None
+        if len(relative.parts) < 2:
+            return None
+        generation_names.add(relative.parts[0])
+    if len(generation_names) != 1:
+        return None
+    return next(iter(generation_names))
+
+
+def cleanup_stale_name_counts_generations(index_dir: str | Path) -> dict[str, int]:
+    """Delete published name-count generations not referenced by the current manifest."""
+
+    index_path = Path(index_dir)
+    generations_dir = index_path / "generations"
     if not generations_dir.exists():
-        return
+        return {"removed_generation_count": 0}
+    removed = 0
     for child in generations_dir.iterdir():
-        if child.name == current_generation_name or child.name.startswith(".") or not child.is_dir():
+        if child.name.startswith(".") or not child.is_dir():
             continue
         if not (child / ".published").exists():
             continue
+        current_generation_name = _current_name_counts_generation_name(index_path)
+        if child.name == current_generation_name:
+            continue
         shutil.rmtree(child)
+        removed += 1
+    return {"removed_generation_count": removed}
 
 
 def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) -> tuple[str, dict[str, int | bool]]:
@@ -1024,7 +1035,6 @@ def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) 
         tmp_manifest_path.replace(manifest_path)
         (generation_dir / ".published").write_text("", encoding="utf-8")
         manifest_published = True
-        _remove_stale_name_counts_generations(index_dir, generation_name)
     finally:
         if tmp_manifest_path.exists():
             tmp_manifest_path.unlink()

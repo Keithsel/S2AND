@@ -5,13 +5,39 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-FILTERED_READ_BATCH_INDEX_KEYS = (
-    "signatures_batch_index",
-    "papers_batch_index",
-    "paper_authors_batch_index",
+
+@dataclass(frozen=True)
+class ArrowBatchIndexContract:
+    """One Arrow table and its raw-planner batch lookup index contract."""
+
+    table_key: str
+    key_column: str
+    index_key: str
+    max_record_batch_rows: int
+
+
+RAW_PLANNER_ARROW_BATCH_INDEX_CONTRACTS = (
+    ArrowBatchIndexContract("signatures", "signature_id", "signatures_batch_index", 16_384),
+    ArrowBatchIndexContract("papers", "paper_id", "papers_batch_index", 16_384),
+    ArrowBatchIndexContract("paper_authors", "paper_id", "paper_authors_batch_index", 16_384),
+    ArrowBatchIndexContract("specter", "paper_id", "specter_batch_index", 2_048),
+)
+RAW_PLANNER_ARROW_KEY_COLUMNS = {
+    contract.table_key: contract.key_column for contract in RAW_PLANNER_ARROW_BATCH_INDEX_CONTRACTS
+}
+RAW_PLANNER_ARROW_BATCH_INDEX_KEYS = {
+    contract.table_key: contract.index_key for contract in RAW_PLANNER_ARROW_BATCH_INDEX_CONTRACTS
+}
+RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS = {
+    contract.table_key: contract.max_record_batch_rows for contract in RAW_PLANNER_ARROW_BATCH_INDEX_CONTRACTS
+}
+FILTERED_READ_ARROW_TABLE_KEYS = ("signatures", "papers", "paper_authors")
+FILTERED_READ_BATCH_INDEX_KEYS = tuple(
+    RAW_PLANNER_ARROW_BATCH_INDEX_KEYS[table_key] for table_key in FILTERED_READ_ARROW_TABLE_KEYS
 )
 DECLARED_ARROW_SIDECAR_KEYS = (
     "cluster_seeds",
@@ -173,9 +199,9 @@ def normalize_arrow_paths(paths: Mapping[Any, Any], *, omit_none: bool = False) 
 def required_filtered_read_batch_index_keys(paths: Mapping[str, str]) -> tuple[str, ...]:
     """Return required batch-index keys for filtered Arrow reads over these paths."""
 
-    required = list(FILTERED_READ_BATCH_INDEX_KEYS)
+    required = [RAW_PLANNER_ARROW_BATCH_INDEX_KEYS[table_key] for table_key in FILTERED_READ_ARROW_TABLE_KEYS]
     if "specter" in paths:
-        required.append("specter_batch_index")
+        required.append(RAW_PLANNER_ARROW_BATCH_INDEX_KEYS["specter"])
     return tuple(required)
 
 

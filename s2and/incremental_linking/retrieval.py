@@ -13,7 +13,6 @@ from s2and.incremental_linking.feature_block import FeatureBlockSignatureOrder
 from s2and.incremental_linking.gate_buckets import first_name_bucket_array, normalize_query_views
 from s2and.incremental_linking.linker_pairwise import LinkerCandidateBatch
 
-_REQUIRED_RUST_PAIR_PLAN_KEYS: tuple[str, ...] = ("row_orcid_match",)
 RAW_CANDIDATE_PLAN_SCHEMA_VERSION = "raw_arrow_candidate_plan_v1"
 RAW_CANDIDATE_PLAN_BATCH_ROW_KEYS: tuple[str, ...] = (
     "row_query_signature_indices",
@@ -84,6 +83,42 @@ RAW_CANDIDATE_PLAN_PAIR_KEYS: tuple[str, ...] = (
     *RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS,
     *RAW_CANDIDATE_PLAN_PAIR_ID_KEYS,
 )
+RUST_PAIR_PLAN_PAIR_KEYS: tuple[str, ...] = (
+    "left_signature_indices",
+    "right_signature_indices",
+    "pair_row_indices",
+)
+RUST_PAIR_PLAN_ROW_SIGNAL_KEYS: tuple[str, ...] = (
+    "row_query_signature_indices",
+    "row_component_keys",
+    "retrieval_scores",
+    "retrieval_ranks",
+    "row_query_first_tokens",
+    "row_component_sizes",
+    "row_named_signature_counts",
+    "row_dominant_first_names",
+    "row_candidate_year_min",
+    "row_candidate_year_max",
+    "row_candidate_year_range_missing",
+    "row_query_years",
+    "row_query_year_missing",
+    "row_query_has_affiliations",
+    "row_query_has_coauthors",
+    "row_orcid_match",
+    "middle_initial_compatibility",
+    "affiliation_overlap",
+    "coauthor_overlap",
+    "venue_overlap",
+    "year_compatibility",
+    "title_overlap",
+    "specter_centroid_similarity",
+    "specter_exemplar_similarity",
+)
+REQUIRED_RUST_PAIR_PLAN_KEYS: tuple[str, ...] = (
+    "row_count",
+    *RUST_PAIR_PLAN_PAIR_KEYS,
+    *RUST_PAIR_PLAN_ROW_SIGNAL_KEYS,
+)
 
 
 @dataclass(frozen=True)
@@ -106,12 +141,44 @@ def _as_uint32_mapping(component_member_indices_by_key: Mapping[str, Sequence[in
 
 
 def _validate_rust_pair_plan_schema(plan: Mapping[str, Any]) -> None:
-    missing = sorted(key for key in _REQUIRED_RUST_PAIR_PLAN_KEYS if key not in plan)
+    missing = sorted(key for key in REQUIRED_RUST_PAIR_PLAN_KEYS if key not in plan)
     if missing:
         raise RuntimeError(
             "RustHybridCentroidRetriever.top_k_hybrid_centroid_pair_plan returned a stale pair-plan schema; "
             f"missing keys={missing}. Rebuild/install the current s2and-rust extension."
         )
+    row_count = int(plan["row_count"])
+    if row_count < 0:
+        raise RuntimeError(
+            "RustHybridCentroidRetriever.top_k_hybrid_centroid_pair_plan returned invalid row_count; "
+            f"row_count={row_count}. Rebuild/install the current s2and-rust extension."
+        )
+    pair_count = _rust_plan_sequence_len(plan, "pair_row_indices")
+    for key in ("left_signature_indices", "right_signature_indices"):
+        length = _rust_plan_sequence_len(plan, key)
+        if length != pair_count:
+            raise RuntimeError(
+                "RustHybridCentroidRetriever.top_k_hybrid_centroid_pair_plan returned inconsistent pair arrays; "
+                f"{key} length={length} pair_row_indices length={pair_count}. "
+                "Rebuild/install the current s2and-rust extension."
+            )
+    for key in RUST_PAIR_PLAN_ROW_SIGNAL_KEYS:
+        length = _rust_plan_sequence_len(plan, key)
+        if length != row_count:
+            raise RuntimeError(
+                "RustHybridCentroidRetriever.top_k_hybrid_centroid_pair_plan returned inconsistent row arrays; "
+                f"{key} length={length} row_count={row_count}. Rebuild/install the current s2and-rust extension."
+            )
+
+
+def _rust_plan_sequence_len(plan: Mapping[str, Any], key: str) -> int:
+    try:
+        return len(plan[key])
+    except TypeError as exc:
+        raise RuntimeError(
+            "RustHybridCentroidRetriever.top_k_hybrid_centroid_pair_plan returned a stale pair-plan schema; "
+            f"key {key!r} is not a sized sequence. Rebuild/install the current s2and-rust extension."
+        ) from exc
 
 
 def _required_raw_plan_value(plan: Mapping[str, Any], key: str) -> Any:

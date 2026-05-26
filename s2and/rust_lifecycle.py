@@ -76,6 +76,14 @@ class RustJsonIngestContract:
     allow_normalization_version_mismatch: bool = False
 
 
+def rust_json_ingest_paths(dataset: Any) -> tuple[str | None, str | None]:
+    """Return explicit Rust-ingest JSON paths, falling back to stable source paths."""
+
+    signatures_path = getattr(dataset, "rust_ingest_signatures_path", None) or getattr(dataset, "signatures_path", None)
+    papers_path = getattr(dataset, "rust_ingest_papers_path", None) or getattr(dataset, "papers_path", None)
+    return signatures_path, papers_path
+
+
 def build_rust_json_ingest_contract(
     dataset: Any,
     *,
@@ -87,8 +95,7 @@ def build_rust_json_ingest_contract(
     expected_normalization_version: str | None = None,
     allow_normalization_version_mismatch: bool = False,
 ) -> RustJsonIngestContract:
-    signatures_path = getattr(dataset, "signatures_path", None)
-    papers_path = getattr(dataset, "papers_path", None)
+    signatures_path, papers_path = rust_json_ingest_paths(dataset)
     if not signatures_path or not papers_path:
         raise RuntimeError("Dataset does not expose signatures_path/papers_path for Rust JSON ingest")
 

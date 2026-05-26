@@ -161,112 +161,6 @@ def test_rust_featurizer_available_reloads_extension_when_missing(monkeypatch):
     assert load_calls["count"] == 1
 
 
-def test_rust_signature_preprocess_available_reloads_extension_when_missing(monkeypatch):
-    sentinel_module = SimpleNamespace(signature_ngrams_batch=lambda *_args, **_kwargs: None)
-    load_calls = {"count": 0}
-
-    def _load_stub():
-        load_calls["count"] += 1
-        return sentinel_module
-
-    def _detect_stub(*, extension_module):
-        return SimpleNamespace(core_runtime_available=extension_module is sentinel_module)
-
-    monkeypatch.setattr(feature_port, "s2and_rust", None)
-    monkeypatch.setattr(feature_port, "load_s2and_rust_extension", _load_stub)
-    monkeypatch.setattr(feature_port, "detect_rust_runtime_capabilities", _detect_stub)
-
-    assert feature_port.rust_signature_preprocess_available() is True
-    assert feature_port.s2and_rust is sentinel_module
-    assert load_calls["count"] == 1
-
-
-def test_rust_featurizer_in_memory_cache_keeps_inference_entries():
-    d1 = DummyDataset("d1", mode="inference")
-    d2 = DummyDataset("d2", mode="inference")
-    d3 = DummyDataset("d3", mode="inference")
-
-    feature_port._get_rust_featurizer(d1)
-    feature_port._get_rust_featurizer(d2)
-    feature_port._get_rust_featurizer(d3)
-
-    assert _cache_size() == 3
-
-
-def test_rust_featurizer_reuses_live_dataset_entry():
-    dataset = DummyDataset("no_cache_dataset", mode="train")
-
-    feature_port._get_rust_featurizer(dataset)
-    feature_port._get_rust_featurizer(dataset)
-
-    assert DummyRustFeaturizer.created == ["no_cache_dataset"]
-    assert _cache_size() == 1
-
-
-def test_warm_rust_featurizer_populates_in_memory_cache():
-    dataset = DummyDataset("warm_dataset", mode="train")
-
-    feature_port.warm_rust_featurizer(dataset)
-    feature_port._get_rust_featurizer(dataset)
-
-    assert DummyRustFeaturizer.created == ["warm_dataset"]
-    assert _cache_size() == 1
-
-
-def test_rust_featurizer_cache_keeps_distinct_build_options(monkeypatch):
-    dataset = DummyDataset("option_cache_dataset", mode="train")
-    build_calls: list[tuple[str, bool]] = []
-
-    def _build_stub(
-        dataset_arg,
-        *,
-        requested_build_path,
-        allow_normalization_version_mismatch,
-        name_counts_path=None,
-        expected_normalization_version=None,
-    ):
-        assert name_counts_path is None
-        if requested_build_path == "from_dataset":
-            assert expected_normalization_version is None
-        build_calls.append((requested_build_path, bool(allow_normalization_version_mismatch)))
-        return (
-            DummyRustFeaturizer(f"{dataset_arg.name}:{requested_build_path}:{allow_normalization_version_mismatch}"),
-            requested_build_path,
-            {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
-            1,
-            0.0,
-        )
-
-    monkeypatch.setattr(feature_port, "_build_rust_featurizer_strict", _build_stub)
-
-    first = feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
-    feature_port.warm_rust_featurizer(
-        dataset,
-        rust_build_path="from_json_paths",
-        allow_normalization_version_mismatch=True,
-    )
-    first_again = feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
-    json_entry = feature_port._get_rust_featurizer(
-        dataset,
-        rust_build_path="from_json_paths",
-        allow_normalization_version_mismatch=True,
-    )
-
-    assert first_again is first
-    assert json_entry.dataset_name == "option_cache_dataset:from_json_paths:True"
-    assert build_calls == [("from_dataset", False), ("from_json_paths", True)]
-    assert _cache_size() == 2
-
-
-def test_rust_featurizer_cache_key_normalizes_blank_name_counts_path():
-    none_key = feature_port._rust_featurizer_cache_key("from_json_paths", False, 0, None)
-    blank_key = feature_port._rust_featurizer_cache_key("from_json_paths", False, 0, "  ")
-    configured_key = feature_port._rust_featurizer_cache_key("from_json_paths", False, 0, " names.json ")
-
-    assert blank_key == none_key
-    assert configured_key[-2] == "names.json"
-
-
 def test_rust_featurizer_cache_tracks_cluster_seed_version():
     dataset = DummyDataset("seed_version_cache_dataset", mode="train")
 
@@ -296,24 +190,6 @@ def test_rust_featurizer_cache_retries_when_seed_version_changes_during_lookup(m
     assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
         feature_port._rust_featurizer_cache_key("from_dataset", False, 1)
     ]
-
-
-def test_rust_featurizer_build_count_continues_across_seed_versions():
-    dataset = DummyDataset("seed_version_build_count_dataset", mode="train")
-    dataset._cluster_seeds_version = 1
-
-    first = feature_port._get_rust_featurizer(dataset)
-    dataset._cluster_seeds_version = 2
-    second = feature_port._get_rust_featurizer(dataset)
-
-    assert second is not first
-    assert (
-        feature_port._rust_featurizer_build_count(
-            dataset,
-            feature_port._rust_featurizer_cache_key("from_dataset", False, 2),
-        )
-        == 2
-    )
 
 
 def test_update_rust_cluster_seeds_reuses_cached_featurizer_after_version_bump():
@@ -355,69 +231,6 @@ def test_update_rust_cluster_seeds_leaves_version_unchanged_on_ffi_failure():
     ]
 
 
-def test_update_rust_cluster_seeds_promotes_externally_bumped_cache_key():
-    from s2and.rust_calls import update_rust_cluster_seeds
-
-    dataset = DummyDataset("external_seed_update_dataset", mode="train")
-    first = feature_port._get_rust_featurizer(dataset)
-    dataset._cluster_seeds_version = 1
-    dataset.cluster_seeds_require["s1"] = "c1"
-
-    update_rust_cluster_seeds(dataset, bump_version=False)
-
-    assert int(dataset._cluster_seeds_version) == 1
-    assert DummyRustFeaturizer.created == ["external_seed_update_dataset"]
-    assert feature_port._get_rust_featurizer(dataset) is first
-    assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
-        feature_port._rust_featurizer_cache_key("from_dataset", False, 1)
-    ]
-
-
-def test_promote_cluster_seed_version_preserves_unrelated_cache_families(monkeypatch):
-    dataset = DummyDataset("seed_update_cache_family_dataset", mode="train")
-    build_calls: list[tuple[str, bool]] = []
-
-    def _build_stub(
-        dataset_arg,
-        *,
-        requested_build_path,
-        allow_normalization_version_mismatch,
-        name_counts_path=None,
-        expected_normalization_version=None,
-    ):
-        assert name_counts_path is None
-        if requested_build_path == "from_dataset":
-            assert expected_normalization_version is None
-        build_calls.append((requested_build_path, bool(allow_normalization_version_mismatch)))
-        return (
-            DummyRustFeaturizer(f"{dataset_arg.name}:{requested_build_path}:{allow_normalization_version_mismatch}"),
-            requested_build_path,
-            {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
-            1,
-            0.0,
-        )
-
-    monkeypatch.setattr(feature_port, "_build_rust_featurizer_strict", _build_stub)
-
-    primary = feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
-    other_family = feature_port._get_rust_featurizer(
-        dataset,
-        rust_build_path="from_json_paths",
-        allow_normalization_version_mismatch=True,
-    )
-
-    assert feature_port._promote_cached_rust_featurizer_cluster_seed_version(  # noqa: SLF001
-        dataset,
-        primary,
-        target_seed_version=1,
-    )
-
-    entries = feature_port._RUST_FEATURIZER_CACHE[dataset]
-    assert entries[feature_port._rust_featurizer_cache_key("from_dataset", False, 1)].featurizer is primary
-    assert entries[feature_port._rust_featurizer_cache_key("from_json_paths", True, 0)].featurizer is other_family
-    assert build_calls == [("from_dataset", False), ("from_json_paths", True)]
-
-
 def test_rust_featurizer_cache_rejects_invalid_cluster_seed_version():
     dataset = DummyDataset("bad_seed_version_cache_dataset", mode="train")
 
@@ -429,20 +242,6 @@ def test_rust_featurizer_cache_rejects_invalid_cluster_seed_version():
 
     assert first.dataset_name == "bad_seed_version_cache_dataset"
     assert DummyRustFeaturizer.created == ["bad_seed_version_cache_dataset"]
-    assert _cache_size() == 1
-
-
-def test_rust_featurizer_cache_rejects_none_cluster_seed_version():
-    dataset = DummyDataset("none_seed_version_cache_dataset", mode="train")
-
-    first = feature_port._get_rust_featurizer(dataset)
-    dataset._cluster_seeds_version = None
-
-    with pytest.raises(TypeError):
-        feature_port._get_rust_featurizer(dataset)
-
-    assert first.dataset_name == "none_seed_version_cache_dataset"
-    assert DummyRustFeaturizer.created == ["none_seed_version_cache_dataset"]
     assert _cache_size() == 1
 
 

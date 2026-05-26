@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
+use std::io::{BufReader, BufWriter, Read};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -53,7 +53,6 @@ const ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN: usize = 48;
 const ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN: usize = 16;
 const ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN: &[u8] =
     b"s2and-arrow-batch-lookup-index-source\0";
-const ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES: u64 = 65_536;
 
 fn is_dropped_affix(token: &str) -> bool {
     DROPPED_AFFIXES.contains(&token)
@@ -1813,7 +1812,7 @@ fn arrow_error_to_py(context: &str, path: &str, err: impl std::fmt::Display) -> 
     pyo3::exceptions::PyValueError::new_err(format!("{context} '{}': {err}", path))
 }
 
-fn source_file_sample_fingerprint(path: &str, source_size: u64) -> PyResult<u64> {
+fn source_file_fingerprint(path: &str, source_size: u64) -> PyResult<u64> {
     let mut file = File::open(path).map_err(|err| {
         io_error_to_py(
             "failed to open Arrow IPC file for fingerprinting",
@@ -1823,40 +1822,15 @@ fn source_file_sample_fingerprint(path: &str, source_size: u64) -> PyResult<u64>
     })?;
     let mut digest = fnv64(ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN);
     digest = fnv64_update(digest, &source_size.to_le_bytes());
-    let first_len =
-        std::cmp::min(ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES, source_size) as usize;
-    let mut buffer = vec![0u8; first_len];
-    if first_len > 0 {
-        file.read_exact(&mut buffer).map_err(|err| {
-            io_error_to_py(
-                "failed to read Arrow IPC file fingerprint prefix",
-                path,
-                err,
-            )
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read_len = file.read(&mut buffer).map_err(|err| {
+            io_error_to_py("failed to read Arrow IPC file fingerprint bytes", path, err)
         })?;
-        digest = fnv64_update(digest, &buffer);
-    }
-    if source_size > ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES {
-        let suffix_start = std::cmp::max(
-            ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES,
-            source_size - ARROW_BATCH_LOOKUP_INDEX_SOURCE_SAMPLE_BYTES,
-        );
-        file.seek(SeekFrom::Start(suffix_start)).map_err(|err| {
-            io_error_to_py(
-                "failed to seek Arrow IPC file fingerprint suffix",
-                path,
-                err,
-            )
-        })?;
-        let mut suffix = vec![0u8; (source_size - suffix_start) as usize];
-        file.read_exact(&mut suffix).map_err(|err| {
-            io_error_to_py(
-                "failed to read Arrow IPC file fingerprint suffix",
-                path,
-                err,
-            )
-        })?;
-        digest = fnv64_update(digest, &suffix);
+        if read_len == 0 {
+            break;
+        }
+        digest = fnv64_update(digest, &buffer[..read_len]);
     }
     Ok(digest)
 }
@@ -1937,7 +1911,7 @@ impl ArrowBatchLookupIndex {
                 .try_into()
                 .expect("indexed source fingerprint slice has fixed length"),
         );
-        let source_fingerprint = source_file_sample_fingerprint(source_arrow_path, source_size)?;
+        let source_fingerprint = source_file_fingerprint(source_arrow_path, source_size)?;
         if indexed_source_size != source_size || indexed_source_fingerprint != source_fingerprint {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Arrow batch lookup index '{path}' is stale for '{source_arrow_path}': \
@@ -14293,6 +14267,58 @@ mod tests {
     fn validate_retrieval_top_k_rejects_uint16_rank_overflow() {
         let error = validate_retrieval_rank_top_k((u16::MAX as usize) + 1).unwrap_err();
         assert!(py_err_message(error).contains("retrieval_ranks are stored as uint16"));
+    }
+
+    #[test]
+    fn arrow_batch_lookup_index_rejects_same_size_middle_rewrite() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "s2and_arrow_index_digest_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_root).expect("create temp test dir");
+        let source_path = temp_root.join("source.arrow");
+        let index_path = temp_root.join("source.index.bin");
+        let mut source_bytes = vec![b'a'; 200_000];
+        source_bytes[100_000..100_016].copy_from_slice(b"middle-key-00000");
+        fs::write(&source_path, &source_bytes).expect("write source bytes");
+        let source_path_str = source_path
+            .to_str()
+            .expect("temp path should be valid unicode")
+            .to_string();
+        let source_fingerprint =
+            source_file_fingerprint(&source_path_str, source_bytes.len() as u64)
+                .expect("hash source");
+        fs::write(
+            &index_path,
+            ARROW_BATCH_LOOKUP_INDEX_MAGIC
+                .iter()
+                .copied()
+                .chain(0_u64.to_le_bytes())
+                .chain((source_bytes.len() as u64).to_le_bytes())
+                .chain(0_u64.to_le_bytes())
+                .chain(fnv64(b"signature_id").to_le_bytes())
+                .chain(source_fingerprint.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .expect("write index bytes");
+        source_bytes[100_000..100_016].copy_from_slice(b"middle-key-99999");
+        fs::write(&source_path, &source_bytes).expect("rewrite source bytes");
+
+        let index_path_str = index_path
+            .to_str()
+            .expect("temp path should be valid unicode");
+        let error =
+            match ArrowBatchLookupIndex::open(index_path_str, &source_path_str, "signature_id") {
+                Ok(_) => panic!("same-size middle rewrite must stale the index"),
+                Err(err) => err,
+            };
+        assert!(py_err_message(error).contains("is stale"));
+
+        fs::remove_dir_all(&temp_root).ok();
     }
 
     #[test]

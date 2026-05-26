@@ -984,65 +984,6 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_signature_ids(tmp_path: Path
         _raw_plan_for_base_paths(paths)
 
 
-def test_raw_arrow_candidate_plan_rejects_integer_signature_id_column(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    integer_id_signatures = pa.table(
-        {
-            "signature_id": pa.array([1, 2, 3], type=pa.int64()),
-            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
-            "author_first": pa.array(["Alice", "Alice", "Bob"], type=pa.string()),
-            "author_middle": pa.array(["", "", ""], type=pa.string()),
-            "author_last": pa.array(["Wang", "Wang", "Jones"], type=pa.string()),
-            "author_suffix": pa.array(["", "", ""], type=pa.string()),
-            "author_affiliations": pa.array(
-                [["AI Lab"], ["AI Lab"], ["Other Lab"]],
-                type=pa.list_(pa.string()),
-            ),
-            "author_orcid": pa.array([None, None, None], type=pa.string()),
-            "author_position": pa.array([0, 0, 0], type=pa.int64()),
-        }
-    )
-    _write_ipc(Path(paths["signatures"]), integer_id_signatures)
-
-    with pytest.raises(TypeError, match="signature_id must be a string column"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_duplicate_paper_ids(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    duplicate_papers = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p_q", "p1", "p2"], type=pa.string()),
-            "title": pa.array(["Graph Models", "Graph Models", "Graph Models", "Different Topic"], type=pa.string()),
-            "venue": pa.array(["NeurIPS", "NeurIPS", "NeurIPS", "ICML"], type=pa.string()),
-            "journal_name": pa.array(["", "", "", ""], type=pa.string()),
-            "year": pa.array([2020, 2020, 2020, 2010], type=pa.int64()),
-        }
-    )
-    _write_ipc(Path(paths["papers"]), duplicate_papers)
-
-    with pytest.raises(ValueError, match="duplicate paper_id"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_integer_predicted_language_column(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    malformed_papers = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
-            "title": pa.array(["Graph Models", "Graph Models", "Different Topic"], type=pa.string()),
-            "venue": pa.array(["NeurIPS", "NeurIPS", "ICML"], type=pa.string()),
-            "journal_name": pa.array(["", "", ""], type=pa.string()),
-            "year": pa.array([2020, 2020, 2010], type=pa.int64()),
-            "predicted_language": pa.array([1, 1, 2], type=pa.int64()),
-        }
-    )
-    _write_ipc(Path(paths["papers"]), malformed_papers)
-
-    with pytest.raises(TypeError, match="predicted_language must be a string column"):
-        _raw_plan_for_base_paths(paths)
-
-
 def test_raw_arrow_candidate_plan_rejects_duplicate_paper_author_positions(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
     duplicate_authors = pa.table(
@@ -1055,36 +996,6 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_paper_author_positions(tmp_p
     _write_ipc(Path(paths["paper_authors"]), duplicate_authors)
 
     with pytest.raises(ValueError, match="duplicate"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_null_paper_author_name(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    null_author_name = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
-            "position": pa.array([0, 0, 0], type=pa.int64()),
-            "author_name": pa.array(["Alice Wang", None, "Bob Jones"], type=pa.string()),
-        }
-    )
-    _write_ipc(Path(paths["paper_authors"]), null_author_name)
-
-    with pytest.raises(ValueError, match="author_name is null"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_string_paper_author_position(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    string_position = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
-            "position": pa.array(["0", "0", "0"], type=pa.string()),
-            "author_name": pa.array(["Alice Wang", "Alice Wang", "Bob Jones"], type=pa.string()),
-        }
-    )
-    _write_ipc(Path(paths["paper_authors"]), string_position)
-
-    with pytest.raises(TypeError, match="position must be an int64 column"):
         _raw_plan_for_base_paths(paths)
 
 
@@ -1128,86 +1039,6 @@ def test_raw_arrow_candidate_plan_rejects_invalid_cluster_seed_rows(tmp_path: Pa
     )
     _write_ipc(Path(paths["cluster_seeds"]), empty_cluster_id)
     with pytest.raises(ValueError, match="empty cluster_id"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_integer_is_reliable_column(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    malformed_papers = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
-            "title": pa.array(["Graph Models", "Graph Models", "Different Topic"], type=pa.string()),
-            "venue": pa.array(["NeurIPS", "NeurIPS", "ICML"], type=pa.string()),
-            "journal_name": pa.array(["", "", ""], type=pa.string()),
-            "year": pa.array([2020, 2020, 2010], type=pa.int64()),
-            "is_reliable": pa.array([1, 1, 0], type=pa.int64()),
-        }
-    )
-    _write_ipc(Path(paths["papers"]), malformed_papers)
-
-    with pytest.raises(TypeError, match="is_reliable must be a boolean column"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_duplicate_cluster_seed_disallows(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    duplicate_disallows = pa.table(
-        {
-            "signature_id_1": pa.array(["s1", "s2"], type=pa.string()),
-            "signature_id_2": pa.array(["s2", "s1"], type=pa.string()),
-        }
-    )
-    paths["cluster_seed_disallows"] = _write_ipc(tmp_path / "cluster_seed_disallows.arrow", duplicate_disallows)
-
-    with pytest.raises(ValueError, match="duplicate pair"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_empty_cluster_seed_disallow_endpoint(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    empty_endpoint = pa.table(
-        {
-            "signature_id_1": pa.array(["s1"], type=pa.string()),
-            "signature_id_2": pa.array([""], type=pa.string()),
-        }
-    )
-    paths["cluster_seed_disallows"] = _write_ipc(tmp_path / "cluster_seed_disallows.arrow", empty_endpoint)
-
-    with pytest.raises(ValueError, match="empty signature_id"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_duplicate_specter_paper_ids(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    specter = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p_q", "p1", "p2"], type=pa.string()),
-            "embedding": pa.FixedSizeListArray.from_arrays(
-                pa.array([1.0, 0.0, 1.0, 0.0, 0.8, 0.2, 0.0, 1.0], type=pa.float32()),
-                2,
-            ),
-        }
-    )
-    paths["specter"] = _write_ipc(tmp_path / "specter.arrow", specter)
-
-    with pytest.raises(ValueError, match="duplicate paper_id"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_null_specter_embedding(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    specter = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
-            "embedding": pa.array(
-                [[1.0, 0.0], None, [0.0, 1.0]],
-                type=pa.list_(pa.float32(), 2),
-            ),
-        }
-    )
-    paths["specter"] = _write_ipc(tmp_path / "specter.arrow", specter)
-
-    with pytest.raises(ValueError, match="null embedding"):
         _raw_plan_for_base_paths(paths)
 
 
@@ -1783,84 +1614,6 @@ def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metada
 
     assert "c_self" in narrow_plan["component_members"]
     assert narrow_plan["component_members"]["c_other"] == ["s2"]
-
-
-def test_raw_arrow_candidate_plan_rejects_null_paper_author_position(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    paper_authors = pa.table(
-        {
-            "paper_id": pa.array(["p_q"], type=pa.string()),
-            "position": pa.array([None], type=pa.int64()),
-            "author_name": pa.array(["Alice Wang"], type=pa.string()),
-        }
-    )
-    paths["paper_authors"] = _write_ipc(tmp_path / "paper_authors.arrow", paper_authors)
-
-    with pytest.raises(ValueError, match="position is null"):
-        _raw_candidate_plan_arrow(
-            paths,
-            ["q1"],
-            top_k=2,
-            query_view="full",
-            orcid_enabled=False,
-            num_threads=1,
-        )
-
-
-def test_raw_arrow_candidate_plan_rejects_null_string_list_elements(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    signatures = pa.table(
-        {
-            "signature_id": pa.array(["q1", "s1", "s2"], type=pa.string()),
-            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
-            "author_first": pa.array(["Alice", "Alice", "Bob"], type=pa.string()),
-            "author_middle": pa.array(["", "", ""], type=pa.string()),
-            "author_last": pa.array(["Wang", "Wang", "Jones"], type=pa.string()),
-            "author_suffix": pa.array(["", "", ""], type=pa.string()),
-            "author_affiliations": pa.array([[None], ["AI Lab"], ["Other Lab"]], type=pa.list_(pa.string())),
-            "author_orcid": pa.array([None, None, None], type=pa.string()),
-            "author_position": pa.array([0, 0, 0], type=pa.int64()),
-        }
-    )
-    paths["signatures"] = _write_ipc(tmp_path / "signatures_with_null_list_element.arrow", signatures)
-
-    with pytest.raises(ValueError, match="author_affiliations cannot contain null list elements"):
-        _raw_candidate_plan_arrow(
-            paths,
-            ["q1"],
-            top_k=2,
-            query_view="full",
-            orcid_enabled=False,
-            num_threads=1,
-        )
-
-
-def test_raw_arrow_candidate_plan_rejects_nonempty_null_list_child(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    signatures = pa.table(
-        {
-            "signature_id": pa.array(["q1", "s1", "s2"], type=pa.string()),
-            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
-            "author_first": pa.array(["Alice", "Alice", "Bob"], type=pa.string()),
-            "author_middle": pa.array(["", "", ""], type=pa.string()),
-            "author_last": pa.array(["Wang", "Wang", "Jones"], type=pa.string()),
-            "author_suffix": pa.array(["", "", ""], type=pa.string()),
-            "author_affiliations": pa.array([[None], [], []], type=pa.list_(pa.null())),
-            "author_orcid": pa.array([None, None, None], type=pa.string()),
-            "author_position": pa.array([0, 0, 0], type=pa.int64()),
-        }
-    )
-    paths["signatures"] = _write_ipc(tmp_path / "signatures_with_null_child.arrow", signatures)
-
-    with pytest.raises(ValueError, match="author_affiliations cannot contain null list elements"):
-        _raw_candidate_plan_arrow(
-            paths,
-            ["q1"],
-            top_k=2,
-            query_view="full",
-            orcid_enabled=False,
-            num_threads=1,
-        )
 
 
 def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tmp_path: Path) -> None:

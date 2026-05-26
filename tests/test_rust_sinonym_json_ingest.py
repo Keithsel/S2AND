@@ -182,17 +182,29 @@ def test_inference_sinonym_overwrite_materializes_post_sinonym_json_payload(tmp_
 
     assert dataset.signatures_path is not None
     assert dataset.papers_path is not None
-    assert Path(dataset.signatures_path).name == "signatures_filtered.json"
-    assert Path(dataset.papers_path).name == "papers_filtered.json"
+    assert dataset.rust_ingest_signatures_path is not None
+    assert dataset.rust_ingest_papers_path is not None
+    assert Path(dataset.signatures_path).name == "signatures.json"
+    assert Path(dataset.papers_path).name == "papers.json"
+    assert Path(dataset.rust_ingest_signatures_path).name == "signatures_filtered.json"
+    assert Path(dataset.rust_ingest_papers_path).name == "papers_filtered.json"
 
-    written_signatures = json.loads(Path(dataset.signatures_path).read_text(encoding="utf-8"))
-    written_papers = json.loads(Path(dataset.papers_path).read_text(encoding="utf-8"))
+    written_signatures = json.loads(Path(dataset.rust_ingest_signatures_path).read_text(encoding="utf-8"))
+    written_papers = json.loads(Path(dataset.rust_ingest_papers_path).read_text(encoding="utf-8"))
 
     assert written_signatures["s2"]["author_info"]["first"] == "Alex"
     assert written_signatures["s2"]["author_info"]["last"] == "Wang"
     assert written_signatures["s2"]["author_info"]["block"] == "a wang"
     assert written_papers["p2"]["authors"][0]["author_name"] == "Alex Wang"
     assert "p_extra" not in written_papers
+
+    original_signatures_path = dataset.signatures_path
+    original_papers_path = dataset.papers_path
+    dataset.cleanup_rust_ingest_tmpdir()
+    assert dataset.signatures_path == original_signatures_path
+    assert dataset.papers_path == original_papers_path
+    assert dataset.rust_ingest_signatures_path is None
+    assert dataset.rust_ingest_papers_path is None
 
 
 def test_inference_sinonym_overwrite_constraint_parity_python_vs_rust(tmp_path, monkeypatch):

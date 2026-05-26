@@ -214,7 +214,7 @@ index per file. At runtime, the selected embedding file is passed under the
 
 The batch-index format is S2AND-owned. Current writers and readers require
 `arrow_batch_lookup_index` / `S2ABI001`, which records the key-column hash and
-source fingerprint in addition to key-to-batch records. Each record maps a
+full-file source fingerprint in addition to key-to-batch records. Each record maps a
 64-bit FNV-1a hash of the lookup key to an IPC record-batch index; the Rust
 reader verifies exact ids after loading the selected batches, so hash collisions
 do not change results.
@@ -632,7 +632,7 @@ Required physical-layout checks for large-block optimized artifacts:
   files and the manifest path keys point to those sidecars.
 - Batch-index validation must not require source file mtimes to match. Object
   store downloads can rewrite mtimes; validators use source size plus the
-  stored source fingerprint for portable release artifacts.
+  stored full-file source fingerprint for portable release artifacts.
 
 Recommended smoke checks:
 

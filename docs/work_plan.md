@@ -53,7 +53,8 @@ The canonical surface owns:
 
 1. Keep the local canonical Arrow replay/profiling source at
    `s2and/data/s2and_and_big_blocks_linker_dataset_20260525`.
-2. Complete release artifact validation for the Arrow S3 prefix.
+2. Treat release artifact validation for the current Arrow S3 prefix as
+   complete; keep future publication smokes explicit and network opt-in.
 3. Convert production-facing scripts to Arrow routes where that is a direct
    replacement; relabel raw/reference parity scripts instead of expanding them.
 4. Preserve strict production routing through `s2and.arrow_inputs`; do not add
@@ -98,6 +99,16 @@ Target prefix:
 Current state:
 
 - The prefix was published and no-auth spot-checked on 2026-05-25.
+- The refreshed root manifest and root helper files were uploaded on
+  2026-05-26 after default and size-only dry runs showed no changed large
+  Arrow objects. A final dry run returned no pending uploads.
+- A bounded public-release smoke on 2026-05-26 copied the root, `qian`, and
+  `name_counts_index` manifests with `--no-sign-request`, then ran
+  `scripts/eval_prod_models.py --dataset full --use-arrow --datasets qian
+  --specter-suffixes _specter2.pkl --seed 42 --n_jobs 2` against the
+  S3-converged local release root. The direct Arrow
+  `predict_from_arrow_paths(...)` route completed with qian B3
+  `(0.978, 0.964, 0.971)`.
 - Keep the canonical replay subbundle name
   `s2and_and_big_blocks_linker_dataset_20260525/` for the current public Arrow
   release.
@@ -118,8 +129,7 @@ Remaining:
 
 - Keep S3/network validation as an explicit release smoke command, not default
   pytest, until CI has a dedicated network-enabled release job.
-- Upload the refreshed local root manifest only as an explicit public-release
-  action.
+- For future publications, rerun the bounded public-release smoke after upload.
 
 Done when:
 

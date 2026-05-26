@@ -1,13 +1,10 @@
+import logging
 import os
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from s2and.data import NameCounts
-
 import re
 import threading
 import warnings
 from collections import Counter
+from typing import TYPE_CHECKING, Any
 
 import fasttext
 import jellyfish
@@ -20,6 +17,11 @@ from text_unidecode import unidecode
 
 from s2and.consts import FASTTEXT_PATH, NUMPY_NAN
 from s2and.file_cache import cached_path
+
+if TYPE_CHECKING:
+    from s2and.data import NameCounts
+
+logger = logging.getLogger("s2and")
 
 # Lazily-loaded fastText model to avoid heavy import-time cost
 _FASTTEXT_MODEL = None
@@ -75,8 +77,8 @@ def _get_fasttext_model():
             return _FASTTEXT_MODEL
         try:
             _FASTTEXT_MODEL = fasttext.load_model(cached_path(FASTTEXT_PATH))
-        except Exception:
-            # If loading fails, degrade gracefully to no fastText.
+        except (OSError, RuntimeError, ValueError):
+            logger.exception("Failed to load fastText language model; language detection will skip fastText")
             _FASTTEXT_MODEL = None
         _FASTTEXT_MODEL_INITIALIZED = True
         return _FASTTEXT_MODEL
@@ -359,7 +361,8 @@ def detect_language(text: str):
         predicted_language_2 = cld2_pred[2][0][1]
         if predicted_language_2 == "un":
             predicted_language_2 = "un_2"
-    except Exception:
+    except (UnicodeError, cld2.error):
+        logger.exception("cld2 language detection failed; using unknown language marker")
         predicted_language_2 = "un_2"
 
     if predicted_language_ft == "un_ft" and predicted_language_2 == "un_2":

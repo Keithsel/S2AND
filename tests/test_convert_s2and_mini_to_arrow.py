@@ -245,6 +245,7 @@ def test_root_manifest_upsert_keeps_dataset_order_stable(tmp_path: Path) -> None
 
     root_manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
     assert root_manifest["datasets"] == ["a", "b"]
+    assert root_manifest["output_root"] == str(output_root)
     assert [entry["dataset"] for entry in root_manifest["dataset_manifests"]] == ["a", "b"]
     assert root_manifest["generator"]["script"] == "scripts/convert_to_arrow.py"
     assert isinstance(root_manifest["generated_at_utc"], str)
@@ -257,7 +258,7 @@ def test_root_manifest_upsert_keeps_dataset_order_stable(tmp_path: Path) -> None
         "total_missing_embedding_count": 2,
         "total_batch_index_count": 2,
     }
-    assert root_manifest["validation_command_cwd"] == str(output_root)
+    assert root_manifest["validation_command_cwd"] == str(convert_to_arrow._PROJECT_ROOT)
     first_entry = root_manifest["dataset_manifests"][0]
     assert first_entry["manifest_exists"] is True
     assert first_entry["manifest_size_bytes"] > 0
@@ -274,9 +275,176 @@ def test_root_manifest_upsert_keeps_dataset_order_stable(tmp_path: Path) -> None
         "uv run python scripts/convert_to_arrow.py validate --dataset-dir "
         "{dataset_dir} --require-embeddings --require-name-counts-index"
     )
+    dataset_dir_a = convert_to_arrow._manifest_relative_path(output_root / "a", convert_to_arrow._PROJECT_ROOT).replace(
+        "\\", "/"
+    )
+    dataset_dir_b = convert_to_arrow._manifest_relative_path(output_root / "b", convert_to_arrow._PROJECT_ROOT).replace(
+        "\\", "/"
+    )
     assert root_manifest["validation_commands"] == [
-        validation_command.format(dataset_dir="a"),
-        validation_command.format(dataset_dir="b"),
+        validation_command.format(dataset_dir=dataset_dir_a),
+        validation_command.format(dataset_dir=dataset_dir_b),
+    ]
+
+
+def test_root_manifest_upsert_preserves_existing_output_root_label(tmp_path: Path) -> None:
+    output_root = tmp_path / "release"
+    output_root.mkdir()
+    dataset_dir = output_root / "qian"
+    dataset_dir.mkdir()
+    (dataset_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "qian",
+                "conversion_kind": "table-runtime",
+                "signature_count": 7,
+                "paper_count": 5,
+                "paths": {
+                    "signatures": "signatures.arrow",
+                    "papers": "papers.arrow",
+                    "paper_authors": "paper_authors.arrow",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": convert_to_arrow.ROOT_MANIFEST_SCHEMA,
+                "output_root": "s3://ai2-s2-research-public/s2and-release-arrow",
+                "datasets": [],
+                "dataset_manifests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    convert_to_arrow._upsert_root_manifest(output_root, dataset_name="qian", dataset_dir=dataset_dir)
+
+    root_manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
+    assert root_manifest["output_root"] == "s3://ai2-s2-research-public/s2and-release-arrow"
+
+
+def test_refresh_root_manifest_enriches_release_and_replay_entries(tmp_path: Path) -> None:
+    release_root = tmp_path / "release"
+    release_root.mkdir()
+    dataset_dir = release_root / "qian"
+    dataset_dir.mkdir()
+    dataset_manifest = {
+        "dataset": "qian",
+        "conversion_kind": "table-runtime",
+        "signature_count": 7,
+        "paper_count": 5,
+        "paths": {
+            "signatures": "signatures.arrow",
+            "papers": "papers.arrow",
+            "paper_authors": "paper_authors.arrow",
+            "specter2": "specter2.arrow",
+            "name_counts_index": "../name_counts_index",
+            "signatures_batch_index": "signatures.signatures_batch_index.bin",
+        },
+        "validation": {"specter_count": 5, "missing_specter_paper_count": 0},
+    }
+    (dataset_dir / "manifest.json").write_text(json.dumps(dataset_manifest), encoding="utf-8")
+
+    replay_root = release_root / "s2and_and_big_blocks_linker_dataset_20260525"
+    replay_dataset_dir = replay_root / "datasets" / "pubmed"
+    replay_dataset_dir.mkdir(parents=True)
+    replay_dataset_manifest = {
+        "dataset": "pubmed",
+        "conversion_kind": "table-runtime",
+        "signature_count": 11,
+        "paper_count": 9,
+        "paths": {
+            "signatures": "signatures.arrow",
+            "papers": "papers.arrow",
+            "paper_authors": "paper_authors.arrow",
+            "specter2": "specter2.arrow",
+            "name_counts_index": "../../../name_counts_index",
+        },
+        "validation": {"specter_count": 8, "missing_specter_paper_count": 1},
+    }
+    (replay_dataset_dir / "manifest.json").write_text(json.dumps(replay_dataset_manifest), encoding="utf-8")
+    (replay_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "inference_arrow_bundle_v1",
+                "datasets": ["pubmed"],
+                "dataset_manifests": [
+                    {
+                        "dataset": "pubmed",
+                        "dataset_dir": "datasets/pubmed",
+                        "manifest_path": "datasets/pubmed/manifest.json",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (release_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "inference_arrow_bundle_v1",
+                "output_root": "s3://ai2-s2-research-public/s2and-release-arrow",
+                "datasets": ["qian"],
+                "dataset_manifests": [
+                    {
+                        "dataset": "qian",
+                        "dataset_dir": "qian",
+                        "manifest_path": "qian/manifest.json",
+                    }
+                ],
+                "replay_bundles": [
+                    {
+                        "bundle": "s2and_and_big_blocks_linker_dataset_20260525",
+                        "manifest_path": "s2and_and_big_blocks_linker_dataset_20260525/manifest.json",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = convert_to_arrow._build_parser().parse_args(
+        [
+            "refresh-root-manifest",
+            "--output-root",
+            str(release_root),
+        ]
+    )
+    args.func(args)
+
+    root_manifest = json.loads((release_root / "manifest.json").read_text(encoding="utf-8"))
+    assert root_manifest["output_root"] == "s3://ai2-s2-research-public/s2and-release-arrow"
+    assert len(root_manifest["dataset_manifests"][0]["manifest_sha256"]) == 64
+    assert root_manifest["audit"]["total_signature_count"] == 7
+    replay_entry = root_manifest["replay_bundles"][0]
+    assert len(replay_entry["manifest_sha256"]) == 64
+    assert replay_entry["audit"]["total_signature_count"] == 11
+    assert root_manifest["replay_audit"] == {
+        "bundle_count": 1,
+        "bundles_with_missing_manifests": [],
+        "total_dataset_count": 1,
+    }
+    qian_dir = convert_to_arrow._manifest_relative_path(release_root / "qian", convert_to_arrow._PROJECT_ROOT).replace(
+        "\\", "/"
+    )
+    replay_pubmed_dir = convert_to_arrow._manifest_relative_path(
+        release_root / "s2and_and_big_blocks_linker_dataset_20260525" / "datasets" / "pubmed",
+        convert_to_arrow._PROJECT_ROOT,
+    ).replace("\\", "/")
+    assert root_manifest["validation_commands"] == [
+        (
+            "uv run python scripts/convert_to_arrow.py validate --dataset-dir "
+            f"{qian_dir} "
+            "--require-embeddings --require-name-counts-index"
+        ),
+        (
+            "uv run python scripts/convert_to_arrow.py validate --dataset-dir "
+            f"{replay_pubmed_dir} "
+            "--require-embeddings --require-name-counts-index"
+        ),
     ]
 
 

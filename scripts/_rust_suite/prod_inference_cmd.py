@@ -139,7 +139,7 @@ def _single_run(
     if backend == "rust":
         rust_extension_identity = collect_rust_extension_identity(
             require_release=bool(require_rust_release),
-            fail_if_unavailable=False,
+            fail_if_unavailable=True,
         )
 
     from s2and.consts import PROJECT_ROOT_PATH
@@ -248,7 +248,7 @@ def _single_arrow_run(
     os.environ["S2AND_BACKEND"] = "rust"
     rust_extension_identity = collect_rust_extension_identity(
         require_release=bool(require_rust_release),
-        fail_if_unavailable=False,
+        fail_if_unavailable=True,
     )
 
     from s2and.consts import PROJECT_ROOT_PATH

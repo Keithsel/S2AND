@@ -39,7 +39,7 @@ def _install_common_runtime_fakes(
     captured: dict[str, Any] = {"fasttext_enabled": []}
 
     consts_module = ModuleType("s2and.consts")
-    consts_module.PROJECT_ROOT_PATH = str(tmp_path)
+    consts_module.__dict__["PROJECT_ROOT_PATH"] = str(tmp_path)
 
     production_model_module = ModuleType("s2and.production_model")
 
@@ -47,10 +47,10 @@ def _install_common_runtime_fakes(
         captured["model_path"] = model_path
         return clusterer
 
-    production_model_module.load_production_model = load_production_model
+    production_model_module.__dict__["load_production_model"] = load_production_model
 
     text_module = ModuleType("s2and.text")
-    text_module.set_fasttext_loading_enabled = lambda enabled: captured["fasttext_enabled"].append(enabled)
+    text_module.__dict__["set_fasttext_loading_enabled"] = lambda enabled: captured["fasttext_enabled"].append(enabled)
 
     monkeypatch.setitem(sys.modules, "s2and.consts", consts_module)
     monkeypatch.setitem(sys.modules, "s2and.production_model", production_model_module)
@@ -90,8 +90,8 @@ def test_run_reuse_profile_defaults_to_arrow_bundle_root(monkeypatch: pytest.Mon
         }
         return _metrics(), {}
 
-    eval_prod_models_module.resolve_arrow_dataset_paths = resolve_arrow_dataset_paths
-    eval_prod_models_module.cluster_eval_arrow = cluster_eval_arrow
+    eval_prod_models_module.__dict__["resolve_arrow_dataset_paths"] = resolve_arrow_dataset_paths
+    eval_prod_models_module.__dict__["cluster_eval_arrow"] = cluster_eval_arrow
     monkeypatch.setitem(sys.modules, "scripts.eval_prod_models", eval_prod_models_module)
 
     result = featurizer_reuse_cmd.run_reuse_profile(dataset_name="kisti", n_jobs=2, repeats=2)
@@ -141,7 +141,7 @@ def test_run_reuse_profile_json_mode_uses_legacy_anddata(monkeypatch: pytest.Mon
     clear_calls: list[None] = []
 
     data_module = ModuleType("s2and.data")
-    data_module.ANDData = FakeANDData
+    data_module.__dict__["ANDData"] = FakeANDData
 
     eval_module = ModuleType("s2and.eval")
 
@@ -149,11 +149,13 @@ def test_run_reuse_profile_json_mode_uses_legacy_anddata(monkeypatch: pytest.Mon
         eval_calls.append({"dataset": dataset, "clusterer": clusterer_arg, "kwargs": kwargs})
         return _metrics(), {}
 
-    eval_module.cluster_eval = cluster_eval
+    eval_module.__dict__["cluster_eval"] = cluster_eval
 
     feature_port_module = ModuleType("s2and.feature_port")
-    feature_port_module.clear_rust_featurizer_cache = lambda: clear_calls.append(None)
-    feature_port_module._rust_featurizer_build_count = lambda dataset: FakeANDData.instances.index(dataset) + 1
+    feature_port_module.__dict__["clear_rust_featurizer_cache"] = lambda: clear_calls.append(None)
+    feature_port_module.__dict__["_rust_featurizer_build_count"] = (
+        lambda dataset: FakeANDData.instances.index(dataset) + 1
+    )
 
     monkeypatch.setitem(sys.modules, "s2and.data", data_module)
     monkeypatch.setitem(sys.modules, "s2and.eval", eval_module)
@@ -164,9 +166,11 @@ def test_run_reuse_profile_json_mode_uses_legacy_anddata(monkeypatch: pytest.Mon
         n_jobs=3,
         repeats=2,
         input_format="json",
+        json_data_root="custom-json-root",
     )
 
     assert result["input_format"] == "json"
+    assert Path(result["json_data_root"]) == tmp_path / "custom-json-root"
     assert len(FakeANDData.instances) == 3
     assert len(eval_calls) == 4
     assert len(clear_calls) == 2
@@ -178,6 +182,7 @@ def test_run_reuse_profile_json_mode_uses_legacy_anddata(monkeypatch: pytest.Mon
 
     first_dataset_kwargs = FakeANDData.instances[0].kwargs
     assert first_dataset_kwargs["name"] == "qian"
+    assert first_dataset_kwargs["signatures"] == str(tmp_path / "custom-json-root" / "qian" / "qian_signatures.json")
     assert first_dataset_kwargs["n_jobs"] == 3
     assert first_dataset_kwargs["mode"] == "train"
     assert first_dataset_kwargs["load_name_counts"] is True
@@ -236,6 +241,7 @@ def test_main_forwards_explicit_json_mode(monkeypatch: pytest.MonkeyPatch, tmp_p
         "require_rust_release": True,
         "input_format": "json",
         "arrow_data_root": featurizer_reuse_cmd.DEFAULT_ARROW_DATA_ROOT,
+        "json_data_root": featurizer_reuse_cmd.DEFAULT_JSON_DATA_ROOT,
         "specter_suffix": featurizer_reuse_cmd.DEFAULT_SPECTER_SUFFIX,
     }
     assert json.loads(output_path.read_text(encoding="utf-8")) == {"ok": True}

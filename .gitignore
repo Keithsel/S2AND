@@ -30,9 +30,11 @@ s2and/data/inventors_s2and/
 s2and/data/name_counts_rust.json
 s2and/data/lid.176.bin
 s2and/data/LICENSE.txt
+s2and/data/manifest.json
+s2and/data/release_audit.json
 s2and/data/joint_*/
-s2and/data/s2and_and_big_blocks_linker_dataset_20260513/
-s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow/
+s2and/data/s2and_and_big_blocks_linker_dataset_*/
+s2and/data-backup/
 
 
 # C extensions

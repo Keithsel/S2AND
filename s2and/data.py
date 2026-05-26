@@ -241,7 +241,10 @@ def _signature_preprocess_backend_decision(runtime_context: RuntimeContext) -> b
 
 def _ordered_coauthors_for_signature(signature: "Signature", papers: dict[str, "Paper"]) -> list[str]:
     if signature.author_info_position is None:
-        return []
+        raise ValueError(
+            "Signature is missing author_info_position for coauthor ngram materialization "
+            f"(signature_id={signature.signature_id} paper_id={signature.paper_id})"
+        )
     paper = papers.get(str(signature.paper_id))
     if paper is None:
         logger.warning(
@@ -940,6 +943,20 @@ class ANDData:
             source_papers_count,
             time.perf_counter() - filtered_paths_start,
         )
+
+    def cleanup_rust_ingest_tmpdir(self) -> None:
+        """Remove temporary Rust-ingest JSON files materialized for this dataset."""
+
+        tmpdir = self._rust_ingest_tmpdir
+        self._rust_ingest_tmpdir = None
+        if tmpdir is not None:
+            tmpdir.cleanup()
+
+    def __del__(self) -> None:
+        try:
+            self.cleanup_rust_ingest_tmpdir()
+        except Exception:
+            pass
 
     def _compute_signature_name_counts(
         self,

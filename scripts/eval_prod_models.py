@@ -91,8 +91,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--seed",
         type=int,
-        default=1,
-        help="Random seed (default: 1, matches transfer_experiment_internal)",
+        default=42,
+        help="Random seed (default: 42, matching documented production-model evaluation numbers)",
     )
     parser.add_argument("--n_jobs", type=int, default=4, help="Number of parallel jobs (default: 4)")
     parser.add_argument(

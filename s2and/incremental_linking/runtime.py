@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 import warnings
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
@@ -62,14 +63,14 @@ LinkAction = Literal["link", "abstain"]
 SeedSetup = (
     tuple[
         Mapping[str, int | str],
-        Mapping[int | str, int | str],
-        Mapping[int | str, Sequence[str]],
+        Mapping[str, int | str],
+        Mapping[str, Sequence[str]],
     ]
     | tuple[
         Mapping[str, int | str],
-        Mapping[int | str, int | str],
-        Mapping[int | str, Sequence[str]],
-        Mapping[int | str, Sequence[str]],
+        Mapping[str, int | str],
+        Mapping[str, Sequence[str]],
+        Mapping[str, Sequence[str]],
     ]
 )
 
@@ -83,9 +84,9 @@ def _unpack_seed_setup(
     seed_setup: SeedSetup,
 ) -> tuple[
     Mapping[str, int | str],
-    Mapping[int | str, int | str],
-    Mapping[int | str, Sequence[str]],
-    Mapping[int | str, Sequence[str]] | None,
+    Mapping[str, int | str],
+    Mapping[str, Sequence[str]],
+    Mapping[str, Sequence[str]] | None,
 ]:
     seed_setup_values: Sequence[Any] = list(seed_setup)
     if len(seed_setup_values) == 3:
@@ -169,6 +170,26 @@ def _best_row_for_group(
         return (-float(probabilities[row_index]), rank, component_key)
 
     return min((int(row_index) for row_index in group), key=sort_key)
+
+
+def _forced_runner_up_score(
+    forced_rows: np.ndarray,
+    *,
+    best_row: int,
+    probabilities: np.ndarray,
+    retrieval_ranks: np.ndarray | None,
+    component_keys: tuple[object, ...] | None,
+) -> float:
+    eligible = np.asarray([int(row) for row in forced_rows if int(row) != best_row], dtype=np.int64)
+    if len(eligible) == 0:
+        return float("nan")
+    runner_up = _best_row_for_group(
+        eligible,
+        probabilities=probabilities,
+        retrieval_ranks=retrieval_ranks,
+        component_keys=component_keys,
+    )
+    return float(probabilities[runner_up])
 
 
 def _artifact_logistic_gate(artifact: IncrementalLinkingArtifact) -> NumpyLogisticGate:
@@ -402,8 +423,13 @@ def _predict_incremental_link_or_abstain_compact(
                 retrieval_ranks=candidate_batch.retrieval_ranks,
                 component_keys=component_keys,
             )
-            ranked_nonbest = [int(row) for row in gate_query_rows.ranked_groups[query_pos] if int(row) != best_row]
-            runner_up_score = float(probabilities[ranked_nonbest[0]]) if ranked_nonbest else float("nan")
+            runner_up_score = _forced_runner_up_score(
+                forced_orcid_rows,
+                best_row=best_row,
+                probabilities=probabilities,
+                retrieval_ranks=candidate_batch.retrieval_ranks,
+                component_keys=component_keys,
+            )
             margin = None if np.isnan(runner_up_score) else float(probabilities[best_row] - runner_up_score)
             action: LinkAction = "link"
         elif len(forced_constraint_rows):
@@ -418,8 +444,13 @@ def _predict_incremental_link_or_abstain_compact(
                 retrieval_ranks=candidate_batch.retrieval_ranks,
                 component_keys=component_keys,
             )
-            ranked_nonbest = [int(row) for row in gate_query_rows.ranked_groups[query_pos] if int(row) != best_row]
-            runner_up_score = float(probabilities[ranked_nonbest[0]]) if ranked_nonbest else float("nan")
+            runner_up_score = _forced_runner_up_score(
+                forced_constraint_rows,
+                best_row=best_row,
+                probabilities=probabilities,
+                retrieval_ranks=candidate_batch.retrieval_ranks,
+                component_keys=component_keys,
+            )
             margin = None if np.isnan(runner_up_score) else float(probabilities[best_row] - runner_up_score)
             action = "link"
         elif constraint_vetoes is not None and np.any(constraint_vetoes[group]):
@@ -1090,6 +1121,7 @@ def _validate_partial_supervision_window(
 ) -> dict[str, int]:
     telemetry = {
         "partial_supervision_pair_count": int(len(partial_supervision)),
+        "partial_supervision_require_outside_retrieval_window": 0,
         "partial_supervision_disallow_outside_retrieval_window": 0,
         "partial_supervision_disallow_between_residual_queries": 0,
         "partial_supervision_ignored_outside_window": 0,
@@ -1149,11 +1181,8 @@ def _validate_partial_supervision_window(
         if (query_signature_id, seed_signature_id) in inside_window_pairs:
             continue
         if kind == "require":
-            raise ValueError(
-                "partial_supervision_require_outside_retrieval_window: "
-                f"query_signature_id={query_signature_id!r} seed_signature_id={seed_signature_id!r} "
-                f"seed_component={seed_component!r}"
-            )
+            telemetry["partial_supervision_require_outside_retrieval_window"] += 1
+            continue
         if kind == "disallow":
             telemetry["partial_supervision_disallow_outside_retrieval_window"] += 1
         else:
@@ -1450,6 +1479,7 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
     else:
         partial_telemetry = {
             "partial_supervision_pair_count": 0,
+            "partial_supervision_require_outside_retrieval_window": 0,
             "partial_supervision_disallow_outside_retrieval_window": 0,
             "partial_supervision_disallow_between_residual_queries": 0,
             "partial_supervision_ignored_outside_window": 0,
@@ -1582,18 +1612,13 @@ def _validate_raw_plan_query_signature_ids(
 
 def _identity_seed_setup(
     cluster_seeds_require: Mapping[str, int | str],
-) -> tuple[dict[str, int | str], dict[int | str, int | str], dict[int | str, list[str]]]:
-    recluster_map: dict[int | str, int | str] = {
-        component_id: component_id for component_id in cluster_seeds_require.values()
-    }
-    inverse: dict[int | str, list[str]] = {}
-    for signature_id, component_id in cluster_seeds_require.items():
-        inverse.setdefault(component_id, []).append(str(signature_id))
-    return (
-        {str(signature_id): component_id for signature_id, component_id in cluster_seeds_require.items()},
-        recluster_map,
-        inverse,
-    )
+) -> tuple[dict[str, str], dict[str, str], dict[str, list[str]]]:
+    normalized = {str(signature_id): str(component_id) for signature_id, component_id in cluster_seeds_require.items()}
+    recluster_map: dict[str, str] = {component_id: component_id for component_id in normalized.values()}
+    inverse: dict[str, list[str]] = {}
+    for signature_id, component_id in normalized.items():
+        inverse.setdefault(component_id, []).append(signature_id)
+    return (normalized, recluster_map, inverse)
 
 
 def _raw_candidate_plan_telemetry_fields(raw_candidate_plan: Mapping[str, Any]) -> dict[str, int | float | str]:
@@ -1920,7 +1945,7 @@ def subset_raw_candidate_plan_for_query_ids(
 
 def _raw_candidate_plan_seed_setup(
     raw_candidate_plan: Mapping[str, Any],
-) -> tuple[dict[str, int | str], dict[int | str, int | str], dict[int | str, list[str]]]:
+) -> tuple[dict[str, str], dict[str, str], dict[str, list[str]]]:
     component_members = raw_candidate_plan.get("component_members")
     if not isinstance(component_members, Mapping):
         component_keys = sorted({str(value) for value in raw_candidate_plan.get("row_component_keys", ())})
@@ -2039,7 +2064,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
         _merge_raw_arrow_planner_build_telemetry(raw_candidate_plan, build_telemetry())
         raw_arrow_retrieval_seconds = time.perf_counter() - stage_start
     else:
-        raw_candidate_plan = dict(raw_candidate_plan)
+        raw_candidate_plan = copy.deepcopy(raw_candidate_plan)
         _validate_raw_plan_query_signature_ids(raw_candidate_plan, query_signature_id_strings)
         raw_arrow_retrieval_seconds = 0.0
 
@@ -2074,6 +2099,9 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     raw_arrow_featurizer_seconds = time.perf_counter() - stage_start
     featurizer_signature_id_to_index = signature_id_to_index_map(featurizer)
     raw_arrow_signature_count = len(featurizer_signature_id_to_index)
+    raw_arrow_plan_signature_count = (
+        raw_arrow_signature_count if raw_arrow_featurizer_reused else len(signature_order.signature_ids)
+    )
 
     retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
         raw_candidate_plan,
@@ -2120,7 +2148,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
         "raw_arrow_featurizer_reused": int(raw_arrow_featurizer_reused),
         "raw_arrow_signal_seconds": float(raw_arrow_signal_seconds),
         "raw_arrow_signature_count": int(raw_arrow_signature_count),
-        "raw_arrow_plan_signature_count": int(len(signature_order.signature_ids)),
+        "raw_arrow_plan_signature_count": int(raw_arrow_plan_signature_count),
         "raw_arrow_seed_signature_count": int(seed_signature_count),
         "raw_arrow_seed_component_count": int(seed_component_count),
     }

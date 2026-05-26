@@ -40,12 +40,8 @@ from s2and.rust_lifecycle import (
 )
 from s2and.thread_config import resolve_n_jobs
 
-# Treat extension as Any for typing; it is optional.
-_s2and_rust: Any | None
-
-
-_s2and_rust = load_s2and_rust_extension()
-s2and_rust: Any | None = _s2and_rust
+# Treat extension as Any for typing; it is optional and loaded on first use.
+s2and_rust: Any | None = None
 
 logger = logging.getLogger("s2and")
 _S2AND_RUST_LOAD_LOCK = threading.Lock()
@@ -205,6 +201,31 @@ def _resolve_json_ingest_normalization_version(normalization_version: str | None
     )
 
 
+def _effective_name_counts_cache_inputs(
+    dataset: Any,
+    *,
+    requested_build_path: RustBuildPath,
+    name_counts_path: str | None,
+) -> tuple[str | None, str | None]:
+    if requested_build_path != "from_json_paths":
+        return _normalize_name_counts_path(name_counts_path), None
+    rust_module = _require_rust_runtime()
+    rust_featurizer_cls = getattr(rust_module, "RustFeaturizer", None)
+    if rust_featurizer_cls is None:
+        raise RuntimeError("s2and_rust extension does not expose RustFeaturizer")
+    plan = _resolve_json_ingest_name_counts_plan(
+        dataset,
+        rust_featurizer_cls=rust_featurizer_cls,
+        name_counts_path=name_counts_path,
+    )
+    if str(plan["name_counts_source"]) != "artifact":
+        return None, None
+    return (
+        _normalize_name_counts_path(cast(str | None, plan["name_counts_path"])),
+        _resolve_json_ingest_normalization_version(),
+    )
+
+
 def _cluster_seeds_version_for_cache(dataset: Any) -> int:
     missing = object()
     raw_version = getattr(dataset, "_cluster_seeds_version", missing)
@@ -241,13 +262,10 @@ def _get_cached_rust_featurizer_for_cluster_seed_update(
         dataset_mode=dataset_mode,
         rust_build_path=None,
     )
-    effective_name_counts_path = (
-        _resolve_json_ingest_name_counts_path(None) if requested_build_path == "from_json_paths" else None
-    )
-    effective_normalization_version = (
-        _resolve_json_ingest_normalization_version()
-        if requested_build_path == "from_json_paths" and effective_name_counts_path is not None
-        else None
+    effective_name_counts_path, effective_normalization_version = _effective_name_counts_cache_inputs(
+        dataset,
+        requested_build_path=requested_build_path,
+        name_counts_path=None,
     )
     cache_family = (
         requested_build_path,
@@ -693,6 +711,11 @@ def _build_rust_featurizer_from_json_paths(
         overlay_start = time.perf_counter()
         updated_count = featurizer.update_signature_name_counts(dataset_signature_counts_payload)
         post_build_seconds = time.perf_counter() - overlay_start
+        if int(updated_count) != len(dataset_signature_counts_payload):
+            raise RuntimeError(
+                "Rust JSON ingest signature name-count overlay updated "
+                f"{int(updated_count)} of {len(dataset_signature_counts_payload)} signatures"
+            )
         logger.info(
             "Telemetry stage: stage=rust_json_signature_name_counts_overlay "
             "seconds=%.3f updated_signatures=%d dataset=%s",
@@ -1137,15 +1160,10 @@ def _get_rust_featurizer(
         dataset_mode=dataset_mode,
         rust_build_path=rust_build_path,
     )
-    effective_name_counts_path = (
-        _resolve_json_ingest_name_counts_path(name_counts_path)
-        if requested_build_path == "from_json_paths"
-        else _normalize_name_counts_path(name_counts_path)
-    )
-    effective_normalization_version = (
-        _resolve_json_ingest_normalization_version()
-        if requested_build_path == "from_json_paths" and effective_name_counts_path is not None
-        else None
+    effective_name_counts_path, effective_normalization_version = _effective_name_counts_cache_inputs(
+        dataset,
+        requested_build_path=requested_build_path,
+        name_counts_path=name_counts_path,
     )
     ds_log = _dataset_name_for_logs(dataset)
     max_empty_wait_retries = _rust_featurizer_empty_wait_max_retries()

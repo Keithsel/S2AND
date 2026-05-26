@@ -1,0 +1,377 @@
+use pyo3::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::{
+    fnv64, fnv64_update, read_f64_le_unchecked, read_u32_le_unchecked, read_u64_le_unchecked,
+    FNV_OFFSET,
+};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct NameCountsData {
+    pub(crate) first: f64,
+    pub(crate) first_last: f64,
+    pub(crate) last: f64,
+    pub(crate) last_first_initial: f64,
+}
+
+#[derive(Default)]
+pub(crate) struct RawNameCountMaps {
+    pub(crate) first: HashMap<String, f64>,
+    pub(crate) last: HashMap<String, f64>,
+    pub(crate) first_last: HashMap<String, f64>,
+    pub(crate) last_first_initial: HashMap<String, f64>,
+    pub(crate) index: Option<RawNameCountIndex>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RawNameCountKind {
+    First,
+    Last,
+    FirstLast,
+    LastFirstInitial,
+}
+
+impl RawNameCountKind {
+    fn key(self) -> &'static str {
+        match self {
+            RawNameCountKind::First => "first",
+            RawNameCountKind::Last => "last",
+            RawNameCountKind::FirstLast => "first_last",
+            RawNameCountKind::LastFirstInitial => "last_first_initial",
+        }
+    }
+}
+
+const NAME_COUNTS_INDEX_MAGIC: &[u8; 8] = b"S2NCI001";
+const NAME_COUNTS_INDEX_HASH_DOMAIN: &[u8] = b"s2and-name-counts-index-v1\0";
+const NAME_COUNTS_INDEX_HEADER_LEN: usize = 32;
+const NAME_COUNTS_INDEX_RECORD_LEN: usize = 40;
+
+pub(crate) struct RawNameCountIndex {
+    first: RawNameCountIndexFile,
+    last: RawNameCountIndexFile,
+    first_last: RawNameCountIndexFile,
+    last_first_initial: RawNameCountIndexFile,
+}
+
+struct RawNameCountIndexPaths {
+    first: PathBuf,
+    last: PathBuf,
+    first_last: PathBuf,
+    last_first_initial: PathBuf,
+}
+
+impl RawNameCountIndex {
+    pub(crate) fn open(path: &str) -> PyResult<Self> {
+        let paths = resolve_name_counts_index_paths(path)?;
+        Ok(Self {
+            first: RawNameCountIndexFile::open(&paths.first, RawNameCountKind::First)?,
+            last: RawNameCountIndexFile::open(&paths.last, RawNameCountKind::Last)?,
+            first_last: RawNameCountIndexFile::open(
+                &paths.first_last,
+                RawNameCountKind::FirstLast,
+            )?,
+            last_first_initial: RawNameCountIndexFile::open(
+                &paths.last_first_initial,
+                RawNameCountKind::LastFirstInitial,
+            )?,
+        })
+    }
+
+    fn get(&self, kind: RawNameCountKind, name: &str) -> Option<f64> {
+        match kind {
+            RawNameCountKind::First => self.first.get(kind, name),
+            RawNameCountKind::Last => self.last.get(kind, name),
+            RawNameCountKind::FirstLast => self.first_last.get(kind, name),
+            RawNameCountKind::LastFirstInitial => self.last_first_initial.get(kind, name),
+        }
+    }
+}
+
+struct RawNameCountIndexFile {
+    bytes: Box<[u8]>,
+    record_count: usize,
+    blob_offset: usize,
+    blob_len: usize,
+}
+
+impl RawNameCountIndexFile {
+    fn open(path: &Path, kind: RawNameCountKind) -> PyResult<Self> {
+        let bytes = fs::read(path).map_err(|err| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "failed to read name-count index file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+        let bytes = bytes.into_boxed_slice();
+        if bytes.len() < NAME_COUNTS_INDEX_HEADER_LEN {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index file {} is shorter than the header",
+                path.display()
+            )));
+        }
+        if &bytes[0..8] != NAME_COUNTS_INDEX_MAGIC {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index file {} has unsupported magic for kind {}",
+                path.display(),
+                kind.key(),
+            )));
+        }
+        let record_count = read_u64_le(&bytes, 8)? as usize;
+        let blob_offset = read_u64_le(&bytes, 16)? as usize;
+        let blob_len = read_u64_le(&bytes, 24)? as usize;
+        let records_end = NAME_COUNTS_INDEX_HEADER_LEN
+            .checked_add(
+                record_count
+                    .checked_mul(NAME_COUNTS_INDEX_RECORD_LEN)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyOverflowError::new_err(format!(
+                            "name-count index file {} has too many records",
+                            path.display()
+                        ))
+                    })?,
+            )
+            .ok_or_else(|| {
+                pyo3::exceptions::PyOverflowError::new_err(format!(
+                    "name-count index file {} record section overflows",
+                    path.display()
+                ))
+            })?;
+        let blob_end = blob_offset.checked_add(blob_len).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err(format!(
+                "name-count index file {} blob section overflows",
+                path.display()
+            ))
+        })?;
+        if blob_offset < records_end || blob_end > bytes.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index file {} has invalid record/blob offsets",
+                path.display()
+            )));
+        }
+        if record_count > 1 {
+            let read_pair = |index: usize| {
+                let offset = NAME_COUNTS_INDEX_HEADER_LEN + index * NAME_COUNTS_INDEX_RECORD_LEN;
+                (
+                    read_u64_le_unchecked(&bytes, offset),
+                    read_u64_le_unchecked(&bytes, offset + 8),
+                )
+            };
+            let mut previous_index = 0usize;
+            let mut previous_pair = read_pair(0);
+            for index in 1..record_count {
+                let pair = read_pair(index);
+                if pair < previous_pair {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "name-count index file {} is not sorted for kind {}: record {} {:?} follows record {} {:?}",
+                        path.display(),
+                        kind.key(),
+                        index,
+                        pair,
+                        previous_index,
+                        previous_pair
+                    )));
+                }
+                previous_index = index;
+                previous_pair = pair;
+            }
+        }
+        Ok(Self {
+            bytes,
+            record_count,
+            blob_offset,
+            blob_len,
+        })
+    }
+
+    fn record_offset(&self, index: usize) -> usize {
+        NAME_COUNTS_INDEX_HEADER_LEN + index * NAME_COUNTS_INDEX_RECORD_LEN
+    }
+
+    fn record_hash_pair(&self, index: usize) -> (u64, u64) {
+        let offset = self.record_offset(index);
+        (
+            read_u64_le_unchecked(&self.bytes, offset),
+            read_u64_le_unchecked(&self.bytes, offset + 8),
+        )
+    }
+
+    fn get(&self, kind: RawNameCountKind, name: &str) -> Option<f64> {
+        let name_bytes = name.as_bytes();
+        let (hash_1, hash_2) = name_counts_index_hashes(kind, name_bytes);
+        let mut lower = 0usize;
+        let mut upper = self.record_count;
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            let (middle_hash_1, middle_hash_2) = self.record_hash_pair(middle);
+            if middle_hash_1 < hash_1 || (middle_hash_1 == hash_1 && middle_hash_2 < hash_2) {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+
+        let mut index = lower;
+        while index < self.record_count {
+            let (record_hash_1, record_hash_2) = self.record_hash_pair(index);
+            if record_hash_1 != hash_1 || record_hash_2 != hash_2 {
+                break;
+            }
+            let offset = self.record_offset(index);
+            let name_offset = read_u64_le_unchecked(&self.bytes, offset + 16) as usize;
+            let name_len = read_u32_le_unchecked(&self.bytes, offset + 24) as usize;
+            if name_offset
+                .checked_add(name_len)
+                .map_or(false, |end| end <= self.blob_len)
+            {
+                let start = self.blob_offset + name_offset;
+                let end = start + name_len;
+                if &self.bytes[start..end] == name_bytes {
+                    return Some(read_f64_le_unchecked(&self.bytes, offset + 32));
+                }
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
+impl RawNameCountMaps {
+    pub(crate) fn from_index(index: RawNameCountIndex) -> Self {
+        Self {
+            first: HashMap::new(),
+            last: HashMap::new(),
+            first_last: HashMap::new(),
+            last_first_initial: HashMap::new(),
+            index: Some(index),
+        }
+    }
+
+    pub(crate) fn has_data(&self) -> bool {
+        self.index.is_some()
+            || !self.first.is_empty()
+            || !self.last.is_empty()
+            || !self.first_last.is_empty()
+            || !self.last_first_initial.is_empty()
+    }
+
+    pub(crate) fn get(&self, kind: RawNameCountKind, name: &str) -> Option<f64> {
+        if let Some(index) = self.index.as_ref() {
+            return index.get(kind, name);
+        }
+        match kind {
+            RawNameCountKind::First => self.first.get(name),
+            RawNameCountKind::Last => self.last.get(name),
+            RawNameCountKind::FirstLast => self.first_last.get(name),
+            RawNameCountKind::LastFirstInitial => self.last_first_initial.get(name),
+        }
+        .copied()
+    }
+}
+
+fn name_counts_index_manifest_path(
+    index_dir: &Path,
+    files: &serde_json::Map<String, serde_json::Value>,
+    kind: &str,
+) -> PyResult<PathBuf> {
+    let path_value = files
+        .get(kind)
+        .and_then(|entry| entry.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index manifest {} is missing files.{}.path",
+                index_dir.join("manifest.json").display(),
+                kind
+            ))
+        })?;
+    let raw_path = PathBuf::from(path_value);
+    let resolved = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        index_dir.join(raw_path)
+    };
+    if !resolved.exists() {
+        return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
+            "name-count index manifest {} points to missing file {}",
+            index_dir.join("manifest.json").display(),
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+fn read_name_counts_index_manifest(index_dir: &Path) -> PyResult<RawNameCountIndexPaths> {
+    let manifest_path = index_dir.join("manifest.json");
+    let manifest_text = fs::read_to_string(&manifest_path).map_err(|err| {
+        pyo3::exceptions::PyIOError::new_err(format!(
+            "failed to read name-count index manifest {}: {}",
+            manifest_path.display(),
+            err
+        ))
+    })?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text).map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to parse name-count index manifest {}: {}",
+            manifest_path.display(),
+            err
+        ))
+    })?;
+    let files = manifest
+        .get("files")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index manifest {} is missing files",
+                manifest_path.display()
+            ))
+        })?;
+    Ok(RawNameCountIndexPaths {
+        first: name_counts_index_manifest_path(index_dir, files, "first")?,
+        last: name_counts_index_manifest_path(index_dir, files, "last")?,
+        first_last: name_counts_index_manifest_path(index_dir, files, "first_last")?,
+        last_first_initial: name_counts_index_manifest_path(
+            index_dir,
+            files,
+            "last_first_initial",
+        )?,
+    })
+}
+
+fn resolve_name_counts_index_paths(path: &str) -> PyResult<RawNameCountIndexPaths> {
+    let direct = PathBuf::from(path);
+    let nested = direct.join("name_counts_index");
+    for index_dir in [&direct, &nested] {
+        if index_dir.join("manifest.json").exists() {
+            return read_name_counts_index_manifest(index_dir);
+        }
+    }
+    Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
+        "name-count index path {} does not contain manifest.json",
+        path
+    )))
+}
+
+fn name_counts_index_hashes(kind: RawNameCountKind, name_bytes: &[u8]) -> (u64, u64) {
+    let first = fnv64(name_bytes);
+    let mut second = FNV_OFFSET;
+    second = fnv64_update(second, NAME_COUNTS_INDEX_HASH_DOMAIN);
+    second = fnv64_update(second, kind.key().as_bytes());
+    second = fnv64_update(second, b"\0");
+    second = fnv64_update(second, name_bytes);
+    (first, second)
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> PyResult<u64> {
+    let end = offset.checked_add(8).ok_or_else(|| {
+        pyo3::exceptions::PyOverflowError::new_err("u64 offset overflows while reading index")
+    })?;
+    let slice = bytes.get(offset..end).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("u64 offset is outside name-count index")
+    })?;
+    Ok(read_u64_le_unchecked(slice, 0))
+}

@@ -7,7 +7,6 @@ use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::record_batch::RecordBatch;
 use cld2::{detect_language_ext as cld2_detect_language_ext, Format as Cld2Format};
 use fasttext::FastText;
-use memmap2::Mmap;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, ToPyArray};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyIterator, PyModule, PyTuple};
@@ -20,11 +19,20 @@ use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+mod name_counts;
 mod promoted_linker;
+mod text_compat;
+
+use name_counts::{NameCountsData, RawNameCountIndex, RawNameCountKind, RawNameCountMaps};
+use text_compat::{
+    compute_block_compat, contains_name_dash, ensure_unidecode_for_text,
+    first_normalized_token_python_compat, normalize_text_compat_from_map,
+    split_first_middle_hyphen_aware_compat,
+};
 
 fn py_len(s: &str) -> usize {
     // Python len() semantics for str: count of Unicode scalar values
@@ -78,381 +86,6 @@ fn fnv64_update(mut h: u64, bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(FNV_PRIME);
     }
     h
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct NameCountsData {
-    first: f64,
-    first_last: f64,
-    last: f64,
-    last_first_initial: f64,
-}
-
-#[derive(Default)]
-struct RawNameCountMaps {
-    first: HashMap<String, f64>,
-    last: HashMap<String, f64>,
-    first_last: HashMap<String, f64>,
-    last_first_initial: HashMap<String, f64>,
-    index: Option<RawNameCountIndex>,
-}
-
-#[derive(Clone, Copy)]
-enum RawNameCountKind {
-    First,
-    Last,
-    FirstLast,
-    LastFirstInitial,
-}
-
-impl RawNameCountKind {
-    fn key(self) -> &'static str {
-        match self {
-            RawNameCountKind::First => "first",
-            RawNameCountKind::Last => "last",
-            RawNameCountKind::FirstLast => "first_last",
-            RawNameCountKind::LastFirstInitial => "last_first_initial",
-        }
-    }
-}
-
-const NAME_COUNTS_INDEX_MAGIC: &[u8; 8] = b"S2NCI001";
-const NAME_COUNTS_INDEX_HASH_DOMAIN: &[u8] = b"s2and-name-counts-index-v1\0";
-const NAME_COUNTS_INDEX_HEADER_LEN: usize = 32;
-const NAME_COUNTS_INDEX_RECORD_LEN: usize = 40;
-
-struct RawNameCountIndex {
-    first: RawNameCountIndexFile,
-    last: RawNameCountIndexFile,
-    first_last: RawNameCountIndexFile,
-    last_first_initial: RawNameCountIndexFile,
-}
-
-struct RawNameCountIndexPaths {
-    first: PathBuf,
-    last: PathBuf,
-    first_last: PathBuf,
-    last_first_initial: PathBuf,
-}
-
-impl RawNameCountIndex {
-    fn open(path: &str) -> PyResult<Self> {
-        let paths = resolve_name_counts_index_paths(path)?;
-        Ok(Self {
-            first: RawNameCountIndexFile::open(&paths.first, RawNameCountKind::First)?,
-            last: RawNameCountIndexFile::open(&paths.last, RawNameCountKind::Last)?,
-            first_last: RawNameCountIndexFile::open(
-                &paths.first_last,
-                RawNameCountKind::FirstLast,
-            )?,
-            last_first_initial: RawNameCountIndexFile::open(
-                &paths.last_first_initial,
-                RawNameCountKind::LastFirstInitial,
-            )?,
-        })
-    }
-
-    fn get(&self, kind: RawNameCountKind, name: &str) -> Option<f64> {
-        match kind {
-            RawNameCountKind::First => self.first.get(kind, name),
-            RawNameCountKind::Last => self.last.get(kind, name),
-            RawNameCountKind::FirstLast => self.first_last.get(kind, name),
-            RawNameCountKind::LastFirstInitial => self.last_first_initial.get(kind, name),
-        }
-    }
-}
-
-struct RawNameCountIndexFile {
-    mmap: Mmap,
-    record_count: usize,
-    blob_offset: usize,
-    blob_len: usize,
-}
-
-impl RawNameCountIndexFile {
-    fn open(path: &Path, kind: RawNameCountKind) -> PyResult<Self> {
-        let file = File::open(path).map_err(|err| {
-            pyo3::exceptions::PyIOError::new_err(format!(
-                "failed to open name-count index file {}: {}",
-                path.display(),
-                err
-            ))
-        })?;
-        // The writer produces immutable binary sidecars. Mapping avoids reading
-        // the multi-GB global name-count artifact into Rust heap memory.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|err| {
-            pyo3::exceptions::PyIOError::new_err(format!(
-                "failed to mmap name-count index file {}: {}",
-                path.display(),
-                err
-            ))
-        })?;
-        if mmap.len() < NAME_COUNTS_INDEX_HEADER_LEN {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "name-count index file {} is shorter than the header",
-                path.display()
-            )));
-        }
-        if &mmap[0..8] != NAME_COUNTS_INDEX_MAGIC {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "name-count index file {} has unsupported magic for kind {}",
-                path.display(),
-                kind.key(),
-            )));
-        }
-        let record_count = read_u64_le(&mmap, 8)? as usize;
-        let blob_offset = read_u64_le(&mmap, 16)? as usize;
-        let blob_len = read_u64_le(&mmap, 24)? as usize;
-        let records_end = NAME_COUNTS_INDEX_HEADER_LEN
-            .checked_add(
-                record_count
-                    .checked_mul(NAME_COUNTS_INDEX_RECORD_LEN)
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyOverflowError::new_err(format!(
-                            "name-count index file {} has too many records",
-                            path.display()
-                        ))
-                    })?,
-            )
-            .ok_or_else(|| {
-                pyo3::exceptions::PyOverflowError::new_err(format!(
-                    "name-count index file {} record section overflows",
-                    path.display()
-                ))
-            })?;
-        let blob_end = blob_offset.checked_add(blob_len).ok_or_else(|| {
-            pyo3::exceptions::PyOverflowError::new_err(format!(
-                "name-count index file {} blob section overflows",
-                path.display()
-            ))
-        })?;
-        if blob_offset < records_end || blob_end > mmap.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "name-count index file {} has invalid record/blob offsets",
-                path.display()
-            )));
-        }
-        if record_count > 1 {
-            let read_pair = |index: usize| {
-                let offset = NAME_COUNTS_INDEX_HEADER_LEN + index * NAME_COUNTS_INDEX_RECORD_LEN;
-                (
-                    read_u64_le_unchecked(&mmap, offset),
-                    read_u64_le_unchecked(&mmap, offset + 8),
-                )
-            };
-            let mut previous_index = 0usize;
-            let mut previous_pair = read_pair(0);
-            for index in 1..record_count {
-                let pair = read_pair(index);
-                if pair < previous_pair {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "name-count index file {} is not sorted for kind {}: record {} {:?} follows record {} {:?}",
-                        path.display(),
-                        kind.key(),
-                        index,
-                        pair,
-                        previous_index,
-                        previous_pair
-                    )));
-                }
-                previous_index = index;
-                previous_pair = pair;
-            }
-        }
-        Ok(Self {
-            mmap,
-            record_count,
-            blob_offset,
-            blob_len,
-        })
-    }
-
-    fn record_offset(&self, index: usize) -> usize {
-        NAME_COUNTS_INDEX_HEADER_LEN + index * NAME_COUNTS_INDEX_RECORD_LEN
-    }
-
-    fn record_hash_pair(&self, index: usize) -> (u64, u64) {
-        let offset = self.record_offset(index);
-        (
-            read_u64_le_unchecked(&self.mmap, offset),
-            read_u64_le_unchecked(&self.mmap, offset + 8),
-        )
-    }
-
-    fn get(&self, kind: RawNameCountKind, name: &str) -> Option<f64> {
-        let name_bytes = name.as_bytes();
-        let (hash_1, hash_2) = name_counts_index_hashes(kind, name_bytes);
-        let mut lower = 0usize;
-        let mut upper = self.record_count;
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2;
-            let (middle_hash_1, middle_hash_2) = self.record_hash_pair(middle);
-            if middle_hash_1 < hash_1 || (middle_hash_1 == hash_1 && middle_hash_2 < hash_2) {
-                lower = middle + 1;
-            } else {
-                upper = middle;
-            }
-        }
-
-        let mut index = lower;
-        while index < self.record_count {
-            let (record_hash_1, record_hash_2) = self.record_hash_pair(index);
-            if record_hash_1 != hash_1 || record_hash_2 != hash_2 {
-                break;
-            }
-            let offset = self.record_offset(index);
-            let name_offset = read_u64_le_unchecked(&self.mmap, offset + 16) as usize;
-            let name_len = read_u32_le_unchecked(&self.mmap, offset + 24) as usize;
-            if name_offset
-                .checked_add(name_len)
-                .map_or(false, |end| end <= self.blob_len)
-            {
-                let start = self.blob_offset + name_offset;
-                let end = start + name_len;
-                if &self.mmap[start..end] == name_bytes {
-                    return Some(read_f64_le_unchecked(&self.mmap, offset + 32));
-                }
-            }
-            index += 1;
-        }
-        None
-    }
-}
-
-impl RawNameCountMaps {
-    fn from_index(index: RawNameCountIndex) -> Self {
-        Self {
-            first: HashMap::new(),
-            last: HashMap::new(),
-            first_last: HashMap::new(),
-            last_first_initial: HashMap::new(),
-            index: Some(index),
-        }
-    }
-
-    fn has_data(&self) -> bool {
-        self.index.is_some()
-            || !self.first.is_empty()
-            || !self.last.is_empty()
-            || !self.first_last.is_empty()
-            || !self.last_first_initial.is_empty()
-    }
-
-    fn get(&self, kind: RawNameCountKind, name: &str) -> Option<f64> {
-        if let Some(index) = self.index.as_ref() {
-            return index.get(kind, name);
-        }
-        match kind {
-            RawNameCountKind::First => self.first.get(name),
-            RawNameCountKind::Last => self.last.get(name),
-            RawNameCountKind::FirstLast => self.first_last.get(name),
-            RawNameCountKind::LastFirstInitial => self.last_first_initial.get(name),
-        }
-        .copied()
-    }
-}
-
-fn name_counts_index_manifest_path(
-    index_dir: &Path,
-    files: &serde_json::Map<String, serde_json::Value>,
-    kind: &str,
-) -> PyResult<PathBuf> {
-    let path_value = files
-        .get(kind)
-        .and_then(|entry| entry.get("path"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "name-count index manifest {} is missing files.{}.path",
-                index_dir.join("manifest.json").display(),
-                kind
-            ))
-        })?;
-    let raw_path = PathBuf::from(path_value);
-    let resolved = if raw_path.is_absolute() {
-        raw_path
-    } else {
-        index_dir.join(raw_path)
-    };
-    if !resolved.exists() {
-        return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
-            "name-count index manifest {} points to missing file {}",
-            index_dir.join("manifest.json").display(),
-            resolved.display()
-        )));
-    }
-    Ok(resolved)
-}
-
-fn read_name_counts_index_manifest(index_dir: &Path) -> PyResult<RawNameCountIndexPaths> {
-    let manifest_path = index_dir.join("manifest.json");
-    let manifest_text = fs::read_to_string(&manifest_path).map_err(|err| {
-        pyo3::exceptions::PyIOError::new_err(format!(
-            "failed to read name-count index manifest {}: {}",
-            manifest_path.display(),
-            err
-        ))
-    })?;
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_text).map_err(|err| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "failed to parse name-count index manifest {}: {}",
-            manifest_path.display(),
-            err
-        ))
-    })?;
-    let files = manifest
-        .get("files")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "name-count index manifest {} is missing files",
-                manifest_path.display()
-            ))
-        })?;
-    Ok(RawNameCountIndexPaths {
-        first: name_counts_index_manifest_path(index_dir, files, "first")?,
-        last: name_counts_index_manifest_path(index_dir, files, "last")?,
-        first_last: name_counts_index_manifest_path(index_dir, files, "first_last")?,
-        last_first_initial: name_counts_index_manifest_path(
-            index_dir,
-            files,
-            "last_first_initial",
-        )?,
-    })
-}
-
-fn resolve_name_counts_index_paths(path: &str) -> PyResult<RawNameCountIndexPaths> {
-    let direct = PathBuf::from(path);
-    let nested = direct.join("name_counts_index");
-    for index_dir in [&direct, &nested] {
-        if index_dir.join("manifest.json").exists() {
-            return read_name_counts_index_manifest(index_dir);
-        }
-    }
-    Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
-        "name-count index path {} does not contain manifest.json",
-        path
-    )))
-}
-
-fn name_counts_index_hashes(kind: RawNameCountKind, name_bytes: &[u8]) -> (u64, u64) {
-    let first = fnv64(name_bytes);
-    let mut second = FNV_OFFSET;
-    second = fnv64_update(second, NAME_COUNTS_INDEX_HASH_DOMAIN);
-    second = fnv64_update(second, kind.key().as_bytes());
-    second = fnv64_update(second, b"\0");
-    second = fnv64_update(second, name_bytes);
-    (first, second)
-}
-
-fn read_u64_le(bytes: &[u8], offset: usize) -> PyResult<u64> {
-    let end = offset.checked_add(8).ok_or_else(|| {
-        pyo3::exceptions::PyOverflowError::new_err("u64 offset overflows while reading index")
-    })?;
-    let slice = bytes.get(offset..end).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err("u64 offset is outside name-count index")
-    })?;
-    Ok(read_u64_le_unchecked(slice, 0))
 }
 
 #[inline(always)]
@@ -961,8 +594,7 @@ impl RustHybridCentroidRetriever {
             .as_str();
         right
             .1
-            .partial_cmp(&left.1)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&left.1)
             .then_with(|| left_component_key.cmp(right_component_key))
     }
 
@@ -1854,183 +1486,6 @@ fn prefilter_affiliation_text(affiliations: &[String], stopwords: &HashSet<Strin
     tokens.join(" ")
 }
 
-fn ensure_unidecode_for_text(
-    unidecode_fn: &Bound<'_, PyAny>,
-    text: &str,
-    unidecode_char_map: &mut HashMap<char, String>,
-) -> PyResult<()> {
-    if text.is_ascii() {
-        return Ok(());
-    }
-    for ch in text.chars() {
-        if ch.is_ascii() || unidecode_char_map.contains_key(&ch) {
-            continue;
-        }
-        let mapped: String = unidecode_fn.call1((ch.to_string(),))?.extract()?;
-        unidecode_char_map.insert(ch, mapped);
-    }
-    Ok(())
-}
-
-fn normalize_ascii_text_compat(text: &str, special_case_apostrophes: bool) -> String {
-    let mut normalized = String::with_capacity(text.len());
-    let mut prev_space = true;
-    for byte in text.bytes() {
-        let lowered = byte.to_ascii_lowercase();
-        if lowered.is_ascii_alphabetic() {
-            normalized.push(lowered as char);
-            prev_space = false;
-        } else if special_case_apostrophes && lowered == b'\'' {
-            continue;
-        } else if !prev_space {
-            normalized.push(' ');
-            prev_space = true;
-        }
-    }
-    while normalized.ends_with(' ') {
-        normalized.pop();
-    }
-    normalized
-}
-
-fn normalize_text_compat_from_map(
-    text: &str,
-    special_case_apostrophes: bool,
-    unidecode_char_map: &HashMap<char, String>,
-) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    if text.is_ascii() {
-        return normalize_ascii_text_compat(text, special_case_apostrophes);
-    }
-
-    let mut transliterated = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            transliterated.push(ch.to_ascii_lowercase());
-            continue;
-        }
-        let mapped = unidecode_char_map
-            .get(&ch)
-            .unwrap_or_else(|| panic!("missing unidecode mapping for non-ASCII character {ch:?}"));
-        for mapped_ch in mapped.chars() {
-            for lowered in mapped_ch.to_lowercase() {
-                transliterated.push(lowered);
-            }
-        }
-    }
-
-    let source = if special_case_apostrophes {
-        transliterated.replace('\'', "")
-    } else {
-        transliterated
-    };
-    let mut normalized = String::with_capacity(source.len());
-    let mut prev_space = true;
-    for ch in source.chars() {
-        if ch.is_ascii_alphabetic() {
-            normalized.push(ch);
-            prev_space = false;
-        } else if !prev_space {
-            normalized.push(' ');
-            prev_space = true;
-        }
-    }
-    while normalized.ends_with(' ') {
-        normalized.pop();
-    }
-    normalized
-}
-
-fn first_normalized_token_python_compat(
-    first_normalized: &str,
-    middle_normalized: &str,
-    name_prefixes: &HashSet<String>,
-) -> String {
-    let joined = format!("{} {}", first_normalized, middle_normalized);
-    let mut parts: Vec<String> = joined.split(' ').map(|token| token.to_string()).collect();
-    if let Some(prefix) = parts.first() {
-        if name_prefixes.contains(prefix) {
-            parts.remove(0);
-        }
-    }
-    parts.get(0).cloned().unwrap_or_default()
-}
-
-fn is_name_dash(ch: char) -> bool {
-    matches!(
-        ch,
-        '-' | '\u{2010}'
-            | '\u{2011}'
-            | '\u{2012}'
-            | '\u{2013}'
-            | '\u{2014}'
-            | '\u{2212}'
-            | '\u{FE58}'
-            | '\u{FE63}'
-            | '\u{FF0D}'
-    )
-}
-
-fn contains_name_dash(value: &str) -> bool {
-    value.chars().any(is_name_dash)
-}
-
-fn split_first_middle_hyphen_aware_compat(
-    first_raw: &str,
-    middle_raw: &str,
-    name_prefixes: &HashSet<String>,
-    unidecode_char_map: &HashMap<char, String>,
-) -> (String, String) {
-    let has_dash_in_first = contains_name_dash(first_raw);
-    let first_noapos = normalize_text_compat_from_map(first_raw, true, unidecode_char_map);
-    let middle_norm = normalize_text_compat_from_map(middle_raw, false, unidecode_char_map);
-
-    let mut f_parts: Vec<String> = first_noapos
-        .split_whitespace()
-        .map(|token| token.to_string())
-        .collect();
-    let m_parts: Vec<String> = middle_norm
-        .split_whitespace()
-        .map(|token| token.to_string())
-        .collect();
-    if let Some(prefix) = f_parts.first() {
-        if name_prefixes.contains(prefix) {
-            f_parts.remove(0);
-        }
-    }
-
-    if f_parts.is_empty() {
-        return (String::new(), m_parts.join(" "));
-    }
-    if has_dash_in_first {
-        return (f_parts.join(" "), m_parts.join(" "));
-    }
-    let first = f_parts[0].clone();
-    let middle = f_parts[1..]
-        .iter()
-        .chain(m_parts.iter())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
-    (first, middle)
-}
-
-fn compute_block_compat(name: &str) -> String {
-    if name.is_empty() {
-        return String::new();
-    }
-    let name_parts: Vec<&str> = name.split(' ').collect();
-    if name_parts.len() == 1 {
-        return name_parts[0].to_string();
-    }
-    let Some(first_initial) = name_parts[0].chars().next() else {
-        return String::new();
-    };
-    format!("{} {}", first_initial, name_parts[name_parts.len() - 1])
-}
-
 fn parse_fasttext_label(label: &str) -> String {
     label.rsplit("__").next().unwrap_or(label).to_string()
 }
@@ -2421,25 +1876,21 @@ fn read_arrow_batches(path: &str) -> PyResult<Vec<RecordBatch>> {
 }
 
 struct ArrowBatchLookupIndex {
-    mmap: Mmap,
+    bytes: Box<[u8]>,
     record_count: usize,
 }
 
 impl ArrowBatchLookupIndex {
     fn open(path: &str, source_arrow_path: &str, key_column: &str) -> PyResult<Self> {
-        let file = File::open(path)
-            .map_err(|err| io_error_to_py("failed to open Arrow batch lookup index", path, err))?;
-        let mmap = unsafe {
-            Mmap::map(&file).map_err(|err| {
-                io_error_to_py("failed to memory-map Arrow batch lookup index", path, err)
-            })?
-        };
-        if mmap.len() < ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN {
+        let bytes = fs::read(path)
+            .map_err(|err| io_error_to_py("failed to read Arrow batch lookup index", path, err))?
+            .into_boxed_slice();
+        if bytes.len() < ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Arrow batch lookup index '{path}' is shorter than its header"
             )));
         }
-        let magic = &mmap[0..8];
+        let magic = &bytes[0..8];
         if magic != ARROW_BATCH_LOOKUP_INDEX_MAGIC {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Arrow batch lookup index '{path}' has invalid magic bytes"
@@ -2454,22 +1905,22 @@ impl ArrowBatchLookupIndex {
         })?;
         let source_size = source_metadata.len();
         let record_count = u64::from_le_bytes(
-            mmap[8..16]
+            bytes[8..16]
                 .try_into()
                 .expect("slice length is checked by fixed header length"),
         ) as usize;
         let indexed_source_size = u64::from_le_bytes(
-            mmap[16..24]
+            bytes[16..24]
                 .try_into()
                 .expect("indexed source-size slice has fixed length"),
         );
         let _indexed_source_mtime_ns = u64::from_le_bytes(
-            mmap[24..32]
+            bytes[24..32]
                 .try_into()
                 .expect("indexed source-mtime slice has fixed length"),
         );
         let indexed_key_column_hash = u64::from_le_bytes(
-            mmap[32..40]
+            bytes[32..40]
                 .try_into()
                 .expect("indexed key-column hash slice has fixed length"),
         );
@@ -2482,7 +1933,7 @@ impl ArrowBatchLookupIndex {
             )));
         }
         let indexed_source_fingerprint = u64::from_le_bytes(
-            mmap[40..48]
+            bytes[40..48]
                 .try_into()
                 .expect("indexed source fingerprint slice has fixed length"),
         );
@@ -2509,15 +1960,18 @@ impl ArrowBatchLookupIndex {
                     "Arrow batch lookup index length overflows usize",
                 )
             })?;
-        if mmap.len() != expected_len {
+        if bytes.len() != expected_len {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Arrow batch lookup index '{path}' length {} does not match expected length {expected_len} \
                  (record_count={record_count}, header_len={ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN}, \
                  record_len={ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN})",
-                mmap.len()
+                bytes.len()
             )));
         }
-        Ok(Self { mmap, record_count })
+        Ok(Self {
+            bytes,
+            record_count,
+        })
     }
 
     fn record_offset(&self, index: usize) -> usize {
@@ -2527,7 +1981,7 @@ impl ArrowBatchLookupIndex {
     fn record_hash(&self, index: usize) -> u64 {
         let offset = self.record_offset(index);
         u64::from_le_bytes(
-            self.mmap[offset..offset + 8]
+            self.bytes[offset..offset + 8]
                 .try_into()
                 .expect("record hash slice has fixed length"),
         )
@@ -2536,7 +1990,7 @@ impl ArrowBatchLookupIndex {
     fn record_batch_index(&self, index: usize) -> u32 {
         let offset = self.record_offset(index) + 8;
         u32::from_le_bytes(
-            self.mmap[offset..offset + 4]
+            self.bytes[offset..offset + 4]
                 .try_into()
                 .expect("record batch-index slice has fixed length"),
         )
@@ -6267,8 +5721,7 @@ fn sorted_subblock_merge_candidates(
     candidates.sort_by(|left, right| {
         right
             .1
-            .partial_cmp(&left.1)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&left.1)
             .then_with(|| right.0 .0.cmp(&left.0 .0))
             .then_with(|| right.0 .1.cmp(&left.0 .1))
     });
@@ -8391,7 +7844,7 @@ impl RustFeaturizer {
             return;
         }
         row[4] = value;
-        row.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+        row.sort_by(|left, right| left.total_cmp(right));
     }
 }
 
@@ -14329,8 +13782,7 @@ fn raw_arrow_labeled_candidate_plan<'py>(
         scored_rows.sort_unstable_by(|left, right| {
             right
                 .1
-                .partial_cmp(&left.1)
-                .unwrap_or(Ordering::Equal)
+                .total_cmp(&left.1)
                 .then_with(|| left.2.cmp(&right.2))
                 .then_with(|| left.3.cmp(&right.3))
         });
@@ -15017,10 +14469,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "missing unidecode mapping")]
-    fn normalize_text_compat_requires_mapping_for_non_ascii() {
+    fn normalize_text_compat_missing_mapping_does_not_panic() {
         let unidecode_char_map = HashMap::new();
-        let _ = normalize_text_compat_from_map("\u{00C9}lodie", false, &unidecode_char_map);
+        assert_eq!(
+            normalize_text_compat_from_map("\u{00C9}lodie", false, &unidecode_char_map),
+            "lodie",
+        );
     }
 
     #[test]

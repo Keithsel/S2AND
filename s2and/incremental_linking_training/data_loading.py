@@ -153,6 +153,8 @@ def load_giant_block_dataset(
     filtered_altered = _filter_altered_signatures(altered_cluster_signatures, set(selected_signature_ids))
 
     previous_fasttext_loading_enabled = fasttext_loading_enabled()
+    env_keys = ("S2AND_SKIP_FASTTEXT", "S2AND_BACKEND", "OMP_NUM_THREADS", "RAYON_NUM_THREADS")
+    previous_env = {key: os.environ.get(key) for key in env_keys}
     set_fasttext_loading_enabled(False)
     try:
         os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
@@ -187,6 +189,11 @@ def load_giant_block_dataset(
             compute_reference_features=False,
         )
     finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         set_fasttext_loading_enabled(previous_fasttext_loading_enabled)
 
     load_info = {

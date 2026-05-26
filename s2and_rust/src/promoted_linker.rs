@@ -43,7 +43,7 @@ fn linker_extract_f32_vec(
     row_count: usize,
 ) -> PyResult<Vec<f32>> {
     let obj = linker_dict_item(dict, key)?;
-    let values = if let Ok(arr) = obj.downcast::<PyArray1<f32>>() {
+    let values: Vec<f32> = if let Ok(arr) = obj.downcast::<PyArray1<f32>>() {
         arr.readonly().as_slice()?.to_vec()
     } else if let Ok(arr) = obj.downcast::<PyArray1<f64>>() {
         arr.readonly()
@@ -78,7 +78,8 @@ fn linker_extract_f32_vec(
     } else {
         let mut out = Vec::with_capacity(row_count);
         for item in PyIterator::from_object(&obj)? {
-            out.push(item?.extract::<f64>()? as f32);
+            let value = item?.extract::<f64>()? as f32;
+            out.push(value);
         }
         out
     };
@@ -88,12 +89,25 @@ fn linker_extract_f32_vec(
             values.len()
         )));
     }
-    if values.iter().any(|value| value.is_nan()) {
+    if values.iter().any(|value| !value.is_finite()) {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Signal {key:?} contains NaN values"
+            "Signal {key:?} contains non-finite values"
         )));
     }
     Ok(values)
+}
+
+fn linker_rank_order_values(values: &[f32], key: &str) -> PyResult<Vec<i64>> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        if value.fract() != 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Signal {key:?} contains non-integral rank value {value}"
+            )));
+        }
+        out.push(*value as i64);
+    }
+    Ok(out)
 }
 
 fn linker_extract_string_vec(
@@ -153,7 +167,7 @@ fn linker_groups(row_query_signature_indices: &[u32]) -> Vec<Vec<usize>> {
 fn linker_retrieval_ordered_groups(
     groups: &[Vec<usize>],
     retrieval_score: &[f32],
-    retrieval_rank: &[f32],
+    retrieval_rank_order: &[i64],
     component_keys: &[String],
 ) -> Vec<Vec<usize>> {
     let mut out = Vec::with_capacity(groups.len());
@@ -162,7 +176,7 @@ fn linker_retrieval_ordered_groups(
         ordered.sort_by(|left, right| {
             retrieval_score[*right]
                 .total_cmp(&retrieval_score[*left])
-                .then_with(|| (retrieval_rank[*left] as i64).cmp(&(retrieval_rank[*right] as i64)))
+                .then_with(|| retrieval_rank_order[*left].cmp(&retrieval_rank_order[*right]))
                 .then_with(|| component_keys[*left].cmp(&component_keys[*right]))
         });
         out.push(ordered);
@@ -227,7 +241,7 @@ struct LinkerGroupFeatures {
 fn linker_derive_group_features(
     ordered_groups: &[Vec<usize>],
     retrieval_score: &[f32],
-    retrieval_rank: &[f32],
+    retrieval_rank_order: &[i64],
     component_keys: &[String],
     family_ids: &[String],
     dominant_first_alpha: &[String],
@@ -252,12 +266,12 @@ fn linker_derive_group_features(
         for index in ordered.iter().copied().skip(1) {
             let current_key = (
                 top5_mean_distance[index],
-                retrieval_rank[index] as i64,
+                retrieval_rank_order[index],
                 component_keys[index].as_str(),
             );
             let best_key = (
                 top5_mean_distance[best_top5],
-                retrieval_rank[best_top5] as i64,
+                retrieval_rank_order[best_top5],
                 component_keys[best_top5].as_str(),
             );
             if current_key < best_key {
@@ -363,6 +377,7 @@ fn promoted_linker_non_pairwise_features<'py>(
 
     let retrieval_score = linker_extract_f32_vec(signals, "retrieval_score", row_count)?;
     let retrieval_rank = linker_extract_f32_vec(signals, "retrieval_rank", row_count)?;
+    let retrieval_rank_order = linker_rank_order_values(&retrieval_rank, "retrieval_rank")?;
     let component_keys = linker_extract_string_vec(signals, "candidate_component_key", row_count)?;
     let cluster_size = linker_extract_f32_vec(signals, "cluster_size", row_count)?;
     let named_signature_count =
@@ -413,7 +428,7 @@ fn promoted_linker_non_pairwise_features<'py>(
     let ordered_groups = linker_retrieval_ordered_groups(
         &groups,
         &retrieval_score,
-        &retrieval_rank,
+        &retrieval_rank_order,
         &component_keys,
     );
     let family_ids_from_signal = linker_optional_string_vec(signals, "family_id", row_count)?;
@@ -448,7 +463,7 @@ fn promoted_linker_non_pairwise_features<'py>(
     let group_features = linker_derive_group_features(
         &ordered_groups,
         &retrieval_score,
-        &retrieval_rank,
+        &retrieval_rank_order,
         &component_keys,
         &family_ids,
         &dominant_first_alpha,

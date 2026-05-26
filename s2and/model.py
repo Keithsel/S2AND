@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -99,12 +100,12 @@ DEFAULT_INCREMENTAL_LINKER_ARTIFACT_DIR = Path(_PACKAGE_DATA_DIR) / "production_
 _ALTERED_PRESPLIT_CACHE_MAX_ENTRIES = 128
 _CLUSTER_SEEDS_ARROW_CACHE_MAX_ENTRIES = 16
 _CLUSTER_SEEDS_ARROW_CACHE: OrderedDict[
-    tuple[str, int | None, int | None, int | None],
+    tuple[str, int | None, int | None, int | None, str | None],
     tuple[tuple[str, str], ...],
 ] = OrderedDict()
 _CLUSTER_SEED_DISALLOWS_ARROW_CACHE_MAX_ENTRIES = 16
 _CLUSTER_SEED_DISALLOWS_ARROW_CACHE: OrderedDict[
-    tuple[str, int | None, int | None, int | None],
+    tuple[str, int | None, int | None, int | None, str | None],
     tuple[tuple[str, str], ...],
 ] = OrderedDict()
 
@@ -114,7 +115,7 @@ for _export in (FastCluster, PairwiseModeler, VotingClassifier, intify):
 
 
 def _is_recoverable_graph_subblocking_error(exc: Exception) -> bool:
-    if isinstance(exc, KeyError | FileNotFoundError | OSError | ImportError):
+    if isinstance(exc, FileNotFoundError):
         return True
     exc_type = type(exc)
     return exc_type.__module__.split(".", maxsplit=1)[0] == "pyarrow" or exc_type.__name__.startswith("Arrow")
@@ -278,13 +279,33 @@ def _cacheable_value(value: Any) -> Any:
     return repr(value)
 
 
-def _path_cache_fingerprint(path_value: Any) -> tuple[str, int | None, int | None, int | None]:
+def _path_sample_digest(path: Path, size: int) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    sample_size = 65_536
+    with path.open("rb") as infile:
+        digest.update(infile.read(min(sample_size, size)))
+        if size > sample_size:
+            middle_start = max(0, (size // 2) - (sample_size // 2))
+            infile.seek(middle_start)
+            digest.update(infile.read(min(sample_size, size - middle_start)))
+            suffix_start = max(sample_size, size - sample_size)
+            infile.seek(suffix_start)
+            digest.update(infile.read(size - suffix_start))
+    return digest.hexdigest()
+
+
+def _path_cache_fingerprint(path_value: Any) -> tuple[str, int | None, int | None, int | None, str | None]:
     path = Path(str(path_value))
     try:
         stat = path.stat()
     except OSError:
-        return str(path_value), None, None, None
-    return str(path), int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)
+        return str(path_value), None, None, None, None
+    size = int(stat.st_size)
+    try:
+        digest = _path_sample_digest(path, size)
+    except OSError:
+        digest = None
+    return str(path), size, int(stat.st_mtime_ns), int(stat.st_ctime_ns), digest
 
 
 def _arrow_paths_cache_fingerprint(arrow_paths: Mapping[str, Any] | None) -> tuple[tuple[str, Any], ...]:
@@ -319,8 +340,8 @@ def _model_presplit_cache_fingerprint(clusterer: Any) -> tuple[Any, ...]:
     get_params = getattr(cluster_model, "get_params", None)
     cluster_model_params = get_params(deep=False) if callable(get_params) else {}
     return (
-        id(getattr(clusterer, "classifier", None)),
-        id(getattr(clusterer, "nameless_classifier", None)),
+        _estimator_cache_fingerprint(getattr(clusterer, "classifier", None)),
+        _estimator_cache_fingerprint(getattr(clusterer, "nameless_classifier", None)),
         _cacheable_value(cluster_model_params),
         _cacheable_value(getattr(getattr(clusterer, "featurizer_info", None), "features_to_use", ())),
         _cacheable_value(getattr(getattr(clusterer, "nameless_featurizer_info", None), "features_to_use", ())),
@@ -328,6 +349,32 @@ def _model_presplit_cache_fingerprint(clusterer: Any) -> tuple[Any, ...]:
         bool(getattr(clusterer, "dont_merge_cluster_seeds", True)),
         bool(getattr(clusterer, "suppress_orcid", False)),
     )
+
+
+def _estimator_cache_fingerprint(estimator: Any) -> Any:
+    if estimator is None:
+        return None
+    inner = getattr(estimator, "classifier", None)
+    if inner is not None and inner is not estimator:
+        return (
+            "wrapped",
+            type(estimator).__module__,
+            type(estimator).__qualname__,
+            _estimator_cache_fingerprint(inner),
+        )
+    booster = getattr(estimator, "booster_", None)
+    model_to_string = getattr(booster, "model_to_string", None)
+    if callable(model_to_string):
+        model_string = str(model_to_string())
+        return (
+            type(estimator).__module__,
+            type(estimator).__qualname__,
+            hashlib.blake2b(model_string.encode("utf-8"), digest_size=16).hexdigest(),
+        )
+    state = getattr(estimator, "__dict__", None)
+    if isinstance(state, Mapping):
+        return (type(estimator).__module__, type(estimator).__qualname__, _cacheable_value(state))
+    return (type(estimator).__module__, type(estimator).__qualname__)
 
 
 def _altered_presplit_cache(clusterer: Any) -> OrderedDict[tuple[Any, ...], tuple[tuple[str, ...], ...]]:
@@ -782,11 +829,11 @@ def _arrow_paths_need_current_cluster_seeds(dataset: Any, arrow_paths: Mapping[s
 
 
 def _cluster_seeds_require_inverse(
-    cluster_seeds_require: Mapping[str, int | str],
+    cluster_seeds_require: Mapping[Any, Any],
 ) -> dict[int | str, list[str]]:
     inverse: dict[int | str, list[str]] = defaultdict(list)
     for signature_id, cluster_num in cluster_seeds_require.items():
-        inverse[cluster_num].append(str(signature_id))
+        inverse[str(cluster_num)].append(str(signature_id))
     return inverse
 
 
@@ -1109,6 +1156,13 @@ def _signature_first_for_rules(signature: Any) -> str:
     return signature.author_info_first_normalized_without_apostrophe or signature.author_info_first or ""
 
 
+def _signature_first_initials_for_rules(first: str) -> frozenset[str]:
+    tokens = [token for token in first.replace("-", " ").split() if token]
+    if not tokens and first:
+        tokens = [first]
+    return frozenset(token[0] for token in tokens if token)
+
+
 def _residual_phase_b_first_initial_groups(
     clusterer: Any,
     dataset: Any,
@@ -1126,7 +1180,7 @@ def _residual_phase_b_first_initial_groups(
     if not isinstance(signatures, Mapping):
         return [residual_signature_ids]
 
-    initials: dict[str, str] = {}
+    initials: dict[str, frozenset[str]] = {}
     for signature_id in residual_signature_ids:
         signature = signatures.get(signature_id)
         if signature is None:
@@ -1134,8 +1188,11 @@ def _residual_phase_b_first_initial_groups(
         first = _signature_first_for_rules(signature)
         if not first:
             return [residual_signature_ids]
-        initials[signature_id] = first[0]
-    if len(set(initials.values())) <= 1:
+        first_initials = _signature_first_initials_for_rules(first)
+        if not first_initials:
+            return [residual_signature_ids]
+        initials[signature_id] = first_initials
+    if len(set().union(*initials.values())) <= 1:
         return [residual_signature_ids]
 
     parent = {signature_id: signature_id for signature_id in residual_signature_ids}
@@ -1158,9 +1215,9 @@ def _residual_phase_b_first_initial_groups(
 
     initial_representatives: dict[str, str] = {}
     for signature_id in residual_signature_ids:
-        initial = initials[signature_id]
-        representative = initial_representatives.setdefault(initial, signature_id)
-        union(representative, signature_id)
+        for initial in initials[signature_id]:
+            representative = initial_representatives.setdefault(initial, signature_id)
+            union(representative, signature_id)
 
     if not bool(getattr(clusterer, "suppress_orcid", False)):
         orcid_representatives: dict[str, str] = {}
@@ -4946,12 +5003,7 @@ class Clusterer:
             if source_cluster_seeds_require:
                 source_cluster_seeds_origin = "arrow"
         for signature_id, cluster_num in source_cluster_seeds_require.items():
-            cluster_num_value: int | str
-            if isinstance(cluster_num, int | str):
-                cluster_num_value = cluster_num
-            else:
-                cluster_num_value = str(cluster_num)
-            cluster_seeds_require[str(signature_id)] = cluster_num_value
+            cluster_seeds_require[str(signature_id)] = str(cluster_num)
         cluster_seeds_require_inverse = _cluster_seeds_require_inverse(cluster_seeds_require)
 
         altered_cluster_signatures = _dataset_altered_cluster_signatures(dataset, arrow_paths)
@@ -4988,7 +5040,7 @@ class Clusterer:
             reclustered_by_cluster_num: dict[int | str, list[list[str]]] = defaultdict(list)
             presplit_jobs: list[_AlteredPresplitJob] = []
             for altered_index, altered_cluster_num in enumerate(sorted_altered_cluster_nums):
-                signature_ids_for_cluster_num = cluster_seeds_require_inverse.get(altered_cluster_num, [])
+                signature_ids_for_cluster_num = cluster_seeds_require_inverse.get(str(altered_cluster_num), [])
                 if len(signature_ids_for_cluster_num) <= 1:
                     continue
                 altered_presplit_block_count += 1

@@ -166,7 +166,8 @@ def test_run_profiles_arrow_only_incremental_path(monkeypatch: pytest.MonkeyPatc
     assert len(captured_calls) == 1
     assert captured_calls[0]["block_signatures"] == ["a", "c", "b"]
     assert captured_calls[0]["arrow_paths"]["signatures"] == str(signatures_path)
-    assert captured_calls[0]["arrow_paths"]["cluster_seeds"].endswith("cluster_seeds_run_0.arrow")
+    assert Path(captured_calls[0]["arrow_paths"]["cluster_seeds"]).name.endswith("_run_0.arrow")
+    assert Path(captured_calls[0]["arrow_paths"]["cluster_seeds"]).name.startswith("cluster_seeds_")
     assert "clusters" not in captured_calls[0]["arrow_paths"]
     assert captured_calls[0]["signatures"] == {"a", "b", "c", "d", "x"}
     assert captured_calls[0]["use_cache"] is False

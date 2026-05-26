@@ -386,9 +386,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     prior_env = _set_runtime_env(int(args.n_jobs))
     per_run: list[dict[str, Any]] = []
+    run_file_prefix = f"{os.getpid()}_{time.time_ns()}"
     try:
         for run_index in range(int(args.runs)):
-            cluster_seeds_path = output_dir / f"cluster_seeds_run_{run_index}.arrow"
+            cluster_seeds_path = output_dir / f"cluster_seeds_{run_file_prefix}_run_{run_index}.arrow"
             write_cluster_seeds_arrow(cluster_seeds_path, workload.seed_signature_to_cluster)
             dataset = ArrowProfileDataset(
                 name=f"{args.dataset}_arrow_promoted_profile",

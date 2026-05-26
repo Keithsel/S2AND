@@ -563,8 +563,12 @@ def test_convert_service_json_to_arrow_overwrite_preserves_other_root_manifest_e
     assert entries["new_dataset"]["audit"]["signature_count"] == 1
     assert root_manifest["audit"]["datasets_with_missing_manifests"] == ["existing_dataset"]
     assert root_manifest["audit"]["total_signature_count"] == 1
+    new_dataset_dir = convert_module._manifest_relative_path(
+        output_root / "new_dataset",
+        convert_module._PROJECT_ROOT,
+    ).replace("\\", "/")
     assert root_manifest["validation_commands"] == [
-        "uv run python scripts/convert_to_arrow.py validate --dataset-dir new_dataset"
+        f"uv run python scripts/convert_to_arrow.py validate --dataset-dir {new_dataset_dir}"
     ]
 
 

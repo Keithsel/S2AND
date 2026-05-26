@@ -576,19 +576,33 @@ def write_arrow_batch_lookup_index(
     source_stat = arrow_path_obj.stat()
     key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
     source_fingerprint = _source_file_sample_fingerprint(arrow_path_obj)
-    with output_path.open("wb") as outfile:
-        outfile.write(
-            _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.pack(
-                _ARROW_BATCH_LOOKUP_INDEX_MAGIC,
-                len(records),
-                source_stat.st_size,
-                source_stat.st_mtime_ns,
-                key_column_hash,
-                source_fingerprint,
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as outfile:
+            tmp_path = Path(outfile.name)
+            outfile.write(
+                _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.pack(
+                    _ARROW_BATCH_LOOKUP_INDEX_MAGIC,
+                    len(records),
+                    source_stat.st_size,
+                    source_stat.st_mtime_ns,
+                    key_column_hash,
+                    source_fingerprint,
+                )
             )
-        )
-        for key_hash, batch_index in records:
-            outfile.write(_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.pack(key_hash, batch_index, 0))
+            for key_hash, batch_index in records:
+                outfile.write(_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.pack(key_hash, batch_index, 0))
+        tmp_path.replace(output_path)
+    except Exception:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
     return str(output_path), {
         "reused": False,
         "schema_version": ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION,
@@ -931,6 +945,8 @@ def _remove_stale_name_counts_generations(index_dir: Path, current_generation_na
     for child in generations_dir.iterdir():
         if child.name == current_generation_name or child.name.startswith(".") or not child.is_dir():
             continue
+        if not (child / ".published").exists():
+            continue
         shutil.rmtree(child)
 
 
@@ -999,13 +1015,14 @@ def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) 
             "exact_string_verification": True,
             "files": manifest_files,
         }
-        tmp_generation_dir.rename(generation_dir)
         tmp_manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_generation_dir.rename(generation_dir)
         for entry in manifest_files.values():
             path = index_dir / str(entry["path"])
             if not path.exists():
                 raise FileNotFoundError(f"name-count index generation is incomplete: {path}")
         tmp_manifest_path.replace(manifest_path)
+        (generation_dir / ".published").write_text("", encoding="utf-8")
         manifest_published = True
         _remove_stale_name_counts_generations(index_dir, generation_name)
     finally:
@@ -1132,6 +1149,8 @@ def _require_arrow_string_list_columns(table: Any, table_name: str, required_col
             value_type is not None and (pa.types.is_string(value_type) or pa.types.is_large_string(value_type))
         ):
             raise ValueError(f"{table_name} Arrow column {column_name} expected list<string>, got {column_type}")
+        if int(table[column_name].null_count) > 0:
+            raise ValueError(f"{table_name} Arrow column {column_name} cannot contain null list values")
 
 
 def feature_block_from_arrow_paths(
@@ -1309,7 +1328,11 @@ def _filter_arrow_table_by_values(pa: Any, pc: Any, table: Any, column: str, val
     value_list = [str(value) for value in values]
     if not value_list:
         return table.slice(0, 0)
-    mask = pc.is_in(table[column], value_set=pa.array(value_list, type=table[column].type))
+    value_set = pa.array(value_list, type=table[column].type)
+    cast_values = value_set.to_pylist()
+    if any(value is None for value in cast_values) or len(set(cast_values)) != len(value_list):
+        raise ValueError(f"{column} filter values are not one-to-one after casting to Arrow type {table[column].type}")
+    mask = pc.is_in(table[column], value_set=value_set)
     return table.filter(mask)
 
 

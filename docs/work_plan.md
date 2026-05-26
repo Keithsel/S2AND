@@ -67,12 +67,18 @@ The canonical surface owns:
 
 ### 1. Production Artifact Generation
 
+Current state:
+
+- The current S3-synced public Arrow release under `s2and/data` has the
+  manifest-backed `name_counts_index/generations/<generation-id>/` layout.
+- The canonical local replay/profiling bundle is
+  `s2and/data/s2and_and_big_blocks_linker_dataset_20260525`.
+
 Remaining:
 
-- Regenerate durable Arrow bundles from the full schema in
-  [rust/arrow_dataset_spec.md](rust/arrow_dataset_spec.md).
-- Regenerate `name_counts_index/` into the manifest-backed
-  `generations/<generation-id>/` layout before the next publication.
+- For the next full regeneration, rebuild durable Arrow bundles from the full
+  schema in [rust/arrow_dataset_spec.md](rust/arrow_dataset_spec.md) and run
+  `refresh-root-manifest` before publication.
 - Keep production-scale `name_counts_index/` in S3, not Git/LFS.
 - Keep `name_counts.arrow` for generation, inspection, and parity debugging,
   not as the default request-time read.
@@ -100,6 +106,9 @@ Current state:
 - Local release-manifest generation now records root-manifest checksums,
   per-dataset audit counts, generator commit metadata, validation requirements,
   and the exact validation commands.
+- `refresh-root-manifest` refreshes those checksums/audits/validation commands
+  in a local S3-synced checkout while preserving the logical S3 `output_root`
+  and nested replay-bundle metadata.
 - The local tiny-fixture release-layout regression covers root manifest
   checksums, dataset manifest references, readable Arrow IPC files, a
   batch-index sidecar, production model manifest, and
@@ -109,8 +118,8 @@ Remaining:
 
 - Keep S3/network validation as an explicit release smoke command, not default
   pytest, until CI has a dedicated network-enabled release job.
-- Publish or refresh the public root manifest with checksums after the next
-  approved S3 upload.
+- Upload the refreshed local root manifest only as an explicit public-release
+  action.
 
 Done when:
 
@@ -142,13 +151,14 @@ Already landed:
 - `scripts/eval_prod_models.py --use-arrow` was run on the local mini Arrow
   bundle for `pubmed`, `qian`, and `zbmath` with no `ANDData` construction:
   B3 F1 was 0.943, 0.971, and 0.976 respectively.
+- The same Arrow eval smoke now runs against the S3-synced public release root
+  in `s2and/data`: `pubmed`, `qian`, and `zbmath` with SPECTER2 produced B3
+  F1 0.943, 0.971, and 0.959 respectively.
 
 Remaining:
 
 - Keep future production call sites on `s2and.arrow_inputs`; do not duplicate
   strict validation in scripts or model helpers.
-- Run the same Arrow eval smoke against the public release root after a local
-  `s2and/data` Arrow release checkout is available.
 
 Done when:
 
@@ -196,6 +206,11 @@ Already landed:
 - Extracted the promoted non-pairwise linker feature kernel into
   `s2and_rust/src/promoted_linker.rs` with its focused Rust unit test and PyO3
   registration helper.
+- Extracted manifest-backed name-count index loading and lookup into
+  `s2and_rust/src/name_counts.rs`, keeping `lib.rs` on the existing
+  `RawNameCountMaps` / `NameCountsData` contract.
+- Extracted Python-compatible text/name normalization helpers into
+  `s2and_rust/src/text_compat.rs`.
 - Current inventory:
   [rust/public_surface_inventory.md](rust/public_surface_inventory.md).
 
@@ -207,10 +222,10 @@ Remaining:
   `featurize_pair(...)` and `featurize_pairs(...)` as parity/debug/fallback
   helpers until Python callers no longer need them.
 - Split `s2and_rust/src/lib.rs` mechanically, one low-coupling module at a
-  time. Completed first extraction: `promoted_linker`. Candidate next modules:
-  `arrow_io`, `name_counts`, `text_compat`, `ingest_arrow`, `ingest_json`,
-  `ingest_dataset`, `features`, `constraints`, `retrieval`, `linker`, and
-  `subblocking`.
+  time. Completed extractions: `promoted_linker`, `name_counts`,
+  `text_compat`. Candidate next modules: `arrow_io`, `ingest_arrow`,
+  `ingest_json`, `ingest_dataset`, `features`, `constraints`, `retrieval`,
+  `linker`, and `subblocking`.
 - Move focused tests with extracted modules where that preserves private
   visibility without unnecessary `pub(crate)` churn.
 

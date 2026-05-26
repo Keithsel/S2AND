@@ -179,9 +179,9 @@ def _unpack_incremental_seed_setup(
     seed_setup: Sequence[Any],
 ) -> tuple[
     Mapping[str, int | str],
-    Mapping[int | str, int | str],
-    Mapping[int | str, Sequence[str]],
-    Mapping[int | str, Sequence[str]] | None,
+    Mapping[str, int | str],
+    Mapping[str, Sequence[str]],
+    Mapping[str, Sequence[str]] | None,
 ]:
     if len(seed_setup) == 3:
         cluster_seeds_require, recluster_map, cluster_seeds_require_inverse = seed_setup
@@ -204,15 +204,15 @@ def _finish_incremental_with_optional_split_inverse(
     unassigned_signature_ids: list[str],
     dataset: ANDData,
     linked_signature_clusters: Mapping[str, int | str],
-    recluster_map: Mapping[int | str, int | str],
-    cluster_seeds_require_inverse: Mapping[int | str, Sequence[str]],
+    recluster_map: Mapping[str, int | str],
+    cluster_seeds_require_inverse: Mapping[str, Sequence[str]],
     prevent_new_incompatibilities: bool,
     partial_supervision: Mapping[tuple[str, str], int | float],
     runtime_context: RuntimeContext,
     *,
     total_ram_bytes: int | None,
     arrow_paths: Mapping[str, Any] | None = None,
-    split_cluster_seeds_require_inverse: Mapping[int | str, Sequence[str]] | None = None,
+    split_cluster_seeds_require_inverse: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, list[str]]:
     method = clusterer._finish_incremental_with_seed_links
     kwargs: dict[str, Any] = {"total_ram_bytes": total_ram_bytes}
@@ -1048,7 +1048,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                 num_threads=clusterer.n_jobs,
                 max_exemplars=4,
                 include_pair_signature_ids=False,
-                include_component_members=False,
+                include_component_members=True,
             )
             raw_window_plan_seconds += time.perf_counter() - raw_window_start
             raw_window_plan_count += 1
@@ -1080,7 +1080,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                 top_k=retrieval_top_k,
                 query_view="auto",
                 include_pair_signature_ids=False,
-                include_component_members=False,
+                include_component_members=True,
             )
             raw_window_planner_plan_call_count += 1
             raw_window_planner_plan_seconds += time.perf_counter() - raw_window_planner_plan_start

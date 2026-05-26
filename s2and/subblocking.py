@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -732,7 +733,8 @@ def cluster_with_graph_fallback(
     if config.neighbor_mode == "exact":
         edge_scores = _exact_neighbor_edge_scores(matrix, evidences, config)
     else:
-        seed = int(getattr(anddata, "random_seed", 0) or 0) + len(signature_ids)
+        group_digest = hashlib.blake2b("\0".join(sorted(signature_ids)).encode("utf-8"), digest_size=8).digest()
+        seed = (int(getattr(anddata, "random_seed", 0) or 0) + int.from_bytes(group_digest, "little")) % (2**32 - 1)
         edge_scores = _projection_neighbor_edge_scores(matrix, evidences, config, seed=seed)
     sparse_evidence_stats: dict[str, int] = {
         "sparse_evidence_feature_count": 0,
@@ -1777,7 +1779,7 @@ def make_subblocks_with_telemetry(
         output_for_specter.update(output_cant_subdivide_loop)
 
     # deal with the single (or zero) letter first names
-    if len(first_names[single_letter_first_names_flag]) < maximum_size:
+    if len(first_names[single_letter_first_names_flag]) <= maximum_size:
         if np.mean(single_letter_first_names_flag) > 0:
             output[first_letter] = signature_ids[single_letter_first_names_flag]
     else:

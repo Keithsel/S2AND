@@ -6,6 +6,7 @@ from collections import Counter
 from typing import Any, cast
 
 import numpy as np
+import pytest
 from sklearn.metrics.pairwise import cosine_similarity
 
 from s2and.consts import NUMPY_NAN
@@ -284,3 +285,34 @@ def test_fasttext_enable_preserves_loaded_model(monkeypatch):
 
     assert text_module._get_fasttext_model() is fake_model
     assert load_calls["count"] == 1
+
+
+def test_fasttext_unexpected_load_error_propagates(monkeypatch):
+    import s2and.text as text_module
+
+    def _raise_type_error(_path: str):
+        raise TypeError("bad monkeypatch")
+
+    monkeypatch.setattr(text_module.fasttext, "load_model", _raise_type_error)
+    monkeypatch.setattr(text_module, "cached_path", lambda path: path)
+    monkeypatch.delenv("S2AND_SKIP_FASTTEXT", raising=False)
+    text_module.set_fasttext_loading_enabled(True)
+    text_module._FASTTEXT_MODEL = None
+    text_module._FASTTEXT_MODEL_INITIALIZED = False
+
+    with pytest.raises(TypeError, match="bad monkeypatch"):
+        text_module._get_fasttext_model()
+
+
+def test_cld2_unexpected_error_propagates(monkeypatch):
+    import s2and.text as text_module
+
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+
+    def _raise_type_error(_text: str):
+        raise TypeError("bad cld2 state")
+
+    monkeypatch.setattr(text_module.cld2, "detect", _raise_type_error)
+
+    with pytest.raises(TypeError, match="bad cld2 state"):
+        detect_language("hello world")

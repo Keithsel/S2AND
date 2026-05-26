@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -143,7 +144,7 @@ def test_compare_runs_defaults_to_arrow_only(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(prod_inference_cmd, "_run_single_subprocess", fake_run_single_subprocess)
     prod_inference_cmd._compare_runs(  # noqa: SLF001
-        SimpleNamespace(
+        argparse.Namespace(
             dataset_name="qian",
             n_jobs=1,
             model_path="model",

@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import numpy as np
@@ -302,6 +302,37 @@ def _root_manifest_entries_from_manifest(
     return entries
 
 
+def _root_manifest_replay_bundle_entries_from_manifest(
+    root_manifest: Mapping[str, Any],
+    root_manifest_path: Path,
+) -> list[dict[str, Any]]:
+    raw_entries = root_manifest.get("replay_bundles", [])
+    if raw_entries is None:
+        return []
+    if not isinstance(raw_entries, Sequence) or isinstance(raw_entries, str | bytes):
+        raise ValueError(f"existing root manifest replay_bundles must be a list: {root_manifest_path}")
+    entries: list[dict[str, Any]] = []
+    for index, raw_entry in enumerate(raw_entries):
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError(f"existing root manifest replay_bundles[{index}] must be an object: {root_manifest_path}")
+        manifest_path = raw_entry.get("manifest_path")
+        if manifest_path is None:
+            raise ValueError(
+                f"existing root manifest replay_bundles[{index}] is missing manifest_path: {root_manifest_path}"
+            )
+        manifest_path_text = str(manifest_path)
+        if not manifest_path_text:
+            raise ValueError(
+                f"existing root manifest replay_bundles[{index}] has empty manifest_path: {root_manifest_path}"
+            )
+        entry = dict(raw_entry)
+        manifest_path_parts = PurePosixPath(manifest_path_text.replace("\\", "/")).parts
+        entry["manifest_path"] = manifest_path_text
+        entry["bundle"] = str(raw_entry.get("bundle") or manifest_path_parts[0])
+        entries.append(entry)
+    return entries
+
+
 def _validated_root_manifest_entries(raw_entries: Any, root_manifest_path: Path) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for index, raw_entry in enumerate(raw_entries):
@@ -452,6 +483,31 @@ def _enrich_root_manifest_entry(output_root: Path, entry: Mapping[str, Any]) -> 
     return enriched
 
 
+def _enrich_replay_bundle_entry(output_root: Path, entry: Mapping[str, Any]) -> dict[str, Any]:
+    enriched = dict(entry)
+    manifest_path = _entry_manifest_path(output_root, entry)
+    if not manifest_path.exists():
+        enriched["manifest_exists"] = False
+        return enriched
+    enriched["manifest_exists"] = True
+    manifest_stat = manifest_path.stat()
+    enriched["manifest_size_bytes"] = int(manifest_stat.st_size)
+    enriched["manifest_sha256"] = _file_sha256(manifest_path)
+    manifest = _load_json(manifest_path)
+    if not isinstance(manifest, Mapping):
+        raise TypeError(f"replay bundle manifest must contain an object: {manifest_path}")
+    nested_entries = _root_manifest_entries_from_manifest(manifest, manifest_path)
+    bundle_root = manifest_path.parent
+    enriched_nested_entries = [_enrich_root_manifest_entry(bundle_root, nested) for nested in nested_entries]
+    enriched["datasets"] = [entry["dataset"] for entry in enriched_nested_entries]
+    enriched["dataset_manifests"] = enriched_nested_entries
+    enriched["audit"] = {
+        "schema": manifest.get("schema"),
+        **_root_manifest_audit(enriched_nested_entries),
+    }
+    return enriched
+
+
 def _root_manifest_audit(dataset_manifests: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     datasets_with_missing_manifests = [
         str(entry["dataset"]) for entry in dataset_manifests if not bool(entry.get("manifest_exists", False))
@@ -472,7 +528,12 @@ def _root_manifest_audit(dataset_manifests: Sequence[Mapping[str, Any]]) -> dict
     }
 
 
-def _root_manifest_validation_commands(dataset_manifests: Sequence[Mapping[str, Any]]) -> list[str]:
+def _root_manifest_validation_commands(
+    output_root: Path,
+    dataset_manifests: Sequence[Mapping[str, Any]],
+    *,
+    dataset_dir_prefix: str = "",
+) -> list[str]:
     commands = []
     for entry in dataset_manifests:
         if not bool(entry.get("manifest_exists", False)):
@@ -480,6 +541,9 @@ def _root_manifest_validation_commands(dataset_manifests: Sequence[Mapping[str, 
         dataset_dir = str(entry.get("dataset_dir") or "").replace("\\", "/")
         if not dataset_dir:
             continue
+        if dataset_dir_prefix:
+            dataset_dir = f"{dataset_dir_prefix.rstrip('/')}/{dataset_dir}"
+        dataset_dir = _manifest_relative_path(output_root / dataset_dir, _PROJECT_ROOT).replace("\\", "/")
         command_parts = ["uv run python scripts/convert_to_arrow.py validate", f"--dataset-dir {dataset_dir}"]
         requirements = entry.get("validation_requirements")
         if isinstance(requirements, Mapping):
@@ -491,10 +555,75 @@ def _root_manifest_validation_commands(dataset_manifests: Sequence[Mapping[str, 
     return commands
 
 
+def _replay_bundle_validation_commands(output_root: Path, replay_bundles: Sequence[Mapping[str, Any]]) -> list[str]:
+    commands: list[str] = []
+    for bundle in replay_bundles:
+        if not bool(bundle.get("manifest_exists", False)):
+            continue
+        manifest_path = str(bundle.get("manifest_path") or "").replace("\\", "/")
+        if not manifest_path:
+            continue
+        bundle_prefix = str(PurePosixPath(manifest_path).parent)
+        nested_entries = bundle.get("dataset_manifests", [])
+        if isinstance(nested_entries, Sequence) and not isinstance(nested_entries, str | bytes):
+            commands.extend(
+                _root_manifest_validation_commands(output_root, nested_entries, dataset_dir_prefix=bundle_prefix)
+            )
+    return commands
+
+
+def _write_root_manifest(
+    output_root: Path,
+    *,
+    dataset_manifests: Sequence[Mapping[str, Any]],
+    replay_bundles: Sequence[Mapping[str, Any]] = (),
+    output_root_label: str | None = None,
+) -> dict[str, Any]:
+    enriched_dataset_manifests = [_enrich_root_manifest_entry(output_root, entry) for entry in dataset_manifests]
+    enriched_replay_bundles = [_enrich_replay_bundle_entry(output_root, entry) for entry in replay_bundles]
+    validation_commands = _root_manifest_validation_commands(output_root, enriched_dataset_manifests)
+    validation_commands.extend(_replay_bundle_validation_commands(output_root, enriched_replay_bundles))
+    payload: dict[str, Any] = {
+        "schema": ROOT_MANIFEST_SCHEMA,
+        "output_root": str(output_root_label or output_root),
+        "generated_at_utc": datetime.now(UTC).isoformat(),
+        "generator": {
+            "script": "scripts/convert_to_arrow.py",
+            **_git_commit_metadata(),
+        },
+        "datasets": [entry["dataset"] for entry in enriched_dataset_manifests],
+        "dataset_manifests": enriched_dataset_manifests,
+        "audit": _root_manifest_audit(enriched_dataset_manifests),
+        "validation_command_cwd": str(_PROJECT_ROOT),
+        "validation_commands": validation_commands,
+    }
+    if enriched_replay_bundles:
+        payload["replay_bundles"] = enriched_replay_bundles
+        payload["replay_audit"] = {
+            "bundle_count": len(enriched_replay_bundles),
+            "bundles_with_missing_manifests": [
+                str(entry.get("bundle")) for entry in enriched_replay_bundles if not entry.get("manifest_exists")
+            ],
+            "total_dataset_count": sum(
+                int(entry.get("audit", {}).get("dataset_count", 0))
+                for entry in enriched_replay_bundles
+                if isinstance(entry.get("audit"), Mapping)
+            ),
+        }
+    _replace_json(output_root / "manifest.json", payload)
+    return payload
+
+
 def _upsert_root_manifest(output_root: Path, *, dataset_name: str, dataset_dir: Path) -> None:
     root_manifest_path = output_root / "manifest.json"
     lock_path = root_manifest_path.with_suffix(root_manifest_path.suffix + ".lock")
     with _RootManifestLock(lock_path):
+        existing_root_manifest: Mapping[str, Any] = {}
+        if root_manifest_path.exists():
+            loaded_root_manifest = _load_json(root_manifest_path)
+            if not isinstance(loaded_root_manifest, Mapping):
+                raise TypeError(f"existing root manifest must contain an object: {root_manifest_path}")
+            existing_root_manifest = loaded_root_manifest
         dataset_manifests = _root_manifest_entries(root_manifest_path, dataset_name)
         dataset_manifests.append(
             {
@@ -504,23 +633,12 @@ def _upsert_root_manifest(output_root: Path, *, dataset_name: str, dataset_dir: 
             }
         )
         dataset_manifests.sort(key=lambda entry: entry["dataset"])
-        enriched_dataset_manifests = [_enrich_root_manifest_entry(output_root, entry) for entry in dataset_manifests]
-        _replace_json(
-            root_manifest_path,
-            {
-                "schema": ROOT_MANIFEST_SCHEMA,
-                "output_root": str(output_root),
-                "generated_at_utc": datetime.now(UTC).isoformat(),
-                "generator": {
-                    "script": "scripts/convert_to_arrow.py",
-                    **_git_commit_metadata(),
-                },
-                "datasets": [entry["dataset"] for entry in enriched_dataset_manifests],
-                "dataset_manifests": enriched_dataset_manifests,
-                "audit": _root_manifest_audit(enriched_dataset_manifests),
-                "validation_command_cwd": str(output_root),
-                "validation_commands": _root_manifest_validation_commands(enriched_dataset_manifests),
-            },
+        replay_bundles = _root_manifest_replay_bundle_entries_from_manifest(existing_root_manifest, root_manifest_path)
+        _write_root_manifest(
+            output_root,
+            dataset_manifests=dataset_manifests,
+            replay_bundles=replay_bundles,
+            output_root_label=str(existing_root_manifest.get("output_root") or output_root),
         )
 
 
@@ -1555,6 +1673,33 @@ def _run_validate(args: argparse.Namespace) -> None:
     print(json.dumps(metrics, indent=2, sort_keys=True))
 
 
+def _run_refresh_root_manifest(args: argparse.Namespace) -> None:
+    root_manifest_path = args.output_root / "manifest.json"
+    root_manifest = _load_json(root_manifest_path)
+    if not isinstance(root_manifest, Mapping):
+        raise TypeError(f"root manifest must contain an object: {root_manifest_path}")
+    dataset_manifests = _root_manifest_entries_from_manifest(root_manifest, root_manifest_path)
+    replay_bundles = _root_manifest_replay_bundle_entries_from_manifest(root_manifest, root_manifest_path)
+    refreshed = _write_root_manifest(
+        args.output_root,
+        dataset_manifests=dataset_manifests,
+        replay_bundles=replay_bundles,
+        output_root_label=args.output_root_label or str(root_manifest.get("output_root") or args.output_root),
+    )
+    print(
+        json.dumps(
+            {
+                "dataset_count": len(refreshed["dataset_manifests"]),
+                "replay_bundle_count": len(refreshed.get("replay_bundles", [])),
+                "manifest_path": str(root_manifest_path),
+                "validation_command_count": len(refreshed.get("validation_commands", [])),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
 def _add_common_runtime_args(parser: argparse.ArgumentParser, *, default_n_jobs: int) -> None:
     parser.add_argument("--name-counts-index-root", type=Path, default=None)
     parser.add_argument("--n-jobs", type=int, default=default_n_jobs)
@@ -1627,6 +1772,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fail if any referenced paper is missing from the embedding table.",
     )
     validate.set_defaults(func=_run_validate)
+
+    refresh_root = subparsers.add_parser(
+        "refresh-root-manifest",
+        help="Refresh root manifest checksums, audits, replay bundle metadata, and validation commands.",
+    )
+    refresh_root.add_argument("--output-root", type=Path, required=True)
+    refresh_root.add_argument(
+        "--output-root-label",
+        default=None,
+        help="Optional logical root to write into output_root, e.g. the public S3 prefix.",
+    )
+    refresh_root.set_defaults(func=_run_refresh_root_manifest)
     return parser
 
 

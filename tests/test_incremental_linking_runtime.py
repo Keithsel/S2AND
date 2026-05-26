@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -406,14 +406,17 @@ def test_private_production_forwards_four_element_seed_setup_to_retrieval_slice(
         fake_from_retrieval_private,
     )
 
-    result = runtime_module._predict_incremental_link_or_abstain_production_private(  # noqa: SLF001
-        FourElementSeedSetupClusterer({"s1": "c1"}),
-        _static_artifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0)),
-        dataset=SimpleNamespace(),
-        featurizer=FakeRuntimeFeaturizer(["s1"]),
-        retriever=object(),
-        queries=[],
-        query_signature_ids=[],
+    result = cast(
+        Any,
+        runtime_module._predict_incremental_link_or_abstain_production_private(  # noqa: SLF001
+            FourElementSeedSetupClusterer({"s1": "c1"}),
+            _static_artifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0)),
+            dataset=cast(Any, SimpleNamespace()),
+            featurizer=FakeRuntimeFeaturizer(["s1"]),
+            retriever=object(),
+            queries=[],
+            query_signature_ids=[],
+        ),
     )
 
     assert result.ok is True
@@ -1532,8 +1535,8 @@ def test_compact_orcid_match_forces_link_and_beats_non_orcid_rows() -> None:
     assert result.decisions[0].action == "link"
     assert result.decisions[0].component_key == "orcid_low_score"
     assert result.decisions[0].score == pytest.approx(0.10)
-    assert result.decisions[0].runner_up_score == pytest.approx(0.95)
-    assert result.decisions[0].score_margin == pytest.approx(-0.85)
+    assert result.decisions[0].runner_up_score is None
+    assert result.decisions[0].score_margin is None
 
 
 def test_private_retrieved_candidate_slice_scores_matrix_and_records_telemetry(
@@ -1952,7 +1955,7 @@ def test_private_production_slice_keeps_seed_disallow_constraints(
     assert result.linked_signature_clusters == {}
 
 
-def test_private_production_slice_rejects_require_outside_retrieval_window(
+def test_private_production_slice_records_require_outside_retrieval_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dataset = SimpleNamespace()
@@ -1968,17 +1971,18 @@ def test_private_production_slice_rejects_require_outside_retrieval_window(
         ),
     )
 
-    with pytest.raises(ValueError, match="partial_supervision_require_outside_retrieval_window"):
-        _predict_incremental_link_or_abstain_production_private(
-            clusterer,
-            artifact,
-            dataset=dataset,
-            featurizer=featurizer,
-            retriever=object(),
-            queries=[object()],
-            query_signature_ids=["q1"],
-            partial_supervision={("q1", "s1"): 0},
-        )
+    result = _predict_incremental_link_or_abstain_production_private(
+        clusterer,
+        artifact,
+        dataset=dataset,
+        featurizer=featurizer,
+        retriever=object(),
+        queries=[object()],
+        query_signature_ids=["q1"],
+        partial_supervision={("q1", "s1"): 0},
+    )
+
+    assert result.telemetry["partial_supervision_require_outside_retrieval_window"] == 1
 
 
 def test_from_retrieval_validates_partial_supervision_against_full_seed_map() -> None:
@@ -1990,19 +1994,20 @@ def test_from_retrieval_validates_partial_supervision_against_full_seed_map() ->
         row_component_keys=(),
     )
 
-    with pytest.raises(ValueError, match="partial_supervision_require_outside_retrieval_window"):
-        runtime_module._predict_incremental_link_or_abstain_production_from_retrieval_private(  # noqa: SLF001
-            clusterer,
-            artifact,
-            dataset=None,
-            featurizer=featurizer,
-            retrieval_batch=retrieval_batch,
-            queries=[object()],
-            query_signature_ids=["q1"],
-            partial_supervision={("q1", "s2"): 0},
-            seed_setup=({"s1": "c1"}, {}, {"c1": ["s1"]}),
-            partial_supervision_seed_signature_to_component={"s1": "c1", "s2": "c2"},
-        )
+    result = runtime_module._predict_incremental_link_or_abstain_production_from_retrieval_private(  # noqa: SLF001
+        clusterer,
+        artifact,
+        dataset=None,
+        featurizer=featurizer,
+        retrieval_batch=retrieval_batch,
+        queries=[object()],
+        query_signature_ids=["q1"],
+        partial_supervision={("q1", "s2"): 0},
+        seed_setup=({"s1": "c1"}, {}, {"c1": ["s1"]}),
+        partial_supervision_seed_signature_to_component={"s1": "c1", "s2": "c2"},
+    )
+
+    assert result.telemetry["partial_supervision_require_outside_retrieval_window"] == 1
 
 
 def test_from_retrieval_records_artifact_retrieval_top_k_when_not_passed(

@@ -769,6 +769,47 @@ def test_feature_block_from_arrow_paths_rejects_malformed_signature_column_types
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
+def test_feature_block_from_arrow_paths_rejects_null_required_list_values(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    null_affiliations = _strict_signature_arrow_table(
+        author_affiliations=pa.array([None, [], [], []], type=pa.list_(pa.string()))
+    )
+    write_arrow_ipc_table(null_affiliations, Path(arrow_paths["signatures"]))
+
+    with pytest.raises(ValueError, match="author_affiliations cannot contain null list values"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_filter_arrow_table_by_values_rejects_post_cast_duplicates() -> None:
+    pa = pytest.importorskip("pyarrow")
+    pc = pytest.importorskip("pyarrow.compute")
+    table = pa.table({"paper_id": pa.array(["p1", "p2"], type=pa.string())})
+
+    with pytest.raises(ValueError, match="paper_id filter values are not one-to-one"):
+        feature_block_arrow_module._filter_arrow_table_by_values(pa, pc, table, "paper_id", ["p1", "p1"])  # noqa: SLF001
+
+
+def test_name_counts_generation_cleanup_skips_unpublished_generation(tmp_path: Path) -> None:
+    generations_dir = tmp_path / "name_counts_index" / "generations"
+    current = generations_dir / "gen-current"
+    unpublished = generations_dir / "gen-unpublished"
+    old_published = generations_dir / "gen-old"
+    current.mkdir(parents=True)
+    unpublished.mkdir()
+    old_published.mkdir()
+    (old_published / ".published").write_text("", encoding="utf-8")
+
+    feature_block_arrow_module._remove_stale_name_counts_generations(  # noqa: SLF001
+        tmp_path / "name_counts_index",
+        "gen-current",
+    )
+
+    assert current.exists()
+    assert unpublished.exists()
+    assert not old_published.exists()
+
+
 def test_feature_block_from_arrow_paths_rejects_missing_signature_paper(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
@@ -1890,7 +1931,7 @@ def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
 
     class FakeFeaturizer:
         def signature_ids(self) -> list[str]:
-            return ["q", "s1", "s2", "s3"]
+            return ["q", "s1", "s2", "s3", "window-only"]
 
     def fail_build_rust_featurizer_from_arrow_paths(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("prebuilt raw Arrow featurizer should be reused")
@@ -1947,8 +1988,8 @@ def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
     assert captured["retrieval_left_indices"] == [0, 0, 0]
     assert captured["retrieval_right_indices"] == [1, 2, 3]
     assert result.telemetry["raw_arrow_featurizer_reused"] == 1
-    assert result.telemetry["raw_arrow_signature_count"] == 4
-    assert result.telemetry["raw_arrow_plan_signature_count"] == 4
+    assert result.telemetry["raw_arrow_signature_count"] == 5
+    assert result.telemetry["raw_arrow_plan_signature_count"] == 5
     assert isinstance(result.telemetry["raw_arrow_featurizer_seconds"], float)
 
 

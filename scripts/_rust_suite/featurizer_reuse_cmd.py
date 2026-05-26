@@ -16,6 +16,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from _rust_suite.common import RSSMonitor, collect_rust_extension_identity  # type: ignore  # noqa: E402
 
 DEFAULT_ARROW_DATA_ROOT = os.path.join("s2and", "data")
+DEFAULT_JSON_DATA_ROOT = os.path.join("s2and", "data", "s2and_mini")
 DEFAULT_SPECTER_SUFFIX = "_specter2.pkl"
 DEFAULT_ARROW_TOTAL_RAM_BYTES = 1_000_000_000_000
 
@@ -27,8 +28,8 @@ def _resolve_path(project_root: str, maybe_relative_path: str) -> str:
     return str(Path(project_root) / candidate)
 
 
-def _build_data_paths(project_root: str, dataset_name: str) -> dict[str, str]:
-    data_root = os.path.join(project_root, "s2and", "data", "s2and_mini")
+def _build_data_paths(project_root: str, dataset_name: str, data_root: str = DEFAULT_JSON_DATA_ROOT) -> dict[str, str]:
+    data_root = _resolve_path(project_root, data_root)
     dataset_root = os.path.join(data_root, dataset_name)
     return {
         "signatures": os.path.join(dataset_root, f"{dataset_name}_signatures.json"),
@@ -226,6 +227,7 @@ def _run_json_reuse_profile(
     n_jobs: int,
     repeats: int,
     require_rust_release: bool,
+    json_data_root: str,
 ) -> dict[str, Any]:
     rust_extension_identity = _prepare_rust_backend(n_jobs, require_rust_release)
 
@@ -238,7 +240,7 @@ def _run_json_reuse_profile(
 
     set_fasttext_loading_enabled(False)
 
-    paths = _build_data_paths(PROJECT_ROOT_PATH, dataset_name)
+    paths = _build_data_paths(PROJECT_ROOT_PATH, dataset_name, json_data_root)
     for key, path in paths.items():
         if not os.path.exists(path):
             raise FileNotFoundError(f"Missing {key} path for dataset '{dataset_name}': {path}")
@@ -268,7 +270,7 @@ def _run_json_reuse_profile(
             iteration_result["featurizer_build_count"] = int(_rust_featurizer_build_count(dataset))
             reinstantiated_iterations.append(iteration_result)
 
-    return _finalize_result(
+    result = _finalize_result(
         dataset_name=dataset_name,
         n_jobs=n_jobs,
         repeats=repeats,
@@ -279,6 +281,8 @@ def _run_json_reuse_profile(
         rust_extension_identity=rust_extension_identity,
         input_format="json",
     )
+    result["json_data_root"] = _resolve_path(PROJECT_ROOT_PATH, json_data_root)
+    return result
 
 
 def run_reuse_profile(
@@ -289,6 +293,7 @@ def run_reuse_profile(
     require_rust_release: bool = False,
     input_format: str = "arrow",
     arrow_data_root: str = DEFAULT_ARROW_DATA_ROOT,
+    json_data_root: str = DEFAULT_JSON_DATA_ROOT,
     specter_suffix: str = DEFAULT_SPECTER_SUFFIX,
 ) -> dict[str, Any]:
     if repeats < 1:
@@ -308,6 +313,7 @@ def run_reuse_profile(
             n_jobs=n_jobs,
             repeats=repeats,
             require_rust_release=require_rust_release,
+            json_data_root=json_data_root,
         )
     raise ValueError(f"Unsupported input_format: {input_format}")
 
@@ -330,6 +336,11 @@ def main() -> None:
         help="Arrow bundle root containing per-dataset manifests (relative to project root or absolute).",
     )
     parser.add_argument(
+        "--json-data-root",
+        default=DEFAULT_JSON_DATA_ROOT,
+        help="JSON dataset root containing per-dataset directories (relative to project root or absolute).",
+    )
+    parser.add_argument(
         "--specter-suffix",
         choices=["_specter.pickle", "_specter2.pkl"],
         default=DEFAULT_SPECTER_SUFFIX,
@@ -345,6 +356,7 @@ def main() -> None:
         require_rust_release=bool(args.require_rust_release),
         input_format=args.input_format,
         arrow_data_root=args.arrow_data_root,
+        json_data_root=args.json_data_root,
         specter_suffix=args.specter_suffix,
     )
 

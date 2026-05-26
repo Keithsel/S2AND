@@ -257,6 +257,29 @@ def test_model_presplit_cache_fingerprint_drops_cluster_model_identity() -> None
     )
 
 
+def test_model_presplit_cache_fingerprint_tracks_classifier_state() -> None:
+    classifier = SimpleNamespace(version=1)
+    clusterer = SimpleNamespace(
+        classifier=classifier,
+        nameless_classifier=None,
+        cluster_model=None,
+        featurizer_info=SimpleNamespace(features_to_use=("year_diff",)),
+        nameless_featurizer_info=SimpleNamespace(features_to_use=()),
+        use_default_constraints_as_supervision=True,
+        dont_merge_cluster_seeds=True,
+        suppress_orcid=False,
+    )
+
+    before = model_module._model_presplit_cache_fingerprint(clusterer)
+    classifier.version = 2
+
+    assert model_module._model_presplit_cache_fingerprint(clusterer) != before
+
+
+def test_cluster_seed_inverse_canonicalizes_component_ids() -> None:
+    assert model_module._cluster_seeds_require_inverse({"s1": 7, "s2": "7"}) == {"7": ["s1", "s2"]}
+
+
 def test_predict_from_rust_featurizer_proxy_exposes_signature_rule_metadata() -> None:
     captured: dict[str, Any] = {}
 
@@ -1952,7 +1975,9 @@ def test_predict_incremental_arrow_promoted_linker_keeps_scoring_batches_within_
     dataset.arrow_paths = arrow_paths
     captured: dict[str, Any] = {
         "planner_inits": [],
+        "planner_init_kwargs": [],
         "planner_plans": [],
+        "planner_plan_kwargs": [],
         "featurizer_signature_ids": [],
         "runtime_featurizers": [],
         "runtime_batches": [],
@@ -1971,12 +1996,13 @@ def test_predict_incremental_arrow_promoted_linker_keeps_scoring_batches_within_
 
     class FakePlanner:
         def __init__(self, paths_arg, query_signature_ids, **kwargs):
-            del paths_arg, kwargs
+            del paths_arg
             captured["planner_inits"].append(tuple(query_signature_ids))
+            captured["planner_init_kwargs"].append(dict(kwargs))
 
         def plan(self, query_signature_ids, **kwargs):
-            del kwargs
             captured["planner_plans"].append(tuple(query_signature_ids))
+            captured["planner_plan_kwargs"].append(dict(kwargs))
             return {"query_signature_ids": tuple(query_signature_ids)}
 
     class FakeRustModule:
@@ -2041,6 +2067,8 @@ def test_predict_incremental_arrow_promoted_linker_keeps_scoring_batches_within_
     assert result["clusters"] == {"0": ["6", "7", "5", "8"], "1": ["3", "4"]}
     assert captured["planner_inits"] == [("5", "8")]
     assert captured["planner_plans"] == [("5", "8")]
+    assert captured["planner_init_kwargs"][0]["include_component_members"] is True
+    assert captured["planner_plan_kwargs"][0]["include_component_members"] is True
     assert captured["featurizer_signature_ids"] == [("6", "7", "5", "8")]
     assert captured["runtime_batches"] == [("5",), ("8",)]
     assert [featurizer.signature_ids() for featurizer in captured["runtime_featurizers"]] == [
@@ -3270,7 +3298,7 @@ def test_graph_subblocking_value_errors_propagate(clusterer_dataset_factory, mon
     assert fallback.graph_fallback_errors == []
 
 
-def test_graph_subblocking_falls_back_to_legacy_specter_for_io_errors(clusterer_dataset_factory, monkeypatch):
+def test_graph_subblocking_falls_back_to_legacy_specter_for_missing_files(clusterer_dataset_factory, monkeypatch):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_graph_io_legacy_fallback")
     captured: dict[str, Any] = {}
 
@@ -3280,7 +3308,7 @@ def test_graph_subblocking_falls_back_to_legacy_specter_for_io_errors(clusterer_
         stats: list[dict[str, Any]] = []
 
         def __call__(self, *_args: object, **_kwargs: object) -> dict[str, list[str]]:
-            raise OSError("arrow mmap failed")
+            raise FileNotFoundError("missing graph sidecar")
 
     def fake_factory(*, config):
         del config
@@ -3305,8 +3333,8 @@ def test_graph_subblocking_falls_back_to_legacy_specter_for_io_errors(clusterer_
     assert fallback.graph_fallback_errors == [
         {
             "stage": "call",
-            "type": "OSError",
-            "message": "arrow mmap failed",
+            "type": "FileNotFoundError",
+            "message": "missing graph sidecar",
             "signature_count": 3,
         }
     ]
@@ -3340,7 +3368,7 @@ def test_arrow_graph_subblocking_io_errors_do_not_fall_back_to_legacy(clusterer_
     assert fallback.graph_fallback_errors == []
 
 
-def test_graph_subblocking_prepare_io_errors_switch_to_legacy_specter(clusterer_dataset_factory, monkeypatch):
+def test_graph_subblocking_prepare_missing_files_switch_to_legacy_specter(clusterer_dataset_factory, monkeypatch):
     clusterer, dataset = clusterer_dataset_factory(name="dummy_graph_prepare_io_legacy_fallback")
     captured: dict[str, Any] = {}
 
@@ -3350,7 +3378,7 @@ def test_graph_subblocking_prepare_io_errors_switch_to_legacy_specter(clusterer_
         stats: list[dict[str, Any]] = []
 
         def prepare(self, _signature_groups):
-            raise OSError("arrow footer is invalid")
+            raise FileNotFoundError("missing graph sidecar")
 
         def __call__(self, *_args: object, **_kwargs: object) -> dict[str, list[str]]:
             raise AssertionError("graph fallback should not be called after prepare failure")
@@ -3378,8 +3406,8 @@ def test_graph_subblocking_prepare_io_errors_switch_to_legacy_specter(clusterer_
     assert fallback.graph_prepare_failed is True
     assert fallback.graph_prepare_error == {
         "stage": "prepare",
-        "type": "OSError",
-        "message": "arrow footer is invalid",
+        "type": "FileNotFoundError",
+        "message": "missing graph sidecar",
         "signature_count": 3,
         "group_count": 2,
     }

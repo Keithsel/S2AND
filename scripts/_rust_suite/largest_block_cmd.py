@@ -1151,8 +1151,8 @@ def main() -> None:
     parser.add_argument(
         "--max-block-size",
         type=int,
-        default=0,
-        help="Limit block to first N signatures (0 = use full block).",
+        default=1000,
+        help="Limit block to first N signatures (default: 1000; pass 0 explicitly to use the full block).",
     )
     parser.add_argument(
         "--model-path",

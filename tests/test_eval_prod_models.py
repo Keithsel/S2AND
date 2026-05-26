@@ -440,7 +440,7 @@ def test_eval_main_use_arrow_calls_arrow_eval_without_anddata(monkeypatch: pytes
         "root": "arrow-root",
     }
     assert captured["kwargs"]["n_jobs"] == 1
-    assert captured["kwargs"]["random_seed"] == 1
+    assert captured["kwargs"]["random_seed"] == 42
 
 
 def test_eval_main_use_arrow_rejects_train(monkeypatch: pytest.MonkeyPatch) -> None:

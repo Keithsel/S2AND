@@ -925,6 +925,34 @@ def test_json_ingest_prefers_dataset_name_counts_over_artifact():
 
     args, _kwargs = DummyRustFeaturizer.from_json_created[0]
     assert args[5] is None
+    assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
+        feature_port._rust_featurizer_cache_key("from_json_paths", False, 0, None, None)
+    ]
+
+
+def test_json_ingest_name_count_overlay_requires_all_signatures(monkeypatch):
+    dataset = DummyDataset("short_overlay", mode="inference")
+    dataset.signatures_path = "signatures.json"
+    dataset.papers_path = "papers.json"
+    dataset.signatures = {
+        "s1": type(
+            "Sig",
+            (),
+            {
+                "author_info_name_counts": NameCounts(
+                    first=1.0,
+                    last=2.0,
+                    first_last=3.0,
+                    last_first_initial=4.0,
+                )
+            },
+        )(),
+    }
+
+    monkeypatch.setattr(DummyRustFeaturizer, "update_signature_name_counts", lambda _self, _payload: 0)
+
+    with pytest.raises(RuntimeError, match="signature name-count overlay updated 0 of 1"):
+        feature_port._get_rust_featurizer(dataset)
 
 
 def test_json_ingest_uses_name_counts_artifact_when_dataset_has_no_counts(tmp_path):

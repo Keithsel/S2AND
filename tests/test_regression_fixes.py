@@ -9,7 +9,7 @@ import pytest
 import s2and.eval as eval_module
 import s2and.model as model_module
 import s2and.subblocking as subblocking_module
-from s2and.data import ANDData
+from s2and.data import ANDData, _ordered_coauthors_for_signature
 from s2and.eval import incremental_cluster_eval
 from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.feature_block import write_cluster_seeds_arrow
@@ -30,6 +30,14 @@ def _subblocking_signature(first_name: str, *, middle_name: str = "", orcid: str
         author_info_middle=middle_name,
         author_info_orcid=orcid,
     )
+
+
+def test_ordered_coauthors_rejects_missing_author_position() -> None:
+    signature = SimpleNamespace(signature_id="s1", paper_id="p1", author_info_position=None)
+    paper = SimpleNamespace(authors=[SimpleNamespace(author_name="Ada Lovelace", position=0)])
+
+    with pytest.raises(ValueError, match="missing author_info_position"):
+        _ordered_coauthors_for_signature(cast(Any, signature), {"p1": cast(Any, paper)})
 
 
 VALID_ORCID_1 = "0000-0001-2345-6789"

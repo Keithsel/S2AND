@@ -185,6 +185,11 @@ Remaining:
   `predict(...)` for production inference.
 - Prefer `RawBlockQueryCandidatePlanner.plan(...)` plus typed Arrow request
   tables for single-query/seeded incremental requests.
+- Split the broad raw-Arrow incremental runtime entrypoint into narrow
+  planner-owned execution and preplanned scoring surfaces. Use a typed
+  `RawArrowPlanBundle` or equivalent only after typed Arrow request-table
+  fixtures pin the boundary and prove the split does not revive raw payload /
+  mini-`ANDData` bridges.
 - Keep `feature_block_from_arrow_paths(...)` implementation-only for
   fixture/parity validation until typed Arrow request-table coverage makes it
   unnecessary. Do not re-export it as public production API.

@@ -549,20 +549,20 @@ to maintain without changing runtime behavior.
     legacy row-by-row fallback.
   - Canonical retriever API: prefer
     `RustHybridCentroidRetriever.top_k_hybrid_centroid_pair_plan(...)` for
-    runtime retrieval. Remove direct `top_k_hybrid_centroid(...)` and
-    `chooser_feature_rows_subset(...)` only after capability probes and tests
-    no longer require them.
+    runtime retrieval.
+  - Status 2026-05-25: direct retriever debug APIs
+    `top_k_hybrid_centroid(...)` and `chooser_feature_rows_subset(...)` were
+    removed after capability probes and tests moved to pair-plan coverage.
 - Deletion order:
   1. Lock strict Arrow production routing so compatibility fallbacks are no
      longer confused with production Rust.
   2. Remove or consolidate duplicate linker pair aggregate APIs.
   3. Remove the string-pair constraint API from core/public routing.
-  4. Prune retriever debug/test APIs after pair-plan probes replace them.
-  5. Decide whether the planner class or one-shot wrapper is the supported raw
+  4. Decide whether the planner class or one-shot wrapper is the supported raw
      Arrow API, then delete the other surface if appropriate.
-  6. Demote or delete raw payload / Python `FeatureBlock` scoring bridges only
+  5. Demote or delete raw payload / Python `FeatureBlock` scoring bridges only
      after Arrow request-table assembly covers the same compatibility use cases.
-  7. Demote `from_json_paths(...)` from core runtime capability checks before
+  6. Demote `from_json_paths(...)` from core runtime capability checks before
      removing JSON ingest helpers.
 - Split `s2and_rust/src/lib.rs` after the production boundary is locked.
   - Start with a compact public-surface inventory before moving code: list each

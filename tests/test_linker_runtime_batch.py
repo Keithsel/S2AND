@@ -32,22 +32,19 @@ def test_rust_retrieval_public_exports_are_available() -> None:
     assert selector.select("q", "alice", ["c2", "c1"]) == ["c1"]
 
 
-def test_direct_top_k_retrieval_allows_values_above_uint16_rank_limit() -> None:
+def test_pair_plan_rejects_values_above_uint16_rank_limit() -> None:
     query = build_query_features(first="alice")
     retriever = s2and_rust.RustHybridCentroidRetriever(
         [build_cluster_summary(component_key="c1", first_name_counts=Counter({"alice": 1}))],
         include_exemplars=True,
     )
 
-    keys, _scores = retriever.top_k_hybrid_centroid(query, np.iinfo(np.uint16).max + 1, 1)
-
-    assert keys == ["c1"]
     with pytest.raises(ValueError, match="retrieval_ranks"):
         retriever.top_k_hybrid_centroid_pair_plan(
             [query],
             np.asarray([0], dtype=np.uint32),
             {"c1": np.asarray([1], dtype=np.uint32)},
-            np.iinfo(np.uint16).max + 1,
+            int(np.iinfo(np.uint16).max) + 1,
             1,
         )
 
@@ -123,30 +120,6 @@ def test_rust_retrieval_batch_returns_flat_pair_plan() -> None:
     assert "affiliation_overlap" in batch.row_signals
 
 
-def test_rust_chooser_feature_rows_subset_honors_num_threads() -> None:
-    if not hasattr(s2and_rust.RustHybridCentroidRetriever, "chooser_feature_rows_subset"):
-        raise pytest.skip.Exception("chooser_feature_rows_subset is unavailable")
-    query = build_query_features(first="alice", has_coauthors=True, has_affiliations=True)
-    summaries = [
-        build_cluster_summary(
-            component_key="c1",
-            size=2,
-            first_name_counts=Counter({"alice": 2}),
-            coauthor_counts=Counter({"a smith": 2}),
-            affiliation_counts=Counter({"lab": 2}),
-        ),
-        build_cluster_summary(component_key="c2", size=1, first_name_counts=Counter({"bob": 1})),
-    ]
-    retriever = s2and_rust.RustHybridCentroidRetriever(summaries, include_exemplars=True)
-
-    single_thread_rows = retriever.chooser_feature_rows_subset(query, ["c1", "c2"], num_threads=1)
-    multi_thread_rows = retriever.chooser_feature_rows_subset(query, ["c1", "c2"], num_threads=2)
-
-    assert multi_thread_rows == single_thread_rows
-    assert set(single_thread_rows) == {"c1", "c2"}
-    assert "coauthor_overlap" in single_thread_rows["c1"]
-
-
 def test_rust_retrieval_batch_preserves_single_character_title_and_venue_terms() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
         raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
@@ -182,7 +155,7 @@ def test_rust_retrieval_batch_preserves_single_character_title_and_venue_terms()
     np.testing.assert_allclose(batch.row_signals["venue_overlap"], [0.5], rtol=1e-6, atol=1e-6)
 
 
-def test_rust_retrieval_batch_matches_direct_top_k_order() -> None:
+def test_rust_retrieval_batch_has_stable_retrieval_order() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
         raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     queries = [
@@ -217,13 +190,6 @@ def test_rust_retrieval_batch_matches_direct_top_k_order() -> None:
     ]
     retriever = s2and_rust.RustHybridCentroidRetriever(summaries, include_exemplars=True)
 
-    direct_keys = []
-    direct_scores = []
-    for query in queries:
-        keys, scores = retriever.top_k_hybrid_centroid(query, 4, 2)
-        direct_keys.extend(str(key) for key in keys)
-        direct_scores.extend(float(score) for score in scores)
-
     batch = build_linker_retrieval_batch_rust(
         retriever=retriever,
         queries=queries,
@@ -243,8 +209,19 @@ def test_rust_retrieval_batch_matches_direct_top_k_order() -> None:
     retrieval_scores = batch.candidate_batch.retrieval_scores
     assert row_component_keys is not None
     assert retrieval_scores is not None
-    assert list(row_component_keys) == direct_keys
-    np.testing.assert_allclose(retrieval_scores, direct_scores, rtol=1e-6, atol=1e-6)
+    assert list(row_component_keys) == [
+        "c_alice",
+        "c_bob",
+        "c_tie_a",
+        "c_tie_b",
+        "c_alice",
+        "c_bob",
+        "c_tie_a",
+        "c_tie_b",
+    ]
+    assert float(retrieval_scores[0]) > 0.0
+    assert float(retrieval_scores[4]) == pytest.approx(float(retrieval_scores[0]))
+    np.testing.assert_allclose(retrieval_scores[[1, 2, 3, 5, 6, 7]], 0.0, rtol=1e-6, atol=1e-6)
 
 
 def test_rust_retrieval_batch_rejects_unknown_query_view_before_retrieval() -> None:
@@ -303,8 +280,18 @@ def test_full_query_view_changes_same_initial_retrieval_order() -> None:
     ]
     retriever = s2and_rust.RustHybridCentroidRetriever(summaries, include_exemplars=True)
 
-    initial_keys, initial_scores = retriever.top_k_hybrid_centroid(initial_query, 2, 1)
-    assert initial_keys == ["c_adam", "c_alice"]
+    initial_batch = build_linker_retrieval_batch_rust(
+        retriever=retriever,
+        queries=[initial_query],
+        query_signature_indices=np.asarray([9], dtype=np.uint32),
+        component_member_indices_by_key={"c_adam": [1], "c_alice": [2]},
+        top_k=2,
+        query_view="initial_only",
+        n_jobs=1,
+    )
+    assert initial_batch.candidate_batch.row_component_keys == ("c_adam", "c_alice")
+    initial_scores = initial_batch.candidate_batch.retrieval_scores
+    assert initial_scores is not None
     np.testing.assert_allclose(initial_scores, [0.0, 0.0], rtol=1e-6, atol=1e-6)
 
     batch = build_linker_retrieval_batch_rust(
@@ -370,7 +357,6 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
     ]
     retriever = s2and_rust.RustHybridCentroidRetriever(summaries, include_exemplars=True)
 
-    direct_keys, _direct_scores = retriever.top_k_hybrid_centroid(query, 1, 1)
     batch = build_linker_retrieval_batch_rust(
         retriever=retriever,
         queries=[query],
@@ -391,7 +377,6 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
     expected = {"orcid_match", "orcid_middle_conflict", "orcid_year_conflict"}
     row_component_keys = batch.candidate_batch.row_component_keys
     assert row_component_keys is not None
-    assert set(direct_keys) == expected
     assert set(row_component_keys) == expected
     assert "non_orcid_candidate" not in row_component_keys
     assert batch.row_signals["orcid_match"].tolist() == [1.0, 1.0, 1.0]

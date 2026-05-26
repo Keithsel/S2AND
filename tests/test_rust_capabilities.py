@@ -239,9 +239,6 @@ def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():
             return None
 
     class NamedRustHybridCentroidRetriever:
-        def top_k_hybrid_centroid(self, *args, **kwargs):
-            return None
-
         top_k_hybrid_centroid_pair_plan = PairPlanMethod()
 
     class Module:
@@ -274,9 +271,6 @@ def test_detect_rust_runtime_capabilities_rejects_stale_incremental_pair_plan_ab
             return None
 
     class NamedRustHybridCentroidRetriever:
-        def top_k_hybrid_centroid(self, *args, **kwargs):
-            return None
-
         top_k_hybrid_centroid_pair_plan = StalePairPlanMethod()
 
     class Module:
@@ -307,9 +301,6 @@ def test_detect_rust_runtime_capabilities_requires_pair_plan_orcid_signal_marker
             return None
 
     class NamedRustHybridCentroidRetriever:
-        def top_k_hybrid_centroid(self, *args, **kwargs):
-            return None
-
         top_k_hybrid_centroid_pair_plan = PairPlanMethod()
 
     class Module:

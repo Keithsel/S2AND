@@ -12200,44 +12200,6 @@ impl RustHybridCentroidRetriever {
         })
     }
 
-    #[pyo3(signature = (query, top_k, num_threads = None))]
-    fn top_k_hybrid_centroid(
-        &self,
-        py: Python<'_>,
-        query: &Bound<'_, PyAny>,
-        top_k: usize,
-        num_threads: Option<usize>,
-    ) -> PyResult<(Vec<String>, Vec<f32>)> {
-        validate_positive_top_k(top_k)?;
-        let query_data = extract_retrieval_query(query)?;
-
-        let selection = self.hard_filtered_candidate_indices_for_query(
-            &query_data,
-            (0..self.summaries.len()).collect(),
-        );
-
-        if selection.indices.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let effective_top_k = if selection.return_all {
-            selection.indices.len()
-        } else {
-            top_k
-        };
-
-        self.score_top_k_candidate_indices_experimental(
-            py,
-            &query_data,
-            &selection.indices,
-            effective_top_k,
-            num_threads,
-            None,
-            None,
-            Self::default_hybrid_weights_for_query(&query_data),
-            Self::default_experimental_config_for_query(&query_data),
-        )
-    }
-
     #[pyo3(signature = (
         queries,
         query_signature_indices,
@@ -12620,89 +12582,6 @@ impl RustHybridCentroidRetriever {
             weights_data,
             config,
         )
-    }
-
-    #[pyo3(signature = (query, component_keys, num_threads = None, override_summary = None))]
-    fn chooser_feature_rows_subset(
-        &self,
-        py: Python<'_>,
-        query: &Bound<'_, PyAny>,
-        component_keys: &Bound<'_, PyAny>,
-        num_threads: Option<usize>,
-        override_summary: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Py<PyDict>> {
-        let query_data = extract_retrieval_query(query)?;
-        let mut candidate_indices = Vec::new();
-        for item in PyIterator::from_object(component_keys)? {
-            let component_key: String = item?.extract()?;
-            let Some(candidate_index) = self.component_index_by_key.get(&component_key) else {
-                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                    "Unknown component_key for RustHybridCentroidRetriever: {component_key}"
-                )));
-            };
-            candidate_indices.push(*candidate_index);
-        }
-
-        let override_data = override_summary
-            .map(|value| extract_retrieval_summary(value, true))
-            .transpose()?;
-        let override_index = if let Some(override_summary_data) = override_data.as_ref() {
-            let Some(candidate_index) = self
-                .component_index_by_key
-                .get(&override_summary_data.component_key)
-            else {
-                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                    "Unknown override component_key for RustHybridCentroidRetriever: {}",
-                    override_summary_data.component_key
-                )));
-            };
-            if !candidate_indices.contains(candidate_index) {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "override_summary component_key {} was not present in component_keys",
-                    override_summary_data.component_key
-                )));
-            }
-            Some(*candidate_index)
-        } else {
-            None
-        };
-
-        let feature_rows = py.allow_threads(|| {
-            let compute = || {
-                candidate_indices
-                    .par_iter()
-                    .map(|candidate_index| {
-                        let summary = if override_index == Some(*candidate_index) {
-                            override_data.as_ref().unwrap_or_else(|| {
-                                unreachable!("override_index implies override_data")
-                            })
-                        } else {
-                            &self.summaries[*candidate_index]
-                        };
-                        (
-                            summary.component_key.clone(),
-                            chooser_summary_features(&query_data, summary),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            };
-            install_with_optional_rayon_pool(num_threads, compute)
-        });
-
-        let payload = PyDict::new(py);
-        for (component_key, feature_values) in feature_rows {
-            let feature_dict = PyDict::new(py);
-            feature_dict.set_item("middle_initial_compatibility", feature_values[0])?;
-            feature_dict.set_item("affiliation_overlap", feature_values[1])?;
-            feature_dict.set_item("coauthor_overlap", feature_values[2])?;
-            feature_dict.set_item("venue_overlap", feature_values[3])?;
-            feature_dict.set_item("year_compatibility", feature_values[4])?;
-            feature_dict.set_item("title_overlap", feature_values[5])?;
-            feature_dict.set_item("specter_centroid_similarity", feature_values[6])?;
-            feature_dict.set_item("specter_exemplar_similarity", feature_values[7])?;
-            payload.set_item(component_key.as_str(), feature_dict)?;
-        }
-        Ok(payload.unbind())
     }
 }
 

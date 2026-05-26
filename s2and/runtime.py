@@ -165,7 +165,9 @@ def _detect_named_rust_capabilities(module: Any) -> tuple[str, ...]:
     capabilities: list[str] = []
     rust_featurizer_cls = getattr(module, "RustFeaturizer", None)
     rust_retriever_cls = getattr(module, "RustHybridCentroidRetriever", None)
-    if rust_retriever_cls is not None and callable(getattr(rust_retriever_cls, "top_k_hybrid_centroid", None)):
+    if rust_retriever_cls is not None and callable(
+        getattr(rust_retriever_cls, "top_k_hybrid_centroid_pair_plan", None)
+    ):
         capabilities.append(RUST_CAPABILITY_HYBRID_CENTROID_RETRIEVER_V1)
     if rust_featurizer_cls is not None and callable(
         getattr(rust_featurizer_cls, "linker_pair_index_arrays_and_aggregate_stats", None)

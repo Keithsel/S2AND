@@ -54,8 +54,6 @@ cleanup risk, not a user-facing API promise.
 | `RustHybridCentroidRetriever.__new__(...)` | raw Arrow planners, training query support, tests | Maintained constructor. |
 | `top_k_hybrid_centroid_pair_plan(...)` | `s2and/incremental_linking/retrieval.py`, raw Arrow planners | Canonical runtime retrieval output. |
 | `top_k_experimental_weighted_hybrid_centroid_subset(...)` | `s2and/incremental_linking_training/query_support.py`, tests | Training/query-support scoring surface. |
-| `top_k_hybrid_centroid(...)` | capability probes and tests | Direct debug/capability surface; remove only after probes/tests stop requiring it. |
-| `chooser_feature_rows_subset(...)` | tests only in current repo | Candidate for deletion after tests move to pair-plan or training support APIs. |
 | `RustNameCompatibleSubblockSelector.select(...)` | tests only; internal Rust helper trio used by pair-plan | Keep while pair-plan subblock filtering depends on the selector internals. |
 | `RawBlockQueryCandidatePlanner.__new__(...)`, `build_telemetry(...)`, `plan(...)` | `s2and/incremental_linking/production.py`; tests | Reusable production raw Arrow planner. |
 
@@ -89,3 +87,7 @@ cleanup risk, not a user-facing API promise.
 - Status 2026-05-25: the string-pair `get_constraints_matrix(...)` PyO3 method
   and `rust_calls.get_constraints_matrix_rust(...)` wrapper were removed after
   parity tests moved to indexed constraint matrices.
+- Status 2026-05-25: direct retriever debug APIs
+  `top_k_hybrid_centroid(...)` and `chooser_feature_rows_subset(...)` were
+  removed after capability probes and tests moved to the canonical pair-plan
+  route.

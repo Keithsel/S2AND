@@ -22,6 +22,12 @@ from sklearn.exceptions import EfficiencyWarning
 from tqdm import tqdm
 
 from s2and import memory_budget
+from s2and.arrow_inputs import (
+    MissingArrowArtifactError,
+    normalize_arrow_paths,
+    require_arrow_artifacts,
+    validate_arrow_prediction_artifacts,
+)
 from s2and.consts import _PACKAGE_DATA_DIR, DEFAULT_CHUNK_SIZE, LARGE_DISTANCE, LARGE_INTEGER, PROJECT_ROOT_PATH
 from s2and.data import (
     NAME_COUNTS_LAST_FIRST_INITIAL_INITIAL_CHAR,
@@ -33,7 +39,6 @@ from s2and.feature_port import (
     _get_rust_featurizer,
     build_rust_featurizer_from_arrow_paths,
     evict_rust_featurizer,
-    normalize_arrow_paths,
 )
 from s2and.featurizer import FeaturizationInfo, many_pairs_featurize, resolve_cache_policy
 from s2and.incremental_linking.feature_block import (
@@ -43,10 +48,14 @@ from s2and.incremental_linking.feature_block import (
     read_cluster_seed_disallows_arrow,
     temporary_arrow_paths_with_cluster_seeds,
 )
+from s2and.incremental_linking.feature_block import (
+    read_cluster_seeds_arrow as _read_cluster_seeds_arrow_file,
+)
 from s2and.incremental_linking.policy import (
     arrow_paths_have_name_counts_index as _arrow_paths_have_name_counts_index,
 )
 from s2and.incremental_linking.policy import (
+    clusterer_uses_embedding_features,
     clusterer_uses_name_count_features,
     request_cluster_seed_disallow_parts,
 )
@@ -91,7 +100,7 @@ _ALTERED_PRESPLIT_CACHE_MAX_ENTRIES = 128
 _CLUSTER_SEEDS_ARROW_CACHE_MAX_ENTRIES = 16
 _CLUSTER_SEEDS_ARROW_CACHE: OrderedDict[
     tuple[str, int | None, int | None, int | None],
-    tuple[tuple[str, int | str], ...],
+    tuple[tuple[str, str], ...],
 ] = OrderedDict()
 _CLUSTER_SEED_DISALLOWS_ARROW_CACHE_MAX_ENTRIES = 16
 _CLUSTER_SEED_DISALLOWS_ARROW_CACHE: OrderedDict[
@@ -151,6 +160,8 @@ class _GraphSubblockingFallbackWithLegacyFallback:
         except Exception as exc:
             if not _is_recoverable_graph_subblocking_error(exc):
                 raise
+            if self.source == "arrow":
+                raise
             self.graph_prepare_failed = True
             self.graph_prepare_error = self._error_payload(
                 exc,
@@ -186,6 +197,8 @@ class _GraphSubblockingFallbackWithLegacyFallback:
             )
         except Exception as exc:
             if not _is_recoverable_graph_subblocking_error(exc):
+                raise
+            if self.source == "arrow":
                 raise
             self.graph_fallback_errors.append(
                 self._error_payload(exc, stage="call", signature_count=len(signature_id_list))
@@ -429,104 +442,11 @@ def _uses_reference_features(featurizer_info: FeaturizationInfo | None) -> bool:
 
 
 def _uses_embedding_features(clusterer: Any) -> bool:
-    featurizer_info = getattr(clusterer, "featurizer_info", None)
-    nameless_featurizer_info = getattr(clusterer, "nameless_featurizer_info", None)
-    return (featurizer_info is not None and "embedding_similarity" in featurizer_info.features_to_use) or (
-        nameless_featurizer_info is not None and "embedding_similarity" in nameless_featurizer_info.features_to_use
-    )
+    return clusterer_uses_embedding_features(clusterer)
 
 
 def _uses_name_count_features(clusterer: Any) -> bool:
     return clusterer_uses_name_count_features(clusterer)
-
-
-class MissingArrowArtifactError(ValueError):
-    """Raised when a strict Arrow production route is missing required artifacts."""
-
-    def __init__(
-        self,
-        *,
-        context: str,
-        required_keys: Sequence[str],
-        missing_keys: Sequence[str],
-        missing_files: Mapping[str, str],
-        producer_hint: str,
-    ) -> None:
-        self.context = str(context)
-        self.required_keys = tuple(str(key) for key in required_keys)
-        self.missing_keys = tuple(str(key) for key in missing_keys)
-        self.missing_files = {str(key): str(value) for key, value in missing_files.items()}
-        self.producer_hint = str(producer_hint)
-        details = [f"{self.context} is missing required Arrow artifacts"]
-        if self.missing_keys:
-            details.append(f"missing mapping keys: {', '.join(self.missing_keys)}")
-        if self.missing_files:
-            formatted_files = "; ".join(f"{key}={value}" for key, value in sorted(self.missing_files.items()))
-            details.append(f"missing files: {formatted_files}")
-        if self.producer_hint:
-            details.append(f"producer hint: {self.producer_hint}")
-        super().__init__(". ".join(details))
-
-
-def validate_arrow_prediction_artifacts(
-    arrow_paths: Mapping[str, Any],
-    *,
-    require_specter: bool,
-    require_name_counts_index: bool,
-    require_cluster_seeds: bool = False,
-    context: str = "Arrow prediction",
-    producer_hint: str = (
-        "generate a complete Arrow bundle with scripts/convert_to_arrow.py or use the published "
-        "s2and-release-arrow bundle"
-    ),
-) -> dict[str, str]:
-    """Validate strict production Arrow prediction artifacts and return normalized paths."""
-
-    required = {"signatures", "papers", "paper_authors"}
-    if require_specter:
-        required.add("specter")
-    if require_name_counts_index:
-        required.add("name_counts_index")
-    if require_cluster_seeds:
-        required.add("cluster_seeds")
-
-    missing_keys = sorted(key for key in required if key not in arrow_paths)
-    normalized: dict[str, str] = {}
-    invalid_paths: dict[str, str] = {}
-    for key, value in arrow_paths.items():
-        key_text = str(key)
-        if value is None:
-            invalid_paths[key_text] = "<None>"
-            continue
-        path_text = str(value)
-        if not path_text.strip():
-            invalid_paths[key_text] = "<empty>"
-            continue
-        if path_text == ".":
-            invalid_paths[key_text] = "."
-            continue
-        normalized[key_text] = path_text
-
-    missing_files = {
-        key: path
-        for key, path in normalized.items()
-        if (
-            key in required
-            or key.endswith("_batch_index")
-            or key in {"cluster_seed_disallows", "altered_cluster_signatures"}
-        )
-        and not Path(path).exists()
-    }
-    missing_files.update(invalid_paths)
-    if missing_keys or missing_files:
-        raise MissingArrowArtifactError(
-            context=context,
-            required_keys=sorted(required),
-            missing_keys=missing_keys,
-            missing_files=missing_files,
-            producer_hint=producer_hint,
-        )
-    return normalized
 
 
 def _coerce_existing_arrow_paths(
@@ -542,26 +462,30 @@ def _coerce_existing_arrow_paths(
         if strict:
             raise TypeError("dataset Arrow paths must be a mapping")
         return None
-    paths = {str(key): str(path) for key, path in value.items() if path is not None}
     required = {"signatures", "papers", "paper_authors"}
     if require_specter:
         required.add("specter")
     if require_cluster_seeds:
         required.add("cluster_seeds")
+    if strict:
+        return validate_arrow_prediction_artifacts(
+            value,
+            require_specter=require_specter,
+            require_name_counts_index="name_counts_index" in value,
+            require_cluster_seeds=require_cluster_seeds,
+            require_batch_indexes=False,
+            context="Dataset Arrow paths",
+            producer_hint="fix dataset.arrow_paths or regenerate the Arrow bundle",
+        )
+
+    paths = {str(key): str(path) for key, path in value.items() if path is not None}
     missing_keys = sorted(required.difference(paths))
     if missing_keys:
-        if strict:
-            raise ValueError(f"dataset Arrow paths are missing required keys: {missing_keys}")
         return None
     missing_files = sorted(key for key in required if not Path(paths[key]).exists())
     if missing_files:
-        if strict:
-            formatted = ", ".join(f"{key}={paths[key]}" for key in missing_files)
-            raise FileNotFoundError(f"dataset Arrow paths point to missing files: {formatted}")
         return None
     if "name_counts_index" in paths and not Path(paths["name_counts_index"]).exists():
-        if strict:
-            raise FileNotFoundError(f"dataset Arrow path name_counts_index={paths['name_counts_index']} does not exist")
         return None
     return paths
 
@@ -617,14 +541,6 @@ def _resolve_name_counts_index_path(arrow_dataset_dir: Path) -> str | None:
                     f"Arrow manifest {manifest_path} specifies name_counts_index path that does not exist: "
                     f"{path_value}"
                 )
-    for candidate in (
-        arrow_dataset_dir / "name_counts_index",
-        arrow_dataset_dir.parent / "name_counts_index",
-        arrow_dataset_dir.parent.parent / "name_counts_index",
-        Path(PROJECT_ROOT_PATH) / "s2and" / "data" / "name_counts_index",
-    ):
-        if candidate.exists():
-            return str(candidate)
     return None
 
 
@@ -749,40 +665,14 @@ def _resolve_dataset_arrow_paths(
     return None
 
 
-def _read_cluster_seeds_arrow(path: Path) -> dict[str, int | str]:
+def _read_cluster_seeds_arrow(path: Path) -> dict[str, str]:
     cache_key = _path_cache_fingerprint(path)
     cached_items = _CLUSTER_SEEDS_ARROW_CACHE.get(cache_key)
     if cached_items is not None:
         _CLUSTER_SEEDS_ARROW_CACHE.move_to_end(cache_key)
         return dict(cached_items)
 
-    import pyarrow as pa
-
-    with pa.memory_map(str(path), "r") as source:
-        table = pa.ipc.open_file(source).read_all()
-        missing = sorted({"signature_id", "cluster_id"}.difference(table.column_names))
-        if missing:
-            raise ValueError(f"cluster seeds Arrow is missing required columns: {missing}")
-        rows = list(
-            zip(
-                table["signature_id"].to_pylist(),
-                table["cluster_id"].to_pylist(),
-                strict=True,
-            )
-        )
-    cluster_seeds_require: dict[str, int | str] = {}
-    for signature_id, cluster_id in rows:
-        if signature_id is None or cluster_id is None:
-            raise ValueError("cluster seeds Arrow cannot contain null signature_id or cluster_id values")
-        signature_key = str(signature_id)
-        cluster_key = str(cluster_id)
-        if not signature_key:
-            raise ValueError("cluster seeds Arrow cannot contain empty signature_id values")
-        if not cluster_key:
-            raise ValueError(f"cluster seeds Arrow cannot contain empty cluster_id values: {signature_key!r}")
-        if signature_key in cluster_seeds_require:
-            raise ValueError(f"cluster seeds Arrow contains duplicate signature_id: {signature_key!r}")
-        cluster_seeds_require[signature_key] = cluster_key
+    cluster_seeds_require = _read_cluster_seeds_arrow_file(path)
     _CLUSTER_SEEDS_ARROW_CACHE[cache_key] = tuple(cluster_seeds_require.items())
     _CLUSTER_SEEDS_ARROW_CACHE.move_to_end(cache_key)
     while len(_CLUSTER_SEEDS_ARROW_CACHE) > _CLUSTER_SEEDS_ARROW_CACHE_MAX_ENTRIES:
@@ -790,7 +680,7 @@ def _read_cluster_seeds_arrow(path: Path) -> dict[str, int | str]:
     return cluster_seeds_require
 
 
-def _cluster_seeds_require_from_arrow_paths(arrow_paths: Mapping[str, Any] | None) -> dict[str, int | str]:
+def _cluster_seeds_require_from_arrow_paths(arrow_paths: Mapping[str, Any] | None) -> dict[str, str]:
     if arrow_paths is None:
         return {}
     path_value = arrow_paths.get("cluster_seeds")
@@ -807,6 +697,14 @@ def _cluster_seeds_arrow_path_exists(arrow_paths: Mapping[str, Any] | None) -> b
         return False
     path_value = arrow_paths.get("cluster_seeds")
     return path_value is not None and Path(str(path_value)).exists()
+
+
+def _first_explicit_dataset_arrow_paths(dataset: Any) -> Mapping[str, Any] | None:
+    for attr_name in ("arrow_paths", "feature_block_arrow_paths", "rust_arrow_paths"):
+        explicit_value = getattr(dataset, attr_name, None)
+        if isinstance(explicit_value, Mapping):
+            return explicit_value
+    return None
 
 
 def _has_incremental_seed_source(dataset: Any, arrow_paths: Mapping[str, Any] | None) -> bool:
@@ -842,12 +740,25 @@ def _missing_arrow_prediction_artifacts_error(
     *,
     context: str,
     producer_hint: str,
+    arrow_paths: Mapping[str, Any] | None = None,
 ) -> MissingArrowArtifactError:
     required = ["signatures", "papers", "paper_authors"]
     if _uses_embedding_features(clusterer):
         required.append("specter")
     if _uses_name_count_features(clusterer):
         required.append("name_counts_index")
+    if arrow_paths is not None:
+        try:
+            validate_arrow_prediction_artifacts(
+                arrow_paths,
+                require_specter=_uses_embedding_features(clusterer),
+                require_name_counts_index=_uses_name_count_features(clusterer),
+                require_batch_indexes=True,
+                context=context,
+                producer_hint=producer_hint,
+            )
+        except MissingArrowArtifactError as exc:
+            return exc
     return MissingArrowArtifactError(
         context=context,
         required_keys=required,
@@ -1036,6 +947,11 @@ def _read_altered_cluster_signatures_arrow(path: Path) -> list[str]:
         table = pa.ipc.open_file(source).read_all()
         if "signature_id" not in table.column_names:
             raise ValueError("altered cluster signatures Arrow is missing required column: signature_id")
+        signature_type = table["signature_id"].type
+        if not (pa.types.is_string(signature_type) or pa.types.is_large_string(signature_type)):
+            raise ValueError(
+                f"altered cluster signatures Arrow column signature_id expected string, got {signature_type}"
+            )
         signature_values = table["signature_id"].to_pylist()
     values: list[str] = []
     seen: set[str] = set()
@@ -1067,8 +983,18 @@ def _dataset_altered_cluster_signatures(
         path_value = arrow_paths.get("altered_cluster_signatures")
         if path_value is not None:
             path = Path(str(path_value))
-            if path.exists():
-                return _read_altered_cluster_signatures_file(path)
+            if not path.exists():
+                raise MissingArrowArtifactError(
+                    context="altered cluster signatures",
+                    required_keys=("altered_cluster_signatures",),
+                    missing_keys=(),
+                    missing_files={"altered_cluster_signatures": str(path)},
+                    producer_hint=(
+                        "omit altered_cluster_signatures when no altered claimed profiles are present, "
+                        "or generate a valid altered_cluster_signatures.arrow sidecar"
+                    ),
+                )
+            return _read_altered_cluster_signatures_file(path)
     return []
 
 
@@ -3654,10 +3580,12 @@ class Clusterer:
             arrow_paths,
             require_specter=_uses_embedding_features(self),
             require_name_counts_index=require_name_counts_index,
+            require_batch_indexes=True,
             context="Clusterer.predict_from_arrow_paths",
             producer_hint=(
                 "provide signatures, papers, paper_authors, model-required specter, and model-required "
-                "name_counts_index from scripts/convert_to_arrow.py or the published s2and-release-arrow bundle"
+                "name_counts_index plus raw-planner batch indexes from scripts/convert_to_arrow.py or the "
+                "published s2and-release-arrow bundle"
             ),
         )
         _require_arrow_name_counts_index_for_clusterer(self, arrow_path_payload, context="Arrow prediction")
@@ -3895,15 +3823,24 @@ class Clusterer:
                 kwargs: dict[str, Any] = {"maximum_size": batching_threshold}
                 if specter_cluster_fn is not None:
                     kwargs["specter_cluster_fn"] = specter_cluster_fn
-                if (
-                    subblocking_arrow_paths is not None
-                    and subblocking_arrow_paths.get("signatures")
-                    and subblocking_arrow_paths.get("signatures_batch_index")
-                    and use_rust_subblocking
-                    and rust_arrow_subblocking_available()
-                ):
-                    subblocks = make_subblocks_arrow_rust(
+                if subblocking_arrow_paths is not None and use_rust_subblocking:
+                    arrow_subblocking_paths = require_arrow_artifacts(
                         subblocking_arrow_paths,
+                        required_keys=("signatures", "signatures_batch_index"),
+                        context="Arrow subblocking",
+                        producer_hint=(
+                            "include signatures.arrow and signatures.signatures_batch_index.bin in the Arrow "
+                            "bundle; Rust production subblocking does not fall back to ANDData partitioning "
+                            "when Arrow subblocking artifacts are incomplete"
+                        ),
+                    )
+                    if not rust_arrow_subblocking_available():
+                        raise RuntimeError(
+                            "Rust Arrow subblocking requires an s2and_rust extension with "
+                            "make_subblocks_with_telemetry_arrow"
+                        )
+                    subblocks = make_subblocks_arrow_rust(
+                        arrow_subblocking_paths,
                         block_signatures,
                         dataset,
                         **kwargs,
@@ -4239,6 +4176,11 @@ class Clusterer:
                 evict_rust_featurizer(dataset)
 
         if arrow_paths is not None and not use_s2_clusters:
+            if _arrow_paths_need_current_cluster_seeds(dataset, arrow_paths):
+                arrow_paths_for_predict_context = _temporary_arrow_paths_with_current_cluster_seeds(
+                    dataset,
+                    arrow_paths,
+                )
             try:
                 altered_cluster_signatures = _dataset_altered_cluster_signatures(dataset, arrow_paths)
                 if altered_cluster_signatures:
@@ -4374,7 +4316,17 @@ class Clusterer:
                     and len(block_dict_multiple_letter_first_names) > 0
                     and not use_s2_clusters
                 ):
-                    arrow_path_payload = normalize_arrow_paths(arrow_paths_for_predict)
+                    arrow_path_payload = validate_arrow_prediction_artifacts(
+                        arrow_paths_for_predict,
+                        require_specter=_uses_embedding_features(self),
+                        require_name_counts_index=_uses_name_count_features(self),
+                        require_batch_indexes=True,
+                        context="Clusterer.predict subblocked Arrow prediction",
+                        producer_hint=(
+                            "include signatures, papers, paper_authors, raw-planner batch indexes, "
+                            "and model-required sidecars for Rust subblocked prediction"
+                        ),
+                    )
                     _require_arrow_name_counts_index_for_clusterer(
                         self,
                         arrow_path_payload,
@@ -4530,6 +4482,7 @@ class Clusterer:
                 raise _missing_arrow_prediction_artifacts_error(
                     self,
                     context="Clusterer.predict Rust prediction",
+                    arrow_paths=_first_explicit_dataset_arrow_paths(dataset),
                     producer_hint=(
                         "pass complete Arrow paths for signatures, papers, paper_authors, selected embeddings, "
                         "and model-required sidecars; Rust production prediction no longer falls back to "
@@ -5516,6 +5469,7 @@ class Clusterer:
             raise _missing_arrow_prediction_artifacts_error(
                 self,
                 context="Clusterer._predict_incremental_promoted_linker",
+                arrow_paths=_first_explicit_dataset_arrow_paths(dataset),
                 producer_hint=(
                     "pass complete Arrow paths for signatures, papers, paper_authors, selected embeddings, "
                     "and model-required sidecars; promoted incremental Rust prediction no longer uses "
@@ -5617,6 +5571,7 @@ class Clusterer:
             raise _missing_arrow_prediction_artifacts_error(
                 self,
                 context="Clusterer.predict_incremental promoted Rust prediction",
+                arrow_paths=_first_explicit_dataset_arrow_paths(dataset),
                 producer_hint=(
                     "pass complete Arrow paths for signatures, papers, paper_authors, selected embeddings, "
                     "and model-required sidecars; promoted incremental Rust prediction no longer uses "

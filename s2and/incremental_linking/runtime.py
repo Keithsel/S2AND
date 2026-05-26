@@ -12,6 +12,7 @@ from typing import Any, Literal
 import numpy as np
 
 from s2and import feature_port
+from s2and.arrow_inputs import validate_arrow_prediction_artifacts
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
@@ -36,6 +37,8 @@ from s2and.incremental_linking.logistic_gate import (
     load_logistic_gate_config,
 )
 from s2and.incremental_linking.policy import (
+    clusterer_uses_embedding_features,
+    clusterer_uses_name_count_features,
     require_arrow_name_counts_index_for_clusterer,
 )
 from s2and.incremental_linking.policy import (
@@ -1977,14 +1980,28 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     resolved_runtime_context = runtime_context or build_runtime_context("incremental_link_or_abstain_raw_arrow")
     n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
     top_k_resolved = int(artifact.metadata.retrieval_top_k if top_k is None else top_k)
-    arrow_path_payload = feature_port.normalize_arrow_paths(arrow_paths)
+    provided_raw_candidate_plan = raw_candidate_plan is not None
+    if provided_raw_candidate_plan:
+        arrow_path_payload = feature_port.normalize_arrow_paths(arrow_paths)
+    else:
+        arrow_path_payload = validate_arrow_prediction_artifacts(
+            arrow_paths,
+            require_specter=clusterer_uses_embedding_features(clusterer),
+            require_name_counts_index=clusterer_uses_name_count_features(clusterer),
+            require_cluster_seeds=True,
+            require_batch_indexes=True,
+            context="Raw Arrow scoring",
+            producer_hint=(
+                "include raw Arrow tables, raw-planner batch indexes, and cluster_seeds.arrow when planner "
+                "retrieval is requested; use a provided raw_candidate_plan plus matching rust_featurizer only "
+                "for bounded compatibility tests"
+            ),
+        )
     require_arrow_name_counts_index_for_clusterer(clusterer, arrow_path_payload, context="Raw Arrow scoring")
     query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
     resolved_orcid_enabled = (
         not bool(getattr(clusterer, "suppress_orcid", False)) if orcid_enabled is None else bool(orcid_enabled)
     )
-    provided_raw_candidate_plan = raw_candidate_plan is not None
-
     if raw_candidate_plan is None:
         stage_start = time.perf_counter()
         rust_module = feature_port._require_rust_runtime()  # noqa: SLF001

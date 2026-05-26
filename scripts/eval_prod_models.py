@@ -229,6 +229,7 @@ def resolve_arrow_dataset_root(arrow_root: str, dataset_name: str) -> str:
 
 
 def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suffix: str) -> dict[str, str]:
+    from s2and.arrow_inputs import MissingArrowArtifactError, validate_arrow_prediction_artifacts
     from s2and.incremental_linking.feature_block import RAW_PLANNER_ARROW_BATCH_INDEX_KEYS
 
     dataset_root = resolve_arrow_dataset_root(arrow_root, dataset_name)
@@ -265,7 +266,20 @@ def resolve_arrow_dataset_paths(arrow_root: str, dataset_name: str, specter_suff
             if os.path.exists(candidate):
                 paths[index_key] = candidate
                 break
-    return paths
+    try:
+        return validate_arrow_prediction_artifacts(
+            paths,
+            require_specter=True,
+            require_name_counts_index=True,
+            require_batch_indexes=True,
+            context=f"eval_prod_models Arrow dataset {dataset_name}",
+            producer_hint=(
+                "convert the dataset with scripts/convert_to_arrow.py so the manifest includes "
+                "name_counts_index and raw-planner batch indexes"
+            ),
+        )
+    except MissingArrowArtifactError as exc:
+        raise FileNotFoundError(str(exc)) from exc
 
 
 def _resolve_eval_name_counts_index_path(dataset_root: Path) -> str | None:
@@ -313,7 +327,7 @@ def first_missing_arrow_dataset_error(
         for specter_suffix in specter_suffixes:
             try:
                 resolve_arrow_dataset_paths(arrow_root, dataset_name, specter_suffix)
-            except FileNotFoundError as exc:
+            except (FileNotFoundError, ValueError) as exc:
                 return FileNotFoundError(
                     f"Missing Arrow files for dataset={dataset_name!r}, specter_suffix={specter_suffix!r}: {exc}"
                 )
@@ -590,6 +604,10 @@ def main() -> None:
             if use_arrow:
                 if clusterer is None:
                     raise RuntimeError("Arrow evaluation requires a loaded production Clusterer")
+                if arrow_data_root is None:
+                    raise RuntimeError(
+                        "Arrow evaluation requires --arrow-data-root or a supported default dataset root"
+                    )
                 arrow_paths = resolve_arrow_dataset_paths(arrow_data_root, dataset_name, specter_suffix)
                 cluster_metrics, _b3_metrics_per_signature = cluster_eval_arrow(
                     arrow_paths,

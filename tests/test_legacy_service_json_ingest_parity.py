@@ -1,3 +1,9 @@
+"""Compatibility/parity coverage for legacy service-shaped JSON ingest.
+
+Production inference converts service-shaped JSON to Arrow before entering Rust.
+These tests keep the legacy JSON loader honest for compatibility and parity only.
+"""
+
 from __future__ import annotations
 
 import json
@@ -323,16 +329,26 @@ def test_service_shaped_from_json_paths_prediction_partition_parity_with_dict_ba
     dict_backed_dataset = _build_dict_backed_service_dataset()
     path_backed_dataset, _specter_embeddings = _build_service_shaped_dataset()
     block_dict = {"a sattar": ["0", "1", "2"]}
+    runtime_context = build_runtime_context("service_json_ingest_prediction_parity")
 
-    dict_backed_clusters, _ = _build_service_clusterer().predict(
+    dict_backed_featurizer = _get_rust_featurizer(dict_backed_dataset, runtime_context=runtime_context)
+    path_backed_featurizer = _get_rust_featurizer(path_backed_dataset, runtime_context=runtime_context)
+
+    dict_backed_clusters, _ = _build_service_clusterer().predict_from_rust_featurizer(
         block_dict,
-        dict_backed_dataset,
+        dict_backed_featurizer,
         cluster_model_params={"eps": 0.5},
+        runtime_context=runtime_context,
+        cluster_seeds_require=dict_backed_dataset.cluster_seeds_require,
+        cluster_seeds_disallow=dict_backed_dataset.cluster_seeds_disallow,
     )
-    path_backed_clusters, _ = _build_service_clusterer().predict(
+    path_backed_clusters, _ = _build_service_clusterer().predict_from_rust_featurizer(
         block_dict,
-        path_backed_dataset,
+        path_backed_featurizer,
         cluster_model_params={"eps": 0.5},
+        runtime_context=runtime_context,
+        cluster_seeds_require=path_backed_dataset.cluster_seeds_require,
+        cluster_seeds_disallow=path_backed_dataset.cluster_seeds_disallow,
     )
 
     assert _normalize_partition(path_backed_clusters) == _normalize_partition(dict_backed_clusters)

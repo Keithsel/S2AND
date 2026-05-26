@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from s2and.arrow_inputs import MissingArrowArtifactError
 from s2and.data import ANDData
 from s2and.model import _ensure_lightgbm_fitted, _selected_feature_indices
 from s2and.production_bundle import finalize_production_bundle, write_pairwise_production_bundle
@@ -115,14 +116,8 @@ def test_native_pairwise_models_match_v12_pickle_fixture() -> None:
     )
 
 
-@pytest.mark.parametrize("backend", ["python", "rust"])
-def test_native_clusterer_predict_matches_v12_pickle(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
-    if backend == "rust":
-        rust_available, rust_error = import_s2and_rust(required_method="from_dataset")
-        if not rust_available:
-            raise pytest.skip.Exception(f"Rust runtime unavailable: {rust_error!r}")
-
-    monkeypatch.setenv("S2AND_BACKEND", backend)
+def test_native_clusterer_predict_matches_v12_pickle_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("S2AND_BACKEND", "python")
 
     for batching_threshold in (None, 7):
         native_clusterer = _prepare_prediction_clusterer(
@@ -136,6 +131,20 @@ def test_native_clusterer_predict_matches_v12_pickle(monkeypatch: pytest.MonkeyP
             legacy_clusterer,
             batching_threshold=batching_threshold,
         )
+
+
+def test_native_clusterer_predict_rust_requires_arrow_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    rust_available, rust_error = import_s2and_rust(required_method="from_dataset")
+    if not rust_available:
+        raise pytest.skip.Exception(f"Rust runtime unavailable: {rust_error!r}")
+
+    monkeypatch.setenv("S2AND_BACKEND", "rust")
+    native_clusterer = _prepare_prediction_clusterer(
+        load_production_model(_NATIVE_BUNDLE_PATH, require_incremental_linker=False)
+    )
+
+    with pytest.raises(MissingArrowArtifactError, match="Rust production prediction no longer falls back"):
+        _predict_dummy_block(native_clusterer, batching_threshold=None)
 
 
 def test_native_clusterer_runtime_config_matches_v12_pickle() -> None:

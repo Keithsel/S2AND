@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import numpy as np
 
+from s2and.arrow_inputs import normalize_arrow_paths, validate_arrow_prediction_artifacts
 from s2and.consts import CLUSTER_SEEDS_LOOKUP
 from s2and.data import ANDData
 from s2and.runtime import (
@@ -732,22 +733,6 @@ def _resolve_direct_name_counts_path(load_name_counts: bool, name_counts_path: s
     return os.path.join(_PACKAGE_DATA_DIR, "name_counts_rust.json")
 
 
-def normalize_arrow_paths(paths: Mapping[Any, Any]) -> dict[str, str]:
-    """Return Arrow path mappings with explicit rejection of missing path values."""
-
-    stringified: dict[str, str] = {}
-    for key, value in paths.items():
-        if value is None:
-            raise ValueError(f"Arrow path for {key!r} is None")
-        path_text = os.fspath(value) if isinstance(value, os.PathLike) else str(value)
-        if not path_text.strip():
-            raise ValueError(f"Arrow path for {key!r} is empty")
-        if path_text == ".":
-            raise ValueError(f"Arrow path for {key!r} resolves to the current directory")
-        stringified[str(key)] = path_text
-    return stringified
-
-
 def _stringified_arrow_paths(paths: Mapping[Any, Any]) -> dict[str, str]:
     return normalize_arrow_paths(paths)
 
@@ -764,34 +749,39 @@ def build_rust_featurizer_from_arrow_paths(
     cluster_seed_require_value: float = 0.0,
     cluster_seed_disallow_value: float = 10000.0,
     num_threads: int | None = None,
+    full_scan_without_index: bool = False,
 ) -> Any:
     """Build a Rust featurizer directly from Arrow IPC FeatureBlock paths."""
 
     method = _rust_featurizer_method("from_arrow_paths", "raw Arrow scoring")
-    normalized_paths = normalize_arrow_paths(paths)
     configured_name_counts_path = _normalize_name_counts_path(name_counts_path)
     if configured_name_counts_path is not None:
         raise ValueError(
             "RustFeaturizer.from_arrow_paths does not accept name_counts_path; "
             "pass the Arrow name-count index directory in paths['name_counts_index']."
         )
-    if load_name_counts:
-        name_counts_index_path = normalized_paths.get("name_counts_index")
-        if name_counts_index_path is None or not os.path.exists(name_counts_index_path):
-            raise ValueError(
-                "RustFeaturizer.from_arrow_paths with name counts requires name_counts_index. "
-                "Pass the Arrow name-count index directory in paths['name_counts_index']."
-            )
+    normalized_paths = normalize_arrow_paths(paths)
+    normalized_paths = validate_arrow_prediction_artifacts(
+        normalized_paths,
+        require_specter="specter" in normalized_paths or "specter2" in normalized_paths,
+        require_name_counts_index=bool(load_name_counts),
+        require_batch_indexes=not full_scan_without_index,
+        context="RustFeaturizer.from_arrow_paths production build",
+        producer_hint=(
+            "include signatures, papers, paper_authors, raw-planner batch indexes, model-required specter, "
+            "model-required name_counts_index, and any declared optional sidecars in the Arrow bundle"
+        ),
+    )
     return method(
         normalized_paths,
         None if signature_ids is None else [str(value) for value in signature_ids],
         name_tuples,
-        None,
         bool(preprocess),
         bool(compute_reference_features),
         float(cluster_seed_require_value),
         float(cluster_seed_disallow_value),
         None if num_threads is None else resolve_n_jobs(num_threads),
+        bool(full_scan_without_index),
     )
 
 

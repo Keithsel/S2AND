@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 _PROJECT_ROOT = _SCRIPTS_DIR.parent
@@ -282,7 +282,7 @@ def run_rebuild_stress(
             try:
                 if build_path == "from_arrow_paths":
                     featurizer = _build_from_arrow_paths(
-                        paths=paths,
+                        paths=cast(dict[str, str], paths),
                         compute_reference_features=compute_reference_features,
                         preprocess=preprocess,
                         num_threads=num_threads,
@@ -290,7 +290,7 @@ def run_rebuild_stress(
                 elif build_path == "from_json_paths":
                     featurizer = _build_from_json_paths(
                         s2and_rust_module=s2and_rust_module,
-                        paths=paths,
+                        paths=cast(dict[str, str | None], paths),
                         compute_reference_features=compute_reference_features,
                         preprocess=preprocess,
                         num_threads=num_threads,
@@ -299,7 +299,7 @@ def run_rebuild_stress(
                 else:
                     featurizer, dataset_obj = _build_from_dataset(
                         s2and_rust_module=s2and_rust_module,
-                        paths=paths,
+                        paths=cast(dict[str, str | None], paths),
                         compute_reference_features=compute_reference_features,
                         preprocess=preprocess,
                         num_threads=num_threads,

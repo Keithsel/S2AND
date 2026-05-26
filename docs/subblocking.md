@@ -13,8 +13,9 @@ The current default is graph-first subblocking fallback:
 
 - Prefix and middle-name splitting still define the main subblock structure.
 - Oversized groups that cannot be split by names call the graph fallback instead of the old SPECTER fallback.
-- If graph preparation or a graph fallback call fails, the old Python `cluster_with_specter(...)` path runs for that
-  fallback group.
+- For Python/`ANDData` graph fallback, graph preparation or fallback-call IO failures run the old Python
+  `cluster_with_specter(...)` path for that fallback group. Arrow-backed Rust production graph failures raise instead
+  of falling back to `ANDData`.
 - Set `clusterer.subblocking_fallback_mode = "legacy"` to bypass graph fallback and use the old behavior directly.
 
 The default is configured on `Clusterer`:
@@ -65,12 +66,17 @@ Default `GraphSubblockingConfig` behavior:
   off by default.
 
 When Arrow paths are available, the graph fallback is Arrow-backed. Before fallback calls, `prepare(...)` receives the
-actual fallback-signature groups and loads the union of required `signatures`, `paper_authors`, and `specter` rows
-into memory. Each fallback call then slices that in-memory evidence for its group. Without Arrow paths, the graph
-fallback uses the active `ANDData` object.
+actual fallback-signature groups and loads the union of required `signatures`, `paper_authors`, and selected embedding rows
+into memory through the raw-planner batch lookup indexes. Each fallback call then slices that in-memory evidence for
+its group. Arrow graph subblocking refuses filtered full scans: `signatures_batch_index`,
+`paper_authors_batch_index`, and the selected embedding index (`specter_batch_index` or `specter2_batch_index`) must be
+present, and malformed Arrow schemas or declared missing artifacts raise before graph clustering starts. Without Arrow
+paths, the graph fallback uses the active `ANDData` object.
 
-Graph fallback is intentionally wrapped with the old Python SPECTER fallback. Graph failures are not swallowed:
-warnings are logged, telemetry records the failure, and then `cluster_with_specter(...)` runs for the affected group.
+For Python/`ANDData` fallback, graph fallback is intentionally wrapped with the old Python SPECTER fallback. Graph
+failures are not swallowed: warnings are logged, telemetry records the failure, and then
+`cluster_with_specter(...)` runs for the affected group. Arrow-backed Rust production graph fallback does not use this
+legacy recovery path; Arrow graph read/prepare/call failures propagate.
 
 ## Python and Rust routing
 
@@ -81,16 +87,20 @@ Subblocking has two supported routes:
 - **Arrow-native Rust.** `Clusterer.predict(...)` can route oversized blocks to Rust when
   the call's resolved backend is Rust and indexed Arrow signature rows are available.
 
-For `Clusterer.predict(...)` with Arrow paths, Rust Arrow subblocking is used only when all of these are true:
+For `Clusterer.predict(...)` with Arrow paths and a Rust-resolved backend, Rust Arrow subblocking is strict. It is
+used only when all of these are true:
 
 - `Clusterer.predict(..., backend="rust")` is used, or its `runtime_context` resolves to Rust.
 - `arrow_paths["signatures"]` is present.
 - `arrow_paths["signatures_batch_index"]` is present.
 
 That path calls `make_subblocks_arrow_rust(...)`, so Rust loads the name and ORCID rows needed for subblocking from
-Arrow. If those conditions are not met, prediction falls back to Python subblocking orchestration. In both Rust and
-Python orchestration, the oversized fallback groups still call the configured fallback callable, so graph fallback
-remains the default unless `subblocking_fallback_mode="legacy"`.
+Arrow. If an Arrow-backed Rust production prediction is missing either artifact, prediction raises a structured
+missing-artifact error instead of silently using `ANDData` partitioning. Python subblocking orchestration remains
+available through explicit Python/compatibility routes and direct `make_subblocks(...)` calls.
+
+In both Rust and Python orchestration, oversized fallback groups still call the configured fallback callable, so graph
+fallback remains the default unless `subblocking_fallback_mode="legacy"`.
 
 ## Telemetry
 

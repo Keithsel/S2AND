@@ -251,11 +251,10 @@ def _single_arrow_run(
         fail_if_unavailable=False,
     )
 
-    from eval_prod_models import cluster_eval_arrow, resolve_arrow_dataset_paths
-
     from s2and.consts import PROJECT_ROOT_PATH
     from s2and.production_model import load_production_model
     from s2and.text import set_fasttext_loading_enabled
+    from scripts.eval_prod_models import cluster_eval_arrow, resolve_arrow_dataset_paths
 
     set_fasttext_loading_enabled(False)
 

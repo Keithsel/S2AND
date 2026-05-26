@@ -12,6 +12,7 @@ import s2and.subblocking as subblocking_module
 from s2and.data import ANDData
 from s2and.eval import incremental_cluster_eval
 from s2and.featurizer import FeaturizationInfo
+from s2and.incremental_linking.feature_block import write_cluster_seeds_arrow
 from s2and.model import Clusterer
 from s2and.runtime import RuntimeContext
 from s2and.sampling import sampling
@@ -334,6 +335,11 @@ def test_predict_from_arrow_paths_rejects_disallows_with_precomputed_dists_befor
         path = tmp_path / filename
         path.touch()
         arrow_paths[key] = str(path)
+    for key in ("signatures", "papers", "paper_authors"):
+        index_key = f"{key}_batch_index"
+        index_path = tmp_path / f"{key}.{index_key}.bin"
+        index_path.touch()
+        arrow_paths[index_key] = str(index_path)
     with pytest.raises(ValueError, match="cluster_seeds_disallow cannot be used with precomputed dists"):
         clusterer.predict_from_arrow_paths(
             {"block": ["s0", "s1"]},
@@ -1191,6 +1197,12 @@ def test_clusterer_predict_subblocked_arrow_presplits_altered_profile_seeds(
     }
     for path in arrow_paths.values():
         Path(path).touch()
+    write_cluster_seeds_arrow(Path(arrow_paths["cluster_seeds"]), {"seed0": "stale"})
+    for key in ("signatures", "papers", "paper_authors"):
+        index_key = f"{key}_batch_index"
+        index_path = tmp_path / f"{key}.{index_key}.bin"
+        index_path.touch()
+        arrow_paths[index_key] = str(index_path)
 
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
     clusterer = Clusterer(featurizer_info=featurizer_info, classifier=None, n_jobs=1, use_cache=False)

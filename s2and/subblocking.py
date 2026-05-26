@@ -18,7 +18,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import MultiLabelBinarizer
 
+from s2and.arrow_inputs import require_arrow_artifacts
 from s2and.consts import _PACKAGE_DATA_DIR, SPECTER_DIM
+from s2and.incremental_linking.feature_block_arrow import read_arrow_batch_lookup_index_batch_indices
 from s2and.text import (
     AFFILIATIONS_STOP_WORDS,
     compute_block,
@@ -793,6 +795,7 @@ def cluster_with_graph_fallback(
 
 def _read_arrow_rows_by_values(
     path: Any,
+    index_path: Any,
     key_column: str,
     values: Sequence[str],
     *,
@@ -804,6 +807,14 @@ def _read_arrow_rows_by_values(
     keep_values = {str(value) for value in values}
     if not keep_values:
         return []
+    batch_indices = sorted(
+        read_arrow_batch_lookup_index_batch_indices(
+            path,
+            index_path,
+            key_column=key_column,
+            values=keep_values,
+        )
+    )
     rows: list[Mapping[str, Any]] = []
     record_batches_scanned = 0
     rows_scanned = 0
@@ -814,12 +825,13 @@ def _read_arrow_rows_by_values(
         missing = sorted(required_columns.difference(reader.schema.names))
         if missing:
             raise ValueError(f"{table_name} Arrow is missing required columns for graph subblocking: {missing}")
+        _validate_arrow_graph_schema(reader.schema, table_name)
         key_column_index = reader.schema.get_field_index(key_column)
         if key_column_index < 0:
             raise ValueError(f"{table_name} Arrow is missing key column for graph subblocking: {key_column!r}")
         selected_column_names = [name for name in reader.schema.names if name in required_columns]
         selected_column_indices = [reader.schema.get_field_index(name) for name in selected_column_names]
-        for batch_index in range(reader.num_record_batches):
+        for batch_index in batch_indices:
             batch = reader.get_batch(batch_index)
             keys = batch.column(key_column_index).to_pylist()
             record_batches_scanned += 1
@@ -844,6 +856,49 @@ def _read_arrow_rows_by_values(
         _add_load_metric(load_metrics, f"{table_name}_rows_scanned", rows_scanned)
         _add_load_metric(load_metrics, f"{table_name}_rows_loaded", len(rows))
     return rows
+
+
+def _require_arrow_column_type(
+    schema: Any, column_name: str, table_name: str, predicate: Callable[[Any], bool], expected: str
+) -> None:
+    field_index = schema.get_field_index(column_name)
+    if field_index < 0:
+        raise ValueError(f"{table_name} Arrow is missing required column for graph subblocking: {column_name!r}")
+    column_type = schema.field(field_index).type
+    if not predicate(column_type):
+        raise ValueError(
+            f"{table_name} Arrow column {column_name!r} expected {expected} for graph subblocking; "
+            f"got {column_type}"
+        )
+
+
+def _validate_arrow_graph_schema(schema: Any, table_name: str) -> None:
+    pa = __import__("pyarrow")
+    if table_name == "signatures":
+        for column_name in ("signature_id", "paper_id", "author_first", "author_middle", "author_orcid"):
+            _require_arrow_column_type(schema, column_name, table_name, pa.types.is_string, "string")
+        _require_arrow_column_type(schema, "author_position", table_name, pa.types.is_int64, "int64")
+        _require_arrow_column_type(
+            schema,
+            "author_affiliations",
+            table_name,
+            lambda column_type: pa.types.is_list(column_type) and pa.types.is_string(column_type.value_type),
+            "list<string>",
+        )
+    elif table_name == "paper_authors":
+        for column_name in ("paper_id", "author_name"):
+            _require_arrow_column_type(schema, column_name, table_name, pa.types.is_string, "string")
+        _require_arrow_column_type(schema, "position", table_name, pa.types.is_int64, "int64")
+    elif table_name == "specter":
+        _require_arrow_column_type(schema, "paper_id", table_name, pa.types.is_string, "string")
+        field = schema.field(schema.get_field_index("embedding"))
+        if not pa.types.is_fixed_size_list(field.type) or not pa.types.is_float32(field.type.value_type):
+            raise ValueError(
+                "specter Arrow column 'embedding' expected fixed_size_list<float32> for graph subblocking; "
+                f"got {field.type}"
+            )
+        if int(field.type.list_size) <= 0:
+            raise ValueError("specter Arrow embedding column must have positive dimension for graph subblocking")
 
 
 def _add_load_metric(load_metrics: dict[str, int], key: str, value: int) -> None:
@@ -892,7 +947,16 @@ def _coauthor_blocks_by_paper_from_arrow(
     paper_authors_path = paths.get("paper_authors")
     if paper_authors_path is None:
         return {}
+    paper_authors_index_path = paths["paper_authors_batch_index"]
     keep_values = {str(value) for value in paper_ids}
+    batch_indices = sorted(
+        read_arrow_batch_lookup_index_batch_indices(
+            paper_authors_path,
+            paper_authors_index_path,
+            key_column="paper_id",
+            values=keep_values,
+        )
+    )
     out: dict[str, list[tuple[int, str]]] = defaultdict(list)
     record_batches_scanned = 0
     rows_scanned = 0
@@ -903,10 +967,12 @@ def _coauthor_blocks_by_paper_from_arrow(
         missing = sorted(required_columns.difference(reader.schema.names))
         if missing:
             raise ValueError(f"paper_authors Arrow is missing required columns for graph subblocking: {missing}")
+        _validate_arrow_graph_schema(reader.schema, "paper_authors")
         paper_id_index = reader.schema.get_field_index("paper_id")
         position_index = reader.schema.get_field_index("position")
         author_name_index = reader.schema.get_field_index("author_name")
-        for batch_index in range(reader.num_record_batches):
+        seen_positions_by_paper: dict[str, set[int]] = defaultdict(set)
+        for batch_index in batch_indices:
             batch = reader.get_batch(batch_index)
             paper_values = batch.column(paper_id_index).to_pylist()
             record_batches_scanned += 1
@@ -937,12 +1003,20 @@ def _coauthor_blocks_by_paper_from_arrow(
                 if position is None:
                     raise ValueError("paper_authors Arrow cannot contain null position values")
                 paper_id = str(paper_id_value)
-                author_name = str(author_name_value or "").strip()
+                if author_name_value is None:
+                    raise ValueError("paper_authors Arrow cannot contain null author_name values")
+                author_name = str(author_name_value).strip()
                 if not author_name:
-                    continue
+                    raise ValueError("paper_authors Arrow cannot contain empty author_name values")
+                position_key = int(position)
+                if position_key in seen_positions_by_paper[paper_id]:
+                    raise ValueError(
+                        f"paper_authors Arrow contains duplicate (paper_id, position): ({paper_id!r}, {position_key})"
+                    )
+                seen_positions_by_paper[paper_id].add(position_key)
                 block = _coauthor_block_from_arrow_author_name(author_name)
                 if block:
-                    out[paper_id].append((int(position), block))
+                    out[paper_id].append((position_key, block))
     _add_load_metric(load_metrics, "paper_authors_record_batches_scanned", record_batches_scanned)
     _add_load_metric(load_metrics, "paper_authors_rows_scanned", rows_scanned)
     _add_load_metric(load_metrics, "paper_authors_rows_loaded", rows_loaded)
@@ -956,10 +1030,20 @@ def _specter_embeddings_from_arrow(
     load_metrics: dict[str, int],
 ) -> dict[str, np.ndarray]:
     pa = __import__("pyarrow")
-    specter_path = paths.get("specter") or paths.get("specter2")
-    if specter_path is None:
+    specter_path_key, specter_index_key = _arrow_graph_specter_path_keys(paths)
+    if specter_path_key is None:
         raise ValueError("Graph subblocking requires a 'specter' or 'specter2' Arrow path")
+    specter_path = paths[specter_path_key]
+    specter_index_path = paths[specter_index_key]
     keep_values = {str(value) for value in paper_ids}
+    batch_indices = sorted(
+        read_arrow_batch_lookup_index_batch_indices(
+            specter_path,
+            specter_index_path,
+            key_column="paper_id",
+            values=keep_values,
+        )
+    )
     embeddings: dict[str, np.ndarray] = {}
     record_batches_scanned = 0
     rows_scanned = 0
@@ -970,9 +1054,10 @@ def _specter_embeddings_from_arrow(
         missing = sorted(required_columns.difference(reader.schema.names))
         if missing:
             raise ValueError(f"specter Arrow is missing required columns for graph subblocking: {missing}")
+        _validate_arrow_graph_schema(reader.schema, "specter")
         paper_id_index = reader.schema.get_field_index("paper_id")
         embedding_index = reader.schema.get_field_index("embedding")
-        for batch_index in range(reader.num_record_batches):
+        for batch_index in batch_indices:
             batch = reader.get_batch(batch_index)
             paper_values = batch.column(paper_id_index).to_pylist()
             record_batches_scanned += 1
@@ -1007,6 +1092,36 @@ def _specter_embeddings_from_arrow(
     return embeddings
 
 
+def _arrow_graph_specter_path_keys(paths: Mapping[str, Any]) -> tuple[str | None, str]:
+    if "specter" in paths:
+        return "specter", "specter_batch_index"
+    if "specter2" in paths:
+        return "specter2", "specter2_batch_index" if "specter2_batch_index" in paths else "specter_batch_index"
+    return None, "specter_batch_index"
+
+
+def _require_arrow_graph_subblocking_artifacts(paths: Mapping[str, Any]) -> dict[str, str]:
+    specter_key, specter_index_key = _arrow_graph_specter_path_keys(paths)
+    if specter_key is None:
+        specter_key = "specter"
+    return require_arrow_artifacts(
+        paths,
+        required_keys=(
+            "signatures",
+            "signatures_batch_index",
+            "paper_authors",
+            "paper_authors_batch_index",
+            specter_key,
+            specter_index_key,
+        ),
+        context="Arrow graph subblocking",
+        producer_hint=(
+            "include signatures, paper_authors, specter, and matching raw-planner batch indexes; "
+            "Arrow graph subblocking refuses filtered full scans"
+        ),
+    )
+
+
 def _load_arrow_graph_subblocking_dataset(
     paths: Mapping[str, Any],
     signature_ids: Sequence[str],
@@ -1015,9 +1130,11 @@ def _load_arrow_graph_subblocking_dataset(
     stats: list[dict[str, Any]],
     load_metrics: dict[str, int],
 ) -> SimpleNamespace:
+    paths = _require_arrow_graph_subblocking_artifacts(paths)
     signature_ids = tuple(dict.fromkeys(str(signature_id) for signature_id in signature_ids))
     signature_rows = _read_arrow_rows_by_values(
         paths["signatures"],
+        paths["signatures_batch_index"],
         "signature_id",
         signature_ids,
         required_columns={
@@ -1080,220 +1197,11 @@ def _load_arrow_graph_subblocking_dataset(
     )
 
 
-def _read_full_arrow_table(path: Any, *, required_columns: set[str], table_name: str, load_metrics: dict[str, int]):
-    pa = __import__("pyarrow")
-    with pa.memory_map(str(path), "r") as source:
-        reader = pa.ipc.open_file(source)
-        missing = sorted(required_columns.difference(reader.schema.names))
-        if missing:
-            raise ValueError(f"{table_name} Arrow is missing required columns for graph subblocking: {missing}")
-        record_batch_count = int(reader.num_record_batches)
-        table = reader.read_all()
-    load_metrics[f"{table_name}_record_batches_scanned"] = record_batch_count
-    load_metrics[f"{table_name}_rows_scanned"] = int(table.num_rows)
-    load_metrics[f"{table_name}_rows_loaded"] = int(table.num_rows)
-    return table.select([name for name in table.column_names if name in required_columns])
-
-
 def _coauthor_block_from_arrow_author_name(author_name_value: Any) -> str:
     normalized_name = normalize_text(str(author_name_value or "").strip())
     if not normalized_name:
         return ""
     return compute_block(normalized_name)
-
-
-def _filter_arrow_table_by_values(table, key_column: str, values: Sequence[str]):
-    pa = __import__("pyarrow")
-    pc = __import__("pyarrow.compute").compute
-    keep_values = list(dict.fromkeys(str(value) for value in values))
-    if not keep_values:
-        return table.slice(0, 0)
-    key_type = table.schema.field(key_column).type
-    return table.filter(pc.is_in(table[key_column], value_set=pa.array(keep_values, type=key_type)))
-
-
-def _coauthor_blocks_by_paper_from_full_arrow(
-    paths: Mapping[str, Any],
-    paper_ids: Sequence[str],
-    load_metrics: dict[str, int],
-):
-    paper_authors_path = paths.get("paper_authors")
-    if paper_authors_path is None:
-        return {}
-    table = _read_full_arrow_table(
-        paper_authors_path,
-        required_columns={"paper_id", "position", "author_name"},
-        table_name="paper_authors",
-        load_metrics=load_metrics,
-    )
-    table = _filter_arrow_table_by_values(table, "paper_id", paper_ids)
-    load_metrics["paper_authors_rows_loaded"] = int(table.num_rows)
-    paper_values = table["paper_id"].to_pylist()
-    positions = table["position"].to_pylist()
-    author_names = table["author_name"].to_pylist()
-    out: dict[str, list[tuple[int, str]]] = defaultdict(list)
-    for paper_id_value, position, author_name_value in zip(paper_values, positions, author_names, strict=True):
-        if paper_id_value is None:
-            raise ValueError("paper_authors Arrow cannot contain null paper_id values")
-        paper_id = str(paper_id_value)
-        if position is None:
-            raise ValueError("paper_authors Arrow cannot contain null position values")
-        block = _coauthor_block_from_arrow_author_name(author_name_value)
-        if not block:
-            continue
-        out[paper_id].append((int(position), block))
-    return out
-
-
-def _specter_embeddings_from_full_arrow(
-    paths: Mapping[str, Any],
-    paper_ids: Sequence[str],
-    load_metrics: dict[str, int],
-):
-    specter_path = paths.get("specter") or paths.get("specter2")
-    if specter_path is None:
-        raise ValueError("Graph subblocking requires a 'specter' or 'specter2' Arrow path")
-    table = _read_full_arrow_table(
-        specter_path,
-        required_columns={"paper_id", "embedding"},
-        table_name="specter",
-        load_metrics=load_metrics,
-    )
-    table = _filter_arrow_table_by_values(table, "paper_id", paper_ids)
-    load_metrics["specter_rows_loaded"] = int(table.num_rows)
-    embeddings: dict[str, np.ndarray] = {}
-    backing_matrices: list[np.ndarray] = []
-    paper_values = table["paper_id"].to_pylist()
-    embedding_values = table["embedding"].combine_chunks()
-    if embedding_values.null_count:
-        raise ValueError("specter Arrow cannot contain null embedding values")
-    if not hasattr(embedding_values.type, "list_size"):
-        raise ValueError("specter Arrow embedding column must be a fixed-size list")
-    dimension = int(embedding_values.type.list_size)
-    matrix = np.asarray(embedding_values.values.to_numpy(zero_copy_only=False), dtype=np.float32).reshape(
-        int(table.num_rows),
-        dimension,
-    )
-    backing_matrices.append(matrix)
-    for row_index, paper_id_value in enumerate(paper_values):
-        if paper_id_value is None:
-            raise ValueError("specter Arrow cannot contain null paper_id values")
-        paper_id = str(paper_id_value)
-        if not paper_id:
-            raise ValueError("specter Arrow cannot contain empty paper_id values")
-        if paper_id in embeddings:
-            raise ValueError(f"specter Arrow contains duplicate paper_id: {paper_id!r}")
-        embeddings[paper_id] = matrix[row_index]
-    return embeddings, backing_matrices
-
-
-def _load_columnar_arrow_graph_subblocking_dataset(
-    paths: Mapping[str, Any],
-    signature_ids: Sequence[str],
-    *,
-    random_seed: int,
-    stats: list[dict[str, Any]],
-    load_metrics: dict[str, int],
-) -> SimpleNamespace:
-    target_signature_ids = tuple(dict.fromkeys(str(signature_id) for signature_id in signature_ids))
-    keep_signature_ids = set(target_signature_ids)
-    signatures_table = _read_full_arrow_table(
-        paths["signatures"],
-        required_columns={
-            "signature_id",
-            "paper_id",
-            "author_first",
-            "author_middle",
-            "author_affiliations",
-            "author_orcid",
-            "author_position",
-        },
-        table_name="signatures",
-        load_metrics=load_metrics,
-    )
-    signatures_table = _filter_arrow_table_by_values(signatures_table, "signature_id", target_signature_ids)
-    load_metrics["signatures_rows_loaded"] = int(signatures_table.num_rows)
-    table_signature_ids = signatures_table["signature_id"].to_pylist()
-    paper_ids = signatures_table["paper_id"].to_pylist()
-    first_names = signatures_table["author_first"].to_pylist()
-    middle_names = signatures_table["author_middle"].to_pylist()
-    affiliations = signatures_table["author_affiliations"].to_pylist()
-    orcids = signatures_table["author_orcid"].to_pylist()
-    positions = signatures_table["author_position"].to_pylist()
-    signature_rows: dict[str, tuple[str, Any, Any, Any, Any, Any]] = {}
-    for row in zip(
-        table_signature_ids,
-        paper_ids,
-        first_names,
-        middle_names,
-        affiliations,
-        orcids,
-        positions,
-        strict=True,
-    ):
-        signature_id_value, paper_id_value, first_name, middle_name, affiliation_values, orcid, position_value = row
-        if signature_id_value is None:
-            raise ValueError("signatures Arrow cannot contain null signature_id values")
-        if paper_id_value is None:
-            raise ValueError("signatures Arrow cannot contain null paper_id values")
-        signature_id = str(signature_id_value)
-        if signature_id not in keep_signature_ids:
-            continue
-        if not signature_id:
-            raise ValueError("signatures Arrow cannot contain empty signature_id values")
-        if signature_id in signature_rows:
-            raise ValueError(f"signatures Arrow contains duplicate signature_id: {signature_id!r}")
-        paper_id = str(paper_id_value)
-        signature_rows[signature_id] = (paper_id, first_name, middle_name, affiliation_values, orcid, position_value)
-    missing_signature_ids = [
-        signature_id for signature_id in target_signature_ids if signature_id not in signature_rows
-    ]
-    if missing_signature_ids:
-        raise ValueError(f"signatures Arrow is missing graph-subblocking signature ids: {missing_signature_ids[:10]}")
-    selected_paper_ids = tuple(dict.fromkeys(row[0] for row in signature_rows.values()))
-    coauthors_by_paper = _coauthor_blocks_by_paper_from_full_arrow(paths, selected_paper_ids, load_metrics)
-    specter_embeddings, specter_backing_matrices = _specter_embeddings_from_full_arrow(
-        paths,
-        selected_paper_ids,
-        load_metrics,
-    )
-
-    signature_objects: dict[str, SimpleNamespace] = {}
-    for signature_id in target_signature_ids:
-        paper_id, first_name, middle_name, affiliation_values, orcid, position_value = signature_rows[signature_id]
-        position = None if position_value is None else int(position_value)
-        affiliations = _string_tuple(affiliation_values)
-        coauthor_blocks = (
-            ()
-            if position is None
-            else tuple(
-                block
-                for author_position, block in coauthors_by_paper.get(paper_id, ())
-                if int(author_position) != position
-            )
-        )
-        signature_objects[signature_id] = SimpleNamespace(
-            signature_id=signature_id,
-            paper_id=paper_id,
-            author_info_first=_optional_str(first_name),
-            author_info_middle=_optional_str(middle_name),
-            author_info_first_normalized_without_apostrophe=None,
-            author_info_middle_normalized_without_apostrophe=None,
-            author_info_affiliations=affiliations,
-            author_info_affiliations_n_grams=_affiliation_ngrams_from_raw_affiliations(affiliations),
-            author_info_coauthor_blocks=coauthor_blocks,
-            author_info_coauthors=None,
-            author_info_orcid=_optional_str(orcid),
-            author_info_position=position,
-        )
-    return SimpleNamespace(
-        signatures=signature_objects,
-        papers={},
-        specter_embeddings=specter_embeddings,
-        _specter_backing_matrices=specter_backing_matrices,
-        random_seed=int(random_seed),
-        _graph_subblocking_stats=stats,
-    )
 
 
 class ArrowGraphSubblockingFallback:

@@ -7,7 +7,8 @@ from typing import Any, cast
 import numpy as np
 import pytest
 
-from s2and.incremental_linking.feature_block import write_arrow_ipc_table
+from s2and.arrow_inputs import MissingArrowArtifactError
+from s2and.incremental_linking.feature_block import write_arrow_batch_lookup_index, write_arrow_ipc_table
 from s2and.subblocking import (
     GraphSubblockingConfig,
     _projection_neighbor_edge_scores,
@@ -76,6 +77,29 @@ def _legacy_sorted_subblock_merge_candidates(output, maximum_size, first_k_lette
                     small_enough_pairs_counts.append((pair, first_k_letter_counts_sorted[lookup_1][lookup_2]))
 
     return sorted(small_enough_pairs_counts, key=lambda x: (x[1], x[0][0], x[0][1]), reverse=True)
+
+
+def _write_arrow_ipc_batches(path, batches) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, batches[0].schema) as writer:
+            for batch in batches:
+                writer.write_batch(batch)
+
+
+def _add_graph_batch_indexes(paths: dict[str, Any], tmp_path) -> dict[str, Any]:
+    specter_key = "specter2" if "specter2" in paths and "specter" not in paths else "specter"
+    index_specs = (
+        ("signatures", "signatures_batch_index", "signature_id"),
+        ("paper_authors", "paper_authors_batch_index", "paper_id"),
+        (specter_key, f"{specter_key}_batch_index", "paper_id"),
+    )
+    for table_key, index_key, key_column in index_specs:
+        index_path = tmp_path / f"{table_key}.{index_key}.bin"
+        write_arrow_batch_lookup_index(paths[table_key], index_path, key_column=key_column, table_name=table_key)
+        paths[index_key] = index_path
+    return paths
 
 
 def test_sorted_subblock_merge_candidates_matches_legacy_edge_cases() -> None:
@@ -282,8 +306,13 @@ def test_arrow_graph_subblocking_fallback_loads_arrow_evidence_and_packs_compone
         specter_path,
     )
 
-    fallback = make_arrow_graph_subblocking_cluster_fn(
+    paths = _add_graph_batch_indexes(
         {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter": specter_path},
+        tmp_path,
+    )
+
+    fallback = make_arrow_graph_subblocking_cluster_fn(
+        paths,
         ["s1", "s2", "s3", "s4"],
         config=GraphSubblockingConfig(
             neighbor_mode="exact",
@@ -319,41 +348,57 @@ def test_arrow_graph_subblocking_prepare_limits_loaded_evidence_to_fallback_unio
     paper_authors_path = tmp_path / "paper_authors.arrow"
     specter_path = tmp_path / "specter.arrow"
 
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "signature_id": pa.array(["s1", "s2", "s3", "s4"], type=pa.string()),
-                "paper_id": pa.array(["p1", "p2", "p3", "p4"], type=pa.string()),
-                "author_first": pa.array(["hui", "hui", "hui", "hui"], type=pa.string()),
-                "author_middle": pa.array(["", "", "", ""], type=pa.string()),
-                "author_affiliations": pa.array([["lab a"], ["lab a"], ["lab b"], ["lab b"]]),
-                "author_orcid": pa.array([None, None, None, None], type=pa.string()),
-                "author_position": pa.array([0, 0, 0, 0], type=pa.int64()),
-            }
-        ),
+    _write_arrow_ipc_batches(
         signatures_path,
+        [
+            pa.record_batch(
+                {
+                    "signature_id": pa.array(["s1", "s2"], type=pa.string()),
+                    "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+                    "author_first": pa.array(["hui", "hui"], type=pa.string()),
+                    "author_middle": pa.array(["", ""], type=pa.string()),
+                    "author_affiliations": pa.array([["lab a"], ["lab a"]]),
+                    "author_orcid": pa.array([None, None], type=pa.string()),
+                    "author_position": pa.array([0, 0], type=pa.int64()),
+                }
+            ),
+            pa.record_batch(
+                {
+                    "signature_id": pa.array(["s3", "s4"], type=pa.string()),
+                    "paper_id": pa.array(["p3", "p4"], type=pa.string()),
+                    "author_first": pa.array(["hui", "hui"], type=pa.string()),
+                    "author_middle": pa.array(["", ""], type=pa.string()),
+                    "author_affiliations": pa.array([["lab b"], ["lab b"]]),
+                    "author_orcid": pa.array([None, None], type=pa.string()),
+                    "author_position": pa.array([0, 0], type=pa.int64()),
+                }
+            ),
+        ],
     )
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "paper_id": pa.array(["p1", "p1", "p2", "p2", "p3", "p3", "p4", "p4"], type=pa.string()),
-                "position": pa.array([0, 1, 0, 1, 0, 1, 0, 1], type=pa.int64()),
-                "author_name": pa.array(
-                    [
-                        "Hui Wang",
-                        "Ada Lovelace",
-                        "Hui Wang",
-                        "Ada Lovelace",
-                        "Hui Wang",
-                        "Grace Hopper",
-                        "Hui Wang",
-                        "Grace Hopper",
-                    ],
-                    type=pa.string(),
-                ),
-            }
-        ),
+    _write_arrow_ipc_batches(
         paper_authors_path,
+        [
+            pa.record_batch(
+                {
+                    "paper_id": pa.array(["p1", "p1", "p2", "p2"], type=pa.string()),
+                    "position": pa.array([0, 1, 0, 1], type=pa.int64()),
+                    "author_name": pa.array(
+                        ["Hui Wang", "Ada Lovelace", "Hui Wang", "Ada Lovelace"],
+                        type=pa.string(),
+                    ),
+                }
+            ),
+            pa.record_batch(
+                {
+                    "paper_id": pa.array(["p3", "p3", "p4", "p4"], type=pa.string()),
+                    "position": pa.array([0, 1, 0, 1], type=pa.int64()),
+                    "author_name": pa.array(
+                        ["Hui Wang", "Grace Hopper", "Hui Wang", "Grace Hopper"],
+                        type=pa.string(),
+                    ),
+                }
+            ),
+        ],
     )
     embeddings = np.asarray(
         [
@@ -364,21 +409,36 @@ def test_arrow_graph_subblocking_prepare_limits_loaded_evidence_to_fallback_unio
         ],
         dtype=np.float32,
     )
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "paper_id": pa.array(["p1", "p2", "p3", "p4"], type=pa.string()),
-                "embedding": pa.FixedSizeListArray.from_arrays(
-                    pa.array(np.ravel(embeddings), type=pa.float32()),
-                    2,
-                ),
-            }
-        ),
+    _write_arrow_ipc_batches(
         specter_path,
+        [
+            pa.record_batch(
+                {
+                    "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+                    "embedding": pa.FixedSizeListArray.from_arrays(
+                        pa.array(np.ravel(embeddings[:2]), type=pa.float32()),
+                        2,
+                    ),
+                }
+            ),
+            pa.record_batch(
+                {
+                    "paper_id": pa.array(["p3", "p4"], type=pa.string()),
+                    "embedding": pa.FixedSizeListArray.from_arrays(
+                        pa.array(np.ravel(embeddings[2:]), type=pa.float32()),
+                        2,
+                    ),
+                }
+            ),
+        ],
     )
 
-    fallback = make_arrow_graph_subblocking_cluster_fn(
+    paths = _add_graph_batch_indexes(
         {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter": specter_path},
+        tmp_path,
+    )
+    fallback = make_arrow_graph_subblocking_cluster_fn(
+        paths,
         ["s1", "s2", "s3", "s4"],
         config=GraphSubblockingConfig(neighbor_mode="exact", neighbors=1, min_edge_score=0.8),
         random_seed=7,
@@ -389,8 +449,121 @@ def test_arrow_graph_subblocking_prepare_limits_loaded_evidence_to_fallback_unio
 
     assert {frozenset(values) for values in subblocks.values()} == {frozenset({"s1", "s2"})}
     assert fallback.load_metrics["prepared_signature_count"] == 2
+    assert fallback.load_metrics["signatures_record_batches_scanned"] == 1
+    assert fallback.load_metrics["signatures_rows_scanned"] == 2
     assert fallback.load_metrics["signatures_rows_loaded"] == 2
+    assert fallback.load_metrics["paper_authors_record_batches_scanned"] == 1
+    assert fallback.load_metrics["paper_authors_rows_scanned"] == 4
     assert fallback.load_metrics["paper_authors_rows_loaded"] == 4
+    assert fallback.load_metrics["specter_record_batches_scanned"] == 1
+    assert fallback.load_metrics["specter_rows_scanned"] == 2
+    assert fallback.load_metrics["specter_rows_loaded"] == 2
+
+
+def test_arrow_graph_subblocking_requires_batch_indexes(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signatures_path = tmp_path / "signatures.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter_path = tmp_path / "specter.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1"], type=pa.string()),
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "author_first": pa.array(["hui"], type=pa.string()),
+                "author_middle": pa.array([""], type=pa.string()),
+                "author_affiliations": pa.array([["lab"]]),
+                "author_orcid": pa.array([None], type=pa.string()),
+                "author_position": pa.array([0], type=pa.int64()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "position": pa.array([0], type=pa.int64()),
+                "author_name": pa.array(["Hui Wang"], type=pa.string()),
+            }
+        ),
+        paper_authors_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([1.0, 0.0], type=pa.float32()), 2),
+            }
+        ),
+        specter_path,
+    )
+    fallback = make_arrow_graph_subblocking_cluster_fn(
+        {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter": specter_path},
+        ["s1"],
+    )
+
+    with pytest.raises(MissingArrowArtifactError, match="signatures_batch_index"):
+        fallback.prepare([["s1"]])
+
+
+def test_arrow_graph_subblocking_accepts_specter2_with_matching_batch_index(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signatures_path = tmp_path / "signatures.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter2_path = tmp_path / "specter2.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1", "s2"], type=pa.string()),
+                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+                "author_first": pa.array(["hui", "hui"], type=pa.string()),
+                "author_middle": pa.array(["", ""], type=pa.string()),
+                "author_affiliations": pa.array([["lab"], ["lab"]], type=pa.list_(pa.string())),
+                "author_orcid": pa.array([None, None], type=pa.string()),
+                "author_position": pa.array([0, 0], type=pa.int64()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+                "position": pa.array([0, 0], type=pa.int64()),
+                "author_name": pa.array(["Hui Wang", "Hui Wang"], type=pa.string()),
+            }
+        ),
+        paper_authors_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([1.0, 0.0, 0.99, 0.01], type=pa.float32()), 2),
+            }
+        ),
+        specter2_path,
+    )
+    paths = _add_graph_batch_indexes(
+        {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter2": specter2_path},
+        tmp_path,
+    )
+    assert "specter2_batch_index" in paths
+    assert "specter_batch_index" not in paths
+
+    fallback = make_arrow_graph_subblocking_cluster_fn(
+        paths,
+        ["s1", "s2"],
+        config=GraphSubblockingConfig(neighbor_mode="exact", neighbors=1, min_edge_score=0.8),
+        random_seed=7,
+    )
+
+    subblocks = fallback(["s1", "s2"], object(), target_subblock_size=2)
+
+    assert {frozenset(values) for values in subblocks.values()} == {frozenset({"s1", "s2"})}
     assert fallback.load_metrics["specter_rows_loaded"] == 2
 
 
@@ -424,7 +597,7 @@ def test_arrow_graph_subblocking_tolerates_sparse_evidence_and_reports_load_metr
                 "paper_id": pa.array(["p1", "p1", "p2", "p2", "p3", "p4"], type=pa.string()),
                 "position": pa.array([0, 1, 0, 1, 0, 0], type=pa.int64()),
                 "author_name": pa.array(
-                    ["Hui Wang", "Ada Lovelace", "Hui Wang", "Grace Hopper", "", "   "],
+                    ["Hui Wang", "Ada Lovelace", "Hui Wang", "Grace Hopper", "Hui Wang", "Grace Hopper"],
                     type=pa.string(),
                 ),
             }
@@ -444,8 +617,13 @@ def test_arrow_graph_subblocking_tolerates_sparse_evidence_and_reports_load_metr
         specter_path,
     )
 
-    fallback = make_arrow_graph_subblocking_cluster_fn(
+    paths = _add_graph_batch_indexes(
         {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter": specter_path},
+        tmp_path,
+    )
+
+    fallback = make_arrow_graph_subblocking_cluster_fn(
+        paths,
         ["s1", "s2", "s3", "s4"],
         config=GraphSubblockingConfig(
             neighbor_mode="projection",

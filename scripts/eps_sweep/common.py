@@ -8,6 +8,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from s2and.arrow_inputs import MissingArrowArtifactError, validate_arrow_prediction_artifacts
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LINKER_BUNDLE_ROOT = PROJECT_ROOT / "s2and" / "data" / "s2and_and_big_blocks_linker_dataset_20260513"
 DEFAULT_ARROW_ROOT = PROJECT_ROOT / "s2and" / "data" / "s2and_and_big_blocks_linker_dataset_20260513_arrow"
@@ -84,9 +86,20 @@ def load_arrow_paths(arrow_root: Path, dataset: str) -> dict[str, str]:
     }
     if "specter" not in paths and "specter2" in paths:
         paths["specter"] = paths["specter2"]
+    if "specter_batch_index" not in paths and "specter2_batch_index" in paths:
+        paths["specter_batch_index"] = paths["specter2_batch_index"]
     paths["manifest"] = str(manifest_path.resolve())
-    required = ["signatures", "papers", "paper_authors", "specter"]
-    missing = [key for key in required if key not in paths or not Path(paths[key]).exists()]
-    if missing:
-        raise FileNotFoundError(f"Arrow dataset {dataset!r} is missing required paths: {missing}")
-    return paths
+    try:
+        return validate_arrow_prediction_artifacts(
+            paths,
+            require_specter=True,
+            require_name_counts_index=True,
+            require_batch_indexes=True,
+            context=f"EPS sweep Arrow dataset {dataset}",
+            producer_hint=(
+                "convert the linker replay dataset with scripts/convert_to_arrow.py so the manifest "
+                "declares name_counts_index and raw-planner batch indexes"
+            ),
+        )
+    except MissingArrowArtifactError as exc:
+        raise FileNotFoundError(str(exc)) from exc

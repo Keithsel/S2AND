@@ -1,3 +1,5 @@
+"""Compatibility contract tests for the legacy Rust JSON ingest helper."""
+
 from s2and.feature_port import _from_json_paths_with_contract
 from s2and.rust_lifecycle import build_rust_json_ingest_contract
 

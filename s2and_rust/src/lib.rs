@@ -1,6 +1,6 @@
 use arrow::array::{
-    Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeListArray,
-    LargeStringArray, ListArray, StringArray, UInt32Array, UInt64Array,
+    Array, BooleanArray, FixedSizeListArray, Float32Array, Int64Array, LargeListArray,
+    LargeStringArray, ListArray, StringArray,
 };
 use arrow::datatypes::DataType;
 use arrow::ipc::reader::FileReader as ArrowFileReader;
@@ -2642,31 +2642,13 @@ fn arrow_first_existing_column_index(
     )))
 }
 
-fn arrow_required_string(array: &dyn Array, row: usize, context: &str) -> PyResult<String> {
-    if array.is_null(row) {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "{context} is null at row {row}"
-        )));
-    }
-    arrow_optional_string(array, row, context).and_then(|value| {
-        value.ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!("{context} is null at row {row}"))
-        })
-    })
-}
-
 enum ArrowStringColumn<'a> {
     Utf8(&'a StringArray),
     LargeUtf8(&'a LargeStringArray),
-    Int64(&'a Int64Array),
-    Int32(&'a Int32Array),
-    UInt64(&'a UInt64Array),
-    UInt32(&'a UInt32Array),
-    Null,
 }
 
 impl<'a> ArrowStringColumn<'a> {
-    fn from_array(array: &'a dyn Array, context: &str) -> PyResult<Self> {
+    fn from_string_array(array: &'a dyn Array, context: &str) -> PyResult<Self> {
         match array.data_type() {
             DataType::Utf8 => Ok(Self::Utf8(
                 array
@@ -2688,43 +2670,8 @@ impl<'a> ArrowStringColumn<'a> {
                         ))
                     })?,
             )),
-            DataType::Int64 => Ok(Self::Int64(
-                array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{context} is not an Int64 array"
-                    ))
-                })?,
-            )),
-            DataType::Int32 => Ok(Self::Int32(
-                array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{context} is not an Int32 array"
-                    ))
-                })?,
-            )),
-            DataType::UInt64 => Ok(Self::UInt64(
-                array
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyTypeError::new_err(format!(
-                            "{context} is not a UInt64 array"
-                        ))
-                    })?,
-            )),
-            DataType::UInt32 => Ok(Self::UInt32(
-                array
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyTypeError::new_err(format!(
-                            "{context} is not a UInt32 array"
-                        ))
-                    })?,
-            )),
-            DataType::Null => Ok(Self::Null),
             other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                "{context} must be a string or integer column, got {other:?}"
+                "{context} must be a string column, got {other:?}"
             ))),
         }
     }
@@ -2735,19 +2682,6 @@ impl<'a> ArrowStringColumn<'a> {
             Self::LargeUtf8(values) => {
                 (!values.is_null(row)).then(|| Cow::Borrowed(values.value(row)))
             }
-            Self::Int64(values) => {
-                (!values.is_null(row)).then(|| Cow::Owned(values.value(row).to_string()))
-            }
-            Self::Int32(values) => {
-                (!values.is_null(row)).then(|| Cow::Owned(values.value(row).to_string()))
-            }
-            Self::UInt64(values) => {
-                (!values.is_null(row)).then(|| Cow::Owned(values.value(row).to_string()))
-            }
-            Self::UInt32(values) => {
-                (!values.is_null(row)).then(|| Cow::Owned(values.value(row).to_string()))
-            }
-            Self::Null => None,
         }
     }
 
@@ -2764,16 +2698,10 @@ impl<'a> ArrowStringColumn<'a> {
 
 enum ArrowI64Column<'a> {
     Int64(&'a Int64Array),
-    Int32(&'a Int32Array),
-    UInt64(&'a UInt64Array),
-    UInt32(&'a UInt32Array),
-    Utf8(&'a StringArray),
-    LargeUtf8(&'a LargeStringArray),
-    Null,
 }
 
 impl<'a> ArrowI64Column<'a> {
-    fn from_array(array: &'a dyn Array, context: &str) -> PyResult<Self> {
+    fn from_i64_array(array: &'a dyn Array, context: &str) -> PyResult<Self> {
         match array.data_type() {
             DataType::Int64 => Ok(Self::Int64(
                 array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
@@ -2782,96 +2710,15 @@ impl<'a> ArrowI64Column<'a> {
                     ))
                 })?,
             )),
-            DataType::Int32 => Ok(Self::Int32(
-                array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{context} is not an Int32 array"
-                    ))
-                })?,
-            )),
-            DataType::UInt64 => Ok(Self::UInt64(
-                array
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyTypeError::new_err(format!(
-                            "{context} is not a UInt64 array"
-                        ))
-                    })?,
-            )),
-            DataType::UInt32 => Ok(Self::UInt32(
-                array
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyTypeError::new_err(format!(
-                            "{context} is not a UInt32 array"
-                        ))
-                    })?,
-            )),
-            DataType::Utf8 => Ok(Self::Utf8(
-                array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyTypeError::new_err(format!(
-                            "{context} is not a Utf8 array"
-                        ))
-                    })?,
-            )),
-            DataType::LargeUtf8 => Ok(Self::LargeUtf8(
-                array
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyTypeError::new_err(format!(
-                            "{context} is not a LargeUtf8 array"
-                        ))
-                    })?,
-            )),
-            DataType::Null => Ok(Self::Null),
             other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                "{context} must be an integer column, got {other:?}"
+                "{context} must be an int64 column, got {other:?}"
             ))),
         }
     }
 
-    fn optional_value(&self, row: usize, context: &str) -> PyResult<Option<i64>> {
+    fn optional_value(&self, row: usize, _context: &str) -> PyResult<Option<i64>> {
         match self {
             Self::Int64(values) => Ok((!values.is_null(row)).then(|| values.value(row))),
-            Self::Int32(values) => Ok((!values.is_null(row)).then(|| values.value(row) as i64)),
-            Self::UInt64(values) => {
-                if values.is_null(row) {
-                    return Ok(None);
-                }
-                i64::try_from(values.value(row)).map(Some).map_err(|_| {
-                    pyo3::exceptions::PyOverflowError::new_err(format!(
-                        "{context} value at row {row} exceeds i64"
-                    ))
-                })
-            }
-            Self::UInt32(values) => Ok((!values.is_null(row)).then(|| values.value(row) as i64)),
-            Self::Utf8(values) => {
-                if values.is_null(row) {
-                    return Ok(None);
-                }
-                values.value(row).parse::<i64>().map(Some).map_err(|err| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "{context} string value at row {row} is not an integer: {err}"
-                    ))
-                })
-            }
-            Self::LargeUtf8(values) => {
-                if values.is_null(row) {
-                    return Ok(None);
-                }
-                values.value(row).parse::<i64>().map(Some).map_err(|err| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "{context} string value at row {row} is not an integer: {err}"
-                    ))
-                })
-            }
-            Self::Null => Ok(None),
         }
     }
 
@@ -2880,76 +2727,6 @@ impl<'a> ArrowI64Column<'a> {
             pyo3::exceptions::PyValueError::new_err(format!("{context} is null at row {row}"))
         })
     }
-}
-
-fn arrow_optional_string(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<String>> {
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    match array.data_type() {
-        DataType::Utf8 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyTypeError::new_err(format!("{context} is not a Utf8 array"))
-                })?;
-            Ok(Some(values.value(row).to_string()))
-        }
-        DataType::LargeUtf8 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{context} is not a LargeUtf8 array"
-                    ))
-                })?;
-            Ok(Some(values.value(row).to_string()))
-        }
-        DataType::Int64 => {
-            let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                pyo3::exceptions::PyTypeError::new_err(format!("{context} is not an Int64 array"))
-            })?;
-            Ok(Some(values.value(row).to_string()))
-        }
-        DataType::Int32 => {
-            let values = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                pyo3::exceptions::PyTypeError::new_err(format!("{context} is not an Int32 array"))
-            })?;
-            Ok(Some(values.value(row).to_string()))
-        }
-        DataType::UInt64 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{context} is not a UInt64 array"
-                    ))
-                })?;
-            Ok(Some(values.value(row).to_string()))
-        }
-        DataType::UInt32 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{context} is not a UInt32 array"
-                    ))
-                })?;
-            Ok(Some(values.value(row).to_string()))
-        }
-        DataType::Null => Ok(None),
-        other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "{context} must be a string or integer column, got {other:?}"
-        ))),
-    }
-}
-
-fn arrow_optional_i64(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<i64>> {
-    ArrowI64Column::from_array(array, context)?.optional_value(row, context)
 }
 
 fn arrow_optional_bool(array: &dyn Array, row: usize, context: &str) -> PyResult<Option<bool>> {
@@ -2967,9 +2744,6 @@ fn arrow_optional_bool(array: &dyn Array, row: usize, context: &str) -> PyResult
                     ))
                 })?;
             Ok(Some(values.value(row)))
-        }
-        DataType::Int64 | DataType::Int32 | DataType::UInt64 | DataType::UInt32 => {
-            arrow_optional_i64(array, row, context).map(|value| value.map(|integer| integer != 0))
         }
         DataType::Null => Ok(None),
         other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -3120,33 +2894,45 @@ fn read_raw_arrow_signatures_from_batches(
     for batch in batches {
         let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
         let signature_id_values =
-            ArrowStringColumn::from_array(signature_id_col.as_ref(), "signature_id")?;
+            ArrowStringColumn::from_string_array(signature_id_col.as_ref(), "signature_id")?;
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
-        let paper_id_values = ArrowStringColumn::from_array(paper_id_col.as_ref(), "paper_id")?;
+        let paper_id_values =
+            ArrowStringColumn::from_string_array(paper_id_col.as_ref(), "paper_id")?;
         let first_col = batch.column(arrow_column_index(&batch, "author_first", path)?);
-        let first_values = ArrowStringColumn::from_array(first_col.as_ref(), "author_first")?;
+        let first_values =
+            ArrowStringColumn::from_string_array(first_col.as_ref(), "author_first")?;
         let middle_col = batch.column(arrow_column_index(&batch, "author_middle", path)?);
-        let middle_values = ArrowStringColumn::from_array(middle_col.as_ref(), "author_middle")?;
+        let middle_values =
+            ArrowStringColumn::from_string_array(middle_col.as_ref(), "author_middle")?;
         let last_col = batch.column(arrow_column_index(&batch, "author_last", path)?);
-        let last_values = ArrowStringColumn::from_array(last_col.as_ref(), "author_last")?;
+        let last_values = ArrowStringColumn::from_string_array(last_col.as_ref(), "author_last")?;
         let suffix_col = batch.column(arrow_column_index(&batch, "author_suffix", path)?);
-        let suffix_values = ArrowStringColumn::from_array(suffix_col.as_ref(), "author_suffix")?;
+        let suffix_values =
+            ArrowStringColumn::from_string_array(suffix_col.as_ref(), "author_suffix")?;
         let affiliations_col =
             batch.column(arrow_column_index(&batch, "author_affiliations", path)?);
         let orcid_col = batch.column(arrow_column_index(&batch, "author_orcid", path)?);
-        let orcid_values = ArrowStringColumn::from_array(orcid_col.as_ref(), "author_orcid")?;
+        let orcid_values =
+            ArrowStringColumn::from_string_array(orcid_col.as_ref(), "author_orcid")?;
         let position_col = batch.column(arrow_column_index(&batch, "author_position", path)?);
-        let position_values = ArrowI64Column::from_array(position_col.as_ref(), "author_position")?;
+        let position_values =
+            ArrowI64Column::from_i64_array(position_col.as_ref(), "author_position")?;
         let author_block_col =
             arrow_optional_column_index(&batch, "author_block").map(|index| batch.column(index));
         let author_block_values = match author_block_col.as_ref() {
-            Some(col) => Some(ArrowStringColumn::from_array(col.as_ref(), "author_block")?),
+            Some(col) => Some(ArrowStringColumn::from_string_array(
+                col.as_ref(),
+                "author_block",
+            )?),
             None => None,
         };
         let email_col =
             arrow_optional_column_index(&batch, "author_email").map(|index| batch.column(index));
         let email_values = match email_col.as_ref() {
-            Some(col) => Some(ArrowStringColumn::from_array(col.as_ref(), "author_email")?),
+            Some(col) => Some(ArrowStringColumn::from_string_array(
+                col.as_ref(),
+                "author_email",
+            )?),
             None => None,
         };
         for row in 0..batch.num_rows() {
@@ -3209,25 +2995,30 @@ fn read_raw_arrow_papers_from_batches(
     let mut out = HashMap::new();
     for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
-        let paper_id_values = ArrowStringColumn::from_array(paper_id_col.as_ref(), "paper_id")?;
+        let paper_id_values =
+            ArrowStringColumn::from_string_array(paper_id_col.as_ref(), "paper_id")?;
         let title_col = batch.column(arrow_column_index(&batch, "title", path)?);
-        let title_values = ArrowStringColumn::from_array(title_col.as_ref(), "title")?;
+        let title_values = ArrowStringColumn::from_string_array(title_col.as_ref(), "title")?;
         let abstract_col =
             arrow_optional_column_index(&batch, "abstract").map(|index| batch.column(index));
         let abstract_values = match abstract_col.as_ref() {
-            Some(col) => Some(ArrowStringColumn::from_array(col.as_ref(), "abstract")?),
+            Some(col) => Some(ArrowStringColumn::from_string_array(
+                col.as_ref(),
+                "abstract",
+            )?),
             None => None,
         };
         let venue_col = batch.column(arrow_column_index(&batch, "venue", path)?);
-        let venue_values = ArrowStringColumn::from_array(venue_col.as_ref(), "venue")?;
+        let venue_values = ArrowStringColumn::from_string_array(venue_col.as_ref(), "venue")?;
         let journal_col = batch.column(arrow_column_index(&batch, "journal_name", path)?);
-        let journal_values = ArrowStringColumn::from_array(journal_col.as_ref(), "journal_name")?;
+        let journal_values =
+            ArrowStringColumn::from_string_array(journal_col.as_ref(), "journal_name")?;
         let year_col = batch.column(arrow_column_index(&batch, "year", path)?);
-        let year_values = ArrowI64Column::from_array(year_col.as_ref(), "year")?;
+        let year_values = ArrowI64Column::from_i64_array(year_col.as_ref(), "year")?;
         let predicted_language_col = arrow_optional_column_index(&batch, "predicted_language")
             .map(|index| batch.column(index));
         let predicted_language_values = match predicted_language_col.as_ref() {
-            Some(col) => Some(ArrowStringColumn::from_array(
+            Some(col) => Some(ArrowStringColumn::from_string_array(
                 col.as_ref(),
                 "predicted_language",
             )?),
@@ -3286,12 +3077,13 @@ fn read_raw_arrow_paper_authors_from_batches(
     let mut out: HashMap<String, Vec<(i64, String)>> = HashMap::new();
     for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
-        let paper_id_values = ArrowStringColumn::from_array(paper_id_col.as_ref(), "paper_id")?;
+        let paper_id_values =
+            ArrowStringColumn::from_string_array(paper_id_col.as_ref(), "paper_id")?;
         let position_col = batch.column(arrow_column_index(&batch, "position", path)?);
-        let position_values = ArrowI64Column::from_array(position_col.as_ref(), "position")?;
+        let position_values = ArrowI64Column::from_i64_array(position_col.as_ref(), "position")?;
         let author_name_col = batch.column(arrow_column_index(&batch, "author_name", path)?);
         let author_name_values =
-            ArrowStringColumn::from_array(author_name_col.as_ref(), "author_name")?;
+            ArrowStringColumn::from_string_array(author_name_col.as_ref(), "author_name")?;
         for row in 0..batch.num_rows() {
             let paper_id_value = paper_id_values.required_value(row, "paper_id")?;
             if keep_paper_ids.map_or(false, |keep| !keep.contains(paper_id_value.as_ref())) {
@@ -3304,7 +3096,9 @@ fn read_raw_arrow_paper_authors_from_batches(
             }
             let paper_id = paper_id_value.into_owned();
             let position = position_values.required_value(row, "position")?;
-            let author_name = author_name_values.optional_owned(row).unwrap_or_default();
+            let author_name = author_name_values
+                .required_value(row, "author_name")?
+                .into_owned();
             out.entry(paper_id)
                 .or_default()
                 .push((position, author_name));
@@ -3332,11 +3126,18 @@ fn read_raw_arrow_cluster_seeds(
     let mut component_by_signature_id = HashMap::<String, String>::new();
     for batch in read_arrow_batches(path)? {
         let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
+        let signature_id_values =
+            ArrowStringColumn::from_string_array(signature_id_col.as_ref(), "signature_id")?;
         let cluster_id_col = batch.column(arrow_column_index(&batch, "cluster_id", path)?);
+        let cluster_id_values =
+            ArrowStringColumn::from_string_array(cluster_id_col.as_ref(), "cluster_id")?;
         for row in 0..batch.num_rows() {
-            let signature_id =
-                arrow_required_string(signature_id_col.as_ref(), row, "signature_id")?;
-            let component_key = arrow_required_string(cluster_id_col.as_ref(), row, "cluster_id")?;
+            let signature_id = signature_id_values
+                .required_value(row, "signature_id")?
+                .into_owned();
+            let component_key = cluster_id_values
+                .required_value(row, "cluster_id")?
+                .into_owned();
             if signature_id.is_empty() {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "cluster_seeds Arrow cannot contain empty signature_id values",
@@ -3348,11 +3149,8 @@ fn read_raw_arrow_cluster_seeds(
                 )));
             }
             if let Some(existing_component_key) = component_by_signature_id.get(&signature_id) {
-                if existing_component_key == &component_key {
-                    continue;
-                }
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "cluster_seeds Arrow assigns signature_id {signature_id:?} to multiple clusters: \
+                    "cluster_seeds Arrow contains duplicate signature_id {signature_id:?}: \
                      {existing_component_key:?} and {component_key:?}"
                 )));
             }
@@ -3374,16 +3172,33 @@ fn read_raw_arrow_cluster_seed_disallows(path: &str) -> PyResult<HashSet<(String
     for batch in read_arrow_batches(path)? {
         let left_col = batch.column(arrow_column_index(&batch, "signature_id_1", path)?);
         let right_col = batch.column(arrow_column_index(&batch, "signature_id_2", path)?);
+        let left_values =
+            ArrowStringColumn::from_string_array(left_col.as_ref(), "signature_id_1")?;
+        let right_values =
+            ArrowStringColumn::from_string_array(right_col.as_ref(), "signature_id_2")?;
         for row in 0..batch.num_rows() {
-            let left = arrow_required_string(left_col.as_ref(), row, "signature_id_1")?;
-            let right = arrow_required_string(right_col.as_ref(), row, "signature_id_2")?;
+            let left = left_values
+                .required_value(row, "signature_id_1")?
+                .into_owned();
+            let right = right_values
+                .required_value(row, "signature_id_2")?
+                .into_owned();
+            if left.is_empty() || right.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "cluster_seed_disallows cannot contain empty signature_id values",
+                ));
+            }
             if left == right {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "cluster_seed_disallows contains a self-pair for signature_id={left:?}"
                 )));
             }
             let pair = canonical_signature_pair_owned(left, right);
-            out.insert(pair);
+            if !out.insert(pair.clone()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "cluster_seed_disallows contains duplicate pair: {pair:?}"
+                )));
+            }
         }
     }
     Ok(out)
@@ -3398,7 +3213,8 @@ fn read_raw_arrow_specter_from_batches(
     let mut seen_paper_ids = HashSet::<String>::new();
     for batch in batches {
         let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
-        let paper_id_values = ArrowStringColumn::from_array(paper_id_col.as_ref(), "paper_id")?;
+        let paper_id_values =
+            ArrowStringColumn::from_string_array(paper_id_col.as_ref(), "paper_id")?;
         let embedding_col = batch.column(arrow_column_index(&batch, "embedding", path)?);
         for row in 0..batch.num_rows() {
             let paper_id_value = paper_id_values.required_value(row, "paper_id")?;
@@ -3416,13 +3232,18 @@ fn read_raw_arrow_specter_from_batches(
                     "specter Arrow contains duplicate paper_id: {paper_id:?}"
                 )));
             }
-            if let Some(vector) =
-                arrow_optional_f32_vector(embedding_col.as_ref(), row, "embedding")?
-            {
-                if !vector.is_empty() {
-                    insert_nonzero_specter_row(&mut out, &paper_id, &vector);
-                }
+            let vector = arrow_optional_f32_vector(embedding_col.as_ref(), row, "embedding")?
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "specter Arrow cannot contain null embedding values: {paper_id:?}"
+                    ))
+                })?;
+            if vector.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "specter Arrow cannot contain zero-dimension embedding values: {paper_id:?}"
+                )));
             }
+            out.insert(paper_id, vector);
         }
     }
     Ok(out)
@@ -3540,9 +3361,17 @@ fn read_raw_arrow_name_tuples(path: &str) -> PyResult<HashMap<String, HashSet<St
             path,
             &["name_2", "right", "name_b", "second_name"],
         )?);
+        let left_values =
+            ArrowStringColumn::from_string_array(left_col.as_ref(), "name_pairs.name_1")?;
+        let right_values =
+            ArrowStringColumn::from_string_array(right_col.as_ref(), "name_pairs.name_2")?;
         for row in 0..batch.num_rows() {
-            let left = arrow_required_string(left_col.as_ref(), row, "name_pairs.name_1")?;
-            let right = arrow_required_string(right_col.as_ref(), row, "name_pairs.name_2")?;
+            let left = left_values
+                .required_value(row, "name_pairs.name_1")?
+                .into_owned();
+            let right = right_values
+                .required_value(row, "name_pairs.name_2")?
+                .into_owned();
             insert_name_tuple_alias(&mut out, left, right);
         }
     }
@@ -4621,13 +4450,6 @@ fn extract_specter_vec(obj: &Bound<'_, PyAny>) -> PyResult<Option<Vec<f32>>> {
         out.push(v as f32);
     }
     Ok(Some(out))
-}
-
-fn insert_nonzero_specter_row(out: &mut HashMap<String, Vec<f32>>, paper_id: &str, values: &[f32]) {
-    if values.iter().all(|value| *value == 0.0) {
-        return;
-    }
-    out.insert(paper_id.to_string(), values.to_vec());
 }
 
 fn extract_name_tuples_argument(
@@ -6006,13 +5828,16 @@ fn read_subblocking_signature_rows_from_batches(
     for batch in batches {
         let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
         let signature_id_values =
-            ArrowStringColumn::from_array(signature_id_col.as_ref(), "signature_id")?;
+            ArrowStringColumn::from_string_array(signature_id_col.as_ref(), "signature_id")?;
         let first_col = batch.column(arrow_column_index(&batch, "author_first", path)?);
-        let first_values = ArrowStringColumn::from_array(first_col.as_ref(), "author_first")?;
+        let first_values =
+            ArrowStringColumn::from_string_array(first_col.as_ref(), "author_first")?;
         let middle_col = batch.column(arrow_column_index(&batch, "author_middle", path)?);
-        let middle_values = ArrowStringColumn::from_array(middle_col.as_ref(), "author_middle")?;
+        let middle_values =
+            ArrowStringColumn::from_string_array(middle_col.as_ref(), "author_middle")?;
         let orcid_col = batch.column(arrow_column_index(&batch, "author_orcid", path)?);
-        let orcid_values = ArrowStringColumn::from_array(orcid_col.as_ref(), "author_orcid")?;
+        let orcid_values =
+            ArrowStringColumn::from_string_array(orcid_col.as_ref(), "author_orcid")?;
         for row in 0..batch.num_rows() {
             let signature_id_value = signature_id_values.required_value(row, "signature_id")?;
             if keep_signature_ids.map_or(false, |keep| !keep.contains(signature_id_value.as_ref()))
@@ -9272,12 +9097,12 @@ impl RustFeaturizer {
             paths,
             signature_ids = None,
             name_tuples = None,
-            name_counts_path = None,
             preprocess = true,
             compute_reference_features = false,
             cluster_seed_require_value = 0.0,
             cluster_seed_disallow_value = 10000.0,
-            num_threads = None
+            num_threads = None,
+            full_scan_without_index = false
         )
     )]
     fn from_arrow_paths(
@@ -9285,12 +9110,12 @@ impl RustFeaturizer {
         paths: &Bound<'_, PyAny>,
         signature_ids: Option<&Bound<'_, PyAny>>,
         name_tuples: Option<&Bound<'_, PyAny>>,
-        name_counts_path: Option<&str>,
         preprocess: bool,
         compute_reference_features: bool,
         cluster_seed_require_value: f64,
         cluster_seed_disallow_value: f64,
         num_threads: Option<usize>,
+        full_scan_without_index: bool,
     ) -> PyResult<Self> {
         if compute_reference_features {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -9345,7 +9170,7 @@ impl RustFeaturizer {
             &signatures_path,
             signatures_batch_index_path.as_deref(),
             keep_signature_ids.as_ref(),
-            true,
+            full_scan_without_index,
         )?;
         let mut signature_ids = match requested_signature_ids {
             Some(ids) => ids,
@@ -9378,13 +9203,13 @@ impl RustFeaturizer {
             &papers_path,
             papers_batch_index_path.as_deref(),
             &needed_paper_ids,
-            true,
+            full_scan_without_index,
         )?;
         let (mut raw_authors_by_paper, _) = read_raw_arrow_paper_authors_with_optional_index(
             &paper_authors_path,
             paper_authors_batch_index_path.as_deref(),
             &needed_paper_ids,
-            true,
+            full_scan_without_index,
         )?;
         let specter_by_paper = match specter_path.as_ref() {
             Some(path) => {
@@ -9392,7 +9217,7 @@ impl RustFeaturizer {
                     path,
                     specter_batch_index_path.as_deref(),
                     &needed_paper_ids,
-                    true,
+                    full_scan_without_index,
                 )?
                 .0
             }
@@ -9437,7 +9262,7 @@ impl RustFeaturizer {
                         "name_counts Arrow path '{path}' requires name_counts_index; refusing slow Arrow fallback"
                     )));
                 }
-                None => load_raw_name_counts_from_json_path(name_counts_path, None, false)?,
+                None => RawNameCountMaps::default(),
             },
         };
         let language_detector = Some(LanguageDetectorCompat::new(py));

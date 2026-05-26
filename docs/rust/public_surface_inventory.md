@@ -24,7 +24,7 @@ cleanup risk, not a user-facing API promise.
 
 | Method | Owner / caller | Status |
 |---|---|---|
-| `from_arrow_paths(...)` | `feature_port.build_rust_featurizer_from_arrow_paths(...)`; full predict, subblocked predict, raw Arrow scoring | Production Arrow constructor. |
+| `from_arrow_paths(...)` | `feature_port.build_rust_featurizer_from_arrow_paths(...)`; full predict, subblocked predict, raw Arrow scoring | Production Arrow constructor. Filtered reads require batch indexes by default; explicit full-scan opt-in is compatibility/testing only. |
 | `from_dataset(...)` | `feature_port.build_rust_featurizer(...)`, `_get_rust_featurizer(...)`; training/eval, parity, compatibility | Keep callable but do not present as production inference. |
 | `from_json_paths(...)` | `feature_port.build_rust_featurizer(...)`; JSON compatibility scripts/tests | Compatibility and benchmark surface. |
 | `json_ingest_telemetry(...)` | JSON ingest validation and service-JSON tests | Compatibility telemetry. |
@@ -97,3 +97,10 @@ cleanup risk, not a user-facing API promise.
   Lower-level Python `FeatureBlock` builders remain only for fixture,
   compatibility-conversion, and parity-helper tests; production Rust scoring
   uses Arrow request tables.
+- Status 2026-05-25: Arrow string columns are strict at the Rust boundary.
+  ID, text/language, and alias columns must be Arrow string types; integer
+  coercion is not accepted. Declared alias override paths (`name_pairs` or
+  `name_tuples`) are preflighted like other optional sidecars.
+- Status 2026-05-25: Arrow graph subblocking uses raw-planner batch lookup
+  indexes for filtered evidence reads and no longer exposes the unused Python
+  full-table graph loader.

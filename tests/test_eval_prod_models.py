@@ -10,6 +10,8 @@ from typing import Any, cast
 import pytest
 
 import scripts.eval_prod_models as eval_prod_models
+from s2and.incremental_linking.feature_block import write_name_counts_index
+from tests.helpers import patch_tiny_name_counts_loader
 
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec"
 
@@ -31,6 +33,16 @@ def _skip_if_missing_or_lfs_pointer(paths: list[Path]) -> None:
         if os.environ.get("CI"):
             raise pytest.fail.Exception(f"Git LFS artifact(s) not materialized in CI: {pointers}")
         raise pytest.skip.Exception(f"Git LFS artifact(s) not materialized: {pointers}")
+
+
+def _touch_eval_batch_indexes(dataset_root: Path, *, specter_stem: str = "specter") -> None:
+    for index_name in (
+        "signatures.signatures_batch_index.bin",
+        "papers.papers_batch_index.bin",
+        "paper_authors.paper_authors_batch_index.bin",
+        f"{specter_stem}.specter_batch_index.bin",
+    ):
+        (dataset_root / index_name).touch()
 
 
 def test_first_missing_arrow_dataset_error_reports_failing_pair(monkeypatch) -> None:
@@ -178,11 +190,14 @@ class _ArrowIncrementalFixtureDataset:
         self.name_counts_last_first_initial_semantics = semantics
 
 
-def test_resolve_arrow_dataset_paths_includes_name_counts_index_from_manifest(tmp_path: Path) -> None:
+def test_resolve_arrow_dataset_paths_includes_name_counts_index_from_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     dataset_root = tmp_path / "arrow" / "dummy"
     dataset_root.mkdir(parents=True)
-    name_counts_index = tmp_path / "name_counts_index"
-    name_counts_index.mkdir()
+    patch_tiny_name_counts_loader(monkeypatch)
+    name_counts_index, _metrics = write_name_counts_index(tmp_path)
     for filename in (
         "signatures.arrow",
         "papers.arrow",
@@ -191,6 +206,7 @@ def test_resolve_arrow_dataset_paths_includes_name_counts_index_from_manifest(tm
         "dummy_clusters.json",
     ):
         (dataset_root / filename).touch()
+    _touch_eval_batch_indexes(dataset_root)
     (dataset_root / "manifest.json").write_text(
         json.dumps({"paths": {"name_counts_index": str(name_counts_index)}}),
         encoding="utf-8",
@@ -201,11 +217,14 @@ def test_resolve_arrow_dataset_paths_includes_name_counts_index_from_manifest(tm
     assert resolved["name_counts_index"] == str(name_counts_index)
 
 
-def test_resolve_arrow_dataset_paths_supports_nested_datasets_layout(tmp_path: Path) -> None:
+def test_resolve_arrow_dataset_paths_supports_nested_datasets_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     dataset_root = tmp_path / "arrow" / "datasets" / "dummy"
     dataset_root.mkdir(parents=True)
-    name_counts_index = tmp_path / "arrow" / "name_counts_index"
-    name_counts_index.mkdir()
+    patch_tiny_name_counts_loader(monkeypatch)
+    name_counts_index, _metrics = write_name_counts_index(tmp_path / "arrow")
     for filename in (
         "signatures.arrow",
         "papers.arrow",
@@ -214,6 +233,7 @@ def test_resolve_arrow_dataset_paths_supports_nested_datasets_layout(tmp_path: P
         "dummy_clusters.json",
     ):
         (dataset_root / filename).touch()
+    _touch_eval_batch_indexes(dataset_root)
     (dataset_root / "manifest.json").write_text(
         json.dumps({"paths": {"name_counts_index": "../../name_counts_index"}}),
         encoding="utf-8",
@@ -225,11 +245,14 @@ def test_resolve_arrow_dataset_paths_supports_nested_datasets_layout(tmp_path: P
     assert resolved["name_counts_index"] == str(name_counts_index)
 
 
-def test_resolve_arrow_dataset_paths_supports_release_parent_layout(tmp_path: Path) -> None:
+def test_resolve_arrow_dataset_paths_supports_release_parent_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     dataset_root = tmp_path / "arrow" / "release_parent" / "datasets" / "dummy"
     dataset_root.mkdir(parents=True)
-    name_counts_index = tmp_path / "arrow" / "release_parent" / "name_counts_index"
-    name_counts_index.mkdir()
+    patch_tiny_name_counts_loader(monkeypatch)
+    name_counts_index, _metrics = write_name_counts_index(tmp_path / "arrow" / "release_parent")
     for filename in (
         "signatures.arrow",
         "papers.arrow",
@@ -238,6 +261,7 @@ def test_resolve_arrow_dataset_paths_supports_release_parent_layout(tmp_path: Pa
         "dummy_clusters.json",
     ):
         (dataset_root / filename).touch()
+    _touch_eval_batch_indexes(dataset_root, specter_stem="specter2")
     (dataset_root / "manifest.json").write_text(
         json.dumps({"paths": {"name_counts_index": "../../name_counts_index"}}),
         encoding="utf-8",
@@ -246,7 +270,7 @@ def test_resolve_arrow_dataset_paths_supports_release_parent_layout(tmp_path: Pa
     resolved = eval_prod_models.resolve_arrow_dataset_paths(str(tmp_path / "arrow"), "dummy", "_specter2.pkl")
 
     assert resolved["signatures"] == str(dataset_root / "signatures.arrow")
-    assert resolved["name_counts_index"] == str(name_counts_index.resolve())
+    assert resolved["name_counts_index"] == str(Path(name_counts_index).resolve())
 
 
 def test_resolve_arrow_dataset_paths_requires_eval_name_counts_index(tmp_path: Path) -> None:

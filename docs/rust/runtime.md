@@ -51,8 +51,10 @@ Python path remains available via explicit backend and stage overrides at any ti
 - Capability detection is centralized in `s2and/runtime.py`; `s2and/rust_capabilities.py`
   is a compatibility delegation layer.
 - Core runtime capability requires extension importability plus the current
-  Rust markers used by production paths, including dataset, JSON, Arrow,
-  indexed-featurization, constraints, seed, and name-count update support.
+  Rust markers used by production Arrow paths: direct Arrow ingest, indexed
+  featurization, constraints, seed updates, and name-count index support.
+  Dataset and JSON ingest remain maintained compatibility, training, benchmark,
+  and parity markers; they are not production inference authorities.
 
 ### Stage defaults (resolved backend = `rust`)
 

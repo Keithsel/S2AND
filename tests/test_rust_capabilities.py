@@ -17,6 +17,10 @@ def _make_core_rust_featurizer(*, supports_from_dataset_paper_preprocess: bool =
         SUPPORTS_FROM_DATASET_PAPER_PREPROCESS = supports_from_dataset_paper_preprocess
 
         @staticmethod
+        def from_arrow_paths(*args, **kwargs):
+            return None
+
+        @staticmethod
         def from_dataset(*args, **kwargs):
             return None
 
@@ -182,14 +186,10 @@ def test_detect_rust_runtime_capabilities_reads_from_dataset_paper_preprocess_ma
     assert capabilities.from_dataset_paper_preprocess_available is True
 
 
-def test_detect_rust_runtime_capabilities_requires_json_ingest_telemetry():
-    class RustFeaturizerWithoutTelemetry:
+def test_detect_rust_runtime_capabilities_does_not_require_json_ingest_markers():
+    class RustFeaturizerWithoutJsonCompat:
         @staticmethod
-        def from_dataset(*args, **kwargs):
-            return None
-
-        @staticmethod
-        def from_json_paths(*args, **kwargs):
+        def from_arrow_paths(*args, **kwargs):
             return None
 
         def signature_ids(self):
@@ -209,12 +209,12 @@ def test_detect_rust_runtime_capabilities_requires_json_ingest_telemetry():
 
     class Module:
         __version__ = "0.50.0"
-        RustFeaturizer = RustFeaturizerWithoutTelemetry
+        RustFeaturizer = RustFeaturizerWithoutJsonCompat
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
 
-    assert capabilities.core_runtime_available is False
-    assert "json_ingest_telemetry" in capabilities.reason
+    assert capabilities.core_runtime_available is True
+    assert capabilities.reason == "rust_core_available"
 
 
 def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():

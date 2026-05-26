@@ -18,10 +18,12 @@ contracts live in:
 |---|---|
 | `ANDData` role | Keep as Python reference, training/eval, compatibility, and fallback object. Do not port all of `ANDData` to Rust. |
 | Fast inference boundary | Prefer direct Arrow IPC inputs consumed by Rust. Avoid Arrow-to-Python-object materialization on the hot path. |
-| Name counts | Use `s2and/data/name_counts_index/` for Rust hot-path lookups. Do not embed per-signature name-count columns in `signatures.arrow`. |
+| Name counts | Use a manifest-declared `name_counts_index/` directory for Rust hot-path lookups. Do not use ambient package/global fallback discovery, and do not embed per-signature name-count columns in `signatures.arrow`. |
 | Name aliases | Use the packaged filtered alias text by default. Keep per-dataset alias artifacts experimental only. |
 | Reference features | Direct Arrow prediction fails fast when a model requires reference features. Current production models do not use them. |
 | Optional seed sidecars | Missing `cluster_seed_disallows` means no seed-disallow constraints, and missing `altered_cluster_signatures` means no altered claimed profiles. Strict mode requires these sidecars only when the caller or manifest declares the condition; an explicit mapping key must point to an existing file. Converters may emit canonical empty tables, but strict routing does not require empty tables for empty sets. |
+| Indexed reads | Production Arrow prediction, promoted incremental scoring, Rust subblocking, Arrow graph subblocking, and Arrow training/materialization routes require raw-planner batch lookup indexes for filtered reads. Full scans are compatibility/test-only opt-ins. |
+| SPECTER presence | Missing embedding rows are valid for datasets with incomplete coverage. Present rows are real vectors, including all-zero vectors; all-zero rows are no longer treated as missing sentinels. |
 
 ## Verification Invariants
 
@@ -33,6 +35,33 @@ contracts live in:
   signals, probabilities, and final decisions on bounded fixtures.
 - Do not add complexity for less than a 10% improvement unless it removes a
   real bottleneck or an `ANDData` dependency on a hot path.
+
+## Canonical Arrow Input Surface
+
+`s2and.arrow_inputs` is the policy authority for production Arrow inputs. Call
+sites may resolve manifests or request-local overlays, but they should not
+reimplement production validation. The canonical surface owns:
+
+- Path normalization and structured missing-file errors with producer hints.
+- Required vs optional artifact policy for prediction, subblocking,
+  incremental prediction, feature generation, and script profiling/eval.
+- Arrow schemas, null/duplicate/id validation, and strict string/int/bool
+  typing at runtime boundaries.
+- Batch lookup index policy, including fail-closed filtered reads and explicit
+  test/compatibility-only full-scan opt-ins.
+- Signature filtering, ordering, subset semantics, and request-local seed
+  overlays.
+- SPECTER path selection, dimensions, all-zero vector preservation, and
+  missing-vector semantics.
+- Name counts through manifest-backed `name_counts_index/`, plus name tuple and
+  alias policy.
+- Text normalization/unidecode, language fallback, name splitting,
+  paper-author ordering, null position, and duplicate-position semantics.
+- Seed inputs: `cluster_seeds`, `cluster_seed_disallows`,
+  `altered_cluster_signatures`, and materialized request-local seed files.
+- Subblocking inputs, Arrow graph-subblocking strictness, stable telemetry keys
+  for read/build/planner/scoring stages, and structured errors for every
+  production boundary.
 
 ## Execution Sequence
 
@@ -134,10 +163,12 @@ Release contents:
     `name_counts_index/`; do not publish `name_counts.arrow` in this release.
     The checked-in direct-file `s2and/data/name_counts_index/` layout is a
     legacy source artifact until regenerated.
-  - Generate and ship Arrow batch lookup indexes beside the Arrow files using
+- Generate and ship Arrow batch lookup indexes beside the Arrow files using
     `<table-stem>.<path-key>.bin` names, for example
     `signatures.signatures_batch_index.bin` and
     `<specter-stem>.specter_batch_index.bin`.
+  - Keep `name_counts_index` manifest-declared. Runtime discovery must not
+    silently fall back to a packaged/global index directory.
 - Keep small metadata and offline evaluation artifacts in their existing
   formats.
   - Keep `LICENSE.txt` and `lid.176.bin` unchanged.
@@ -321,10 +352,15 @@ production inference.
   - Status 2026-05-25: production Rust `Clusterer.predict(...)`, including
     subblocked large-block prediction, no longer silently falls back when Arrow
     artifacts are incomplete.
+  - Status 2026-05-25: Rust production subblocking now requires
+    `signatures` and `signatures_batch_index` before partitioning oversized
+    blocks. Missing subblocking artifacts raise `MissingArrowArtifactError`
+    instead of falling back to Python/`ANDData` partitioning.
+  - Status 2026-05-25: Arrow-backed Rust production graph subblocking no
+    longer uses the legacy SPECTER fallback after Arrow read/prepare/call
+    failures. The legacy recovery path remains available only for Python/
+    `ANDData` compatibility graph fallback.
   - Subblocked strict-routing follow-up:
-    - Keep graph/legacy fallbacks only behind explicit compatibility, parity,
-      training, or test paths, not behind `backend="rust"` production
-      inference.
     - Expand bounded large-block fixtures that verify Arrow graph subblocking,
       Arrow featurizer reuse, and promoted incremental completion without
       `ANDData` fallback.
@@ -332,17 +368,22 @@ production inference.
   - Ensure errors name the missing Arrow artifact keys and the caller/script
     that should generate them.
 - Strict routing error contract.
-  - Do not add a standalone strict helper or new strict exception until the
-    first approved strict production call site is being wired. A tested private
-    resolver with no production caller is scaffold, and it risks duplicating
-    compatibility discovery policy before the strictness authority is settled.
-  - When strict routing is approved, introduce the structured missing-artifact
-    error in the same change as the call site that raises it. It should carry
-    enough context for tests and callers: `context`, `required_keys`,
-    `missing_keys`, `missing_files`, and `producer_hint`.
-  - The message should name the prediction context, list missing mapping keys
-    separately from missing files, and name the command or script expected to
-    produce the artifacts.
+  - Status 2026-05-25: `s2and.arrow_inputs` is the shared strict Arrow
+    validation authority for production prediction artifacts, filtered-read
+    batch-index requirements, and structured `MissingArrowArtifactError`
+    reporting.
+  - Status 2026-05-25: Python and Rust Arrow seed/disallow readers reject
+    duplicate seed rows, duplicate undirected disallow rows, null IDs, empty
+    IDs, and integer ID columns. Runtime Arrow ID columns follow the spec's
+    string-only contract instead of coercing numeric IDs.
+  - Status 2026-05-25: Runtime Arrow readers reject null `paper_authors.author_name`,
+    non-string author-name columns, non-`int64` paper-author positions, and
+    null SPECTER embedding rows. Missing SPECTER is represented by no row, not
+    by a null embedding value.
+  - The structured error carries `context`, `required_keys`, `missing_keys`,
+    `missing_files`, and `producer_hint`. The message names the prediction
+    context, lists missing mapping keys separately from missing files, and names
+    the command or script expected to produce the artifacts.
 - Implementation map for strict production routing.
   - Current `_resolve_dataset_arrow_paths(...)` already validates explicit
     mappings, auto-discovers sibling Arrow dataset directories, adds raw-planner
@@ -350,10 +391,9 @@ production inference.
     `require_name_counts_index`, supports `require_cluster_seeds`, and adds
     optional `cluster_seed_disallows` / `altered_cluster_signatures` sidecars
     when files exist.
-  - The remaining strict-routing work is narrower: at the approved call site,
-    distinguish absent mapping keys from mapping keys whose files are missing,
-    raise the structured strict-routing error instead of returning `None`, and
-    carry structured context for callers and tests.
+  - The remaining strict-routing work is narrower: make any future production
+    call site reuse `s2and.arrow_inputs` rather than introducing a parallel
+    strict/compatibility Arrow discovery implementation.
   - Current fallback surfaces to tighten:
     - `_resolve_dataset_arrow_paths(...)` in `s2and/model.py` can return
       `None` for incomplete auto-discovered Arrow artifacts and for missing
@@ -495,6 +535,9 @@ production inference.
   surfaces unless profiling shows they are still on a production hot path. In
   particular, `feature_block_from_arrow_paths(...)` is a bridge/test surface
   unless a caller still needs Python `FeatureBlock` compatibility.
+- Status 2026-05-25: legacy service-shaped JSON ingest tests were relabeled as
+  compatibility/parity coverage. Production service JSON must be converted to
+  Arrow before entering Rust.
 - Keep `RustFeaturizer.from_dataset(...)` as the Python-reference,
   training/eval, and parity surface. Do not add production-only behavior there.
 - Treat `RustFeaturizer.from_json_paths(...)` as a compatibility and benchmark

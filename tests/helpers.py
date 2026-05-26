@@ -38,6 +38,26 @@ def tiny_name_counts() -> dict[str, dict[str, int]]:
     }
 
 
+def tiny_name_counts_tuple() -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
+    """Return tiny name counts in the tuple shape used by the cached loader."""
+
+    counts = tiny_name_counts()
+    return (
+        counts["first_dict"],
+        counts["last_dict"],
+        counts["first_last_dict"],
+        counts["last_first_initial_dict"],
+    )
+
+
+def patch_tiny_name_counts_loader(monkeypatch: Any) -> None:
+    """Patch the production name-count loader to avoid huge fixture generation."""
+
+    import s2and.data as data_module
+
+    monkeypatch.setattr(data_module, "_load_name_counts_cached", tiny_name_counts_tuple)
+
+
 def equalish(a: float, b: float, rel_tol: float = 1e-6, abs_tol: float = 1e-3) -> bool:
     if math.isnan(float(a)) and math.isnan(float(b)):
         return True

@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 import s2and.incremental_linking.feature_block_arrow as feature_block_arrow_module
+from s2and.arrow_inputs import MissingArrowArtifactError
 from s2and.data import ANDData, NameCounts
 from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.feature_block import (
@@ -28,6 +29,7 @@ from s2and.incremental_linking.feature_block import (
     feature_block_signature_order_from_raw_candidate_plan,
     feature_block_to_mini_anddata,
     raw_planner_arrow_physical_layout,
+    read_cluster_seed_disallows_arrow,
     read_cluster_seeds_arrow,
     temporary_arrow_paths_with_cluster_seeds,
     write_arrow_batch_lookup_index,
@@ -255,6 +257,42 @@ def _write_feature_block_arrow_paths(tmp_path: Path) -> dict[str, str]:
     return write_feature_block_arrow_tables(feature_block, tmp_path, include_empty_cluster_seeds=True)
 
 
+def _with_fake_batch_indexes(arrow_paths: dict[str, str], tmp_path: Path) -> dict[str, str]:
+    indexed = dict(arrow_paths)
+    for key in ("signatures", "papers", "paper_authors"):
+        index_path = tmp_path / f"{key}.{key}_batch_index.bin"
+        index_path.touch()
+        indexed[f"{key}_batch_index"] = str(index_path)
+    if "specter" in indexed:
+        index_path = tmp_path / "specter.specter_batch_index.bin"
+        index_path.touch()
+        indexed["specter_batch_index"] = str(index_path)
+    return indexed
+
+
+def _strict_signature_arrow_table(**overrides: Any) -> Any:
+    pa = pytest.importorskip("pyarrow")
+    row_count = len(overrides.get("signature_id", ["q", "s1", "s2", "s3"]))
+    data = {
+        "signature_id": pa.array(["q", "s1", "s2", "s3"], type=pa.string()),
+        "paper_id": pa.array(["p_q", "p1", "p2", "p3"], type=pa.string()),
+        "author_first": pa.array(["Ada", "Ada", "Grace", "Grace"], type=pa.string()),
+        "author_middle": pa.array(["", "", "", ""], type=pa.string()),
+        "author_last": pa.array(["Lovelace", "Lovelace", "Hopper", "Hopper"], type=pa.string()),
+        "author_suffix": pa.array(["", "", "", ""], type=pa.string()),
+        "author_affiliations": pa.array([[], [], [], []], type=pa.list_(pa.string())),
+        "author_orcid": pa.array(["0000-0000-0000-0001", None, None, None], type=pa.string()),
+        "author_position": pa.array([0, 0, 0, 1], type=pa.int64()),
+    }
+    for key, value in overrides.items():
+        if not hasattr(value, "type"):
+            raise TypeError(f"override {key!r} must be a pyarrow Array")
+        if len(value) != row_count:
+            raise ValueError(f"override {key!r} length {len(value)} does not match row count {row_count}")
+        data[key] = value
+    return pa.table(data)
+
+
 def test_feature_block_from_anddata_builds_requested_mini_contract() -> None:
     dataset = _tiny_anddata()
     dataset.cluster_seeds_disallow = set()
@@ -391,7 +429,7 @@ def test_feature_block_from_arrow_paths_reads_cluster_seed_disallows(tmp_path: P
     assert feature_block.cluster_seeds_disallow == (("q", "s2"),)
 
 
-def test_feature_block_from_arrow_paths_deduplicates_bidirectional_cluster_seed_disallows(tmp_path: Path) -> None:
+def test_feature_block_from_arrow_paths_rejects_duplicate_bidirectional_cluster_seed_disallows(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
     bidirectional = pa.table(
@@ -402,9 +440,8 @@ def test_feature_block_from_arrow_paths_deduplicates_bidirectional_cluster_seed_
     )
     write_arrow_ipc_table(bidirectional, Path(arrow_paths["cluster_seed_disallows"]))
 
-    feature_block = feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
-
-    assert feature_block.cluster_seeds_disallow == (("q", "s2"),)
+    with pytest.raises(ValueError, match="duplicate pair"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
 def test_feature_block_from_arrow_paths_filters_one_sided_disallow_pair(tmp_path: Path) -> None:
@@ -423,13 +460,13 @@ def test_feature_block_from_arrow_paths_filters_one_sided_disallow_pair(tmp_path
     assert feature_block.cluster_seeds_disallow == ()
 
 
-def test_feature_block_from_arrow_paths_ignores_invalid_out_of_scope_disallow_pairs(tmp_path: Path) -> None:
+def test_feature_block_from_arrow_paths_filters_valid_out_of_scope_disallow_pairs(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
     out_of_scope = pa.table(
         {
-            "signature_id_1": pa.array(["unused", "", "a", "b", "q"], type=pa.string()),
-            "signature_id_2": pa.array(["unused", "unused", "b", "a", "s2"], type=pa.string()),
+            "signature_id_1": pa.array(["unused1", "q"], type=pa.string()),
+            "signature_id_2": pa.array(["unused2", "s2"], type=pa.string()),
         }
     )
     write_arrow_ipc_table(out_of_scope, Path(arrow_paths["cluster_seed_disallows"]))
@@ -459,6 +496,21 @@ def test_cluster_seed_disallows_from_arrow_paths_rejects_missing_explicit_path(t
 
     with pytest.raises(FileNotFoundError, match="cluster_seed_disallows"):
         cluster_seed_disallows_from_arrow_paths({"cluster_seed_disallows": str(missing_path)})
+
+
+def test_read_cluster_seed_disallows_arrow_rejects_integer_id_columns(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "cluster_seed_disallows.arrow"
+    table = pa.table(
+        {
+            "signature_id_1": pa.array([1], type=pa.int64()),
+            "signature_id_2": pa.array(["s2"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(table, path)
+
+    with pytest.raises(ValueError, match="signature_id_1 expected string"):
+        read_cluster_seed_disallows_arrow(path)
 
 
 def test_temporary_arrow_paths_with_cluster_seeds_rejects_none_path(tmp_path: Path) -> None:
@@ -521,7 +573,7 @@ def test_temporary_arrow_paths_with_cluster_seeds_rewrites_stale_empty_seed_path
         assert cluster_seed_path != stale_seed_path
 
 
-def test_read_cluster_seeds_arrow_dedupes_idempotent_duplicate_signature_rows(tmp_path: Path) -> None:
+def test_read_cluster_seeds_arrow_rejects_duplicate_signature_rows(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     path = tmp_path / "cluster_seeds.arrow"
     table = pa.table(
@@ -532,7 +584,8 @@ def test_read_cluster_seeds_arrow_dedupes_idempotent_duplicate_signature_rows(tm
     )
     write_arrow_ipc_table(table, path)
 
-    assert read_cluster_seeds_arrow(path) == {"s1": "c1"}
+    with pytest.raises(ValueError, match="duplicate signature_id"):
+        read_cluster_seeds_arrow(path)
 
 
 def test_read_cluster_seeds_arrow_rejects_conflicting_duplicate_signature_rows(tmp_path: Path) -> None:
@@ -546,22 +599,45 @@ def test_read_cluster_seeds_arrow_rejects_conflicting_duplicate_signature_rows(t
     )
     write_arrow_ipc_table(table, path)
 
-    with pytest.raises(ValueError, match="multiple clusters"):
+    with pytest.raises(ValueError, match="duplicate signature_id"):
+        read_cluster_seeds_arrow(path)
+
+
+def test_read_cluster_seeds_arrow_rejects_integer_id_columns(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "cluster_seeds.arrow"
+    table = pa.table(
+        {
+            "signature_id": pa.array([1], type=pa.int64()),
+            "cluster_id": pa.array(["c1"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(table, path)
+
+    with pytest.raises(ValueError, match="signature_id expected string"):
         read_cluster_seeds_arrow(path)
 
 
 def test_feature_block_from_arrow_paths_rejects_duplicate_signature_rows(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    duplicate_signatures = pa.table(
-        {
-            "signature_id": pa.array(["q", "q"], type=pa.string()),
-            "paper_id": pa.array(["p_q", "p_q"], type=pa.string()),
-        }
+    duplicate_signatures = _strict_signature_arrow_table(
+        signature_id=pa.array(["q", "q", "s2", "s3"], type=pa.string()),
+        paper_id=pa.array(["p_q", "p_q", "p2", "p3"], type=pa.string()),
     )
     write_arrow_ipc_table(duplicate_signatures, Path(arrow_paths["signatures"]))
 
     with pytest.raises(ValueError, match="duplicate signature_id"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_rejects_integer_signature_ids(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    integer_id_signatures = _strict_signature_arrow_table(signature_id=pa.array([1, 2, 3, 4], type=pa.int64()))
+    write_arrow_ipc_table(integer_id_signatures, Path(arrow_paths["signatures"]))
+
+    with pytest.raises(ValueError, match="signature_id expected string"):
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
@@ -580,14 +656,38 @@ def test_feature_block_from_arrow_paths_rejects_missing_required_signature_colum
     incomplete_signatures = pa.table({"signature_id": pa.array(["q", "s1", "s2", "s3"], type=pa.string())})
     write_arrow_ipc_table(incomplete_signatures, Path(arrow_paths["signatures"]))
 
-    with pytest.raises(ValueError, match="signatures Arrow is missing required columns: \\['paper_id'\\]"):
+    with pytest.raises(ValueError, match="signatures Arrow is missing required columns: .*paper_id"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_rejects_malformed_signature_column_types(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    integer_first = _strict_signature_arrow_table(author_first=pa.array([1, 1, 2, 2], type=pa.int64()))
+    write_arrow_ipc_table(integer_first, Path(arrow_paths["signatures"]))
+
+    with pytest.raises(ValueError, match="author_first expected string"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+    string_position = _strict_signature_arrow_table(author_position=pa.array(["0", "0", "0", "1"], type=pa.string()))
+    write_arrow_ipc_table(string_position, Path(arrow_paths["signatures"]))
+
+    with pytest.raises(ValueError, match="author_position expected int64"):
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
 def test_feature_block_from_arrow_paths_rejects_missing_signature_paper(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
-    incomplete_papers = pa.table({"paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string())})
+    incomplete_papers = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
+            "title": pa.array(["Notes", "Notes", "Compiler"], type=pa.string()),
+            "venue": pa.array(["Royal Society", "Royal Society", ""], type=pa.string()),
+            "journal_name": pa.array(["", "", ""], type=pa.string()),
+            "year": pa.array([1843, 1843, 1952], type=pa.int64()),
+        }
+    )
     write_arrow_ipc_table(incomplete_papers, Path(arrow_paths["papers"]))
 
     with pytest.raises(ValueError, match="missing signature paper_ids"):
@@ -626,6 +726,38 @@ def test_feature_block_from_arrow_paths_rejects_null_paper_author_position(tmp_p
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
+def test_feature_block_from_arrow_paths_rejects_null_paper_author_name(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    null_author_name = pa.table(
+        {
+            "paper_id": pa.array(["p_q"], type=pa.string()),
+            "position": pa.array([0], type=pa.int64()),
+            "author_name": pa.array([None], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(null_author_name, Path(arrow_paths["paper_authors"]))
+
+    with pytest.raises(ValueError, match="null author_name"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_rejects_string_paper_author_position(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    string_position = pa.table(
+        {
+            "paper_id": pa.array(["p_q"], type=pa.string()),
+            "position": pa.array(["0"], type=pa.string()),
+            "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
+        }
+    )
+    write_arrow_ipc_table(string_position, Path(arrow_paths["paper_authors"]))
+
+    with pytest.raises(ValueError, match="position expected int64"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
 def test_feature_block_from_arrow_paths_rejects_malformed_optional_scalars(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
@@ -640,7 +772,60 @@ def test_feature_block_from_arrow_paths_rejects_malformed_optional_scalars(tmp_p
     )
     write_arrow_ipc_table(malformed_papers, Path(arrow_paths["papers"]))
 
-    with pytest.raises(ValueError, match="papers.year"):
+    with pytest.raises(ValueError, match="year expected int64"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_rejects_wrong_paper_scalar_types(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    string_year = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p1", "p2", "p3"], type=pa.string()),
+            "title": pa.array(["Notes", "Notes", "Compiler", "Compiler"], type=pa.string()),
+            "venue": pa.array(["Royal Society", "Royal Society", "", ""], type=pa.string()),
+            "journal_name": pa.array(["", "", "", ""], type=pa.string()),
+            "year": pa.array(["1843", "1843", "1952", "1952"], type=pa.string()),
+            "is_reliable": pa.array([True, True, False, False], type=pa.bool_()),
+        }
+    )
+    write_arrow_ipc_table(string_year, Path(arrow_paths["papers"]))
+
+    with pytest.raises(ValueError, match="year expected int64"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+    integer_reliable = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p1", "p2", "p3"], type=pa.string()),
+            "title": pa.array(["Notes", "Notes", "Compiler", "Compiler"], type=pa.string()),
+            "venue": pa.array(["Royal Society", "Royal Society", "", ""], type=pa.string()),
+            "journal_name": pa.array(["", "", "", ""], type=pa.string()),
+            "year": pa.array([1843, 1843, 1952, 1952], type=pa.int64()),
+            "is_reliable": pa.array([1, 1, 0, 0], type=pa.int64()),
+        }
+    )
+    write_arrow_ipc_table(integer_reliable, Path(arrow_paths["papers"]))
+
+    with pytest.raises(ValueError, match="is_reliable expected bool"):
+        feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+
+def test_feature_block_from_arrow_paths_rejects_integer_paper_text_columns(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    malformed_papers = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p1", "p2", "p3"], type=pa.string()),
+            "title": pa.array(["Notes", "Notes", "Compiler", "Compiler"], type=pa.string()),
+            "venue": pa.array(["Royal Society", "Royal Society", "", ""], type=pa.string()),
+            "journal_name": pa.array(["", "", "", ""], type=pa.string()),
+            "year": pa.array([1843, 1843, 1952, 1952], type=pa.int64()),
+            "predicted_language": pa.array([1, 1, 2, 2], type=pa.int64()),
+        }
+    )
+    write_arrow_ipc_table(malformed_papers, Path(arrow_paths["papers"]))
+
+    with pytest.raises(ValueError, match="predicted_language expected string"):
         feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
 
 
@@ -1650,7 +1835,7 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    arrow_paths = _with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path)
     captured: dict[str, Any] = {}
 
     class FakePlanner:
@@ -1754,6 +1939,34 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     assert captured["retrieval_paths"] == captured["featurizer_paths"]
 
 
+def test_raw_arrow_scoring_requires_planner_artifacts_before_planner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arrow_paths = _with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path)
+    del arrow_paths["cluster_seeds"]
+
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port._require_rust_runtime",
+        lambda: (_ for _ in ()).throw(AssertionError("planner should not be loaded before validation")),
+    )
+
+    with pytest.raises(MissingArrowArtifactError) as exc_info:
+        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            _raw_test_clusterer(),
+            _raw_test_artifact(),
+            arrow_paths=arrow_paths,
+            query_signature_ids=["q"],
+            top_k=2,
+            n_jobs=1,
+            load_name_counts=False,
+            name_tuples=set(),
+        )
+
+    assert exc_info.value.context == "Raw Arrow scoring"
+    assert exc_info.value.missing_keys == ("cluster_seeds",)
+
+
 def test_raw_arrow_partial_supervision_require_unknown_seed_rejected() -> None:
     class FakeFeaturizer:
         def signature_ids(self) -> list[str]:
@@ -1799,7 +2012,7 @@ def test_raw_arrow_scoring_requires_featurizer_with_provided_raw_plan(
         )
 
 
-def test_raw_arrow_scoring_requires_planner_build_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_raw_arrow_scoring_requires_planner_build_telemetry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     class FakePlanner:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             pass
@@ -1814,10 +2027,6 @@ def test_raw_arrow_scoring_requires_planner_build_telemetry(monkeypatch: pytest.
         raise AssertionError("stale raw planner should fail before featurizer construction")
 
     monkeypatch.setattr(
-        "s2and.incremental_linking.runtime.feature_port.normalize_arrow_paths",
-        lambda paths: dict(paths),
-    )
-    monkeypatch.setattr(
         "s2and.incremental_linking.runtime.require_arrow_name_counts_index_for_clusterer",
         lambda *_args, **_kwargs: None,
     )
@@ -1831,7 +2040,7 @@ def test_raw_arrow_scoring_requires_planner_build_telemetry(monkeypatch: pytest.
         predict_incremental_link_or_abstain_from_raw_arrow_paths(
             _raw_test_clusterer(),
             _raw_test_artifact(),
-            arrow_paths={"signatures": "signatures.arrow"},
+            arrow_paths=_with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path),
             query_signature_ids=["q"],
             top_k=2,
             n_jobs=1,
@@ -1851,6 +2060,7 @@ def test_raw_arrow_scoring_requires_planner_build_telemetry(monkeypatch: pytest.
 )
 def test_raw_arrow_scoring_resolves_orcid_enabled_from_clusterer(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     suppress_orcid: bool,
     orcid_enabled_arg: bool | None,
     expected_orcid_enabled: bool,
@@ -1882,10 +2092,6 @@ def test_raw_arrow_scoring_resolves_orcid_enabled_from_clusterer(
         raise StopAfterRetrieval("captured retrieval kwargs")
 
     monkeypatch.setattr(
-        "s2and.incremental_linking.runtime.feature_port.normalize_arrow_paths",
-        lambda paths: dict(paths),
-    )
-    monkeypatch.setattr(
         "s2and.incremental_linking.runtime.require_arrow_name_counts_index_for_clusterer",
         lambda *_args, **_kwargs: None,
     )
@@ -1903,7 +2109,7 @@ def test_raw_arrow_scoring_resolves_orcid_enabled_from_clusterer(
         predict_incremental_link_or_abstain_from_raw_arrow_paths(
             _raw_test_clusterer(suppress_orcid=suppress_orcid),
             _raw_test_artifact(),
-            arrow_paths={"signatures": "signatures.arrow"},
+            arrow_paths=_with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path),
             query_signature_ids=["q"],
             top_k=2,
             n_jobs=1,

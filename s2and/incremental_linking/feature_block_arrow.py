@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mmap
 import shutil
 import struct
 import tempfile
@@ -106,6 +107,7 @@ def read_cluster_seeds_arrow(path: Path) -> dict[str, str]:
     missing_columns = sorted({"signature_id", "cluster_id"} - set(table.column_names))
     if missing_columns:
         raise ValueError(f"cluster seeds Arrow is missing required columns: {missing_columns}")
+    _require_arrow_string_columns(table, "cluster seeds", {"signature_id", "cluster_id"})
     rows: dict[str, str] = {}
     for index in range(table.num_rows):
         signature_value = table["signature_id"][index].as_py()
@@ -120,11 +122,9 @@ def read_cluster_seeds_arrow(path: Path) -> dict[str, str]:
             raise ValueError(f"cluster seeds Arrow cannot contain empty cluster_id values: {signature_id!r}")
         existing_cluster_id = rows.get(signature_id)
         if existing_cluster_id is not None:
-            if existing_cluster_id == cluster_id:
-                continue
             raise ValueError(
-                f"cluster seeds Arrow assigns signature_id {signature_id!r} to multiple clusters: "
-                f"{existing_cluster_id!r} and {cluster_id!r}"
+                f"cluster seeds Arrow contains duplicate signature_id: {signature_id!r} "
+                f"({existing_cluster_id!r} and {cluster_id!r})"
             )
         rows[signature_id] = cluster_id
     return rows
@@ -158,7 +158,9 @@ def read_cluster_seed_disallows_arrow(path: Path) -> tuple[tuple[str, str], ...]
     missing_columns = sorted({"signature_id_1", "signature_id_2"} - set(table.column_names))
     if missing_columns:
         raise ValueError(f"cluster seed disallows Arrow is missing required columns: {missing_columns}")
+    _require_arrow_string_columns(table, "cluster seed disallows", {"signature_id_1", "signature_id_2"})
     rows = []
+    seen_pairs: set[tuple[str, str]] = set()
     for left, right in zip(
         table["signature_id_1"].to_pylist(),
         table["signature_id_2"].to_pylist(),
@@ -166,8 +168,12 @@ def read_cluster_seed_disallows_arrow(path: Path) -> tuple[tuple[str, str], ...]
     ):
         if left is None or right is None:
             raise ValueError("cluster seed disallows Arrow cannot contain null signature ids")
-        rows.append((str(left), str(right)))
-    return normalize_cluster_seed_disallow_pairs(rows)
+        normalized_pair = normalize_cluster_seed_disallow_pairs([(str(left), str(right))])[0]
+        if normalized_pair in seen_pairs:
+            raise ValueError(f"cluster seed disallows Arrow contains duplicate pair: {normalized_pair!r}")
+        seen_pairs.add(normalized_pair)
+        rows.append(normalized_pair)
+    return tuple(rows)
 
 
 def cluster_seed_disallows_path_from_arrow_paths(arrow_paths: Mapping[str, Any] | None) -> Path | None:
@@ -347,6 +353,81 @@ def _read_arrow_batch_lookup_index_header(index_path: Path) -> dict[str, int | s
         "key_column_hash": int(key_column_hash),
         "source_fingerprint": int(source_fingerprint),
     }
+
+
+def _arrow_batch_lookup_record_hash(index_mmap: mmap.mmap, record_index: int) -> int:
+    offset = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size + record_index * _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.size
+    return int(_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.unpack_from(index_mmap, offset)[0])
+
+
+def _arrow_batch_lookup_record_batch_index(index_mmap: mmap.mmap, record_index: int) -> int:
+    offset = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size + record_index * _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.size
+    return int(_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.unpack_from(index_mmap, offset)[1])
+
+
+def _arrow_batch_lookup_lower_bound(index_mmap: mmap.mmap, record_count: int, key_hash: int) -> int:
+    lower = 0
+    upper = int(record_count)
+    while lower < upper:
+        midpoint = lower + (upper - lower) // 2
+        if _arrow_batch_lookup_record_hash(index_mmap, midpoint) < key_hash:
+            lower = midpoint + 1
+        else:
+            upper = midpoint
+    return lower
+
+
+def read_arrow_batch_lookup_index_batch_indices(
+    arrow_path: str | Path,
+    index_path: str | Path,
+    *,
+    key_column: str,
+    values: Iterable[Any],
+) -> set[int]:
+    """Return Arrow record-batch indices that may contain the requested key values."""
+
+    keep_hashes = {_fnv64_bytes(str(value).encode("utf-8")) for value in values}
+    if not keep_hashes:
+        return set()
+    arrow_path_obj = Path(arrow_path)
+    index_path_obj = Path(index_path)
+    header = _read_arrow_batch_lookup_index_header(index_path_obj)
+    source_stat = arrow_path_obj.stat()
+    expected_key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
+    if int(header["key_column_hash"]) != expected_key_column_hash:
+        raise ValueError(
+            f"Arrow batch lookup index '{index_path_obj!s}' was built for a different key column: "
+            f"indexed hash={int(header['key_column_hash'])} expected hash={expected_key_column_hash} "
+            f"key_column={key_column!r}"
+        )
+    source_fingerprint = _source_file_sample_fingerprint(arrow_path_obj)
+    if int(header["source_size"]) != source_stat.st_size or int(header["source_fingerprint"]) != source_fingerprint:
+        raise ValueError(
+            f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': "
+            f"indexed size/fingerprint=({int(header['source_size'])}, {int(header['source_fingerprint'])}) "
+            f"current size/fingerprint=({source_stat.st_size}, {source_fingerprint})"
+        )
+    record_count = int(header["record_count"])
+    expected_len = (
+        _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size + record_count * _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.size
+    )
+    with index_path_obj.open("rb") as infile:
+        with mmap.mmap(infile.fileno(), 0, access=mmap.ACCESS_READ) as index_mmap:
+            if len(index_mmap) != expected_len:
+                raise ValueError(
+                    f"Arrow batch lookup index '{index_path_obj!s}' length {len(index_mmap)} does not match "
+                    f"expected length {expected_len} (record_count={record_count})"
+                )
+            batch_indices: set[int] = set()
+            for key_hash in keep_hashes:
+                record_index = _arrow_batch_lookup_lower_bound(index_mmap, record_count, key_hash)
+                while (
+                    record_index < record_count
+                    and _arrow_batch_lookup_record_hash(index_mmap, record_index) == key_hash
+                ):
+                    batch_indices.add(_arrow_batch_lookup_record_batch_index(index_mmap, record_index))
+                    record_index += 1
+    return batch_indices
 
 
 def write_arrow_batch_lookup_index(
@@ -956,6 +1037,45 @@ def _require_arrow_columns(table: Any, table_name: str, required_columns: set[st
         raise ValueError(f"{table_name} Arrow is missing required columns: {missing_columns}")
 
 
+def _require_arrow_string_columns(table: Any, table_name: str, required_columns: set[str]) -> None:
+    _require_arrow_columns(table, table_name, required_columns)
+    pa = __import__("pyarrow")
+    for column_name in sorted(required_columns):
+        column_type = table[column_name].type
+        if not (pa.types.is_string(column_type) or pa.types.is_large_string(column_type)):
+            raise ValueError(f"{table_name} Arrow column {column_name} expected string, got {column_type}")
+
+
+def _require_arrow_int64_columns(table: Any, table_name: str, required_columns: set[str]) -> None:
+    _require_arrow_columns(table, table_name, required_columns)
+    pa = __import__("pyarrow")
+    for column_name in sorted(required_columns):
+        column_type = table[column_name].type
+        if not pa.types.is_int64(column_type):
+            raise ValueError(f"{table_name} Arrow column {column_name} expected int64, got {column_type}")
+
+
+def _require_arrow_bool_columns(table: Any, table_name: str, required_columns: set[str]) -> None:
+    _require_arrow_columns(table, table_name, required_columns)
+    pa = __import__("pyarrow")
+    for column_name in sorted(required_columns):
+        column_type = table[column_name].type
+        if not pa.types.is_boolean(column_type):
+            raise ValueError(f"{table_name} Arrow column {column_name} expected bool, got {column_type}")
+
+
+def _require_arrow_string_list_columns(table: Any, table_name: str, required_columns: set[str]) -> None:
+    _require_arrow_columns(table, table_name, required_columns)
+    pa = __import__("pyarrow")
+    for column_name in sorted(required_columns):
+        column_type = table[column_name].type
+        value_type = getattr(column_type, "value_type", None)
+        if not (pa.types.is_list(column_type) or pa.types.is_large_list(column_type)) or not (
+            value_type is not None and (pa.types.is_string(value_type) or pa.types.is_large_string(value_type))
+        ):
+            raise ValueError(f"{table_name} Arrow column {column_name} expected list<string>, got {column_type}")
+
+
 def feature_block_from_arrow_paths(
     paths: Mapping[str, Any],
     *,
@@ -974,7 +1094,26 @@ def feature_block_from_arrow_paths(
     selected_signature_id_set = set(selected_signature_ids)
 
     signatures_table = _read_arrow_ipc_table(pa, paths["signatures"])
-    _require_arrow_columns(signatures_table, "signatures", {"signature_id", "paper_id"})
+    _require_arrow_string_columns(
+        signatures_table,
+        "signatures",
+        {
+            "signature_id",
+            "paper_id",
+            "author_first",
+            "author_middle",
+            "author_last",
+            "author_suffix",
+            "author_orcid",
+        },
+    )
+    _require_arrow_int64_columns(signatures_table, "signatures", {"author_position"})
+    _require_arrow_string_list_columns(signatures_table, "signatures", {"author_affiliations"})
+    for optional_signature_string_column in ("author_block", "author_email"):
+        if optional_signature_string_column in signatures_table.column_names:
+            _require_arrow_string_columns(signatures_table, "signatures", {optional_signature_string_column})
+    if "source_author_ids" in signatures_table.column_names:
+        _require_arrow_string_list_columns(signatures_table, "signatures", {"source_author_ids"})
     signatures_table = _filter_arrow_table_by_values(pa, pc, signatures_table, "signature_id", selected_signature_ids)
     signatures_by_id = _arrow_rows_by_unique_key(
         signatures_table.to_pylist(),
@@ -993,7 +1132,14 @@ def feature_block_from_arrow_paths(
 
     paper_ids = tuple(dict.fromkeys(row.paper_id for row in signature_rows))
     papers_table = _read_arrow_ipc_table(pa, paths["papers"])
-    _require_arrow_columns(papers_table, "papers", {"paper_id"})
+    _require_arrow_string_columns(papers_table, "papers", {"journal_name", "paper_id", "title", "venue"})
+    for optional_string_column in ("abstract", "predicted_language"):
+        if optional_string_column in papers_table.column_names:
+            _require_arrow_string_columns(papers_table, "papers", {optional_string_column})
+    if "year" in papers_table.column_names:
+        _require_arrow_int64_columns(papers_table, "papers", {"year"})
+    if "is_reliable" in papers_table.column_names:
+        _require_arrow_bool_columns(papers_table, "papers", {"is_reliable"})
     papers_table = _filter_arrow_table_by_values(pa, pc, papers_table, "paper_id", paper_ids)
     papers_by_id = _arrow_rows_by_unique_key(
         papers_table.to_pylist(),
@@ -1009,7 +1155,8 @@ def feature_block_from_arrow_paths(
     paper_authors_path = paths.get("paper_authors")
     if paper_authors_path is not None:
         paper_authors_table = _read_arrow_ipc_table(pa, paper_authors_path)
-        _require_arrow_columns(paper_authors_table, "paper_authors", {"paper_id", "position"})
+        _require_arrow_int64_columns(paper_authors_table, "paper_authors", {"position"})
+        _require_arrow_string_columns(paper_authors_table, "paper_authors", {"author_name", "paper_id"})
         paper_authors_table = _filter_arrow_table_by_values(pa, pc, paper_authors_table, "paper_id", paper_ids)
         paper_author_row_list: list[FeatureBlockPaperAuthor] = []
         seen_paper_author_positions: set[tuple[str, int]] = set()
@@ -1023,6 +1170,12 @@ def feature_block_from_arrow_paths(
             if row.get("position") is None:
                 raise ValueError("paper_authors Arrow cannot contain null position values")
             position = int(row["position"])
+            author_name_value = row.get("author_name")
+            if author_name_value is None:
+                raise ValueError("paper_authors Arrow cannot contain null author_name values")
+            author_name = str(author_name_value)
+            if not author_name:
+                raise ValueError("paper_authors Arrow cannot contain empty author_name values")
             key = (paper_id, position)
             if key in seen_paper_author_positions:
                 raise ValueError(f"paper_authors Arrow contains duplicate (paper_id, position): {key!r}")
@@ -1031,7 +1184,7 @@ def feature_block_from_arrow_paths(
                 FeatureBlockPaperAuthor(
                     paper_id=paper_id,
                     position=position,
-                    author_name=str(row.get("author_name") or ""),
+                    author_name=author_name,
                 )
             )
         paper_author_rows = tuple(paper_author_row_list)
@@ -1048,19 +1201,7 @@ def feature_block_from_arrow_paths(
     disallow_pairs: tuple[tuple[str, str], ...] = ()
     disallow_path = paths.get("cluster_seed_disallows")
     if disallow_path is not None:
-        disallow_table = _read_arrow_ipc_table(pa, disallow_path)
-        missing_disallow_columns = sorted({"signature_id_1", "signature_id_2"}.difference(disallow_table.column_names))
-        if missing_disallow_columns:
-            raise ValueError(f"cluster seed disallows Arrow is missing required columns: {missing_disallow_columns}")
-        disallow_rows: list[tuple[str, str]] = []
-        for left, right in zip(
-            disallow_table["signature_id_1"].to_pylist(),
-            disallow_table["signature_id_2"].to_pylist(),
-            strict=True,
-        ):
-            if left is None or right is None:
-                raise ValueError("cluster seed disallows Arrow cannot contain null signature ids")
-            disallow_rows.append((str(left), str(right)))
+        disallow_rows = read_cluster_seed_disallows_arrow(Path(disallow_path))
         disallow_pairs = filter_cluster_seed_disallows_for_signature_subset(
             disallow_rows,
             selected_signature_id_set,
@@ -1071,7 +1212,8 @@ def feature_block_from_arrow_paths(
     specter_path = paths.get("specter")
     if include_specter and specter_path is not None:
         specter_table = _read_arrow_ipc_table(pa, specter_path)
-        _require_arrow_columns(specter_table, "specter", {"paper_id", "embedding"})
+        _require_arrow_columns(specter_table, "specter", {"embedding"})
+        _require_arrow_string_columns(specter_table, "specter", {"paper_id"})
         specter_table = _filter_arrow_table_by_values(pa, pc, specter_table, "paper_id", paper_ids)
         specter_by_id = _arrow_rows_by_unique_key(
             specter_table.to_pylist(),

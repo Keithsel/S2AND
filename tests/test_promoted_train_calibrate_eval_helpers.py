@@ -965,7 +965,14 @@ def test_minimal_raw_materialization_skips_tables_empty_after_dataset_filter(
     source_bundle = OfficialBundle(
         root=source_root,
         bundle_name="demo",
-        assets={},
+        assets={
+            "featureless_rows": {
+                "files": {
+                    "train_path": "labels/train.parquet",
+                    "hwang_eval_path": "labels/hwang_eval.parquet",
+                }
+            }
+        },
         models={"classic": {}},
         expected_metrics={},
     )

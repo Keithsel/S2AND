@@ -16,6 +16,7 @@ import s2and.incremental_linking.artifact as artifact_module
 import s2and.incremental_linking.query_adapter as query_adapter_module
 import s2and.incremental_linking.runtime as runtime_module
 from s2and import feature_port, memory_budget
+from s2and.arrow_inputs import validate_arrow_prediction_artifacts
 from s2and.data import ANDData
 from s2and.incremental_linking.feature_block import (
     cluster_seed_disallows_from_arrow_paths,
@@ -23,6 +24,7 @@ from s2and.incremental_linking.feature_block import (
     temporary_arrow_paths_with_cluster_seeds,
 )
 from s2and.incremental_linking.policy import (
+    clusterer_uses_embedding_features,
     clusterer_uses_name_count_features,
     request_cluster_seed_disallow_parts,
     require_arrow_name_counts_index_for_clusterer,
@@ -896,7 +898,19 @@ def predict_incremental_promoted_linker_from_arrow_paths(
 
     artifact = artifact_module.load_incremental_linking_artifact(artifact_dir)
     resolved_total_ram_bytes, _ = resolve_total_ram_bytes(total_ram_bytes)
-    base_arrow_path_payload = feature_port.normalize_arrow_paths(arrow_paths)
+    clusterer_requires_specter = clusterer_uses_embedding_features(clusterer)
+    clusterer_requires_name_counts = clusterer_uses_name_count_features(clusterer)
+    base_arrow_path_payload = validate_arrow_prediction_artifacts(
+        arrow_paths,
+        require_specter=clusterer_requires_specter,
+        require_name_counts_index=clusterer_requires_name_counts,
+        require_cluster_seeds=False,
+        require_batch_indexes=False,
+        context="Promoted incremental Arrow input",
+        producer_hint=(
+            "include valid base Arrow tables and any declared seed sidecars before promoted incremental " "seed setup"
+        ),
+    )
     require_arrow_name_counts_index_for_clusterer(clusterer, base_arrow_path_payload, context="Raw Arrow scoring")
     (
         cluster_seeds_require,
@@ -987,6 +1001,19 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             cluster_seeds_disallow=request_disallows,
         )
     with arrow_path_context as arrow_path_payload:
+        if unassigned_signature_ids:
+            arrow_path_payload = validate_arrow_prediction_artifacts(
+                arrow_path_payload,
+                require_specter=clusterer_requires_specter,
+                require_name_counts_index=clusterer_requires_name_counts,
+                require_cluster_seeds=True,
+                require_batch_indexes=True,
+                context="Promoted incremental Arrow scoring",
+                producer_hint=(
+                    "include raw Arrow tables, raw-planner batch indexes, and the request-local "
+                    "cluster_seeds sidecar before promoted incremental retrieval"
+                ),
+            )
         seed_arrow_assignment_seconds = time.perf_counter() - seed_arrow_start
         raw_window_plan_count = 0
         raw_window_plan_seconds = 0.0

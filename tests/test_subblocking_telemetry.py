@@ -6,6 +6,7 @@ import pytest
 
 import s2and.subblocking as subblocking
 from s2and.data import Signature
+from s2and.incremental_linking.feature_block import write_arrow_batch_lookup_index
 
 
 def _write_ipc(path, table: pa.Table) -> str:
@@ -168,34 +169,6 @@ def test_signature_name_parts_for_subblocking_recomputes_deferred_normalized_fie
     assert subblocking.signature_name_parts_for_subblocking(signature) == ("arif ullah", "")
 
 
-def test_coauthor_blocks_from_full_arrow_normalizes_author_names(tmp_path) -> None:
-    paper_authors = pa.table(
-        {
-            "paper_id": pa.array(["p1", "p1", "p1", "p1"], type=pa.string()),
-            "position": pa.array([0, 1, 2, 3], type=pa.int64()),
-            "author_name": pa.array(
-                ["Ali Khan", "Waseeq-Ur-Rehamn", "Mariarosaria D'Alfonso", "Maciej G\u00f3rski"],
-                type=pa.string(),
-            ),
-        }
-    )
-
-    out = subblocking._coauthor_blocks_by_paper_from_full_arrow(  # noqa: SLF001
-        {"paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors)},
-        ["p1"],
-        {},
-    )
-
-    assert out == {
-        "p1": [
-            (0, "a khan"),
-            (1, "w rehamn"),
-            (2, "m alfonso"),
-            (3, "m gorski"),
-        ]
-    }
-
-
 def test_coauthor_blocks_from_rowwise_arrow_normalizes_author_names(tmp_path) -> None:
     paper_authors = pa.table(
         {
@@ -205,8 +178,17 @@ def test_coauthor_blocks_from_rowwise_arrow_normalizes_author_names(tmp_path) ->
         }
     )
 
+    paper_authors_path = _write_ipc(tmp_path / "paper_authors.arrow", paper_authors)
+    paper_authors_index_path = tmp_path / "paper_authors.paper_authors_batch_index.bin"
+    write_arrow_batch_lookup_index(
+        paper_authors_path,
+        paper_authors_index_path,
+        key_column="paper_id",
+        table_name="paper_authors",
+    )
+
     out = subblocking._coauthor_blocks_by_paper_from_arrow(  # noqa: SLF001
-        {"paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors)},
+        {"paper_authors": paper_authors_path, "paper_authors_batch_index": str(paper_authors_index_path)},
         ["p1"],
         load_metrics={},
     )

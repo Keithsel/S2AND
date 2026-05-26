@@ -12,6 +12,7 @@ import pytest
 
 import s2and.incremental_linking.query_adapter as retrieval
 from s2and import text as s2and_text
+from s2and.incremental_linking.feature_block import write_name_counts_index
 from s2and.incremental_linking.linker_pairwise import LinkerCandidateBatch
 from s2and.incremental_linking_training.classic import OfficialBundle
 from s2and.incremental_linking_training.query_support import build_rust_hybrid_centroid_retriever
@@ -33,6 +34,7 @@ from scripts.production.model.linker_train_calibrate_eval import (
     _score_candidate_summaries_with_frozen_rust_policy,
     _write_minimal_raw_partial_frame,
 )
+from tests.helpers import patch_tiny_name_counts_loader
 
 
 class _ConstraintClusterer:
@@ -612,15 +614,26 @@ def test_arrow_rust_pair_label_resolution_applies_seed_bypass_and_disallow_ignor
     assert summary["constraint_disallow_ignored_pair_count"] == 1
 
 
-def test_arrow_paths_use_manifest_name_counts_index_unless_explicit_override(tmp_path: Path) -> None:
+def test_arrow_paths_use_manifest_name_counts_index_unless_explicit_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bundle_root = tmp_path / "bundle"
     dataset_dir = bundle_root / "datasets" / "toy"
     dataset_dir.mkdir(parents=True)
-    for filename in ("signatures.arrow", "papers.arrow", "paper_authors.arrow", "specter.arrow"):
+    for filename in (
+        "signatures.arrow",
+        "papers.arrow",
+        "paper_authors.arrow",
+        "specter.arrow",
+        "signatures.signatures_batch_index.bin",
+        "papers.papers_batch_index.bin",
+        "paper_authors.paper_authors_batch_index.bin",
+        "specter.specter_batch_index.bin",
+    ):
         (dataset_dir / filename).write_bytes(b"placeholder")
-    manifest_index = bundle_root / "name_counts_index"
-    manifest_index.mkdir()
-    (manifest_index / "manifest.json").write_text("{}", encoding="utf-8")
+    patch_tiny_name_counts_loader(monkeypatch)
+    manifest_index, _metrics = write_name_counts_index(bundle_root)
     manifest_path = dataset_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(
@@ -630,6 +643,10 @@ def test_arrow_paths_use_manifest_name_counts_index_unless_explicit_override(tmp
                     "papers": "papers.arrow",
                     "paper_authors": "paper_authors.arrow",
                     "specter": "specter.arrow",
+                    "signatures_batch_index": "signatures.signatures_batch_index.bin",
+                    "papers_batch_index": "papers.papers_batch_index.bin",
+                    "paper_authors_batch_index": "paper_authors.paper_authors_batch_index.bin",
+                    "specter_batch_index": "specter.specter_batch_index.bin",
                     "name_counts_index": "name_counts_index",
                 }
             }
@@ -645,12 +662,11 @@ def test_arrow_paths_use_manifest_name_counts_index_unless_explicit_override(tmp
     )
 
     paths = _arrow_paths_for_dataset(bundle, "toy")
-    assert paths["name_counts_index"] == str(manifest_index.resolve())
+    assert paths["name_counts_index"] == str(Path(manifest_index).resolve())
 
-    override_index = tmp_path / "override_name_counts_index"
-    override_index.mkdir()
+    override_index, _metrics = write_name_counts_index(tmp_path / "override")
     paths = _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=override_index)
-    assert paths["name_counts_index"] == str(override_index.resolve())
+    assert paths["name_counts_index"] == str(Path(override_index).resolve())
 
     manifest_path.write_text(
         json.dumps(
@@ -665,10 +681,30 @@ def test_arrow_paths_use_manifest_name_counts_index_unless_explicit_override(tmp
         ),
         encoding="utf-8",
     )
-    with pytest.raises(FileNotFoundError, match="name_counts_index"):
+    with pytest.raises(ValueError, match="signatures_batch_index"):
+        _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=override_index)
+
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "paths": {
+                    "signatures": "signatures.arrow",
+                    "papers": "papers.arrow",
+                    "paper_authors": "paper_authors.arrow",
+                    "specter": "specter.arrow",
+                    "signatures_batch_index": "signatures.signatures_batch_index.bin",
+                    "papers_batch_index": "papers.papers_batch_index.bin",
+                    "paper_authors_batch_index": "paper_authors.paper_authors_batch_index.bin",
+                    "specter_batch_index": "specter.specter_batch_index.bin",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="name_counts_index"):
         _arrow_paths_for_dataset(bundle, "toy")
     paths = _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=override_index)
-    assert paths["name_counts_index"] == str(override_index.resolve())
+    assert paths["name_counts_index"] == str(Path(override_index).resolve())
 
 
 def test_minimal_raw_query_first_prefix_uses_full_author_before_masked_view() -> None:

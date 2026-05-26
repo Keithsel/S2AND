@@ -16,7 +16,9 @@ import s2and.model as model_module
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
+from s2and.incremental_linking.feature_block import write_cluster_seeds_arrow, write_name_counts_index
 from s2and.model import Clusterer
+from tests.helpers import patch_tiny_name_counts_loader
 
 s2and_rust = cast(Any, feature_port.s2and_rust)
 
@@ -114,6 +116,20 @@ def _dummy_clusterer(
         use_default_constraints_as_supervision=use_default_constraints_as_supervision,
         batch_size=2,
     )
+
+
+def _with_fake_batch_indexes(arrow_paths: dict[str, str], tmp_path: Path) -> dict[str, str]:
+    indexed = dict(arrow_paths)
+    for key in ("signatures", "papers", "paper_authors"):
+        index_key = f"{key}_batch_index"
+        index_path = tmp_path / f"{key}.{index_key}.bin"
+        index_path.touch()
+        indexed[index_key] = str(index_path)
+    if "specter" in indexed:
+        index_path = tmp_path / "specter.specter_batch_index.bin"
+        index_path.touch()
+        indexed["specter_batch_index"] = str(index_path)
+    return indexed
 
 
 def _partial_supervision_for_upper_triangle(signatures: list[str]) -> tuple[dict[tuple[str, str], float], np.ndarray]:
@@ -790,8 +806,9 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, 
     }
     for path in arrow_paths.values():
         Path(path).touch()
-    name_counts_index = tmp_path / "name_counts_index"
-    name_counts_index.mkdir()
+    arrow_paths = _with_fake_batch_indexes(arrow_paths, tmp_path)
+    patch_tiny_name_counts_loader(monkeypatch)
+    name_counts_index, _metrics = write_name_counts_index(tmp_path)
     disallow_path = tmp_path / "cluster_seed_disallows.arrow"
     disallow_table = pa.table(
         {
@@ -829,7 +846,7 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, 
         {"block": ["0", "1", "2"]},
         {
             **arrow_paths,
-            "name_counts_index": str(name_counts_index),
+            "name_counts_index": name_counts_index,
             "cluster_seed_disallows": str(disallow_path),
         },
         load_name_counts=True,
@@ -849,6 +866,46 @@ def test_predict_from_arrow_paths_builds_filtered_arrow_featurizer(monkeypatch, 
     assert telemetry["pair_count"] == 3
     assert telemetry["arrow_featurizer_seconds"] >= 0
     assert telemetry["rust_featurizer_predict_seconds"] >= 0
+
+
+def test_predict_from_arrow_paths_omits_unused_specter_for_non_embedding_model(monkeypatch, tmp_path):
+    captured = {}
+    arrow_paths = {
+        "signatures": str(tmp_path / "signatures.arrow"),
+        "papers": str(tmp_path / "papers.arrow"),
+        "paper_authors": str(tmp_path / "paper_authors.arrow"),
+        "specter": str(tmp_path / "specter.arrow"),
+    }
+    for path in arrow_paths.values():
+        Path(path).touch()
+    arrow_paths = _with_fake_batch_indexes(arrow_paths, tmp_path)
+    arrow_paths.pop("specter_batch_index")
+
+    class _FakeFeaturizer:
+        def signature_ids(self):
+            return ["0", "1"]
+
+    def fake_build_from_arrow_paths(paths, **kwargs):
+        captured["paths"] = dict(paths)
+        captured["signature_ids"] = tuple(kwargs["signature_ids"])
+        return _FakeFeaturizer()
+
+    def fake_predict_from_rust_featurizer(self, block_dict, rust_featurizer, **kwargs):
+        captured["block_dict"] = block_dict
+        captured["rust_featurizer"] = rust_featurizer
+        return {"block": ["0", "1"]}, None
+
+    monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", fake_build_from_arrow_paths)
+    monkeypatch.setattr(Clusterer, "predict_from_rust_featurizer", fake_predict_from_rust_featurizer)
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+    result, dists = clusterer.predict_from_arrow_paths({"block": ["0", "1"]}, arrow_paths)
+
+    assert result == {"block": ["0", "1"]}
+    assert dists is None
+    assert captured["signature_ids"] == ("0", "1")
+    assert "specter" not in captured["paths"]
+    assert "specter_batch_index" not in captured["paths"]
 
 
 def test_predict_from_arrow_paths_rejects_reference_features(monkeypatch):
@@ -890,7 +947,14 @@ def test_predict_from_arrow_paths_merges_explicit_disallows(monkeypatch):
     clusterer = _dummy_clusterer(cluster_model=None)
     result, dists = clusterer.predict_from_arrow_paths(
         {"block": ["0", "1", "2"]},
-        {"signatures": __file__, "papers": __file__, "paper_authors": __file__},
+        {
+            "signatures": __file__,
+            "papers": __file__,
+            "paper_authors": __file__,
+            "signatures_batch_index": __file__,
+            "papers_batch_index": __file__,
+            "paper_authors_batch_index": __file__,
+        },
         partial_supervision={("0", "1"): 0, ("0", "2"): 0},
         cluster_seeds_disallow={("0", "1"), ("1", "2")},
     )
@@ -974,6 +1038,7 @@ def test_predict_auto_requires_arrow_paths_with_name_counts_index(tmp_path, monk
         path = tmp_path / filename
         path.touch()
         arrow_paths[key] = str(path)
+    arrow_paths = _with_fake_batch_indexes(arrow_paths, tmp_path)
     cast(Any, dataset).arrow_paths = arrow_paths
     runtime_context = type(
         "RuntimeContext",
@@ -1013,7 +1078,7 @@ def test_predict_auto_requires_arrow_paths_with_name_counts_index(tmp_path, monk
 
     error = exc_info.value
     assert error.context == "Clusterer.predict Rust prediction"
-    assert error.missing_keys == ("signatures", "papers", "paper_authors", "name_counts_index")
+    assert error.missing_keys == ("name_counts_index",)
 
 
 def test_predict_from_arrow_paths_reports_structured_missing_artifacts(tmp_path):
@@ -1038,8 +1103,21 @@ def test_predict_from_arrow_paths_reports_structured_missing_artifacts(tmp_path)
 
     error = exc_info.value
     assert error.context == "Clusterer.predict_from_arrow_paths"
-    assert error.required_keys == ("name_counts_index", "paper_authors", "papers", "signatures")
-    assert error.missing_keys == ("name_counts_index",)
+    assert error.required_keys == (
+        "name_counts_index",
+        "paper_authors",
+        "paper_authors_batch_index",
+        "papers",
+        "papers_batch_index",
+        "signatures",
+        "signatures_batch_index",
+    )
+    assert error.missing_keys == (
+        "name_counts_index",
+        "paper_authors_batch_index",
+        "papers_batch_index",
+        "signatures_batch_index",
+    )
     assert error.missing_files == {
         "papers": str(tmp_path / "missing_papers.arrow"),
         "paper_authors": str(tmp_path / "missing_paper_authors.arrow"),
@@ -1057,6 +1135,7 @@ def test_predict_from_arrow_paths_rejects_declared_missing_optional_sidecar(tmp_
         path = tmp_path / filename
         path.touch()
         arrow_paths[key] = str(path)
+    arrow_paths = _with_fake_batch_indexes(arrow_paths, tmp_path)
 
     clusterer = _dummy_clusterer(cluster_model=None)
     with pytest.raises(model_module.MissingArrowArtifactError) as exc_info:
@@ -1104,6 +1183,47 @@ def test_predict_subblocked_rust_requires_arrow_paths(monkeypatch):
     assert error.missing_keys == ("signatures", "papers", "paper_authors")
 
 
+def test_predict_subblocked_rust_requires_subblocking_batch_index(tmp_path, monkeypatch):
+    dataset = _dummy_dataset("dummy_predict_subblocked_missing_subblocking_index")
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
+    cast(Any, dataset).arrow_paths = arrow_paths
+    runtime_context = type(
+        "RuntimeContext",
+        (),
+        {
+            "operation": "cluster_predict",
+            "requested_backend": "rust",
+            "resolved_backend": "rust",
+            "use_rust": True,
+            "run_id": "test-subblocked-missing-subblocking-index",
+            "source": "test",
+        },
+    )()
+
+    def fail_make_subblocks(*_args, **_kwargs):
+        raise AssertionError("Rust production subblocking should not fall back to Python partitioning")
+
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
+    monkeypatch.setattr(model_module, "make_subblocks", fail_make_subblocks)
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+    with pytest.raises(model_module.MissingArrowArtifactError) as exc_info:
+        clusterer.predict({"block": ["0", "1"]}, dataset, batching_threshold=1)
+
+    error = exc_info.value
+    assert error.context == "Arrow subblocking"
+    assert error.required_keys == ("signatures", "signatures_batch_index")
+    assert error.missing_keys == ("signatures_batch_index",)
+
+
 def test_predict_subblocked_uses_arrow_featurizer_for_multiple_letter_groups(tmp_path, monkeypatch):
     captured = {"predict_calls": []}
     dataset = _dummy_dataset("dummy_predict_subblocked_arrow")
@@ -1116,6 +1236,7 @@ def test_predict_subblocked_uses_arrow_featurizer_for_multiple_letter_groups(tmp
         path = tmp_path / filename
         path.touch()
         arrow_paths[key] = str(path)
+    arrow_paths = _with_fake_batch_indexes(arrow_paths, tmp_path)
     cast(Any, dataset).arrow_paths = arrow_paths
     runtime_context = type(
         "RuntimeContext",
@@ -1159,6 +1280,75 @@ def test_predict_subblocked_uses_arrow_featurizer_for_multiple_letter_groups(tmp
     assert captured["build_paths"] == arrow_paths
     assert captured["build_signature_ids"] == ("0", "1")
     assert captured["predict_calls"] == [{"block": ["0", "1"]}]
+
+
+def test_predict_subblocked_materializes_current_cluster_seeds_without_altered_presplit(
+    tmp_path,
+    monkeypatch,
+):
+    from contextlib import contextmanager
+
+    captured: dict[str, Any] = {"temporary_seed_context_calls": 0}
+    dataset = _dummy_dataset("dummy_predict_subblocked_arrow_current_seeds")
+    dataset.cluster_seeds_require = {"0": "c0", "1": "c0"}
+    arrow_paths = {}
+    for key, filename in {
+        "signatures": "signatures.arrow",
+        "papers": "papers.arrow",
+        "paper_authors": "paper_authors.arrow",
+    }.items():
+        path = tmp_path / filename
+        path.touch()
+        arrow_paths[key] = str(path)
+    arrow_paths = _with_fake_batch_indexes(arrow_paths, tmp_path)
+    cast(Any, dataset).arrow_paths = arrow_paths
+    runtime_context = type(
+        "RuntimeContext",
+        (),
+        {
+            "operation": "cluster_predict",
+            "requested_backend": "rust",
+            "resolved_backend": "rust",
+            "use_rust": True,
+            "run_id": "test-subblocked-current-seeds",
+            "source": "test",
+        },
+    )()
+
+    class _FakeFeaturizer:
+        pass
+
+    @contextmanager
+    def fake_temporary_seed_paths(dataset_arg, arrow_paths_arg, **_kwargs):
+        captured["temporary_seed_context_calls"] += 1
+        captured["temporary_seed_map"] = dict(dataset_arg.cluster_seeds_require)
+        cluster_seeds_path = tmp_path / "request_cluster_seeds.arrow"
+        write_cluster_seeds_arrow(cluster_seeds_path, dataset_arg.cluster_seeds_require)
+        yield {**dict(arrow_paths_arg), "cluster_seeds": str(cluster_seeds_path)}
+
+    def fake_build_from_arrow_paths(paths, **kwargs):
+        captured["build_paths"] = dict(paths)
+        captured["build_signature_ids"] = tuple(kwargs["signature_ids"])
+        return _FakeFeaturizer()
+
+    def fake_predict_from_rust_featurizer(self, block_dict, rust_featurizer, **kwargs):
+        del self, rust_featurizer, kwargs
+        return {f"{next(iter(block_dict))}_0": list(next(iter(block_dict.values())))}, None
+
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
+    monkeypatch.setattr(model_module, "_temporary_arrow_paths_with_current_cluster_seeds", fake_temporary_seed_paths)
+    monkeypatch.setattr(model_module, "build_rust_featurizer_from_arrow_paths", fake_build_from_arrow_paths)
+    monkeypatch.setattr(Clusterer, "predict_from_rust_featurizer", fake_predict_from_rust_featurizer)
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+    result, dists = clusterer.predict({"block": ["0", "1"]}, dataset, batching_threshold=10)
+
+    assert result == {"block_0": ["0", "1"]}
+    assert dists is None
+    assert captured["temporary_seed_context_calls"] == 1
+    assert captured["temporary_seed_map"] == {"0": "c0", "1": "c0"}
+    assert captured["build_paths"] == {**arrow_paths, "cluster_seeds": str(tmp_path / "request_cluster_seeds.arrow")}
+    assert captured["build_signature_ids"] == ("0", "1")
 
 
 def test_arrow_path_discovery_uses_original_signature_path_after_filtering(tmp_path):

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from pathlib import Path
 from typing import Any
 
+from s2and.arrow_inputs import require_name_counts_index_artifact
 from s2and.incremental_linking.feature_block import normalize_cluster_seed_disallow_pairs
 
 
@@ -20,12 +20,27 @@ def clusterer_uses_name_count_features(clusterer: Any) -> bool:
     return False
 
 
+def clusterer_uses_embedding_features(clusterer: Any) -> bool:
+    """Return whether the clusterer requires SPECTER embedding features."""
+
+    for attr_name in ("featurizer_info", "nameless_featurizer_info"):
+        featurizer_info = getattr(clusterer, attr_name, None)
+        features_to_use = getattr(featurizer_info, "features_to_use", ())
+        if "embedding_similarity" in features_to_use:
+            return True
+    return False
+
+
 def existing_name_counts_index_path(paths: Mapping[str, Any]) -> str | None:
     """Return the configured name-count index path when it exists."""
 
     path_value = paths.get("name_counts_index")
-    if path_value is not None and Path(str(path_value)).exists():
-        return str(path_value)
+    if path_value is not None:
+        return require_name_counts_index_artifact(
+            path_value,
+            context="Arrow name-count index",
+            producer_hint="pass a manifest-backed name_counts_index directory",
+        )
     return None
 
 

@@ -143,7 +143,11 @@ def _drop_unlabeled_singleton_orcid_labels(
         bad_mask = rows["supervision_type"].astype(str).eq(UNLABELED_SINGLETON_ORCID_SUPERVISION_TYPE)
         removed = rows.loc[bad_mask]
         cleaned = rows.loc[~bad_mask].reset_index(drop=True)
-        labels = pd.to_numeric(removed["label"], errors="coerce").fillna(0).astype(int) if "label" in removed else []
+        labels = (
+            pd.to_numeric(removed["label"], errors="coerce").fillna(0).astype(int)
+            if "label" in removed
+            else pd.Series(dtype=int)
+        )
         reports.append(
             {
                 "table_key": table_key,

@@ -1,5 +1,6 @@
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -7,7 +8,10 @@ import pytest
 
 import s2and.feature_port as feature_port
 import s2and.rust_capabilities as rust_capabilities
+from s2and.arrow_inputs import MissingArrowArtifactError
 from s2and.data import ANDData, NameCounts
+from s2and.incremental_linking.feature_block import write_name_counts_index
+from tests.helpers import patch_tiny_name_counts_loader
 
 
 def _missing_module(name: str) -> ModuleNotFoundError:
@@ -43,6 +47,10 @@ class DummyRustFeaturizer:
     def from_json_paths(cls, *_args, **_kwargs):
         cls.from_json_created.append((_args, _kwargs))
         return cls("json")
+
+    @classmethod
+    def from_arrow_paths(cls, *_args, **_kwargs):
+        return cls("arrow")
 
     def update_signature_name_counts(self, signatures):
         self.__class__.signature_overlay_payloads.append(signatures)
@@ -464,8 +472,54 @@ def test_build_rust_featurizer_from_arrow_paths_requires_index_for_name_counts(m
 
     class ArrowRustFeaturizer(DummyRustFeaturizer):
         @classmethod
-        def from_arrow_paths(cls, paths, _signature_ids, _name_tuples, name_counts_path, *_args):
-            calls.append({"paths": dict(paths), "name_counts_path": name_counts_path})
+        def from_arrow_paths(cls, paths, _signature_ids, _name_tuples, *_args):
+            calls.append({"paths": dict(paths)})
+            return cls("arrow")
+
+    class ArrowRustModule:
+        __version__ = "0.51.0"
+        RustFeaturizer = ArrowRustFeaturizer
+
+    monkeypatch.setattr(feature_port, "s2and_rust", ArrowRustModule)
+    for filename in ("signatures.arrow", "papers.arrow", "paper_authors.arrow"):
+        (tmp_path / filename).touch()
+    paths = {
+        "signatures": str(tmp_path / "signatures.arrow"),
+        "papers": str(tmp_path / "papers.arrow"),
+        "paper_authors": str(tmp_path / "paper_authors.arrow"),
+    }
+
+    with pytest.raises(MissingArrowArtifactError) as exc_info:
+        feature_port.build_rust_featurizer_from_arrow_paths(
+            paths,
+            load_name_counts=True,
+            full_scan_without_index=True,
+        )
+    assert exc_info.value.missing_keys == ("name_counts_index",)
+
+    with pytest.raises(ValueError, match="does not accept name_counts_path"):
+        feature_port.build_rust_featurizer_from_arrow_paths(paths, name_counts_path="name_counts.json")
+
+    patch_tiny_name_counts_loader(monkeypatch)
+    index_path, _metrics = write_name_counts_index(tmp_path / "name_counts_index")
+    result = feature_port.build_rust_featurizer_from_arrow_paths(
+        {**paths, "name_counts_index": index_path},
+        load_name_counts=True,
+        full_scan_without_index=True,
+    )
+
+    assert result.dataset_name == "arrow"
+    assert calls == [
+        {
+            "paths": {**paths, "name_counts_index": index_path},
+        }
+    ]
+
+
+def test_build_rust_featurizer_from_arrow_paths_requires_batch_indexes_by_default(monkeypatch, tmp_path):
+    class ArrowRustFeaturizer(DummyRustFeaturizer):
+        @classmethod
+        def from_arrow_paths(cls, *_args, **_kwargs):
             return cls("arrow")
 
     class ArrowRustModule:
@@ -474,30 +528,44 @@ def test_build_rust_featurizer_from_arrow_paths_requires_index_for_name_counts(m
 
     monkeypatch.setattr(feature_port, "s2and_rust", ArrowRustModule)
     paths = {
-        "signatures": "signatures.arrow",
-        "papers": "papers.arrow",
+        "signatures": str(tmp_path / "signatures.arrow"),
+        "papers": str(tmp_path / "papers.arrow"),
+        "paper_authors": str(tmp_path / "paper_authors.arrow"),
     }
+    for path in paths.values():
+        Path(path).touch()
 
-    with pytest.raises(ValueError, match="requires name_counts_index"):
-        feature_port.build_rust_featurizer_from_arrow_paths(paths, load_name_counts=True)
+    with pytest.raises(ValueError, match="signatures_batch_index"):
+        feature_port.build_rust_featurizer_from_arrow_paths(paths)
 
-    with pytest.raises(ValueError, match="does not accept name_counts_path"):
-        feature_port.build_rust_featurizer_from_arrow_paths(paths, name_counts_path="name_counts.json")
+    with pytest.raises(ValueError, match="missing_papers.arrow"):
+        feature_port.build_rust_featurizer_from_arrow_paths(
+            {
+                **paths,
+                "papers": str(tmp_path / "missing_papers.arrow"),
+            },
+            full_scan_without_index=True,
+        )
 
-    index_path = tmp_path / "name_counts_index"
-    index_path.mkdir()
-    result = feature_port.build_rust_featurizer_from_arrow_paths(
-        {**paths, "name_counts_index": str(index_path)},
-        load_name_counts=True,
-    )
+    with pytest.raises(ValueError, match="name_pairs"):
+        feature_port.build_rust_featurizer_from_arrow_paths(
+            {
+                **paths,
+                "name_pairs": str(tmp_path / "missing_name_pairs.arrow"),
+            },
+            full_scan_without_index=True,
+        )
 
+    index_paths = {
+        "signatures_batch_index": str(tmp_path / "signatures.index"),
+        "papers_batch_index": str(tmp_path / "papers.index"),
+        "paper_authors_batch_index": str(tmp_path / "paper_authors.index"),
+    }
+    for path in index_paths.values():
+        Path(path).touch()
+
+    result = feature_port.build_rust_featurizer_from_arrow_paths({**paths, **index_paths})
     assert result.dataset_name == "arrow"
-    assert calls == [
-        {
-            "paths": {**paths, "name_counts_index": str(index_path)},
-            "name_counts_path": None,
-        }
-    ]
 
 
 def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):

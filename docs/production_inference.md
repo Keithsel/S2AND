@@ -428,8 +428,9 @@ pred_clusters, _ = clusterer.predict(
 
 Production Rust inference should call `Clusterer.predict_from_arrow_paths(...)`
 or provide complete Arrow paths to `Clusterer.predict(...)`: at least
-`signatures`, `papers`, and `paper_authors`. Models that use SPECTER features
-also require `specter`, and models that use name-count features require
+`signatures`, `papers`, `paper_authors`, and their raw-planner batch-index
+sidecars. Models that use SPECTER features also require `specter` plus
+`specter_batch_index`, and models that use name-count features require
 `name_counts_index`. The direct Arrow route validates required keys and declared
 files before Rust featurizer construction and raises
 `MissingArrowArtifactError` with structured `missing_keys` and `missing_files`

@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 # When this file is executed directly, ensure `scripts/` is importable so
 # `import _rust_suite.*` works.
@@ -25,6 +25,8 @@ from _rust_suite.common import (  # type: ignore  # noqa: E402
     collect_rust_extension_identity,
     get_result_markers,
 )
+
+from s2and.arrow_inputs import MissingArrowArtifactError, validate_arrow_prediction_artifacts  # noqa: E402
 
 DEFAULT_ARROW_ROOT = PROJECT_ROOT / "s2and" / "data" / "s2and_and_big_blocks_linker_dataset_20260513_arrow"
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "s2and" / "data" / "production_model_v1.21"
@@ -117,24 +119,44 @@ def _resolve_arrow_dataset_paths(arrow_root: Path, dataset: str) -> dict[str, st
         "papers",
         "paper_authors",
         "specter",
+        "specter2",
         "name_counts_index",
         "signatures_batch_index",
         "papers_batch_index",
         "paper_authors_batch_index",
         "specter_batch_index",
+        "specter2_batch_index",
         "cluster_seed_disallows",
         "altered_cluster_signatures",
     ):
         value = manifest_paths.get(key)
         if value is not None:
             paths[key] = _resolve_manifest_path(dataset_root, value)
+    if "specter" not in paths and "specter2" in paths:
+        paths["specter"] = paths["specter2"]
+    if "specter_batch_index" not in paths and "specter2_batch_index" in paths:
+        paths["specter_batch_index"] = paths["specter2_batch_index"]
     paths["clusters"] = str((dataset_root / f"{dataset}_clusters.json").resolve())
-    required = ("signatures", "papers", "paper_authors", "specter", "name_counts_index", "clusters")
-    missing = {key: paths.get(key, "") for key in required if key not in paths or not Path(paths[key]).exists()}
-    if missing:
+    if not Path(paths["clusters"]).exists():
+        missing = {"clusters": paths["clusters"]}
         formatted = ", ".join(f"{key}={value}" for key, value in missing.items())
         raise FileNotFoundError(f"Missing required Arrow profiling paths for {dataset}: {formatted}")
-    return paths
+    try:
+        validated = validate_arrow_prediction_artifacts(
+            paths,
+            require_specter=True,
+            require_name_counts_index=True,
+            require_batch_indexes=True,
+            context=f"promoted incremental Arrow profile dataset {dataset}",
+            producer_hint=(
+                "use the canonical s2and_and_big_blocks_linker_dataset_20260513_arrow bundle "
+                "with manifest-declared name_counts_index and raw-planner batch indexes"
+            ),
+        )
+    except MissingArrowArtifactError as exc:
+        raise FileNotFoundError(str(exc)) from exc
+    validated["clusters"] = paths["clusters"]
+    return validated
 
 
 def _read_signature_rows(signatures_path: Path) -> list[ArrowSignatureRow]:
@@ -321,12 +343,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             with ProcessTreeRSSMonitor() as monitor:
                 start = time.perf_counter()
-                result = clusterer.predict_incremental(
-                    workload.block_signatures,
-                    dataset,
-                    prevent_new_incompatibilities=False,
-                    batching_threshold=None if args.batching_threshold <= 0 else int(args.batching_threshold),
-                    total_ram_bytes=None if args.total_ram_bytes <= 0 else int(args.total_ram_bytes),
+                result = cast(
+                    dict[str, Any],
+                    clusterer.predict_incremental(
+                        workload.block_signatures,
+                        cast(Any, dataset),
+                        prevent_new_incompatibilities=False,
+                        batching_threshold=None if args.batching_threshold <= 0 else int(args.batching_threshold),
+                        total_ram_bytes=None if args.total_ram_bytes <= 0 else int(args.total_ram_bytes),
+                    ),
                 )
                 elapsed = time.perf_counter() - start
             telemetry = dict(result.get("incremental_linker_telemetry", {}))

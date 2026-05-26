@@ -43,6 +43,7 @@ for extra_path in (REPO_ROOT, REPO_ROOT / "scripts"):
 import s2and.incremental_linking.query_adapter as retrieval  # noqa: E402
 from s2and import feature_port  # noqa: E402
 from s2and import text as s2and_text  # noqa: E402
+from s2and.arrow_inputs import validate_arrow_prediction_artifacts  # noqa: E402
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER  # noqa: E402
 from s2and.data import ANDData  # noqa: E402
 from s2and.incremental_linking.artifact import save_incremental_linking_artifact  # noqa: E402
@@ -925,27 +926,27 @@ def _arrow_paths_for_dataset(
     raw_paths = manifest.get("paths", {})
     if not isinstance(raw_paths, Mapping):
         raise ValueError(f"Arrow dataset manifest paths must be a mapping: {manifest_path}")
-    required = ("signatures", "papers", "paper_authors", "specter")
     paths: dict[str, str] = {}
     for key, raw_value in raw_paths.items():
         if key == "specter2":
             continue
         paths[str(key)] = str(_resolve_arrow_manifest_path(raw_value, dataset_dir=dataset_dir, bundle_root=bundle.root))
-    missing = sorted(key for key in required if key not in paths or not Path(paths[key]).exists())
-    if missing:
-        raise FileNotFoundError(f"Arrow dataset {dataset_name!r} is missing required paths: {missing}")
     if name_counts_index_root is not None:
         name_counts_index = Path(name_counts_index_root).resolve()
         if not name_counts_index.exists():
             raise FileNotFoundError(f"name_counts_index root does not exist: {name_counts_index}")
         paths["name_counts_index"] = str(name_counts_index)
-    elif "name_counts_index" in paths:
-        name_counts_index = Path(paths["name_counts_index"])
-        if not name_counts_index.exists():
-            raise FileNotFoundError(f"name_counts_index root does not exist: {name_counts_index}")
-    elif require_name_counts_index:
-        raise FileNotFoundError(f"Arrow dataset {dataset_name!r} manifest is missing required path: name_counts_index")
-    return paths
+    return validate_arrow_prediction_artifacts(
+        paths,
+        require_specter=True,
+        require_name_counts_index=require_name_counts_index,
+        require_batch_indexes=True,
+        context=f"Arrow dataset {dataset_name!r} for linker train/calibrate/eval",
+        producer_hint=(
+            "include signatures/papers/paper_authors/specter Arrow files, raw-planner batch indexes, "
+            "and name_counts_index in the bundle manifest"
+        ),
+    )
 
 
 def _component_member_ids_by_key(path: Path) -> dict[str, tuple[str, ...]]:

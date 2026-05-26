@@ -21,9 +21,7 @@ _STARTUP_WARNING_LOCK = threading.Lock()
 
 MIN_SUPPORTED_RUST_EXTENSION_VERSION = (0, 50, 0)
 _CORE_REQUIRED_FEATURIZER_MARKERS = (
-    "from_dataset",
-    "from_json_paths",
-    "json_ingest_telemetry",
+    "from_arrow_paths",
     "signature_ids",
     "get_constraint",
     "get_constraints_matrix_indexed",
@@ -35,9 +33,7 @@ _FEATURIZER_API_SCORE_MARKERS = tuple(
     for marker in _CORE_REQUIRED_FEATURIZER_MARKERS
     if marker
     in {
-        "from_dataset",
-        "from_json_paths",
-        "json_ingest_telemetry",
+        "from_arrow_paths",
         "signature_ids",
         "featurize_pairs_matrix_indexed",
         "update_signature_name_counts",
@@ -282,6 +278,7 @@ def detect_rust_runtime_capabilities(
 
     from_dataset_paper_preprocess_available = bool(
         core_runtime_available
+        and hasattr(rust_featurizer_cls, "from_dataset")
         and getattr(
             rust_featurizer_cls,
             "SUPPORTS_FROM_DATASET_PAPER_PREPROCESS",

@@ -422,16 +422,17 @@ pred_clusters, _ = clusterer.predict(
 )
 ```
 
-Production Rust full-block inference should call
-`Clusterer.predict_from_arrow_paths(...)` with at least `signatures`, `papers`,
-and `paper_authors` paths. Models that use SPECTER features also require
-`specter`, and models that use name-count features require `name_counts_index`.
-The direct Arrow route validates required keys and declared files before Rust
-featurizer construction and raises `MissingArrowArtifactError` with structured
-`missing_keys` and `missing_files` fields. When the generic full-block
-`Clusterer.predict(...)` route resolves to Rust without subblocking, it follows
-the same strict artifact rule and raises instead of falling back to `ANDData`;
-select the Python backend explicitly for compatibility/reference execution.
+Production Rust inference should call `Clusterer.predict_from_arrow_paths(...)`
+or provide complete Arrow paths to `Clusterer.predict(...)`: at least
+`signatures`, `papers`, and `paper_authors`. Models that use SPECTER features
+also require `specter`, and models that use name-count features require
+`name_counts_index`. The direct Arrow route validates required keys and declared
+files before Rust featurizer construction and raises
+`MissingArrowArtifactError` with structured `missing_keys` and `missing_files`
+fields. When the generic `Clusterer.predict(...)` route resolves to Rust,
+including subblocked large-block prediction, it follows the same strict artifact
+rule and raises instead of falling back to `ANDData`; select the Python backend
+explicitly for compatibility/reference execution.
 
 Incremental prediction with explicit RAM budget:
 
@@ -451,10 +452,10 @@ clusters = result["clusters"]
 The target behavior is that `Clusterer.predict_incremental(...)` uses the
 promoted Rust linker when `S2AND_BACKEND` selects Rust, the extension has the
 required promoted-incremental capabilities, and seed inputs are available from
-the dataset or Arrow artifacts. Without seed inputs, Rust mode falls back to the
-Python incremental helper for partition coverage. Legacy output parity is not a
-release goal; the promoted path intentionally uses different retrieval, linker,
-and logistic-gate decisions.
+the dataset or Arrow artifacts. Without base Arrow artifacts or seed inputs,
+Rust mode raises `MissingArrowArtifactError` before seed sync or helper
+fallback. Legacy output parity is not a release goal; the promoted path
+intentionally uses different retrieval, linker, and logistic-gate decisions.
 
 There is no separate public force flag or artifact override: backend selection
 plus seed availability is the routing contract. Promoted query batching is

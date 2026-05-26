@@ -721,6 +721,7 @@ def test_clusterer_predict_uses_minimum_one_for_incremental_batch_threshold(monk
         dataset,
         batching_threshold=2,
         desired_memory_use=4,
+        backend="python",
     )
 
     assert captured["batching_threshold"] == 1
@@ -804,6 +805,7 @@ def test_clusterer_predict_optionally_skips_final_rust_seed_restore(
         dataset,
         batching_threshold=2,
         restore_rust_cluster_seeds_on_exit=restore_rust_cluster_seeds_on_exit,
+        backend="python",
     )
 
     assert pred_clusters == {"merged": ["m1", "m2", "s1", "s2"]}
@@ -1155,7 +1157,7 @@ def test_clusterer_predict_subblocked_single_letter_restores_state_after_increme
     monkeypatch.setattr(Clusterer, "predict_incremental", fake_predict_incremental)
 
     with pytest.raises(RuntimeError, match="synthetic incremental failed"):
-        clusterer.predict({"block": ["m1", "m2", "s1", "s2"]}, dataset, batching_threshold=2)
+        clusterer.predict({"block": ["m1", "m2", "s1", "s2"]}, dataset, batching_threshold=2, backend="python")
 
     assert dict(dataset.cluster_seeds_require) == original_cluster_seeds
     assert dataset.altered_cluster_signatures == original_altered

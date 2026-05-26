@@ -1073,6 +1073,37 @@ def test_predict_from_arrow_paths_rejects_declared_missing_optional_sidecar(tmp_
     }
 
 
+def test_predict_subblocked_rust_requires_arrow_paths(monkeypatch):
+    dataset = _dummy_dataset("dummy_predict_subblocked_missing_arrow")
+    runtime_context = type(
+        "RuntimeContext",
+        (),
+        {
+            "operation": "cluster_predict",
+            "requested_backend": "rust",
+            "resolved_backend": "rust",
+            "use_rust": True,
+            "run_id": "test-subblocked-missing-arrow-predict",
+            "source": "test",
+        },
+    )()
+
+    monkeypatch.setattr(model_module, "build_runtime_context", lambda _operation, **_kwargs: runtime_context)
+    monkeypatch.setattr(
+        Clusterer,
+        "_predict_subblocked",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("subblocked fallback should not run")),
+    )
+
+    clusterer = _dummy_clusterer(cluster_model=None)
+    with pytest.raises(model_module.MissingArrowArtifactError) as exc_info:
+        clusterer.predict({"block": ["0", "1"]}, dataset, batching_threshold=10)
+
+    error = exc_info.value
+    assert error.context == "Clusterer.predict Rust prediction"
+    assert error.missing_keys == ("signatures", "papers", "paper_authors")
+
+
 def test_predict_subblocked_uses_arrow_featurizer_for_multiple_letter_groups(tmp_path, monkeypatch):
     captured = {"predict_calls": []}
     dataset = _dummy_dataset("dummy_predict_subblocked_arrow")

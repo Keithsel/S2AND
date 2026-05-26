@@ -4526,7 +4526,7 @@ class Clusterer:
                 require_cluster_seeds=False,
                 require_name_counts_index=_uses_name_count_features(self),
             )
-            if arrow_paths is None and batching_threshold is None:
+            if arrow_paths is None:
                 raise _missing_arrow_prediction_artifacts_error(
                     self,
                     context="Clusterer.predict Rust prediction",

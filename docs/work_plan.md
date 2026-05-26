@@ -613,6 +613,12 @@ bridge is removed and should not be restored as an ingest surface.
   splitting, name-count telemetry/defaulting, paper-author handling,
   ORCID/source-id derivation, missing/null/malformed positions, reference
   features, `preprocess=false`, and filtering order.
+  - Status 2026-05-25: the initial inventory is checked in at
+    [rust/ingest_source_policy_inventory.md](rust/ingest_source_policy_inventory.md).
+    It identifies Arrow/JSON no-reference preprocessing as the only plausible
+    short-term reuse target and calls out source-specific decisions for
+    `ANDData`, JSON reference features, language handling, paper-author
+    positions, and name-count default telemetry.
 - Deduplicate staging records only after the inventory names equivalent
   semantics and intentional source-specific differences.
 - Done when: JSON, Arrow, and `ANDData` ingest paths share the reusable staging

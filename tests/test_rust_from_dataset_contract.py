@@ -274,28 +274,9 @@ def test_aggregate_entrypoints_validate_indices_and_preserve_tuple_shapes():
     full_cols = len(rust_featurizer.featurize_pair("s1", "s2"))
     selected_indices = [2, 2, 3]
     aggregate_indices = [2, 3, 2]
-    pairs = [(left_index, right_index)]
-    row_indices = [0]
     left_indices = np.asarray([left_index], dtype=np.uint32)
     right_indices = np.asarray([right_index], dtype=np.uint32)
-    owner_rows = np.asarray(row_indices, dtype=np.uint32)
-
-    matrix, counts, sums, mins, maxs = rust_featurizer.linker_pair_features_and_aggregate_stats_indexed(
-        pairs,
-        row_indices,
-        1,
-        selected_indices,
-        aggregate_indices,
-        1,
-        0.0,
-    )
-    matrix = np.asarray(matrix)
-    expected_values = matrix[:, [0, 2, 0]]
-    assert matrix.shape == (1, 3)
-    np.testing.assert_array_equal(np.asarray(counts), np.asarray([1], dtype=np.uint32))
-    np.testing.assert_allclose(np.asarray(sums), expected_values, equal_nan=True)
-    np.testing.assert_allclose(np.asarray(mins), expected_values, equal_nan=True)
-    np.testing.assert_allclose(np.asarray(maxs), expected_values, equal_nan=True)
+    owner_rows = np.asarray([0], dtype=np.uint32)
 
     matrix, counts, valid_counts, sums, mins, maxs = rust_featurizer.linker_pair_index_arrays_and_aggregate_stats(
         left_indices,

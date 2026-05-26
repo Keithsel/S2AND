@@ -43,7 +43,6 @@ cleanup risk, not a user-facing API promise.
 | `featurize_pairs(...)` | legacy row-by-row fallback in `s2and/featurizer.py` | Keep until Python featurizer no longer needs row-by-row fallback. |
 | `featurize_pairs_matrix(...)` | pairwise compatibility, parity, and Arrow parity script | Matrix API retained while callers still pass string pairs. |
 | `featurize_pairs_matrix_indexed(...)` | `s2and/featurizer.py`, capability probes | Preferred pairwise matrix API for indexed callers. |
-| `linker_pair_features_and_aggregate_stats_indexed(...)` | tests and compatibility wrapper | Legacy list-of-tuples aggregate API; migrate tests/callers to array API before deletion. |
 | `linker_pair_index_arrays_and_aggregate_stats(...)` | `s2and/incremental_linking/linker_pairwise.py` | Canonical promoted linker pair-feature plus aggregate API. |
 | `linker_pair_index_arrays_aggregate_stats(...)` | `s2and/incremental_linking/linker_pairwise.py`, capability probes | Aggregate-only wrapper; decide whether to keep or fold into the canonical array API. |
 | `featurize_block_upper_triangle_matrix_indexed(...)` | blockwise full predict | Maintained blockwise feature API. |
@@ -71,7 +70,6 @@ cleanup risk, not a user-facing API promise.
 | `rust_calls.get_constraints_matrix_rust(...)` | compatibility/tests | String-pair compatibility wrapper. |
 | `rust_calls.build_linker_pair_features_and_aggregate_stats_arrays_rust(...)` | promoted incremental pairwise scoring | Maintained canonical array wrapper. |
 | `rust_calls.build_linker_pair_aggregate_stats_arrays_rust(...)` | promoted incremental aggregate-only path | Pending decision: keep separate or fold into canonical array wrapper. |
-| `rust_calls.build_linker_pair_features_and_aggregate_stats_indexed_rust(...)` | tests and compatibility | Legacy list-of-tuples wrapper. |
 | `runtime.detect_rust_runtime_capabilities(...)` markers | backend selection and tests | Update markers before deleting any method they probe. |
 
 ## Cleanup Notes
@@ -83,7 +81,10 @@ cleanup risk, not a user-facing API promise.
   route still uses them for retrieval subblock filtering.
 - Status 2026-05-25: `RustHybridCentroidRetriever.summary_count(...)` was
   removed after a repo-local no-caller scan.
-- The first larger consolidation target is the linker pair aggregate family:
-  migrate off `linker_pair_features_and_aggregate_stats_indexed(...)`, then
-  decide whether aggregate-only should be a mode of
+- Status 2026-05-25:
+  `linker_pair_features_and_aggregate_stats_indexed(...)` and its Python
+  wrapper were removed after the repo-local callers moved to the canonical
+  index-array API.
+- The next linker aggregate decision is whether aggregate-only should remain a
+  separate API or become a mode of
   `linker_pair_index_arrays_and_aggregate_stats(...)`.

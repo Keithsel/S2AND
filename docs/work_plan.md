@@ -530,11 +530,11 @@ to maintain without changing runtime behavior.
     and currently documented, but it now just constructs the planner and calls
     `plan(...)`; if the class is the canonical API, migrate the remaining
     runtime call and delete wrapper-specific tests.
-  - Canonical linker pair aggregation API: keep the numpy-array
+  - Status 2026-05-25: canonical linker pair aggregation keeps the numpy-array
     `linker_pair_index_arrays_and_aggregate_stats(...)` path used by promoted
-    incremental linking. Migrate any remaining callers away from
-    `linker_pair_features_and_aggregate_stats_indexed(...)`, then delete that
-    list-of-tuples API and its tests.
+    incremental linking. The legacy list-of-tuples
+    `linker_pair_features_and_aggregate_stats_indexed(...)` API and Python
+    wrapper were removed after repo-local callers moved to the array API.
   - Canonical aggregate-only API: either add an explicit `emit_matrix` or
     matrix-empty mode to `linker_pair_index_arrays_and_aggregate_stats(...)`,
     or prove the aggregate-only wrapper is still needed. Otherwise delete

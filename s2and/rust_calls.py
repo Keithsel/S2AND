@@ -326,47 +326,6 @@ def build_pair_feature_matrix_rust(
     return np.asarray(matrix, dtype=np.float64)
 
 
-def build_linker_pair_features_and_aggregate_stats_indexed_rust(
-    dataset: ANDData,
-    pairs: list[tuple[int, int]],
-    row_indices: list[int],
-    row_count: int,
-    matrix_indices: list[int] | None = None,
-    aggregate_indices: list[int] | None = None,
-    num_threads: int | None = None,
-    nan_value: float = np.nan,
-    runtime_context: Any | None = None,
-    featurizer: Any | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Build one indexed pair-feature chunk and row-level aggregate stats in one Rust pass."""
-
-    if featurizer is None:
-        featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
-    method = getattr(featurizer, "linker_pair_features_and_aggregate_stats_indexed", None)
-    if not callable(method):
-        raise RuntimeError(
-            "RustFeaturizer.linker_pair_features_and_aggregate_stats_indexed is unavailable; "
-            "rebuild/install a newer s2and-rust extension."
-        )
-    resolved_num_threads = None if num_threads is None else resolve_n_jobs(num_threads)
-    matrix, counts, sums, mins, maxs = method(
-        pairs,
-        row_indices,
-        int(row_count),
-        matrix_indices,
-        aggregate_indices,
-        resolved_num_threads,
-        nan_value,
-    )
-    return (
-        np.asarray(matrix, dtype=np.float64),
-        np.asarray(counts, dtype=np.uint32),
-        np.asarray(sums, dtype=np.float64),
-        np.asarray(mins, dtype=np.float64),
-        np.asarray(maxs, dtype=np.float64),
-    )
-
-
 def build_linker_pair_features_and_aggregate_stats_arrays_rust(
     dataset: ANDData | None,
     left_signature_indices: np.ndarray,

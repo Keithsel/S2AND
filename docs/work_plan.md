@@ -480,7 +480,7 @@ production inference.
 
 - Prefer upgrading callers to `Clusterer.predict_from_arrow_paths(...)` or
   Arrow-routed `predict(...)` before optimizing `RustFeaturizer.from_dataset`.
-- Prefer the raw Arrow wrapper for single-query/seeded incremental requests
+- Prefer `RawBlockQueryCandidatePlanner.plan(...)` for single-query/seeded incremental requests
   before optimizing raw payload to Python `FeatureBlock` adapters.
 - Keep JSON loaders and Python-object adapters as compatibility surfaces unless
   profiling shows they are still on a production hot path. In particular,
@@ -524,12 +524,11 @@ to maintain without changing runtime behavior.
   before moving code:
   - Status 2026-05-25: the current inventory is checked in at
     [rust/public_surface_inventory.md](rust/public_surface_inventory.md).
-  - Canonical raw Arrow planning API: decide between the reusable
-    `RawBlockQueryCandidatePlanner` class and the one-shot
-    `raw_block_query_candidate_plan_arrow(...)` wrapper. The wrapper is small
-    and currently documented, but it now just constructs the planner and calls
-    `plan(...)`; if the class is the canonical API, migrate the remaining
-    runtime call and delete wrapper-specific tests.
+  - Status 2026-05-25: raw Arrow candidate planning now exposes the reusable
+    `RawBlockQueryCandidatePlanner` class as the canonical public surface. The
+    one-shot `raw_block_query_candidate_plan_arrow(...)` wrapper was removed
+    after runtime callers moved to the planner and Python preserved the
+    single-request telemetry merge.
   - Status 2026-05-25: canonical linker pair aggregation keeps the numpy-array
     `linker_pair_index_arrays_and_aggregate_stats(...)` path used by promoted
     incremental linking. The legacy list-of-tuples
@@ -558,11 +557,9 @@ to maintain without changing runtime behavior.
      longer confused with production Rust.
   2. Remove or consolidate duplicate linker pair aggregate APIs.
   3. Remove the string-pair constraint API from core/public routing.
-  4. Decide whether the planner class or one-shot wrapper is the supported raw
-     Arrow API, then delete the other surface if appropriate.
-  5. Demote or delete raw payload / Python `FeatureBlock` scoring bridges only
+  4. Demote or delete raw payload / Python `FeatureBlock` scoring bridges only
      after Arrow request-table assembly covers the same compatibility use cases.
-  6. Demote `from_json_paths(...)` from core runtime capability checks before
+  5. Demote `from_json_paths(...)` from core runtime capability checks before
      removing JSON ingest helpers.
 - Split `s2and_rust/src/lib.rs` after the production boundary is locked.
   - Start with a compact public-surface inventory before moving code: list each

@@ -1228,10 +1228,6 @@ def test_predict_incremental_arrow_promoted_linker_reuses_raw_planner(
     class FakeRustModule:
         RawBlockQueryCandidatePlanner = FakePlanner
 
-        def raw_block_query_candidate_plan_arrow(self, _paths: object, query_ids: list[str], **_kwargs: object):
-            raw_windows.append(tuple(query_ids))
-            raise AssertionError("planner path should not call one-shot raw planner")
-
     def fake_raw_arrow_linker(*_args: object, **kwargs: Any):
         query_ids = tuple(str(signature_id) for signature_id in kwargs["query_signature_ids"])
         raw_batches.append(query_ids)

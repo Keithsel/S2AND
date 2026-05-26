@@ -214,6 +214,7 @@ def _raw_plan() -> dict[str, Any]:
         "row_best_author_count_log_absdiff": np.asarray([0, 0], dtype=np.float32),
         "query_authors": ["Ada Lovelace"],
         "component_members": {"c_ada": ["s1"], "c_other": ["s2", "s3"]},
+        "telemetry": {"timings": {}},
     }
     return plan
 
@@ -1758,17 +1759,27 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     arrow_paths = _write_feature_block_arrow_paths(tmp_path)
     captured: dict[str, Any] = {}
 
-    class FakeRustModule:
-        @staticmethod
-        def raw_block_query_candidate_plan_arrow(
+    class FakePlanner:
+        def __init__(
+            self,
             paths_arg: dict[str, str],
             query_signature_ids: list[str],
             **kwargs: Any,
-        ) -> dict[str, Any]:
+        ) -> None:
             captured["retrieval_paths"] = paths_arg
             captured["retrieval_query_signature_ids"] = tuple(query_signature_ids)
             captured["retrieval_kwargs"] = kwargs
+
+        def plan(self, query_signature_ids: list[str], **kwargs: Any) -> dict[str, Any]:
+            captured["retrieval_plan_query_signature_ids"] = tuple(query_signature_ids)
+            captured["retrieval_plan_kwargs"] = kwargs
             return _raw_plan()
+
+        def build_telemetry(self) -> dict[str, Any]:
+            return {"timings": {}}
+
+    class FakeRustModule:
+        RawBlockQueryCandidatePlanner = FakePlanner
 
     class FakeFeaturizer:
         def signature_ids(self) -> list[str]:
@@ -1830,6 +1841,8 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
 
     assert captured["retrieval_query_signature_ids"] == ("q",)
     assert captured["retrieval_kwargs"]["top_k"] == 2
+    assert captured["retrieval_plan_query_signature_ids"] == ("q",)
+    assert captured["retrieval_plan_kwargs"]["top_k"] == 2
     assert captured["featurizer_signature_ids"] == ("q", "s1", "s2", "s3")
     assert captured["retrieval_left_indices"] == [0, 0, 0]
     assert captured["retrieval_right_indices"] == [1, 2, 3]
@@ -1875,6 +1888,47 @@ def test_raw_arrow_partial_supervision_require_unknown_seed_rejected(
         )
 
 
+def test_raw_arrow_scoring_requires_planner_build_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakePlanner:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def plan(self, _query_signature_ids: list[str], **_kwargs: Any) -> dict[str, Any]:
+            return _raw_plan()
+
+    class FakeRustModule:
+        RawBlockQueryCandidatePlanner = FakePlanner
+
+    def fail_build_rust_featurizer_from_arrow_paths(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("stale raw planner should fail before featurizer construction")
+
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port.normalize_arrow_paths",
+        lambda paths: dict(paths),
+    )
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.require_arrow_name_counts_index_for_clusterer",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("s2and.incremental_linking.runtime.feature_port._require_rust_runtime", lambda: FakeRustModule)
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port.build_rust_featurizer_from_arrow_paths",
+        fail_build_rust_featurizer_from_arrow_paths,
+    )
+
+    with pytest.raises(RuntimeError, match="RawBlockQueryCandidatePlanner.build_telemetry"):
+        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            _raw_test_clusterer(),
+            _raw_test_artifact(),
+            arrow_paths={"signatures": "signatures.arrow"},
+            query_signature_ids=["q"],
+            top_k=2,
+            n_jobs=1,
+            load_name_counts=False,
+            name_tuples=set(),
+        )
+
+
 @pytest.mark.parametrize(
     ("suppress_orcid", "orcid_enabled_arg", "expected_orcid_enabled"),
     (
@@ -1895,15 +1949,23 @@ def test_raw_arrow_scoring_resolves_orcid_enabled_from_clusterer(
     class StopAfterRetrieval(RuntimeError):
         pass
 
-    class FakeRustModule:
-        @staticmethod
-        def raw_block_query_candidate_plan_arrow(
+    class FakePlanner:
+        def __init__(
+            self,
             _paths_arg: dict[str, str],
             _query_signature_ids: list[str],
             **kwargs: Any,
-        ) -> dict[str, Any]:
+        ) -> None:
             captured["orcid_enabled"] = kwargs["orcid_enabled"]
+
+        def plan(self, _query_signature_ids: list[str], **_kwargs: Any) -> dict[str, Any]:
             return _raw_plan()
+
+        def build_telemetry(self) -> dict[str, Any]:
+            return {"timings": {}}
+
+    class FakeRustModule:
+        RawBlockQueryCandidatePlanner = FakePlanner
 
     def stop_before_featurizer_build(*_args: Any, **_kwargs: Any) -> Any:
         raise StopAfterRetrieval("captured retrieval kwargs")

@@ -13,8 +13,7 @@ cleanup risk, not a user-facing API promise.
 | `RustFeaturizer` | `s2and/feature_port.py`, `s2and/rust_calls.py`, production Arrow paths, parity tests | Core class. Production Rust inference should enter through `from_arrow_paths`; non-Arrow constructors are compatibility/training/parity. |
 | `RustHybridCentroidRetriever` | `s2and/incremental_linking/retrieval.py`, raw Arrow planners, training query-support code | Core retrieval class. Production runtime should prefer `top_k_hybrid_centroid_pair_plan(...)`. |
 | `RustNameCompatibleSubblockSelector` | Internal helper used by `RustHybridCentroidRetriever.top_k_hybrid_centroid_pair_plan(...)`; direct Python use is test-only | Keep until pair-plan subblock filtering no longer needs it. |
-| `RawBlockQueryCandidatePlanner` | `s2and/incremental_linking/production.py` reusable raw Arrow planning | Production raw Arrow planner. Candidate canonical API versus one-shot wrapper. |
-| `raw_block_query_candidate_plan_arrow(...)` | `s2and/incremental_linking/runtime.py`, tests, one-shot smoke paths | Production-capable one-shot wrapper; do not delete until the planner class is chosen as the single public raw Arrow API and runtime callers migrate. |
+| `RawBlockQueryCandidatePlanner` | `s2and/incremental_linking/production.py`, `s2and/incremental_linking/runtime.py` | Canonical production raw Arrow planner. |
 | `raw_arrow_labeled_candidate_plan(...)` | `scripts/production/model/linker_train_calibrate_eval.py` | Training/materialization replay surface, not request-time inference. |
 | `promoted_linker_non_pairwise_features(...)` | `s2and/incremental_linking/row_features.py` | Production promoted-linker row feature builder. |
 | `make_subblocks_with_telemetry_arrow(...)` | `s2and/subblocking.py` | Arrow subblocking helper used by large-block prediction. |
@@ -55,7 +54,7 @@ cleanup risk, not a user-facing API promise.
 | `top_k_hybrid_centroid_pair_plan(...)` | `s2and/incremental_linking/retrieval.py`, raw Arrow planners | Canonical runtime retrieval output. |
 | `top_k_experimental_weighted_hybrid_centroid_subset(...)` | `s2and/incremental_linking_training/query_support.py`, tests | Training/query-support scoring surface. |
 | `RustNameCompatibleSubblockSelector.select(...)` | tests only; internal Rust helper trio used by pair-plan | Keep while pair-plan subblock filtering depends on the selector internals. |
-| `RawBlockQueryCandidatePlanner.__new__(...)`, `build_telemetry(...)`, `plan(...)` | `s2and/incremental_linking/production.py`; tests | Reusable production raw Arrow planner. |
+| `RawBlockQueryCandidatePlanner.__new__(...)`, `build_telemetry(...)`, `plan(...)` | `s2and/incremental_linking/production.py`, `s2and/incremental_linking/runtime.py`; tests | Canonical reusable production raw Arrow planner. |
 
 ## Python Wrapper Ownership
 
@@ -70,9 +69,8 @@ cleanup risk, not a user-facing API promise.
 
 ## Cleanup Notes
 
-- Do not delete `RawBlockQueryCandidatePlanner` or
-  `raw_block_query_candidate_plan_arrow(...)` until the canonical raw Arrow
-  planning API is decided and all runtime callers use it.
+- Keep `RawBlockQueryCandidatePlanner` as the canonical raw Arrow planning
+  API; it owns reusable seed state and strict indexed-read defaults.
 - Do not delete `RustNameCompatibleSubblockSelector` internals; the pair-plan
   route still uses them for retrieval subblock filtering.
 - Status 2026-05-25: `RustHybridCentroidRetriever.summary_count(...)` was
@@ -91,3 +89,6 @@ cleanup risk, not a user-facing API promise.
   `top_k_hybrid_centroid(...)` and `chooser_feature_rows_subset(...)` were
   removed after capability probes and tests moved to the canonical pair-plan
   route.
+- Status 2026-05-25: the one-shot
+  `raw_block_query_candidate_plan_arrow(...)` PyO3 wrapper was removed after
+  runtime callers moved to `RawBlockQueryCandidatePlanner`.

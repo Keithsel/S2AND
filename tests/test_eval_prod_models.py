@@ -386,7 +386,7 @@ def test_pubmed_specter2_arrow_fixture_incremental_smoke_matches_expected_b3(
     tmp_path: Path,
 ) -> None:
     s2and_rust = pytest.importorskip("s2and_rust")
-    if not hasattr(s2and_rust, "raw_block_query_candidate_plan_arrow"):
+    if not hasattr(s2and_rust, "RawBlockQueryCandidatePlanner"):
         raise pytest.skip.Exception("raw Arrow incremental candidate planning is unavailable")
 
     from s2and.eval import b3_precision_recall_fscore

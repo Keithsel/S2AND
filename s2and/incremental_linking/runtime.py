@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import warnings
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -1640,6 +1640,54 @@ _RAW_CANDIDATE_PLAN_WINDOW_REUSE_ZERO_TELEMETRY_KEYS: tuple[str, ...] = (
 )
 
 
+_RAW_ARROW_PLANNER_BUILD_COUNT_TELEMETRY_KEYS: tuple[str, ...] = (
+    "signature_batches_read",
+    "signature_rows_scanned",
+    "paper_batches_read",
+    "paper_rows_scanned",
+    "paper_author_batches_read",
+    "paper_author_rows_scanned",
+    "specter_batches_read",
+    "specter_rows_scanned",
+)
+_RAW_ARROW_PLANNER_BUILD_TIMING_TELEMETRY_KEYS: tuple[str, ...] = (
+    "read_cluster_seeds_secs",
+    "read_signatures_secs",
+    "read_papers_secs",
+    "read_paper_authors_secs",
+    "read_specter_secs",
+    "read_name_counts_secs",
+    "metadata_reads_parallel_secs",
+    "text_context_secs",
+    "feature_secs",
+    "summary_secs",
+    "component_members_secs",
+)
+
+
+def _merge_raw_arrow_planner_build_telemetry(
+    raw_candidate_plan: MutableMapping[str, Any],
+    build_telemetry: Mapping[str, Any],
+) -> None:
+    """Merge reusable-planner construction telemetry into a single-use plan."""
+
+    telemetry = raw_candidate_plan.get("telemetry")
+    if not isinstance(telemetry, MutableMapping):
+        raise KeyError("raw candidate plan is missing telemetry")
+    timings = telemetry.get("timings")
+    if not isinstance(timings, MutableMapping):
+        raise KeyError("raw candidate plan telemetry is missing timings")
+    build_timings = build_telemetry.get("timings")
+    if not isinstance(build_timings, Mapping):
+        raise KeyError("planner build telemetry is missing timings")
+    for key in _RAW_ARROW_PLANNER_BUILD_COUNT_TELEMETRY_KEYS:
+        telemetry[key] = int(telemetry.get(key, 0) or 0) + int(build_telemetry.get(key, 0) or 0)
+    for key in _RAW_ARROW_PLANNER_BUILD_TIMING_TELEMETRY_KEYS:
+        timings[key] = float(timings.get(key, 0.0) or 0.0) + float(build_timings.get(key, 0.0) or 0.0)
+    telemetry["planner_seed_state_reused"] = 0
+    telemetry["planner_seed_state_built"] = 1
+
+
 def _subset_sequence_or_array(values: Any, mask: np.ndarray) -> Any:
     if isinstance(values, np.ndarray):
         return values[mask]
@@ -2044,7 +2092,12 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     if raw_candidate_plan is None:
         stage_start = time.perf_counter()
         rust_module = feature_port._require_rust_runtime()  # noqa: SLF001
-        raw_candidate_plan = rust_module.raw_block_query_candidate_plan_arrow(
+        raw_planner_cls = getattr(rust_module, "RawBlockQueryCandidatePlanner", None)
+        if raw_planner_cls is None:
+            raise RuntimeError(
+                "raw Arrow scoring requires s2and_rust.RawBlockQueryCandidatePlanner; rebuild the Rust extension"
+            )
+        raw_planner = raw_planner_cls(
             arrow_path_payload,
             list(query_signature_id_strings),
             top_k=top_k_resolved,
@@ -2052,8 +2105,24 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
             orcid_enabled=resolved_orcid_enabled,
             num_threads=n_jobs_resolved,
             max_exemplars=int(max_exemplars),
+            include_pair_signature_ids=True,
+            include_component_members=True,
             full_scan_without_index=False,
         )
+        raw_candidate_plan = raw_planner.plan(
+            list(query_signature_id_strings),
+            top_k=top_k_resolved,
+            query_view=str(query_view),
+            include_pair_signature_ids=True,
+            include_component_members=True,
+        )
+        build_telemetry = getattr(raw_planner, "build_telemetry", None)
+        if not callable(build_telemetry):
+            raise RuntimeError(
+                "raw Arrow scoring requires RawBlockQueryCandidatePlanner.build_telemetry; "
+                "rebuild the Rust extension"
+            )
+        _merge_raw_arrow_planner_build_telemetry(raw_candidate_plan, build_telemetry())
         raw_arrow_retrieval_seconds = time.perf_counter() - stage_start
     else:
         raw_candidate_plan = dict(raw_candidate_plan)

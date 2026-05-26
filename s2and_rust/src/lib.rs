@@ -13284,129 +13284,6 @@ fn optional_name_counts_index_path_from_py_dict(
     optional_path_from_py_dict(paths, "name_counts_index")
 }
 
-fn py_dict_usize_or_zero(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<usize> {
-    dict.get_item(key)?
-        .map(|value| value.extract::<usize>())
-        .transpose()
-        .map(|value| value.unwrap_or(0))
-}
-
-fn py_dict_f64_or_zero(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<f64> {
-    dict.get_item(key)?
-        .map(|value| value.extract::<f64>())
-        .transpose()
-        .map(|value| value.unwrap_or(0.0))
-}
-
-fn merge_raw_arrow_planner_build_telemetry(
-    py: Python<'_>,
-    raw_plan: &Py<PyDict>,
-    build_telemetry: &Py<PyDict>,
-) -> PyResult<()> {
-    let telemetry_obj = raw_plan
-        .bind(py)
-        .get_item("telemetry")?
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("raw plan is missing telemetry"))?;
-    let telemetry = telemetry_obj.downcast::<PyDict>()?;
-    let build = build_telemetry.bind(py);
-    for key in [
-        "signature_batches_read",
-        "signature_rows_scanned",
-        "paper_batches_read",
-        "paper_rows_scanned",
-        "paper_author_batches_read",
-        "paper_author_rows_scanned",
-        "specter_batches_read",
-        "specter_rows_scanned",
-    ] {
-        telemetry.set_item(
-            key,
-            py_dict_usize_or_zero(telemetry, key)? + py_dict_usize_or_zero(build, key)?,
-        )?;
-    }
-    let timings_obj = telemetry.get_item("timings")?.ok_or_else(|| {
-        pyo3::exceptions::PyKeyError::new_err("raw plan telemetry is missing timings")
-    })?;
-    let timings = timings_obj.downcast::<PyDict>()?;
-    let build_timings_obj = build.get_item("timings")?.ok_or_else(|| {
-        pyo3::exceptions::PyKeyError::new_err("planner build telemetry is missing timings")
-    })?;
-    let build_timings = build_timings_obj.downcast::<PyDict>()?;
-    for key in [
-        "read_cluster_seeds_secs",
-        "read_signatures_secs",
-        "read_papers_secs",
-        "read_paper_authors_secs",
-        "read_specter_secs",
-        "read_name_counts_secs",
-        "metadata_reads_parallel_secs",
-        "text_context_secs",
-        "feature_secs",
-        "summary_secs",
-        "component_members_secs",
-    ] {
-        timings.set_item(
-            key,
-            py_dict_f64_or_zero(timings, key)? + py_dict_f64_or_zero(build_timings, key)?,
-        )?;
-    }
-    telemetry.set_item("planner_seed_state_reused", 0)?;
-    telemetry.set_item("planner_seed_state_built", 1)?;
-    Ok(())
-}
-
-#[pyfunction]
-#[pyo3(signature = (
-    paths,
-    query_signature_ids,
-    top_k = 25,
-    query_view = "auto",
-    orcid_enabled = true,
-    num_threads = None,
-    max_exemplars = 4,
-    include_pair_signature_ids = true,
-    include_component_members = true,
-    full_scan_without_index = true
-))]
-fn raw_block_query_candidate_plan_arrow<'py>(
-    py: Python<'py>,
-    paths: &Bound<'py, PyDict>,
-    query_signature_ids: Vec<String>,
-    top_k: usize,
-    query_view: &str,
-    orcid_enabled: bool,
-    num_threads: Option<usize>,
-    max_exemplars: usize,
-    include_pair_signature_ids: bool,
-    include_component_members: bool,
-    full_scan_without_index: bool,
-) -> PyResult<Py<PyDict>> {
-    let mut planner = RawBlockQueryCandidatePlanner::new(
-        py,
-        paths,
-        query_signature_ids.clone(),
-        top_k,
-        query_view,
-        orcid_enabled,
-        num_threads,
-        max_exemplars,
-        include_pair_signature_ids,
-        include_component_members,
-        full_scan_without_index,
-    )?;
-    let plan = planner.plan(
-        py,
-        query_signature_ids,
-        Some(top_k),
-        Some(query_view.to_string()),
-        Some(include_pair_signature_ids),
-        Some(include_component_members),
-    )?;
-    let build_telemetry = planner.build_telemetry(py)?;
-    merge_raw_arrow_planner_build_telemetry(py, &plan, &build_telemetry)?;
-    Ok(plan)
-}
-
 struct RawArrowPlannerPaths {
     signatures_path: String,
     papers_path: String,
@@ -16545,7 +16422,6 @@ fn _s2and_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS.to_vec(),
     )?;
     m.add_function(wrap_pyfunction!(get_build_info, m)?)?;
-    m.add_function(wrap_pyfunction!(raw_block_query_candidate_plan_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(raw_arrow_labeled_candidate_plan, m)?)?;
     m.add_function(wrap_pyfunction!(promoted_linker_non_pairwise_features, m)?)?;
     m.add_function(wrap_pyfunction!(signature_ngrams_batch, m)?)?;

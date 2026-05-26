@@ -5674,7 +5674,8 @@ class Clusterer:
     ) -> dict[str, Any]:
         """Internal incremental execution path used by `predict_incremental`.
 
-        For behavior/parameters, refer to `predict_incremental`.
+        This is not an external compatibility API. For behavior/parameters,
+        refer to `predict_incremental`.
         """
         if runtime_context is None:
             runtime_context = build_runtime_context("cluster_predict_incremental")

@@ -636,6 +636,9 @@ recording in `tests/test_cluster_incremental.py`.
 - Current decision: treat `_predict_incremental_helper(...)` as an internal-only
   test seam for now. Leave it in place and document that it is not an external
   compatibility API.
+  - Status 2026-05-25: `s2and/model.py` documents the helper as internal-only
+    and not an external compatibility API. Existing direct monkeypatches remain
+    test plumbing until a future ask-first removal/rename.
 - Before any future rename/removal, migrate tests that monkeypatch
   `Clusterer._predict_incremental_helper(...)`. Prefer fault injection through a
   public routing surface, dependency parameter, or explicit test hook over

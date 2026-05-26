@@ -11,7 +11,6 @@ import numpy as np
 import pytest
 
 from s2and.incremental_linking.feature_block import (
-    feature_block_from_arrow_paths,
     feature_block_signature_order_from_raw_candidate_plan,
     write_arrow_batch_lookup_index,
     write_name_counts_index,
@@ -2123,7 +2122,7 @@ def test_raw_arrow_candidate_plan_emits_native_row_signals_from_name_counts_inde
     )
 
 
-def test_rust_featurizer_from_arrow_paths_matches_feature_block(tmp_path: Path) -> None:
+def test_rust_featurizer_from_arrow_paths_applies_cluster_seed_disallows(tmp_path: Path) -> None:
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
         raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
@@ -2144,21 +2143,11 @@ def test_rust_featurizer_from_arrow_paths_matches_feature_block(tmp_path: Path) 
             }
         ),
     )
-    feature_block = feature_block_from_arrow_paths(paths, raw_candidate_plan=raw_plan)
+    signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_plan)
 
     direct = s2and_rust.RustFeaturizer.from_arrow_paths(
         paths,
-        list(feature_block.signature_ids),
-        set(),
-        None,
-        True,
-        False,
-        0.0,
-        10000.0,
-        1,
-    )
-    incumbent = s2and_rust.RustFeaturizer.from_feature_block(
-        feature_block,
+        list(signature_order.signature_ids),
         set(),
         None,
         True,
@@ -2169,15 +2158,10 @@ def test_rust_featurizer_from_arrow_paths_matches_feature_block(tmp_path: Path) 
     )
     pairs = [("q1", "s1"), ("q1", "s2")]
 
-    assert tuple(direct.signature_ids()) == feature_block.signature_ids
-    assert feature_block.cluster_seeds_disallow == (("q1", "s2"),)
-    np.testing.assert_allclose(
-        direct.featurize_pairs_matrix(pairs, None, 1, np.nan),
-        incumbent.featurize_pairs_matrix(pairs, None, 1, np.nan),
-        equal_nan=True,
-    )
-    assert direct.get_constraint("s1", "s2") == incumbent.get_constraint("s1", "s2")
-    assert direct.get_constraint("q1", "s2") == incumbent.get_constraint("q1", "s2") == 10000.0
+    assert tuple(direct.signature_ids()) == signature_order.signature_ids
+    assert direct.featurize_pairs_matrix(pairs, None, 1, np.nan).shape == (2, 39)
+    assert direct.get_constraint("q1", "s1") is None
+    assert direct.get_constraint("q1", "s2") == 10000.0
 
 
 def test_rust_featurizer_missing_name_counts_presence_is_consistent(
@@ -2187,7 +2171,6 @@ def test_rust_featurizer_missing_name_counts_presence_is_consistent(
     if not hasattr(s2and_rust.RustFeaturizer, "from_arrow_paths"):
         raise pytest.skip.Exception("RustFeaturizer.from_arrow_paths is unavailable")
     paths = _base_arrow_paths(tmp_path)
-    feature_block = feature_block_from_arrow_paths(paths, raw_candidate_plan=_raw_plan_for_base_paths(paths))
     signature_ids = ["q1", "s1", "s2"]
 
     from_arrow = s2and_rust.RustFeaturizer.from_arrow_paths(
@@ -2201,19 +2184,8 @@ def test_rust_featurizer_missing_name_counts_presence_is_consistent(
         10000.0,
         1,
     )
-    from_feature_block = s2and_rust.RustFeaturizer.from_feature_block(
-        feature_block,
-        set(),
-        None,
-        True,
-        False,
-        0.0,
-        10000.0,
-        1,
-    )
 
     assert from_arrow.signature_name_counts_present() == [("q1", False), ("s1", False), ("s2", False)]
-    assert from_feature_block.signature_name_counts_present() == from_arrow.signature_name_counts_present()
 
     paths_with_index = dict(paths)
     paths_with_index["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index_artifact", monkeypatch)

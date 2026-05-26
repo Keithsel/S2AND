@@ -453,7 +453,7 @@ production inference.
   - Status 2026-05-25: compatibility Rust entrypoints remain callable for
     training, fixtures, parity, and legacy scripts, but production docs no
     longer present `RustFeaturizer.from_dataset(...)`,
-    `RustFeaturizer.from_json_paths(...)`, or
+    `RustFeaturizer.from_json_paths(...)`, or the removed
     `RustFeaturizer.from_feature_block(...)` as production inference APIs.
   - Status 2026-05-25: no `s2and/feature_port.py` code change is needed for
     dispatcher demotion. Strict production call sites use
@@ -478,24 +478,30 @@ production inference.
 
 ### Compatibility And Python-Heavy Paths
 
-- Prefer upgrading callers to `Clusterer.predict_from_arrow_paths(...)` or
-  Arrow-routed `predict(...)` before optimizing `RustFeaturizer.from_dataset`.
-- Prefer `RawBlockQueryCandidatePlanner.plan(...)` for single-query/seeded incremental requests
-  before optimizing raw payload to Python `FeatureBlock` adapters.
-- Keep JSON loaders and Python-object adapters as compatibility surfaces unless
-  profiling shows they are still on a production hot path. In particular,
-  `RustFeaturizer.from_feature_block(...)`, raw payload wrappers, and
-  `feature_block_from_arrow_paths(...)` are bridge/test surfaces unless a caller
-  still needs Python `FeatureBlock` compatibility.
+- Prefer `Clusterer.predict_from_arrow_paths(...)` or Arrow-routed
+  `predict(...)` for production inference.
+- Prefer `RawBlockQueryCandidatePlanner.plan(...)` plus typed Arrow request
+  tables for single-query/seeded incremental requests. Do not restore raw
+  payload-to-`FeatureBlock` scoring adapters.
+- Status 2026-05-25: `RustFeaturizer.from_feature_block(...)`,
+  `feature_port.build_rust_featurizer_from_feature_block(...)`, and raw payload
+  scoring wrappers were removed after a repo-local no-caller scan. Keep the
+  lower-level Python `FeatureBlock` construction and query-adapter helpers only
+  as fixture/parity utilities until typed Arrow request-table coverage makes
+  them unnecessary.
+- Keep JSON loaders and remaining Python-object adapters as compatibility
+  surfaces unless profiling shows they are still on a production hot path. In
+  particular, `feature_block_from_arrow_paths(...)` is a bridge/test surface
+  unless a caller still needs Python `FeatureBlock` compatibility.
 - Keep `RustFeaturizer.from_dataset(...)` as the Python-reference,
   training/eval, and parity surface. Do not add production-only behavior there.
 - Treat `RustFeaturizer.from_json_paths(...)` as a compatibility and benchmark
   surface until the Arrow release and strict Arrow routing are complete; then
   remove it from core runtime capability checks before deleting the loader.
-- Done when: production scripts and docs no longer recommend
-  `RustFeaturizer.from_dataset(...)`, `RustFeaturizer.from_json_paths(...)`, or
-  `RustFeaturizer.from_feature_block(...)` for inference, and remaining direct
-  uses are labeled training/reference, compatibility, parity, or test-only.
+- Done when: production scripts and docs recommend only Arrow-backed Rust
+  inference, removed raw payload / `FeatureBlock` scoring bridges have no code
+  callers, and remaining Python-object helpers are explicitly fixture,
+  conversion, parity, or training utilities.
 
 ### Rust Surface Cleanup
 
@@ -557,8 +563,9 @@ to maintain without changing runtime behavior.
      longer confused with production Rust.
   2. Remove or consolidate duplicate linker pair aggregate APIs.
   3. Remove the string-pair constraint API from core/public routing.
-  4. Demote or delete raw payload / Python `FeatureBlock` scoring bridges only
-     after Arrow request-table assembly covers the same compatibility use cases.
+  4. Status 2026-05-25: raw payload / Python `FeatureBlock` scoring bridges
+     were deleted. Continue with typed Arrow request-table assembly for any
+     future ad hoc request callers rather than restoring raw payload scoring.
   5. Demote `from_json_paths(...)` from core runtime capability checks before
      removing JSON ingest helpers.
 - Split `s2and_rust/src/lib.rs` after the production boundary is locked.
@@ -596,10 +603,11 @@ to maintain without changing runtime behavior.
 ### Rust Ingest Deduplication
 
 Evidence: `s2and_rust/src/lib.rs` has shared staging structs and preprocessing
-helpers for Arrow and FeatureBlock construction, while `from_json_paths(...)`
-still keeps local `SignatureInput`, `PaperInput`, and `PaperPreprocessed`
-records. `from_dataset(...)` also keeps a local `PaperInput` record, so include
-both non-Arrow ingest paths in the inventory.
+helpers for Arrow construction, while `from_json_paths(...)` still keeps local
+`SignatureInput`, `PaperInput`, and `PaperPreprocessed` records.
+`from_dataset(...)` also keeps a local `PaperInput` record, so include both
+non-Arrow ingest paths in the inventory. The former `FeatureBlock` Rust scoring
+bridge is removed and should not be restored as an ingest surface.
 
 - Start with a source-policy inventory for unidecode, language handling, name
   splitting, name-count telemetry/defaulting, paper-author handling,
@@ -607,10 +615,10 @@ both non-Arrow ingest paths in the inventory.
   features, `preprocess=false`, and filtering order.
 - Deduplicate staging records only after the inventory names equivalent
   semantics and intentional source-specific differences.
-- Done when: JSON, Arrow, FeatureBlock, and `ANDData` ingest paths share the
-  reusable staging helpers where semantics match; source-specific differences
-  are documented; Rust library tests and focused Python/Rust integration tests,
-  including source-specific `paper_authors.position` expectations, pass.
+- Done when: JSON, Arrow, and `ANDData` ingest paths share the reusable staging
+  helpers where semantics match; source-specific differences are documented;
+  Rust library tests and focused Python/Rust integration tests, including
+  source-specific `paper_authors.position` expectations, pass.
 
 ### Incremental Helper Shim Decision
 

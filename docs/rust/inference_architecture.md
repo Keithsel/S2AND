@@ -47,13 +47,16 @@ Arrow-routed `Clusterer.predict(...)`, or promoted
 paths below remain useful, but they are compatibility, training, parity, or test
 surfaces rather than production inference APIs.
 
+Removed bridge surfaces: `RustFeaturizer.from_feature_block(...)` and raw
+payload scoring wrappers are no longer Rust inference APIs. They built or
+traversed Python `FeatureBlock` objects before scoring; production raw requests
+must materialize typed Arrow request rows before entering Rust.
+
 | Path | Current Python dependency | Production status |
 |---|---|---|
 | `Clusterer.predict(...)` without Arrow paths | Explicit Python/legacy routes can still build normal `ANDData` and use Python block orchestration. | Rust production now raises `MissingArrowArtifactError`. Provide complete Arrow artifacts or select `backend="python"` for compatibility/reference execution. |
 | `Clusterer.predict_incremental(...)` without base Arrow paths or seed source | Explicit Python/legacy routes can still use Python incremental helpers and `ANDData` seed state. | Rust production now raises `MissingArrowArtifactError`. Provide `signatures`, `papers`, `paper_authors`, required embedding/name-count artifacts, and a seed source via `cluster_seeds` or `dataset.cluster_seeds_require`. |
 | `RustFeaturizer.from_dataset(...)` | Traverses Python `ANDData` objects over PyO3. | Keep as incumbent/reference, training/eval, parity, and compatibility surface; do not present or optimize it as the production hot path. |
-| `RustFeaturizer.from_feature_block(...)` | Avoids full `ANDData`, but still traverses a Python `FeatureBlock` object and uses Python text compatibility helpers. | Bridge/test surface for raw payload compatibility; Arrow request tables are the preferred production path. |
-| Raw payload wrappers | Build a Python `FeatureBlock` before entering Rust. | Compatibility bridge until callers can provide typed Arrow request rows. |
 | JSON Rust loaders | Avoid `ANDData`, but still read compatibility JSON and call Python text normalization helpers. | Fixture, legacy script, and benchmark surface only; Arrow IPC is the production table-shaped target. |
 | Training and release replay | Python owns data cleaning, feature table materialization, LightGBM training, calibration, and metrics. | Not a no-`ANDData` inference target; keep Python unless runtime profiling shows a training bottleneck worth porting. |
 

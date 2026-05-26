@@ -57,8 +57,6 @@ from s2and.incremental_linking.runtime import (
     LinkOrAbstainProductionResult,
     LinkOrAbstainRetrievedCandidatesResult,
     predict_incremental_link_or_abstain_from_raw_arrow_paths,
-    predict_incremental_link_or_abstain_from_raw_feature_block,
-    predict_incremental_link_or_abstain_from_raw_payloads,
 )
 from s2and.model import Clusterer
 
@@ -1648,110 +1646,6 @@ def test_feature_block_rejects_duplicate_paper_author_positions() -> None:
         )
 
 
-def test_raw_feature_block_scoring_wrapper_uses_direct_rust_feature_block_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-    )
-    captured: dict[str, Any] = {}
-
-    class FakeFeaturizer:
-        def signature_ids(self) -> list[str]:
-            return ["s3", "q", "s1", "s2"]
-
-    def fake_build_rust_featurizer_from_feature_block(feature_block_arg: Any, **_kwargs: Any) -> FakeFeaturizer:
-        captured["feature_block_signature_ids"] = tuple(feature_block_arg.signature_ids)
-        captured["feature_block_seed_map"] = dict(feature_block_arg.cluster_seeds_require)
-        captured["build_kwargs"] = dict(_kwargs)
-        return FakeFeaturizer()
-
-    def fail_get_rust_featurizer(*_args: Any, **_kwargs: Any) -> None:
-        raise AssertionError("raw FeatureBlock scoring must not materialize mini ANDData")
-
-    def fake_from_retrieval(**kwargs: Any) -> LinkOrAbstainProductionResult:
-        retrieval_batch = kwargs["retrieval_batch"]
-        captured["retrieval_left_indices"] = retrieval_batch.candidate_batch.left_signature_indices.tolist()
-        captured["retrieval_right_indices"] = retrieval_batch.candidate_batch.right_signature_indices.tolist()
-        captured["queries"] = kwargs["queries"]
-        captured["extra_row_signal_builder"] = kwargs["extra_row_signal_builder"]
-        return LinkOrAbstainProductionResult(
-            feature_matrix=LinkerFeatureMatrix(
-                matrix=np.empty((2, 0), dtype=np.float32),
-                feature_columns=(),
-                candidate_batch=retrieval_batch.candidate_batch,
-            ),
-            compact_result=LinkOrAbstainCompactResult(
-                probabilities=np.asarray([0.8, 0.2], dtype=np.float32),
-                decisions=(),
-            ),
-            telemetry={"pairwise_feature_seconds": 1.25, "constraint_api_mode": "rust_index_arrays"},
-            retrieval_batch=retrieval_batch,
-            pairwise_model_result=CandidateBatchPairwiseModelResult(
-                row_signals={},
-                pairwise_stats=cast(Any, None),
-                telemetry={},
-            ),
-            linked_signature_clusters={"q": "c_ada"},
-        )
-
-    monkeypatch.setattr(
-        "s2and.incremental_linking.runtime.feature_port.build_rust_featurizer_from_feature_block",
-        fake_build_rust_featurizer_from_feature_block,
-    )
-    monkeypatch.setattr("s2and.incremental_linking.runtime.feature_port._get_rust_featurizer", fail_get_rust_featurizer)
-    monkeypatch.setattr(
-        "s2and.incremental_linking.runtime._predict_incremental_link_or_abstain_production_from_retrieval_private",
-        lambda *args, **kwargs: fake_from_retrieval(**kwargs),
-    )
-
-    result = predict_incremental_link_or_abstain_from_raw_feature_block(
-        _raw_test_clusterer(suppress_orcid=True, features_to_use=["name_counts"]),
-        _raw_test_artifact(),
-        feature_block=feature_block,
-        raw_candidate_plan=_raw_plan(),
-        name_tuples=set(),
-    )
-
-    assert captured["feature_block_signature_ids"] == ("q", "s1", "s2", "s3")
-    assert captured["feature_block_seed_map"] == {"s1": "c_ada", "s2": "c_other", "s3": "c_other"}
-    assert captured["build_kwargs"]["load_name_counts"] is True
-    queries = captured["queries"]
-    assert len(queries) == 1
-    assert queries[0].query_author == "Ada Lovelace"
-    assert captured["retrieval_left_indices"] == [1, 1, 1]
-    assert captured["retrieval_right_indices"] == [2, 3, 0]
-    assert captured["extra_row_signal_builder"] is None
-    assert result.linked_signature_clusters == {"q": "c_ada"}
-    assert result.telemetry["feature_block_signature_count"] == 4
-    assert "feature_block_rust_featurizer_seconds" in result.telemetry
-    assert result.telemetry["constraint_api_mode"] == "rust_index_arrays"
-
-
-def test_raw_feature_block_scoring_rejects_disabled_required_name_counts() -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    feature_block = feature_block_from_raw_payloads(
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-    )
-
-    with pytest.raises(ValueError, match="load_name_counts=False"):
-        predict_incremental_link_or_abstain_from_raw_feature_block(
-            _raw_test_clusterer(features_to_use=["name_counts"]),
-            _raw_test_artifact(),
-            feature_block=feature_block,
-            raw_candidate_plan=_raw_plan(),
-            load_name_counts=False,
-            name_tuples=set(),
-        )
-
-
 def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1860,20 +1754,13 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     assert captured["retrieval_paths"] == captured["featurizer_paths"]
 
 
-def test_raw_arrow_partial_supervision_require_unknown_seed_rejected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_raw_arrow_partial_supervision_require_unknown_seed_rejected() -> None:
     class FakeFeaturizer:
         def signature_ids(self) -> list[str]:
             return ["q", "s1", "s2", "s3"]
 
     raw_plan = _raw_plan()
     raw_plan["component_members"] = {}
-
-    monkeypatch.setattr(
-        "s2and.incremental_linking.runtime.feature_port.build_rust_featurizer_from_arrow_paths",
-        lambda *_args, **_kwargs: FakeFeaturizer(),
-    )
 
     with pytest.raises(ValueError, match="partial_supervision_require_unknown_seed_signature"):
         predict_incremental_link_or_abstain_from_raw_arrow_paths(
@@ -1882,7 +1769,31 @@ def test_raw_arrow_partial_supervision_require_unknown_seed_rejected(
             arrow_paths={},
             query_signature_ids=["q"],
             raw_candidate_plan=raw_plan,
+            rust_featurizer=FakeFeaturizer(),
             partial_supervision={("q", "s1"): 0},
+            load_name_counts=False,
+            name_tuples=set(),
+        )
+
+
+def test_raw_arrow_scoring_requires_featurizer_with_provided_raw_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_build_rust_featurizer_from_arrow_paths(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("provided raw candidate plans must not trigger a new Arrow featurizer scan")
+
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port.build_rust_featurizer_from_arrow_paths",
+        fail_build_rust_featurizer_from_arrow_paths,
+    )
+
+    with pytest.raises(ValueError, match="provided raw_candidate_plan requires rust_featurizer"):
+        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            _raw_test_clusterer(),
+            _raw_test_artifact(),
+            arrow_paths={},
+            query_signature_ids=["q"],
+            raw_candidate_plan=_raw_plan(),
             load_name_counts=False,
             name_tuples=set(),
         )
@@ -2093,86 +2004,6 @@ def test_raw_arrow_scoring_wrapper_rejects_mismatched_raw_plan_query_ids() -> No
         )
 
 
-def test_rust_featurizer_from_feature_block_matches_mini_anddata() -> None:
-    s2and_rust = pytest.importorskip("s2and_rust")
-    feature_block = feature_block_from_anddata(
-        _tiny_anddata(),
-        signature_ids=["q", "s1", "s2"],
-        query_signature_ids=["q"],
-    )
-    mini = feature_block_to_mini_anddata(
-        feature_block,
-        name="mini_feature_block_rust_parity",
-        load_name_counts=False,
-        name_tuples=set(),
-    )
-
-    direct = s2and_rust.RustFeaturizer.from_feature_block(
-        feature_block,
-        set(),
-        None,
-        True,
-        False,
-        0.0,
-        10000.0,
-        1,
-    )
-    incumbent = s2and_rust.RustFeaturizer.from_dataset(mini, 0.0, 10000.0, 1)
-
-    assert tuple(direct.signature_ids()) == feature_block.signature_ids
-    np.testing.assert_allclose(direct.featurize_pair("q", "s1"), incumbent.featurize_pair("q", "s1"))
-    assert direct.get_constraint("q", "s2") == incumbent.get_constraint("q", "s2")
-
-
-def test_rust_featurizer_from_feature_block_rejects_malformed_paper_author_position() -> None:
-    s2and_rust = pytest.importorskip("s2and_rust")
-    feature_block = SimpleNamespace(
-        signatures=(
-            SimpleNamespace(
-                signature_id="q",
-                paper_id="p1",
-                author_first="Ada",
-                author_middle=None,
-                author_last="Lovelace",
-                author_suffix=None,
-                author_email=None,
-                author_position=0,
-                author_affiliations=(),
-                author_orcid=None,
-            ),
-        ),
-        paper_authors=(SimpleNamespace(paper_id="p1", position=["bad"], author_name="Ada Lovelace"),),
-        papers=(
-            SimpleNamespace(
-                paper_id="p1",
-                title="Notes",
-                venue="",
-                journal_name="",
-                year=1843,
-                abstract=None,
-                predicted_language=None,
-                is_reliable=None,
-            ),
-        ),
-        cluster_seeds_require=(),
-        cluster_seeds_disallow=(),
-        specter_paper_ids=(),
-        specter_embeddings=None,
-    )
-
-    with pytest.raises(TypeError):
-        s2and_rust.RustFeaturizer.from_feature_block(
-            feature_block,
-            set(),
-            None,
-            False,
-            False,
-            0.0,
-            10000.0,
-            1,
-        )
-
-
 def test_from_retrieval_skips_pair_id_build_when_partial_supervision_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2278,63 +2109,3 @@ def test_raw_candidate_plan_bridge_rejects_wrapped_signature_indices() -> None:
             raw_plan,
             feature_block_signature_order=feature_block_signature_order_from_raw_candidate_plan(_raw_plan()),
         )
-
-
-def test_raw_payload_scoring_wrapper_builds_feature_block_and_adds_telemetry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    signatures, papers, cluster_seeds_require = _raw_payloads_for_plan()
-    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
-        _raw_plan(),
-        feature_block_signature_order=feature_block_signature_order_from_raw_candidate_plan(_raw_plan()),
-    )
-    captured: dict[str, Any] = {}
-
-    def fake_score(**kwargs: Any) -> LinkOrAbstainProductionResult:
-        feature_block = kwargs["feature_block"]
-        captured["feature_block_signature_ids"] = feature_block.signature_ids
-        captured["feature_block_disallow"] = feature_block.cluster_seeds_disallow
-        captured["raw_candidate_plan"] = kwargs["raw_candidate_plan"]
-        return LinkOrAbstainProductionResult(
-            feature_matrix=LinkerFeatureMatrix(
-                matrix=np.empty((2, 0), dtype=np.float32),
-                feature_columns=(),
-                candidate_batch=retrieval_batch.candidate_batch,
-            ),
-            compact_result=LinkOrAbstainCompactResult(
-                probabilities=np.asarray([0.8, 0.2], dtype=np.float32),
-                decisions=(),
-            ),
-            telemetry={"candidate_row_count": 2},
-            retrieval_batch=retrieval_batch,
-            pairwise_model_result=CandidateBatchPairwiseModelResult(
-                row_signals={},
-                pairwise_stats=cast(Any, None),
-                telemetry={},
-            ),
-            linked_signature_clusters={"q": "c_ada"},
-        )
-
-    monkeypatch.setattr(
-        "s2and.incremental_linking.runtime.predict_incremental_link_or_abstain_from_raw_feature_block",
-        lambda *args, **kwargs: fake_score(**kwargs),
-    )
-
-    result = predict_incremental_link_or_abstain_from_raw_payloads(
-        _raw_test_clusterer(),
-        _raw_test_artifact(),
-        signatures=signatures,
-        papers=papers,
-        raw_candidate_plan=_raw_plan(),
-        cluster_seeds_require=cluster_seeds_require,
-        cluster_seeds_disallow=[("q", "s2")],
-        load_name_counts=False,
-        name_tuples=set(),
-    )
-
-    assert captured["feature_block_signature_ids"] == ("q", "s1", "s2", "s3")
-    assert captured["feature_block_disallow"] == (("q", "s2"),)
-    assert captured["raw_candidate_plan"] is not None
-    assert result.linked_signature_clusters == {"q": "c_ada"}
-    assert result.telemetry["candidate_row_count"] == 2
-    assert isinstance(result.telemetry["feature_block_raw_payload_build_seconds"], float)

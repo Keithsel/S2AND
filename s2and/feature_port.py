@@ -752,34 +752,6 @@ def _stringified_arrow_paths(paths: Mapping[Any, Any]) -> dict[str, str]:
     return normalize_arrow_paths(paths)
 
 
-def build_rust_featurizer_from_feature_block(
-    feature_block: Any,
-    *,
-    name_tuples: Any = "filtered",
-    load_name_counts: bool = False,
-    name_counts_path: str | None = None,
-    preprocess: bool = True,
-    compute_reference_features: bool = False,
-    cluster_seed_require_value: float = 0.0,
-    cluster_seed_disallow_value: float = 10000.0,
-    num_threads: int | None = None,
-) -> Any:
-    """Build a Rust featurizer directly from the narrow `FeatureBlock` contract."""
-
-    method = _rust_featurizer_method("from_feature_block", "raw FeatureBlock scoring")
-    resolved_name_counts_path = _resolve_direct_name_counts_path(load_name_counts, name_counts_path)
-    return method(
-        feature_block,
-        name_tuples,
-        resolved_name_counts_path,
-        bool(preprocess),
-        bool(compute_reference_features),
-        float(cluster_seed_require_value),
-        float(cluster_seed_disallow_value),
-        None if num_threads is None else resolve_n_jobs(num_threads),
-    )
-
-
 def build_rust_featurizer_from_arrow_paths(
     paths: Mapping[str, Any],
     *,
@@ -1284,7 +1256,6 @@ __all__ = [
     "build_linker_pair_features_and_aggregate_stats_arrays_rust",
     "build_pair_feature_matrix_rust",
     "build_rust_featurizer_from_arrow_paths",
-    "build_rust_featurizer_from_feature_block",
     "clear_rust_featurizer_cache",
     "evict_rust_featurizer",
     "featurize_pair_rust",

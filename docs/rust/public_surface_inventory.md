@@ -27,7 +27,6 @@ cleanup risk, not a user-facing API promise.
 | `from_arrow_paths(...)` | `feature_port.build_rust_featurizer_from_arrow_paths(...)`; full predict, subblocked predict, raw Arrow scoring | Production Arrow constructor. |
 | `from_dataset(...)` | `feature_port.build_rust_featurizer(...)`, `_get_rust_featurizer(...)`; training/eval, parity, compatibility | Keep callable but do not present as production inference. |
 | `from_json_paths(...)` | `feature_port.build_rust_featurizer(...)`; JSON compatibility scripts/tests | Compatibility and benchmark surface. |
-| `from_feature_block(...)` | raw payload compatibility and parity tests | Bridge/test surface until Arrow request-table assembly covers those callers. |
 | `json_ingest_telemetry(...)` | JSON ingest validation and service-JSON tests | Compatibility telemetry. |
 | `update_cluster_seeds(...)` and `update_signature_name_counts(...)` | cache/seed update helpers in `feature_port.py` and tests | Compatibility/training lifecycle helpers. |
 | `signature_ids(...)` | pairwise matrix wrappers, promoted incremental runtime, parity scripts | Shared index-order contract; keep. |
@@ -92,3 +91,9 @@ cleanup risk, not a user-facing API promise.
 - Status 2026-05-25: the one-shot
   `raw_block_query_candidate_plan_arrow(...)` PyO3 wrapper was removed after
   runtime callers moved to `RawBlockQueryCandidatePlanner`.
+- Status 2026-05-25: `RustFeaturizer.from_feature_block(...)`,
+  `feature_port.build_rust_featurizer_from_feature_block(...)`, and raw
+  payload scoring wrappers were removed after a repo-local no-caller scan.
+  Lower-level Python `FeatureBlock` builders remain only for fixture,
+  compatibility-conversion, and parity-helper tests; production Rust scoring
+  uses Arrow request tables.

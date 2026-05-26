@@ -535,11 +535,10 @@ to maintain without changing runtime behavior.
     incremental linking. The legacy list-of-tuples
     `linker_pair_features_and_aggregate_stats_indexed(...)` API and Python
     wrapper were removed after repo-local callers moved to the array API.
-  - Canonical aggregate-only API: either add an explicit `emit_matrix` or
-    matrix-empty mode to `linker_pair_index_arrays_and_aggregate_stats(...)`,
-    or prove the aggregate-only wrapper is still needed. Otherwise delete
-    `linker_pair_index_arrays_aggregate_stats(...)` and update capability
-    probes that currently key off it.
+  - Status 2026-05-25: aggregate-only pair stats now use
+    `linker_pair_index_arrays_and_aggregate_stats(..., emit_matrix=False)`.
+    The separate `linker_pair_index_arrays_aggregate_stats(...)` PyO3 method
+    was deleted, and capability probes key off the canonical array API.
   - Canonical constraint API: prefer indexed and block-upper-triangle
     constraint APIs. Migrate public wrappers/tests off string-pair
     `get_constraints_matrix(...)`, then delete that Rust method and remove it

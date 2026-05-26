@@ -44,7 +44,7 @@ cleanup risk, not a user-facing API promise.
 | `featurize_pairs_matrix(...)` | pairwise compatibility, parity, and Arrow parity script | Matrix API retained while callers still pass string pairs. |
 | `featurize_pairs_matrix_indexed(...)` | `s2and/featurizer.py`, capability probes | Preferred pairwise matrix API for indexed callers. |
 | `linker_pair_index_arrays_and_aggregate_stats(...)` | `s2and/incremental_linking/linker_pairwise.py` | Canonical promoted linker pair-feature plus aggregate API. |
-| `linker_pair_index_arrays_aggregate_stats(...)` | `s2and/incremental_linking/linker_pairwise.py`, capability probes | Aggregate-only wrapper; decide whether to keep or fold into the canonical array API. |
+| `linker_pair_index_arrays_and_aggregate_stats(..., emit_matrix=False)` | `s2and/incremental_linking/linker_pairwise.py`, capability probes | Canonical aggregate-only mode; preserves the no-matrix fast path without a second PyO3 method. |
 | `featurize_block_upper_triangle_matrix_indexed(...)` | blockwise full predict | Maintained blockwise feature API. |
 | `save(...)` / `load(...)` | lifecycle/debug persistence; `load(...)` is used by counter-data measurement scripts | Compatibility/debug persistence. |
 
@@ -69,7 +69,7 @@ cleanup risk, not a user-facing API promise.
 | `rust_calls.get_constraints_matrix_indexed_rust(...)` and `get_constraints_block_upper_triangle_indexed_rust(...)` | full predict and parity | Maintained constraint wrappers. |
 | `rust_calls.get_constraints_matrix_rust(...)` | compatibility/tests | String-pair compatibility wrapper. |
 | `rust_calls.build_linker_pair_features_and_aggregate_stats_arrays_rust(...)` | promoted incremental pairwise scoring | Maintained canonical array wrapper. |
-| `rust_calls.build_linker_pair_aggregate_stats_arrays_rust(...)` | promoted incremental aggregate-only path | Pending decision: keep separate or fold into canonical array wrapper. |
+| `rust_calls.build_linker_pair_aggregate_stats_arrays_rust(...)` | promoted incremental aggregate-only path | Thin Python wrapper over `linker_pair_index_arrays_and_aggregate_stats(..., emit_matrix=False)`. |
 | `runtime.detect_rust_runtime_capabilities(...)` markers | backend selection and tests | Update markers before deleting any method they probe. |
 
 ## Cleanup Notes
@@ -85,6 +85,6 @@ cleanup risk, not a user-facing API promise.
   `linker_pair_features_and_aggregate_stats_indexed(...)` and its Python
   wrapper were removed after the repo-local callers moved to the canonical
   index-array API.
-- The next linker aggregate decision is whether aggregate-only should remain a
-  separate API or become a mode of
-  `linker_pair_index_arrays_and_aggregate_stats(...)`.
+- Status 2026-05-25: aggregate-only remains a runtime mode, but the separate
+  `linker_pair_index_arrays_aggregate_stats(...)` PyO3 method was folded into
+  `linker_pair_index_arrays_and_aggregate_stats(..., emit_matrix=False)`.

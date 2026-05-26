@@ -405,22 +405,38 @@ def build_linker_pair_aggregate_stats_arrays_rust(
     """Build row-level aggregate stats from numeric pair index arrays without returning pair features."""
 
     featurizer = _resolve_featurizer(dataset, featurizer, runtime_context)
-    method = getattr(featurizer, "linker_pair_index_arrays_aggregate_stats", None)
+    method = getattr(featurizer, "linker_pair_index_arrays_and_aggregate_stats", None)
     if not callable(method):
         raise RuntimeError(
-            "RustFeaturizer.linker_pair_index_arrays_aggregate_stats is unavailable; "
+            "RustFeaturizer.linker_pair_index_arrays_and_aggregate_stats is unavailable; "
             "rebuild/install a newer s2and-rust extension."
         )
     resolved_num_threads = None if num_threads is None else resolve_n_jobs(num_threads)
-    counts, valid_counts, sums, mins, maxs = method(
+    result = method(
         as_uint32_1d("left_signature_indices", left_signature_indices),
         as_uint32_1d("right_signature_indices", right_signature_indices),
         as_uint32_1d("row_indices", row_indices),
         int(row_count),
+        None,
         aggregate_indices,
         resolved_num_threads,
         nan_value,
+        None,
+        False,
     )
+    try:
+        result_len = len(result)
+    except TypeError as exc:
+        raise RuntimeError(
+            "RustFeaturizer.linker_pair_index_arrays_and_aggregate_stats returned an outdated "
+            "aggregate contract; rebuild/install a newer s2and-rust extension."
+        ) from exc
+    if result_len != 6:
+        raise RuntimeError(
+            "RustFeaturizer.linker_pair_index_arrays_and_aggregate_stats returned an outdated "
+            "aggregate contract; rebuild/install a newer s2and-rust extension."
+        )
+    _matrix, counts, valid_counts, sums, mins, maxs = result
     return (
         np.asarray(counts, dtype=np.uint32),
         np.asarray(valid_counts, dtype=np.uint64),

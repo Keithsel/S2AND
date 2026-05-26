@@ -11,7 +11,7 @@ from s2and.incremental_linking import linker_pairwise
 from tests.helpers import build_dummy_dataset, import_s2and_rust
 
 HAS_LINKER_ARRAY_FEATURE_AGG_RUST, LINKER_ARRAY_FEATURE_AGG_RUST_IMPORT_ERROR = import_s2and_rust(
-    required_method="linker_pair_index_arrays_aggregate_stats"
+    required_method="linker_pair_index_arrays_and_aggregate_stats"
 )
 
 
@@ -256,17 +256,21 @@ def test_linker_pairwise_aggregates_use_memory_chunk_plan(monkeypatch: pytest.Mo
     aggregate_indices_seen: list[tuple[int, ...]] = []
 
     class FakeRustFeaturizer:
-        def linker_pair_index_arrays_aggregate_stats(
+        def linker_pair_index_arrays_and_aggregate_stats(
             self,
             left_signature_indices,
             right_signature_indices,
             local_row_indices,
             row_count,
+            matrix_indices,
             aggregate_indices,
             num_threads,
             nan_value,
+            aggregate_nan_value,
+            emit_matrix,
         ):
-            del num_threads, nan_value
+            del matrix_indices, num_threads, nan_value, aggregate_nan_value
+            assert emit_matrix is False
             call_sizes.append(len(left_signature_indices))
             aggregate_indices_seen.append(tuple(aggregate_indices))
             counts = np.zeros(int(row_count), dtype=np.uint32)
@@ -286,7 +290,7 @@ def test_linker_pairwise_aggregates_use_memory_chunk_plan(monkeypatch: pytest.Mo
                 sums[int(local_row_index)] += values
                 mins[int(local_row_index)] = np.minimum(mins[int(local_row_index)], values)
                 maxs[int(local_row_index)] = np.maximum(maxs[int(local_row_index)], values)
-            return counts, valid_counts, sums, mins, maxs
+            return np.zeros((len(left_signature_indices), 0), dtype=np.float64), counts, valid_counts, sums, mins, maxs
 
     fake_featurizer = FakeRustFeaturizer()
     plan_call_count = 0
@@ -394,22 +398,27 @@ def test_candidate_batch_aggregates_accept_index_arrays(monkeypatch: pytest.Monk
         def signature_ids(self):
             raise AssertionError("indexed pair path should not request signature_ids")
 
-        def linker_pair_index_arrays_aggregate_stats(
+        def linker_pair_index_arrays_and_aggregate_stats(
             self,
             left_signature_indices,
             right_signature_indices,
             local_row_indices,
             row_count,
+            matrix_indices,
             aggregate_indices,
             num_threads,
             nan_value,
+            aggregate_nan_value,
+            emit_matrix,
         ):
-            del local_row_indices, num_threads, nan_value
+            del local_row_indices, matrix_indices, num_threads, nan_value, aggregate_nan_value
+            assert emit_matrix is False
             indexed_pairs_seen.extend(
                 (int(left), int(right))
                 for left, right in zip(left_signature_indices, right_signature_indices, strict=True)
             )
             return (
+                np.zeros((len(left_signature_indices), 0), dtype=np.float64),
                 np.ones(int(row_count), dtype=np.uint32),
                 np.ones((int(row_count), len(aggregate_indices)), dtype=np.uint64),
                 np.ones((int(row_count), len(aggregate_indices)), dtype=np.float64),
@@ -450,21 +459,21 @@ def test_candidate_batch_aggregates_use_array_api(monkeypatch: pytest.MonkeyPatc
     call_sizes: list[int] = []
 
     class FakeRustFeaturizer:
-        def linker_pair_index_arrays_and_aggregate_stats(self, *args):
-            del args
-            raise AssertionError("aggregate-only path should not materialize pair feature matrices")
-
-        def linker_pair_index_arrays_aggregate_stats(
+        def linker_pair_index_arrays_and_aggregate_stats(
             self,
             left_signature_indices,
             right_signature_indices,
             row_indices,
             row_count,
+            matrix_indices,
             aggregate_indices,
             num_threads,
             nan_value,
+            aggregate_nan_value,
+            emit_matrix,
         ):
-            del num_threads, nan_value
+            del matrix_indices, num_threads, nan_value, aggregate_nan_value
+            assert emit_matrix is False
             call_sizes.append(len(left_signature_indices))
             counts = np.zeros(int(row_count), dtype=np.uint32)
             valid_counts = np.zeros((int(row_count), len(aggregate_indices)), dtype=np.uint64)
@@ -483,7 +492,7 @@ def test_candidate_batch_aggregates_use_array_api(monkeypatch: pytest.MonkeyPatc
                 sums[int(local_row_index)] += values
                 mins[int(local_row_index)] = np.minimum(mins[int(local_row_index)], values)
                 maxs[int(local_row_index)] = np.maximum(maxs[int(local_row_index)], values)
-            return counts, valid_counts, sums, mins, maxs
+            return np.zeros((len(left_signature_indices), 0), dtype=np.float64), counts, valid_counts, sums, mins, maxs
 
     fake_featurizer = FakeRustFeaturizer()
     monkeypatch.setattr(
@@ -520,25 +529,32 @@ def test_candidate_batch_aggregates_trust_rust_aggregate_stats(monkeypatch: pyte
     )
 
     class FakeRustFeaturizer:
-        def linker_pair_index_arrays_aggregate_stats(
+        def linker_pair_index_arrays_and_aggregate_stats(
             self,
             left_signature_indices,
             right_signature_indices,
             row_indices,
             row_count,
+            matrix_indices,
             aggregate_indices,
             num_threads,
             nan_value,
+            aggregate_nan_value,
+            emit_matrix,
         ):
             del (
                 left_signature_indices,
                 right_signature_indices,
                 row_indices,
+                matrix_indices,
                 aggregate_indices,
                 num_threads,
                 nan_value,
+                aggregate_nan_value,
             )
+            assert emit_matrix is False
             return (
+                np.zeros((1, 0), dtype=np.float64),
                 np.ones(int(row_count), dtype=np.uint32),
                 np.ones((int(row_count), 1), dtype=np.uint64),
                 np.asarray([[42.0]], dtype=np.float64),

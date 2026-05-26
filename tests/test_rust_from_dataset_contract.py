@@ -319,14 +319,17 @@ def test_aggregate_entrypoints_validate_indices_and_preserve_tuple_shapes():
     assert np.asarray(empty_maxs).shape == (0, 3)
 
     with pytest.raises(ValueError, match=f"aggregate_indices contains out-of-range index {full_cols}"):
-        rust_featurizer.linker_pair_index_arrays_aggregate_stats(
+        rust_featurizer.linker_pair_index_arrays_and_aggregate_stats(
             empty,
             empty,
             empty,
             0,
+            None,
             [full_cols],
             1,
             np.nan,
+            None,
+            False,
         )
     with pytest.raises(ValueError, match="aggregate index 3 is not present in matrix_indices"):
         rust_featurizer.linker_pair_index_arrays_and_aggregate_stats(

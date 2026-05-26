@@ -11706,7 +11706,8 @@ impl RustFeaturizer {
             aggregate_indices = None,
             num_threads = None,
             nan_value = f64::NAN,
-            aggregate_nan_value = None
+            aggregate_nan_value = None,
+            emit_matrix = true
         )
     )]
     fn linker_pair_index_arrays_and_aggregate_stats<'py>(
@@ -11721,6 +11722,7 @@ impl RustFeaturizer {
         num_threads: Option<usize>,
         nan_value: f64,
         aggregate_nan_value: Option<f64>,
+        emit_matrix: bool,
     ) -> PyResult<(
         Bound<'py, PyArray2<f64>>,
         Bound<'py, PyArray1<u32>>,
@@ -11742,13 +11744,6 @@ impl RustFeaturizer {
             )));
         }
 
-        let full_cols = self.full_feature_count();
-        let index_selection =
-            resolve_matrix_aggregate_indices(matrix_indices, aggregate_indices, full_cols)?;
-        let resolved_matrix_indices = index_selection.matrix_indices;
-        let resolved_aggregate_indices = index_selection.aggregate_indices;
-        let aggregate_matrix_positions = index_selection.aggregate_matrix_positions;
-
         let lookup = self.sparse_signature_paper_lookup_for_indices(left_indices, right_indices)?;
         for row_index in owner_row_indices.iter() {
             let bounded = *row_index as usize;
@@ -11759,6 +11754,92 @@ impl RustFeaturizer {
                 )));
             }
         }
+
+        let full_cols = self.full_feature_count();
+        if !emit_matrix {
+            let resolved_aggregate_indices =
+                resolve_feature_indices("aggregate_indices", aggregate_indices, full_cols)?;
+            let row_ranges = Self::pair_aggregate_row_ranges(owner_row_indices);
+            let aggregate_cols = resolved_aggregate_indices.len();
+            let aggregate_buffers = py.allow_threads(|| {
+                let compute = || match row_ranges.as_ref() {
+                    Some(ranges) => self.aggregate_pair_index_arrays_grouped(
+                        left_indices,
+                        right_indices,
+                        ranges,
+                        row_count,
+                        &resolved_aggregate_indices,
+                        nan_value,
+                        &lookup,
+                    ),
+                    None => self.aggregate_pair_index_arrays_sequential(
+                        left_indices,
+                        right_indices,
+                        owner_row_indices,
+                        row_count,
+                        &resolved_aggregate_indices,
+                        nan_value,
+                        &lookup,
+                    ),
+                };
+                install_with_optional_rayon_pool(num_threads, compute)
+            });
+            let matrix_array = numpy::ndarray::Array2::<f64>::zeros((pair_count, 0));
+            let valid_counts_array = numpy::ndarray::Array2::from_shape_vec(
+                (row_count, aggregate_cols),
+                aggregate_buffers.valid_counts,
+            )
+            .map_err(|err| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to build aggregate valid counts matrix: {}",
+                    err
+                ))
+            })?;
+            let sums_array = numpy::ndarray::Array2::from_shape_vec(
+                (row_count, aggregate_cols),
+                aggregate_buffers.sums,
+            )
+            .map_err(|err| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to build aggregate sums matrix: {}",
+                    err
+                ))
+            })?;
+            let mins_array = numpy::ndarray::Array2::from_shape_vec(
+                (row_count, aggregate_cols),
+                aggregate_buffers.mins,
+            )
+            .map_err(|err| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to build aggregate mins matrix: {}",
+                    err
+                ))
+            })?;
+            let maxs_array = numpy::ndarray::Array2::from_shape_vec(
+                (row_count, aggregate_cols),
+                aggregate_buffers.maxs,
+            )
+            .map_err(|err| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to build aggregate maxs matrix: {}",
+                    err
+                ))
+            })?;
+            return Ok((
+                matrix_array.to_pyarray(py),
+                numpy::ndarray::Array1::from_vec(aggregate_buffers.counts).to_pyarray(py),
+                valid_counts_array.to_pyarray(py),
+                sums_array.to_pyarray(py),
+                mins_array.to_pyarray(py),
+                maxs_array.to_pyarray(py),
+            ));
+        }
+
+        let index_selection =
+            resolve_matrix_aggregate_indices(matrix_indices, aggregate_indices, full_cols)?;
+        let resolved_matrix_indices = index_selection.matrix_indices;
+        let resolved_aggregate_indices = index_selection.aggregate_indices;
+        let aggregate_matrix_positions = index_selection.aggregate_matrix_positions;
 
         let out_cols = resolved_matrix_indices.len();
         let aggregate_cols = resolved_aggregate_indices.len();
@@ -11870,137 +11951,6 @@ impl RustFeaturizer {
         Ok((
             matrix_array.to_pyarray(py),
             numpy::ndarray::Array1::from_vec(counts).to_pyarray(py),
-            valid_counts_array.to_pyarray(py),
-            sums_array.to_pyarray(py),
-            mins_array.to_pyarray(py),
-            maxs_array.to_pyarray(py),
-        ))
-    }
-
-    #[pyo3(
-        signature = (
-            left_signature_indices,
-            right_signature_indices,
-            row_indices,
-            row_count,
-            aggregate_indices = None,
-            num_threads = None,
-            nan_value = f64::NAN
-        )
-    )]
-    fn linker_pair_index_arrays_aggregate_stats<'py>(
-        &self,
-        py: Python<'py>,
-        left_signature_indices: PyReadonlyArray1<'py, u32>,
-        right_signature_indices: PyReadonlyArray1<'py, u32>,
-        row_indices: PyReadonlyArray1<'py, u32>,
-        row_count: usize,
-        aggregate_indices: Option<Vec<usize>>,
-        num_threads: Option<usize>,
-        nan_value: f64,
-    ) -> PyResult<(
-        Bound<'py, PyArray1<u32>>,
-        Bound<'py, PyArray2<u64>>,
-        Bound<'py, PyArray2<f64>>,
-        Bound<'py, PyArray2<f64>>,
-        Bound<'py, PyArray2<f64>>,
-    )> {
-        let left_indices = left_signature_indices.as_slice()?;
-        let right_indices = right_signature_indices.as_slice()?;
-        let owner_row_indices = row_indices.as_slice()?;
-        let pair_count = left_indices.len();
-        if right_indices.len() != pair_count || owner_row_indices.len() != pair_count {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "left_signature_indices, right_signature_indices, and row_indices must have equal length: left={} right={} rows={}",
-                left_indices.len(),
-                right_indices.len(),
-                owner_row_indices.len()
-            )));
-        }
-
-        let full_cols = self.full_feature_count();
-        let resolved_aggregate_indices =
-            resolve_feature_indices("aggregate_indices", aggregate_indices, full_cols)?;
-
-        let lookup = self.sparse_signature_paper_lookup_for_indices(left_indices, right_indices)?;
-        for row_index in owner_row_indices.iter() {
-            let bounded = *row_index as usize;
-            if bounded >= row_count {
-                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "row index out of range: row_index={} row_count={}",
-                    bounded, row_count
-                )));
-            }
-        }
-
-        let row_ranges = Self::pair_aggregate_row_ranges(owner_row_indices);
-        let aggregate_cols = resolved_aggregate_indices.len();
-        let aggregate_buffers = py.allow_threads(|| {
-            let compute = || match row_ranges.as_ref() {
-                Some(ranges) => self.aggregate_pair_index_arrays_grouped(
-                    left_indices,
-                    right_indices,
-                    ranges,
-                    row_count,
-                    &resolved_aggregate_indices,
-                    nan_value,
-                    &lookup,
-                ),
-                None => self.aggregate_pair_index_arrays_sequential(
-                    left_indices,
-                    right_indices,
-                    owner_row_indices,
-                    row_count,
-                    &resolved_aggregate_indices,
-                    nan_value,
-                    &lookup,
-                ),
-            };
-            install_with_optional_rayon_pool(num_threads, compute)
-        });
-
-        let valid_counts_array = numpy::ndarray::Array2::from_shape_vec(
-            (row_count, aggregate_cols),
-            aggregate_buffers.valid_counts,
-        )
-        .map_err(|err| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Failed to build aggregate valid-counts matrix: {}",
-                err
-            ))
-        })?;
-        let sums_array = numpy::ndarray::Array2::from_shape_vec(
-            (row_count, aggregate_cols),
-            aggregate_buffers.sums,
-        )
-        .map_err(|err| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Failed to build aggregate sums matrix: {}",
-                err
-            ))
-        })?;
-        let mins_array = numpy::ndarray::Array2::from_shape_vec(
-            (row_count, aggregate_cols),
-            aggregate_buffers.mins,
-        )
-        .map_err(|err| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Failed to build aggregate mins matrix: {}",
-                err
-            ))
-        })?;
-        let maxs_array = numpy::ndarray::Array2::from_shape_vec(
-            (row_count, aggregate_cols),
-            aggregate_buffers.maxs,
-        )
-        .map_err(|err| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Failed to build aggregate maxs matrix: {}",
-                err
-            ))
-        })?;
-        Ok((
-            numpy::ndarray::Array1::from_vec(aggregate_buffers.counts).to_pyarray(py),
             valid_counts_array.to_pyarray(py),
             sums_array.to_pyarray(py),
             mins_array.to_pyarray(py),

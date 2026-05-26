@@ -169,7 +169,7 @@ def _detect_named_rust_capabilities(module: Any) -> tuple[str, ...]:
     if rust_retriever_cls is not None and callable(getattr(rust_retriever_cls, "top_k_hybrid_centroid", None)):
         capabilities.append(RUST_CAPABILITY_HYBRID_CENTROID_RETRIEVER_V1)
     if rust_featurizer_cls is not None and callable(
-        getattr(rust_featurizer_cls, "linker_pair_index_arrays_aggregate_stats", None)
+        getattr(rust_featurizer_cls, "linker_pair_index_arrays_and_aggregate_stats", None)
     ):
         capabilities.append(RUST_CAPABILITY_INDEXED_PAIR_ARRAY_FEATURIZATION_V1)
     if rust_retriever_cls is not None and _has_current_incremental_pair_plan_abi(module, rust_retriever_cls):

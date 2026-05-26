@@ -225,7 +225,7 @@ def test_detect_rust_runtime_capabilities_requires_json_ingest_telemetry():
 
 def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():
     class NamedRustFeaturizer(_make_core_rust_featurizer()):
-        def linker_pair_index_arrays_aggregate_stats(self, *args, **kwargs):
+        def linker_pair_index_arrays_and_aggregate_stats(self, *args, **kwargs):
             return None
 
         def linker_pair_index_arrays_constraint_labels(self, *args, **kwargs):
@@ -266,7 +266,7 @@ def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():
 
 def test_detect_rust_runtime_capabilities_rejects_stale_incremental_pair_plan_abi():
     class NamedRustFeaturizer(_make_core_rust_featurizer()):
-        def linker_pair_index_arrays_aggregate_stats(self, *args, **kwargs):
+        def linker_pair_index_arrays_and_aggregate_stats(self, *args, **kwargs):
             return None
 
     class StalePairPlanMethod:
@@ -299,7 +299,7 @@ def test_detect_rust_runtime_capabilities_rejects_stale_incremental_pair_plan_ab
 
 def test_detect_rust_runtime_capabilities_requires_pair_plan_orcid_signal_marker():
     class NamedRustFeaturizer(_make_core_rust_featurizer()):
-        def linker_pair_index_arrays_aggregate_stats(self, *args, **kwargs):
+        def linker_pair_index_arrays_and_aggregate_stats(self, *args, **kwargs):
             return None
 
     class PairPlanMethod:

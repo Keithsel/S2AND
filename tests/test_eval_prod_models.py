@@ -79,9 +79,7 @@ def test_arrow_eval_defaults_include_full_release_root() -> None:
     assert eval_prod_models._default_arrow_data_root(project_root, "mini") == str(
         Path(project_root) / "s2and" / "data" / "s2and_mini_arrow"
     )
-    assert eval_prod_models._default_arrow_data_root(project_root, "full") == str(
-        Path(project_root) / "s2and" / "data" / "s2and-release-arrow"
-    )
+    assert eval_prod_models._default_arrow_data_root(project_root, "full") == str(Path(project_root) / "s2and" / "data")
 
 
 def test_arrow_eval_auto_selects_any_available_supported_bundle() -> None:

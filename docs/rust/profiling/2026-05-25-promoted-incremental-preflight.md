@@ -7,7 +7,7 @@ Date: 2026-05-25
 Prepare the next profiling pass for Arrow promoted-incremental inference. The
 work-plan target is Arrow read/summary construction and reusable component
 summaries on a realistic
-`s2and_and_big_blocks_linker_dataset_20260513_arrow` workload. That directory
+`s2and_and_big_blocks_linker_dataset_20260525` workload. That directory
 name is canonical even when its contents are refreshed.
 
 ## Tiny Preflight
@@ -33,7 +33,7 @@ rows, and the expected B3 score.
 
 The local checkout uses:
 
-- `s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow`
+- `s2and/data/s2and_and_big_blocks_linker_dataset_20260525`
 
 That local path is the canonical Arrow replay/profiling source of truth. The
 legacy `scripts/_rust_suite/big_block_incremental_cmd.py` JSON/`ANDData`

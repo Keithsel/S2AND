@@ -861,31 +861,31 @@ def test_raw_arrow_candidate_plan_rejects_stale_batch_index(tmp_path: Path) -> N
         )
 
 
-def test_arrow_batch_lookup_index_rejects_mtime_only_change(tmp_path: Path) -> None:
+def test_arrow_batch_lookup_index_accepts_transport_mtime_change(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
     signatures_path = Path(paths["signatures"])
     stat = signatures_path.stat()
     os.utime(signatures_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
 
-    with pytest.raises(ValueError, match="stale"):
-        _raw_candidate_plan_arrow(
-            indexed_paths,
-            ["q1"],
-            top_k=2,
-            query_view="full",
-            orcid_enabled=False,
-            num_threads=1,
-        )
+    plan = _raw_candidate_plan_arrow(
+        indexed_paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+    assert plan["query_signature_ids"] == ["q1"]
 
-    with pytest.raises(ValueError, match="stale"):
-        write_arrow_batch_lookup_index(
-            signatures_path,
-            indexed_paths["signatures_batch_index"],
-            key_column="signature_id",
-            table_name="signatures",
-            overwrite=False,
-        )
+    _index_path, reuse_metrics = write_arrow_batch_lookup_index(
+        signatures_path,
+        indexed_paths["signatures_batch_index"],
+        key_column="signature_id",
+        table_name="signatures",
+        overwrite=False,
+    )
+    assert reuse_metrics["reused"] is True
 
 
 def test_arrow_batch_lookup_index_rejects_wrong_key_column_reuse(tmp_path: Path) -> None:

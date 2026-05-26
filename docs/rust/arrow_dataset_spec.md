@@ -630,40 +630,51 @@ Required physical-layout checks for large-block optimized artifacts:
   unoptimized for indexed raw planning.
 - If batch-index sidecars are present, they were generated from the final Arrow
   files and the manifest path keys point to those sidecars.
+- Batch-index validation must not require source file mtimes to match. Object
+  store downloads can rewrite mtimes; validators use source size plus the
+  stored source fingerprint for portable release artifacts.
 
 Recommended smoke checks:
 
 PowerShell:
 
 ```powershell
-uv run python scripts/convert_to_arrow.py benchmark `
-  --source-root s2and/data/s2and_mini `
-  --output-root s2and/data/s2and_mini_arrow `
-  --datasets pubmed `
-  --n-jobs 20 `
-  --overwrite
+uv run python scripts/convert_to_arrow.py validate `
+  --dataset-dir s2and/data/qian `
+  --require-embeddings `
+  --require-name-counts-index
 ```
 
 ```powershell
 $env:S2AND_BACKEND='rust'
-uv run python scripts/eval_prod_models.py --dataset mini --n_jobs 20 --seed 42
+uv run python scripts/eval_prod_models.py `
+  --dataset full `
+  --use-arrow `
+  --datasets qian `
+  --specter-suffixes _specter2.pkl `
+  --n_jobs 4 `
+  --seed 42
 ```
 
 Bash:
 
 ```bash
-uv run python scripts/convert_to_arrow.py benchmark \
-  --source-root s2and/data/s2and_mini \
-  --output-root s2and/data/s2and_mini_arrow \
-  --datasets pubmed \
-  --n-jobs 20 \
-  --overwrite
+uv run python scripts/convert_to_arrow.py validate \
+  --dataset-dir s2and/data/qian \
+  --require-embeddings \
+  --require-name-counts-index
 
-S2AND_BACKEND=rust uv run python scripts/eval_prod_models.py --dataset mini --n_jobs 20 --seed 42
+S2AND_BACKEND=rust uv run python scripts/eval_prod_models.py \
+  --dataset full \
+  --use-arrow \
+  --datasets qian \
+  --specter-suffixes _specter2.pkl \
+  --n_jobs 4 \
+  --seed 42
 ```
 
-The eval command should report `use_arrow=True` when the Arrow bundle is
-complete.
+The eval command should report `use_arrow=True` and `Arrow data root:
+s2and/data` after the public Arrow release has been synced locally.
 
 ---
 

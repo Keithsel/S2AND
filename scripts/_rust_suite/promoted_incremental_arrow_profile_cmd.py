@@ -28,7 +28,7 @@ from _rust_suite.common import (  # type: ignore  # noqa: E402
 
 from s2and.arrow_inputs import MissingArrowArtifactError, validate_arrow_prediction_artifacts  # noqa: E402
 
-DEFAULT_ARROW_ROOT = PROJECT_ROOT / "s2and" / "data" / "s2and_and_big_blocks_linker_dataset_20260513_arrow"
+DEFAULT_ARROW_ROOT = PROJECT_ROOT / "s2and" / "data" / "s2and_and_big_blocks_linker_dataset_20260525"
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "s2and" / "data" / "production_model_v1.21"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "scratch" / "promoted_incremental_arrow_profile"
 
@@ -147,7 +147,7 @@ def _resolve_arrow_dataset_paths(arrow_root: Path, dataset: str) -> dict[str, st
             require_batch_indexes=True,
             context=f"promoted incremental Arrow profile dataset {dataset}",
             producer_hint=(
-                "use the canonical s2and_and_big_blocks_linker_dataset_20260513_arrow bundle "
+                "use the canonical s2and_and_big_blocks_linker_dataset_20260525 bundle "
                 "with manifest-declared name_counts_index and raw-planner batch indexes"
             ),
         )

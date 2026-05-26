@@ -52,7 +52,7 @@ The canonical surface owns:
 ## Active Sequence
 
 1. Keep the local canonical Arrow replay/profiling source at
-   `s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow`.
+   `s2and/data/s2and_and_big_blocks_linker_dataset_20260525`.
 2. Complete release artifact validation for the Arrow S3 prefix.
 3. Convert production-facing scripts to Arrow routes where that is a direct
    replacement; relabel raw/reference parity scripts instead of expanding them.
@@ -93,8 +93,8 @@ Current state:
 
 - The prefix was published and no-auth spot-checked on 2026-05-25.
 - Keep the canonical replay subbundle name
-  `s2and_and_big_blocks_linker_dataset_20260513_arrow/`, even when contents are
-  refreshed.
+  `s2and_and_big_blocks_linker_dataset_20260525/` for the current public Arrow
+  release.
 - The release is Arrow-native. Do not mirror `.feature_cache/`, raw JSON,
   pickle embeddings, or precomputed `features_corrected/`.
 - Local release-manifest generation now records root-manifest checksums,
@@ -148,7 +148,7 @@ Remaining:
 - Keep future production call sites on `s2and.arrow_inputs`; do not duplicate
   strict validation in scripts or model helpers.
 - Run the same Arrow eval smoke against the public release root after a local
-  `s2and-release-arrow/` checkout is available.
+  `s2and/data` Arrow release checkout is available.
 
 Done when:
 
@@ -279,7 +279,7 @@ Next profiling target:
 
 - Arrow read/summary construction and reusable component summaries on the
   canonical local promoted-incremental workload:
-  `s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow`.
+  `s2and/data/s2and_and_big_blocks_linker_dataset_20260525`.
 - Use `scripts/rust_suite.py promoted-incremental-arrow-profile`, not the
   deleted JSON/`ANDData` big-block command.
 

@@ -92,7 +92,7 @@ The current train/calibrate/eval source bundle is published as an Arrow-only
 replay bundle with the other Arrow release data:
 
 ```powershell
-aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260513_arrow s2and\data\s2and_and_big_blocks_linker_dataset_20260513_arrow
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260525 s2and\data\s2and_and_big_blocks_linker_dataset_20260525
 ```
 
 This bundle intentionally omits legacy `raw/`, `embeddings/`, and
@@ -341,7 +341,7 @@ from s2and.production_model import load_production_model
 clusterer = load_production_model("s2and/data/production_model_v1.21")
 
 arrow_paths = resolve_arrow_dataset_paths(
-    "s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow",
+    "s2and/data",
     "qian",
     "_specter2.pkl",
 )

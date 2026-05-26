@@ -345,6 +345,23 @@ def _read_arrow_batch_lookup_index_header(index_path: Path) -> dict[str, int | s
     }
 
 
+def _batch_lookup_index_source_mismatch(
+    header: Mapping[str, int | str],
+    *,
+    source_size: int,
+    source_fingerprint: int,
+) -> str | None:
+    indexed_size = int(header["source_size"])
+    indexed_fingerprint = int(header["source_fingerprint"])
+    if indexed_size == int(source_size) and indexed_fingerprint == int(source_fingerprint):
+        return None
+    return (
+        "indexed size/fingerprint="
+        f"({indexed_size}, {indexed_fingerprint}) current size/fingerprint="
+        f"({int(source_size)}, {int(source_fingerprint)})"
+    )
+
+
 def _arrow_batch_lookup_record_hash(index_mmap: mmap.mmap, record_index: int) -> int:
     offset = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size + record_index * _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.size
     return int(_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.unpack_from(index_mmap, offset)[0])
@@ -391,17 +408,14 @@ def read_arrow_batch_lookup_index_batch_indices(
             f"key_column={key_column!r}"
         )
     source_fingerprint = _source_file_sample_fingerprint(arrow_path_obj)
-    if (
-        int(header["source_size"]) != source_stat.st_size
-        or int(header["source_mtime_ns"]) != source_stat.st_mtime_ns
-        or int(header["source_fingerprint"]) != source_fingerprint
-    ):
+    source_mismatch = _batch_lookup_index_source_mismatch(
+        header,
+        source_size=source_stat.st_size,
+        source_fingerprint=source_fingerprint,
+    )
+    if source_mismatch is not None:
         raise ValueError(
-            f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': "
-            "indexed size/mtime/fingerprint="
-            f"({int(header['source_size'])}, {int(header['source_mtime_ns'])}, "
-            f"{int(header['source_fingerprint'])}) current size/mtime/fingerprint="
-            f"({source_stat.st_size}, {source_stat.st_mtime_ns}, {source_fingerprint})"
+            f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': " f"{source_mismatch}"
         )
     record_count = int(header["record_count"])
     expected_len = (
@@ -447,17 +461,14 @@ def validate_arrow_batch_lookup_index(
             f"indexed hash={int(header['key_column_hash'])} expected hash={key_column_hash} "
             f"key_column={key_column!r}"
         )
-    if (
-        int(header["source_size"]) != source_stat.st_size
-        or int(header["source_mtime_ns"]) != source_stat.st_mtime_ns
-        or int(header["source_fingerprint"]) != source_fingerprint
-    ):
+    source_mismatch = _batch_lookup_index_source_mismatch(
+        header,
+        source_size=source_stat.st_size,
+        source_fingerprint=source_fingerprint,
+    )
+    if source_mismatch is not None:
         raise ValueError(
-            f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': "
-            "indexed size/mtime/fingerprint="
-            f"({int(header['source_size'])}, {int(header['source_mtime_ns'])}, "
-            f"{int(header['source_fingerprint'])}) current size/mtime/fingerprint="
-            f"({source_stat.st_size}, {source_stat.st_mtime_ns}, {source_fingerprint})"
+            f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': " f"{source_mismatch}"
         )
     if expected_row_count is not None and int(header["record_count"]) != int(expected_row_count):
         raise ValueError(
@@ -495,12 +506,12 @@ def write_arrow_batch_lookup_index(
         index_header = _read_arrow_batch_lookup_index_header(output_path)
         source_stat = arrow_path_obj.stat()
         key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
-        if (
-            int(index_header["source_size"]) != source_stat.st_size
-            or int(index_header["source_mtime_ns"]) != source_stat.st_mtime_ns
-            or int(index_header["key_column_hash"]) != key_column_hash
-            or int(index_header["source_fingerprint"]) != _source_file_sample_fingerprint(arrow_path_obj)
-        ):
+        source_mismatch = _batch_lookup_index_source_mismatch(
+            index_header,
+            source_size=source_stat.st_size,
+            source_fingerprint=_source_file_sample_fingerprint(arrow_path_obj),
+        )
+        if int(index_header["key_column_hash"]) != key_column_hash or source_mismatch is not None:
             raise ValueError(
                 f"Arrow batch lookup index is stale for {arrow_path_obj!s}: {output_path!s}. "
                 "Rebuild it with overwrite=True."

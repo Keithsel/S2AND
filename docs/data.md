@@ -2,33 +2,36 @@
 
 This document covers dataset download, checked-in model artifacts, and `path_config.json`.
 
-## Full dataset download
+## Dataset download
 
-Download the legacy JSON/pickle S2AND release into `s2and/data/` only when you
-need paper-era `ANDData` inputs:
+Download the Arrow-native production runtime release into `s2and/data/` for
+Rust/Arrow prediction and evaluation:
+
+```bash
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow s2and/data/
+```
+
+Expected size is about `10.1 GiB`. The release root contains the benchmark
+dataset directories, shared `name_counts_index/`, `production_model_v1.21/`,
+and the promoted-linker replay bundle.
+
+Download the legacy JSON/pickle S2AND release only when you need paper-era
+`ANDData` inputs:
 
 ```bash
 aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release s2and/data/
 ```
 
-Expected size is about `55.5 GiB`.
-
-The Arrow-native release is the production runtime release for Rust/Arrow
-paths:
-
-```bash
-aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow s2and/data/s2and-release-arrow
-```
+Expected legacy release size is about `55.5 GiB`.
 
 The promoted-linker replay subbundle can also be downloaded by itself:
 
 ```bash
-aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260513_arrow s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260525 s2and/data/s2and_and_big_blocks_linker_dataset_20260525
 ```
 
-`s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow` is the
-canonical local name for the Arrow replay subbundle. Keep that directory name
-when refreshing the contents.
+`s2and/data/s2and_and_big_blocks_linker_dataset_20260525` is the canonical
+local name for the published Arrow replay subbundle.
 
 The Arrow release stores runtime signatures, papers, paper authors, and SPECTER
 rows as Arrow IPC files. It intentionally does not duplicate legacy `raw/`,
@@ -81,7 +84,7 @@ Arrow release prefix. Download it when you need to rebuild or audit the
 promoted linker artifact:
 
 ```bash
-aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260513_arrow s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260525 s2and/data/s2and_and_big_blocks_linker_dataset_20260525
 ```
 
 This source bundle is the default `--source-bundle-root` for
@@ -111,6 +114,16 @@ Guidance:
 
 ## Dataset file expectations
 
+Arrow production/eval workflows use each dataset's `manifest.json` to resolve:
+
+- `signatures.arrow`
+- `papers.arrow`
+- `paper_authors.arrow`
+- `specter.arrow` or `specter2.arrow`
+- raw-planner `*_batch_index.bin` sidecars
+- shared `name_counts_index/`
+- eval-only clusters JSON when metrics are requested
+
 Legacy workflows use the standard S2AND JSON files for:
 
 - signatures
@@ -119,7 +132,9 @@ Legacy workflows use the standard S2AND JSON files for:
 - optional cluster seeds
 - SPECTER embeddings
 
-The tutorial script supports both:
+The tutorial script supports Arrow by default when a dataset manifest exists,
+and JSON only when `--input-format json` is requested or Arrow artifacts are
+absent. JSON mode supports:
 
 - mini-dataset naming such as `<dataset>_papers.json`
 - plain fixture naming such as `papers.json`

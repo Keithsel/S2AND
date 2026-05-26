@@ -9,19 +9,19 @@ You can also point `--data-root` to `tests` and run `--dataset qian`.
 
 Examples:
   # Arrow release + Rust backend
-  uv run --no-project python scripts/tutorial_for_predicting_with_the_prod_model.py \
-      --input-format arrow --dataset qian --arrow-data-root s2and/data/s2and-release-arrow
+  uv run python scripts/tutorial_for_predicting_with_the_prod_model.py \
+      --input-format arrow --use-rust 1 --dataset qian --arrow-data-root s2and/data
 
   # Bundled JSON fixture + Rust backend
-  uv run --no-project python scripts/tutorial_for_predicting_with_the_prod_model.py \
+  uv run python scripts/tutorial_for_predicting_with_the_prod_model.py \
       --input-format json --use-rust 1 --dataset qian --data-root tests --load-name-counts 0
 
   # Show subblocking + memory budget knobs (for large blocks)
-  uv run --no-project python scripts/tutorial_for_predicting_with_the_prod_model.py \
+  uv run python scripts/tutorial_for_predicting_with_the_prod_model.py \
       --use-rust 1 --dataset qian --batching-threshold 5000 --desired-memory-use 25000000
 
   # Warm Rust featurizer before prediction
-  uv run --no-project python scripts/tutorial_for_predicting_with_the_prod_model.py \
+  uv run python scripts/tutorial_for_predicting_with_the_prod_model.py \
       --use-rust 1 --dataset qian --warm-rust-featurizer-before-predict 1
 """
 
@@ -189,7 +189,7 @@ def main() -> None:
     parser.add_argument(
         "--arrow-data-root",
         type=str,
-        default=os.path.join("s2and", "data", "s2and-release-arrow"),
+        default=os.path.join("s2and", "data"),
         help="Arrow release root containing per-dataset manifests, relative to repo root or absolute.",
     )
     parser.add_argument(

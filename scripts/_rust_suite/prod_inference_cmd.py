@@ -27,7 +27,7 @@ from _rust_suite.common import (  # type: ignore  # noqa: E402
 
 RESULT_JSON_START, RESULT_JSON_END = get_result_markers("profile")
 DEFAULT_DATA_ROOT = os.path.join("s2and", "data", "s2and_mini")
-DEFAULT_ARROW_DATA_ROOT = os.path.join("s2and", "data", "s2and-release-arrow")
+DEFAULT_ARROW_DATA_ROOT = os.path.join("s2and", "data")
 DEFAULT_MODEL_PATH = os.path.join("s2and", "data", "production_model_v1.21")
 
 

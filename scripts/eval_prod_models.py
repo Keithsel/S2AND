@@ -64,8 +64,7 @@ Usage:
     # Uses Arrow automatically when complete Arrow artifacts exist.
 
     # Evaluate released benchmark Arrow bundles directly
-    uv run python scripts/eval_prod_models.py --dataset full --use-arrow \
-      --arrow-data-root s2and/data/s2and-release-arrow
+    uv run python scripts/eval_prod_models.py --dataset full --use-arrow
 
     # Retrain from scratch instead of using prod models
     uv run python scripts/eval_prod_models.py --train
@@ -132,7 +131,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Arrow data root. Defaults to s2and/data/s2and_mini_arrow for --dataset mini and "
-            "s2and/data/s2and-release-arrow for --dataset full."
+            "s2and/data for --dataset full."
         ),
     )
     return parser
@@ -162,7 +161,7 @@ def _default_arrow_data_root(project_root_path: str, dataset_label: str) -> str 
     if dataset_label == "mini":
         return os.path.join(project_root_path, "s2and", "data", "s2and_mini_arrow")
     if dataset_label == "full":
-        return os.path.join(project_root_path, "s2and", "data", "s2and-release-arrow")
+        return os.path.join(project_root_path, "s2and", "data")
     return None
 
 

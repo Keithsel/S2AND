@@ -57,13 +57,20 @@ The Rust build step is optional and only needed when you want the native extensi
 
 ## Download Data or Model
 
-Full dataset download:
+Rust/Arrow dataset download:
 
 ```bash
-aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release s2and/data/
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow s2and/data/
 ```
 
-Expected size is about `55.5 GiB`.
+Expected size is about `10.1 GiB`. This populates the Arrow benchmark
+datasets, shared `name_counts_index/`, language-id model, production model
+bundle, and the promoted-linker replay bundle under
+`s2and/data/s2and_and_big_blocks_linker_dataset_20260525/`.
+
+The legacy JSON/pickle dataset release is still available at
+`s3://ai2-s2-research-public/s2and-release`, but it is only needed for
+paper-era `ANDData` workflows.
 
 The current production model bundle is checked into `s2and/data/production_model_v1.21/`
 and is included in package data. You do not need a separate model download for
@@ -90,17 +97,32 @@ More on dataset layout, config, and model-only usage: [docs/data.md](docs/data.m
 
 ## Quick Start
 
-This uses the bundled `tests/qian` fixture, so you do not need the full S2AND dataset or a model download:
+After the Arrow download above, run the current production model on the released
+`qian` Arrow bundle:
 
 ```bash
-uv run --no-project python scripts/tutorial_for_predicting_with_the_prod_model.py \
+uv run python scripts/tutorial_for_predicting_with_the_prod_model.py \
   --use-rust 1 \
+  --input-format arrow \
+  --arrow-data-root s2and/data \
   --dataset qian \
-  --data-root tests \
-  --load-name-counts 0
+  --specter-suffix _specter2.pkl
 ```
 
-When running repo scripts, prefer `uv run --no-project` so imports resolve from the installed packages and compiled extension in `site-packages`. Avoid setting `PYTHONPATH` to the repo root for scripts because it can shadow the compiled module. Test commands may still intentionally exercise the checkout source tree.
+For a benchmark smoke eval:
+
+```bash
+uv run python scripts/eval_prod_models.py \
+  --dataset full \
+  --use-arrow \
+  --datasets pubmed qian zbmath \
+  --specter-suffixes _specter2.pkl \
+  --seed 42 \
+  --n_jobs 4
+```
+
+When running repo scripts, use `uv run` from the repo root after building the
+Rust extension with `maturin develop`.
 
 ## Production Inference Essentials
 
@@ -159,30 +181,43 @@ Minimal input shape for `v1.1`, `v1.2`, and `v1.21`:
 }
 ```
 
-Minimal prediction example:
+Minimal Arrow prediction example:
 
 ```python
-from s2and.data import ANDData
+import json
+from pathlib import Path
+
+import pyarrow as pa
+
 from s2and.production_model import load_production_model
 
 clusterer = load_production_model("s2and/data/production_model_v1.21")
+dataset_root = Path("s2and/data/qian")
+manifest = json.loads((dataset_root / "manifest.json").read_text())
 
-dataset = ANDData(
-    signatures="path/to/signatures.json",
-    papers="path/to/papers.json",
-    specter_embeddings="path/to/specter_embeddings.pkl",
-    mode="inference",
-    block_type="s2",
-    n_jobs=8,
-    name="my_dataset",
+arrow_paths = {
+    key: str((dataset_root / Path(str(value).replace("\\", "/"))).resolve())
+    for key, value in manifest["paths"].items()
+}
+arrow_paths["specter"] = arrow_paths["specter2"]
+arrow_paths["specter_batch_index"] = arrow_paths["specter2_batch_index"]
+
+with pa.memory_map(arrow_paths["signatures"], "r") as source:
+    signatures = pa.ipc.open_file(source).read_all().to_pydict()
+
+block_dict = {}
+for signature_id, author_block in zip(signatures["signature_id"], signatures["author_block"]):
+    block_dict.setdefault(author_block, []).append(signature_id)
+
+pred_clusters, _ = clusterer.predict_from_arrow_paths(
+    block_dict,
+    arrow_paths,
 )
-
-pred_clusters, _ = clusterer.predict(dataset.get_blocks(), dataset)
 ```
 
 SPECTER embeddings can be sourced from the Semantic Scholar API. Use `embedding.specter_v2` with `v1.21`/`v1.2` and `embedding.specter_v1` with `v1.1`.
 
-Inference-mode `ANDData(..., mode="inference")` automatically applies the name-count semantics expected by the loaded model artifact. Full inference details, large-block examples, and compatibility notes are in [docs/production_inference.md](docs/production_inference.md).
+Full inference details, large-block examples, and compatibility notes are in [docs/production_inference.md](docs/production_inference.md).
 
 ## Training and Evaluation Essentials
 

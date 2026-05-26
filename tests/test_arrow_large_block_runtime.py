@@ -78,7 +78,7 @@ def _arrow_prediction_paths(dataset_root: Path) -> dict[str, str]:
         require_name_counts_index=True,
         require_batch_indexes=True,
         context="large-block Arrow runtime integration test",
-        producer_hint="use the canonical s2and_and_big_blocks_linker_dataset_20260513_arrow bundle",
+        producer_hint="use the canonical s2and_and_big_blocks_linker_dataset_20260525 bundle",
     )
 
 
@@ -95,7 +95,7 @@ def test_canonical_pubmed_large_block_arrow_subblocking_and_incremental_no_andda
 
     from s2and.production_model import load_production_model
 
-    dataset_root = Path("s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow/datasets/pubmed")
+    dataset_root = Path("s2and/data/s2and_and_big_blocks_linker_dataset_20260525/datasets/pubmed")
     model_root = Path("s2and/data/production_model_v1.21")
     _skip_if_missing_or_lfs_pointer(
         [

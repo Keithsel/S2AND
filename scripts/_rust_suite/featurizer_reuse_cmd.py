@@ -15,7 +15,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from _rust_suite.common import RSSMonitor, collect_rust_extension_identity  # type: ignore  # noqa: E402
 
-DEFAULT_ARROW_DATA_ROOT = os.path.join("s2and", "data", "s2and-release-arrow")
+DEFAULT_ARROW_DATA_ROOT = os.path.join("s2and", "data")
 DEFAULT_SPECTER_SUFFIX = "_specter2.pkl"
 DEFAULT_ARROW_TOTAL_RAM_BYTES = 1_000_000_000_000
 

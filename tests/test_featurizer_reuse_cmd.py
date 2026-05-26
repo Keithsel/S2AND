@@ -96,7 +96,7 @@ def test_run_reuse_profile_defaults_to_arrow_bundle_root(monkeypatch: pytest.Mon
 
     result = featurizer_reuse_cmd.run_reuse_profile(dataset_name="kisti", n_jobs=2, repeats=2)
 
-    expected_arrow_root = tmp_path / "s2and" / "data" / "s2and-release-arrow"
+    expected_arrow_root = tmp_path / "s2and" / "data"
     assert result["input_format"] == "arrow"
     assert Path(result["arrow_data_root"]) == expected_arrow_root
     assert result["specter_suffix"] == "_specter2.pkl"

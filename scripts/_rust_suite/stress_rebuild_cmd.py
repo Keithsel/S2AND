@@ -25,7 +25,7 @@ from _rust_suite.common import (  # type: ignore  # noqa: E402
 )
 
 BUILD_PATH_CHOICES = ("from_arrow_paths", "from_json_paths", "from_dataset")
-DEFAULT_ARROW_DATA_ROOT = os.path.join("s2and", "data", "s2and-release-arrow")
+DEFAULT_ARROW_DATA_ROOT = os.path.join("s2and", "data")
 DEFAULT_ARROW_SPECTER_SUFFIX = "_specter2.pkl"
 
 

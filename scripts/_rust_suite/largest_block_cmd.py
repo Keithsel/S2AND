@@ -76,7 +76,7 @@ from _rust_suite.common import (  # type: ignore  # noqa: E402
 RESULT_JSON_START, RESULT_JSON_END = get_result_markers("largest_block")
 DATA_DIR = PROJECT_ROOT / "s2and" / "data"
 DEFAULT_MODEL_PATH = str(DATA_DIR / "production_model_v1.21")
-DEFAULT_ARROW_DATA_ROOT = str(DATA_DIR / "s2and-release-arrow")
+DEFAULT_ARROW_DATA_ROOT = str(DATA_DIR)
 DEFAULT_SPECTER_SUFFIX = "_specter2.pkl"
 DEFAULT_ARROW_TOTAL_RAM_BYTES = 1_000_000_000_000
 

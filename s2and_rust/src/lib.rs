@@ -22,7 +22,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::Instant;
 
 mod promoted_linker;
 
@@ -2406,26 +2406,6 @@ fn source_file_sample_fingerprint(path: &str, source_size: u64) -> PyResult<u64>
     Ok(digest)
 }
 
-fn metadata_mtime_ns(metadata: &fs::Metadata, path: &str) -> PyResult<u64> {
-    let modified = metadata.modified().map_err(|err| {
-        io_error_to_py(
-            "failed to read Arrow IPC file modified time for batch lookup index validation",
-            path,
-            err,
-        )
-    })?;
-    let duration = modified.duration_since(UNIX_EPOCH).map_err(|err| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "Arrow IPC file modified time is before the Unix epoch for {path}: {err}"
-        ))
-    })?;
-    u64::try_from(duration.as_nanos()).map_err(|_| {
-        pyo3::exceptions::PyOverflowError::new_err(format!(
-            "Arrow IPC file modified time overflows u64 nanoseconds for {path}"
-        ))
-    })
-}
-
 fn read_arrow_batches(path: &str) -> PyResult<Vec<RecordBatch>> {
     let file = File::open(path)
         .map_err(|err| io_error_to_py("failed to open Arrow IPC file", path, err))?;
@@ -2473,7 +2453,6 @@ impl ArrowBatchLookupIndex {
             )
         })?;
         let source_size = source_metadata.len();
-        let source_mtime_ns = metadata_mtime_ns(&source_metadata, source_arrow_path)?;
         let record_count = u64::from_le_bytes(
             mmap[8..16]
                 .try_into()
@@ -2484,7 +2463,7 @@ impl ArrowBatchLookupIndex {
                 .try_into()
                 .expect("indexed source-size slice has fixed length"),
         );
-        let indexed_source_mtime_ns = u64::from_le_bytes(
+        let _indexed_source_mtime_ns = u64::from_le_bytes(
             mmap[24..32]
                 .try_into()
                 .expect("indexed source-mtime slice has fixed length"),
@@ -2508,14 +2487,11 @@ impl ArrowBatchLookupIndex {
                 .expect("indexed source fingerprint slice has fixed length"),
         );
         let source_fingerprint = source_file_sample_fingerprint(source_arrow_path, source_size)?;
-        if indexed_source_size != source_size
-            || indexed_source_mtime_ns != source_mtime_ns
-            || indexed_source_fingerprint != source_fingerprint
-        {
+        if indexed_source_size != source_size || indexed_source_fingerprint != source_fingerprint {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Arrow batch lookup index '{path}' is stale for '{source_arrow_path}': \
-                 indexed size/mtime/fingerprint=({indexed_source_size}, {indexed_source_mtime_ns}, {indexed_source_fingerprint}) \
-                 current size/mtime/fingerprint=({source_size}, {source_mtime_ns}, {source_fingerprint})"
+                 indexed size/fingerprint=({indexed_source_size}, {indexed_source_fingerprint}) \
+                 current size/fingerprint=({source_size}, {source_fingerprint})"
             )));
         }
         let expected_len = ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN

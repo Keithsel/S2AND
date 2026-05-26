@@ -6,6 +6,7 @@ This file is the active Rust/platform backlog. Stable architecture and artifact
 contracts live in:
 
 - [rust/inference_architecture.md](rust/inference_architecture.md)
+- [rust/public_surface_inventory.md](rust/public_surface_inventory.md)
 - [rust/artifact_formats.md](rust/artifact_formats.md)
 - [rust/arrow_dataset_spec.md](rust/arrow_dataset_spec.md)
 - [rust/runtime.md](rust/runtime.md)
@@ -521,6 +522,8 @@ to maintain without changing runtime behavior.
     compatibility promise exists.
 - Use the Rust public-surface inventory to choose one good API per behavior
   before moving code:
+  - Status 2026-05-25: the current inventory is checked in at
+    [rust/public_surface_inventory.md](rust/public_surface_inventory.md).
   - Canonical raw Arrow planning API: decide between the reusable
     `RawBlockQueryCandidatePlanner` class and the one-shot
     `raw_block_query_candidate_plan_arrow(...)` wrapper. The wrapper is small

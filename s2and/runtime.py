@@ -26,7 +26,6 @@ _CORE_REQUIRED_FEATURIZER_MARKERS = (
     "json_ingest_telemetry",
     "signature_ids",
     "get_constraint",
-    "get_constraints_matrix",
     "get_constraints_matrix_indexed",
     "featurize_pairs_matrix_indexed",
     "update_signature_name_counts",

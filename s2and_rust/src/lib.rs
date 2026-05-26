@@ -8395,16 +8395,6 @@ impl RustFeaturizer {
         ))
     }
 
-    fn validate_constraint_pair_inputs(&self, sig_id1: &str, sig_id2: &str) -> PyResult<()> {
-        self.signatures
-            .get(sig_id1)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id1.to_string()))?;
-        self.signatures
-            .get(sig_id2)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id2.to_string()))?;
-        Ok(())
-    }
-
     fn signature_id_order(&self) -> &[String] {
         if !self.signature_ids.is_empty() {
             return self.signature_ids.as_slice();
@@ -10948,66 +10938,6 @@ impl RustFeaturizer {
             incremental_dont_use_cluster_seeds,
             suppress_orcid,
         )
-    }
-
-    #[pyo3(
-        signature = (
-            pairs,
-            low_value = 0.0,
-            high_value = 10000.0,
-            dont_merge_cluster_seeds = true,
-            incremental_dont_use_cluster_seeds = false,
-            num_threads = None,
-            suppress_orcid = false
-        )
-    )]
-    fn get_constraints_matrix(
-        &self,
-        py: Python<'_>,
-        pairs: Vec<(String, String)>,
-        low_value: f64,
-        high_value: f64,
-        dont_merge_cluster_seeds: bool,
-        incremental_dont_use_cluster_seeds: bool,
-        num_threads: Option<usize>,
-        suppress_orcid: bool,
-    ) -> PyResult<Vec<Option<f64>>> {
-        if pairs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        for (sig_id1, sig_id2) in pairs.iter() {
-            self.validate_constraint_pair_inputs(sig_id1, sig_id2)?;
-        }
-
-        let values = py.allow_threads(|| {
-            let compute = || {
-                pairs
-                    .par_iter()
-                    .map(|(sig_id1, sig_id2)| -> PyResult<Option<f64>> {
-                        let s1 = self.signatures.get(sig_id1).ok_or_else(|| {
-                            pyo3::exceptions::PyKeyError::new_err(sig_id1.to_string())
-                        })?;
-                        let s2 = self.signatures.get(sig_id2).ok_or_else(|| {
-                            pyo3::exceptions::PyKeyError::new_err(sig_id2.to_string())
-                        })?;
-                        Ok(self.constraint_value_from_records(
-                            sig_id1,
-                            sig_id2,
-                            s1,
-                            s2,
-                            low_value,
-                            high_value,
-                            dont_merge_cluster_seeds,
-                            incremental_dont_use_cluster_seeds,
-                            suppress_orcid,
-                        ))
-                    })
-                    .collect::<PyResult<Vec<_>>>()
-            };
-            install_with_optional_rayon_pool(num_threads, compute)
-        });
-        values
     }
 
     #[pyo3(

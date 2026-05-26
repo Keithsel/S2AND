@@ -539,10 +539,10 @@ to maintain without changing runtime behavior.
     `linker_pair_index_arrays_and_aggregate_stats(..., emit_matrix=False)`.
     The separate `linker_pair_index_arrays_aggregate_stats(...)` PyO3 method
     was deleted, and capability probes key off the canonical array API.
-  - Canonical constraint API: prefer indexed and block-upper-triangle
-    constraint APIs. Migrate public wrappers/tests off string-pair
-    `get_constraints_matrix(...)`, then delete that Rust method and remove it
-    from core capability checks.
+  - Status 2026-05-25: canonical constraint APIs are indexed and
+    block-upper-triangle. The string-pair `get_constraints_matrix(...)` Rust
+    method and `get_constraints_matrix_rust(...)` Python wrapper were removed,
+    and core capability checks no longer require the string-pair matrix API.
   - Canonical pairwise feature API: prefer matrix/indexed APIs. Keep
     `featurize_pair(...)` only as a parity/debug helper, and keep
     `featurize_pairs(...)` only while `s2and/featurizer.py` still requires the

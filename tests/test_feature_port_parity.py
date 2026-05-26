@@ -17,7 +17,6 @@ from s2and.feature_port import (
     get_constraint_labels_index_arrays_rust,
     get_constraint_rust,
     get_constraints_matrix_indexed_rust,
-    get_constraints_matrix_rust,
 )
 from s2and.featurizer import _single_pair_featurize
 from tests.helpers import equalish, import_s2and_rust, tiny_name_counts
@@ -450,14 +449,12 @@ def test_get_constraint_rust_ignores_reliable_language_mismatch():
     signature_ids = list(rust_featurizer.signature_ids())
     signature_index = {sig_id: idx for idx, sig_id in enumerate(signature_ids)}
 
-    got_string = get_constraints_matrix_rust(ds, [(s1, s2)], featurizer=rust_featurizer)
     got_indexed = get_constraints_matrix_indexed_rust(
         ds,
         [(signature_index[s1], signature_index[s2])],
         featurizer=rust_featurizer,
     )
 
-    assert got_string == [None]
     assert got_indexed == [None]
 
 
@@ -559,23 +556,17 @@ def test_get_constraints_matrix_indexed_rust_parity(dataset, constraint_pairs):
     indexed_pairs = [(signature_index[s1], signature_index[s2]) for s1, s2 in constraint_pairs]
 
     expected = [dataset.get_constraint(s1, s2) for s1, s2 in constraint_pairs]
-    string_values = get_constraints_matrix_rust(dataset, constraint_pairs, featurizer=rust_featurizer)
     indexed_values = get_constraints_matrix_indexed_rust(dataset, indexed_pairs, featurizer=rust_featurizer)
-    assert len(string_values) == len(expected)
     assert len(indexed_values) == len(expected)
-    for pair, ref_val, string_val, indexed_val in zip(
+    for pair, ref_val, indexed_val in zip(
         constraint_pairs,
         expected,
-        string_values,
         indexed_values,
         strict=True,
     ):
         assert (
-            ref_val == string_val
-        ), f"Batch string constraint mismatch for pair {pair}: ref={ref_val}, got={string_val}"
-        assert (
-            string_val == indexed_val
-        ), f"Batch indexed constraint mismatch for pair {pair}: string={string_val}, indexed={indexed_val}"
+            ref_val == indexed_val
+        ), f"Batch indexed constraint mismatch for pair {pair}: ref={ref_val}, indexed={indexed_val}"
 
 
 def test_linker_constraint_labels_index_arrays_match_indexed_constraints_large(dataset, constraint_pairs):
@@ -666,10 +657,9 @@ def test_linker_pair_distance_accumulators_match_python_large(dataset):
         {"incremental_dont_use_cluster_seeds": True},
     ],
 )
-def test_get_constraints_matrix_rust_flag_parity(dataset, constraint_pairs, constraint_kwargs):
+def test_get_constraints_matrix_indexed_rust_flag_parity(dataset, constraint_pairs, constraint_kwargs):
     rust_featurizer = _get_rust_featurizer(dataset)
     expected = [dataset.get_constraint(s1, s2, **constraint_kwargs) for s1, s2 in constraint_pairs]
-    got_string = get_constraints_matrix_rust(dataset, constraint_pairs, featurizer=rust_featurizer, **constraint_kwargs)
 
     signature_ids = list(rust_featurizer.signature_ids())
     signature_index = {sig_id: idx for idx, sig_id in enumerate(signature_ids)}
@@ -681,8 +671,7 @@ def test_get_constraints_matrix_rust_flag_parity(dataset, constraint_pairs, cons
         **constraint_kwargs,
     )
 
-    for pair, ref_val, string_val, indexed_val in zip(constraint_pairs, expected, got_string, got_indexed, strict=True):
-        assert ref_val == string_val, f"Flag parity mismatch (string) for pair {pair}: ref={ref_val}, got={string_val}"
+    for pair, ref_val, indexed_val in zip(constraint_pairs, expected, got_indexed, strict=True):
         assert (
-            string_val == indexed_val
-        ), f"Flag parity mismatch (indexed) for pair {pair}: string={string_val}, indexed={indexed_val}"
+            ref_val == indexed_val
+        ), f"Flag parity mismatch (indexed) for pair {pair}: ref={ref_val}, got={indexed_val}"

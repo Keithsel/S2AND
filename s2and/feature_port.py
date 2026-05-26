@@ -29,7 +29,6 @@ from s2and.rust_calls import (
     get_constraint_rust,
     get_constraints_block_upper_triangle_indexed_rust,
     get_constraints_matrix_indexed_rust,
-    get_constraints_matrix_rust,
     update_rust_cluster_seeds,
 )
 from s2and.rust_lifecycle import (
@@ -1293,7 +1292,6 @@ __all__ = [
     "get_constraint_rust",
     "get_constraints_block_upper_triangle_indexed_rust",
     "get_constraints_matrix_indexed_rust",
-    "get_constraints_matrix_rust",
     "inspect_json_ingest_name_counts_source",
     "rust_featurizer_available",
     "rust_signature_preprocess_available",

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, cast
-
 import numpy as np
 import pytest
 
-from s2and import feature_port, runtime, rust_calls
+from s2and import feature_port, runtime
 from s2and.featurizer import FeaturizationInfo, many_pairs_featurize
 from tests.helpers import build_dummy_dataset
 
@@ -125,20 +123,6 @@ def test_resolve_backend_explicit_rust_uses_capability_probe(monkeypatch: pytest
     assert resolution.requested_backend == "rust"
     assert resolution.resolved_backend == "rust"
     assert resolution.capability_reason == "rust_core_available"
-
-
-def test_rust_calls_missing_matrix_reports_runtime_minimum() -> None:
-    class MissingMatrixFeaturizer:
-        pass
-
-    with pytest.raises(RuntimeError) as exc_info:
-        rust_calls.get_constraints_matrix_rust(
-            dataset=cast(Any, object()),
-            pairs=[],
-            featurizer=MissingMatrixFeaturizer(),
-        )
-
-    assert f"s2and-rust>={runtime.min_supported_rust_extension_version_string()}" in str(exc_info.value)
 
 
 def test_resolve_backend_auto_env_uses_capability_probe(monkeypatch: pytest.MonkeyPatch):

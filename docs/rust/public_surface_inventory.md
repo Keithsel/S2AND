@@ -34,7 +34,6 @@ cleanup risk, not a user-facing API promise.
 | `signature_ids(...)` | pairwise matrix wrappers, promoted incremental runtime, parity scripts | Shared index-order contract; keep. |
 | `signature_rule_metadata(...)`, `signature_name_counts_present(...)`, `cluster_seeds_require(...)` | parity/debug tests and state restoration checks | Debug/parity metadata; not production routing. |
 | `get_constraint(...)` | `s2and/model.py`, `s2and/rust_calls.py`, tests | Single-pair `ANDData` Rust constraint helper used by compatibility/full-predict plumbing. |
-| `get_constraints_matrix(...)` | `s2and/rust_calls.py`, capability probes, tests | String-pair compatibility API; candidate for removal after probes/tests migrate to indexed APIs. |
 | `get_constraints_matrix_indexed(...)` | `model.py`, `rust_calls.py`, parity tests | Maintained indexed constraint API. |
 | `get_constraints_block_upper_triangle_indexed(...)` | `model.py`, Arrow parity script | Maintained blockwise constraint API. |
 | `linker_pair_index_arrays_constraint_labels(...)` | promoted linker training/materialization and runtime tests | Maintained promoted incremental constraint-label API. |
@@ -67,7 +66,6 @@ cleanup risk, not a user-facing API promise.
 | `feature_port.build_rust_featurizer_from_arrow_paths(...)` | strict full predict, subblocked predict, raw Arrow scoring | Production constructor wrapper. |
 | `feature_port.build_rust_featurizer(...)`, `_get_rust_featurizer(...)`, `warm_rust_featurizer(...)` | `ANDData` training/eval, compatibility, parity, legacy scripts | Compatibility/training dispatcher. |
 | `rust_calls.get_constraints_matrix_indexed_rust(...)` and `get_constraints_block_upper_triangle_indexed_rust(...)` | full predict and parity | Maintained constraint wrappers. |
-| `rust_calls.get_constraints_matrix_rust(...)` | compatibility/tests | String-pair compatibility wrapper. |
 | `rust_calls.build_linker_pair_features_and_aggregate_stats_arrays_rust(...)` | promoted incremental pairwise scoring | Maintained canonical array wrapper. |
 | `rust_calls.build_linker_pair_aggregate_stats_arrays_rust(...)` | promoted incremental aggregate-only path | Thin Python wrapper over `linker_pair_index_arrays_and_aggregate_stats(..., emit_matrix=False)`. |
 | `runtime.detect_rust_runtime_capabilities(...)` markers | backend selection and tests | Update markers before deleting any method they probe. |
@@ -88,3 +86,6 @@ cleanup risk, not a user-facing API promise.
 - Status 2026-05-25: aggregate-only remains a runtime mode, but the separate
   `linker_pair_index_arrays_aggregate_stats(...)` PyO3 method was folded into
   `linker_pair_index_arrays_and_aggregate_stats(..., emit_matrix=False)`.
+- Status 2026-05-25: the string-pair `get_constraints_matrix(...)` PyO3 method
+  and `rust_calls.get_constraints_matrix_rust(...)` wrapper were removed after
+  parity tests moved to indexed constraint matrices.

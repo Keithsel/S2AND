@@ -121,8 +121,9 @@ These gates must pass before promoting any Rust defaults further.
 
 Key design decisions and their rationale (in order of implementation):
 
-- **Batch constraint APIs** (`get_constraints_matrix`, `get_constraints_matrix_indexed`): integrated
-  across `distance_matrix_helper` and `_predict_incremental_helper`.
+- **Batch constraint APIs** (`get_constraints_matrix_indexed`,
+  `get_constraints_block_upper_triangle_indexed`): integrated across
+  `distance_matrix_helper` and `_predict_incremental_helper`.
 - **Compact `CounterData`**: replaced `HashMap<String, f64>` with `Vec<(u64, f32)>` sorted by
   FNV-1a 64-bit hash; `counter_jaccard_data` uses binary search. ~400 MB savings on kisti.
   Disk-cache version bumped to 5. Note: 64-bit birthday collision risk is very low at million-scale

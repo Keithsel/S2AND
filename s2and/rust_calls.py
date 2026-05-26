@@ -9,7 +9,6 @@ import numpy as np
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
 from s2and.incremental_linking.array_validation import as_uint32_1d
-from s2and.runtime import min_supported_rust_extension_version_string
 from s2and.thread_config import resolve_n_jobs
 
 
@@ -99,41 +98,6 @@ def get_constraint_rust(
         dont_merge_cluster_seeds,
         incremental_dont_use_cluster_seeds,
         suppress_orcid=suppress_orcid,
-    )
-
-
-def get_constraints_matrix_rust(
-    dataset: ANDData,
-    pairs: list[tuple[str, str]],
-    low_value: float = 0.0,
-    high_value: float = LARGE_DISTANCE,
-    dont_merge_cluster_seeds: bool = True,
-    incremental_dont_use_cluster_seeds: bool = False,
-    num_threads: int | None = None,
-    featurizer: Any | None = None,
-    runtime_context: Any | None = None,
-    suppress_orcid: bool = False,
-) -> list[float | None]:
-    if featurizer is None:
-        featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
-    resolved_num_threads = None if num_threads is None else resolve_n_jobs(num_threads)
-
-    get_constraints_matrix = getattr(featurizer, "get_constraints_matrix", None)
-    if not callable(get_constraints_matrix):
-        raise RuntimeError(
-            "RustFeaturizer.get_constraints_matrix is unavailable; "
-            f"rebuild/install s2and-rust>={min_supported_rust_extension_version_string()}."
-        )
-    return list(
-        get_constraints_matrix(
-            pairs,
-            low_value,
-            high_value,
-            dont_merge_cluster_seeds,
-            incremental_dont_use_cluster_seeds,
-            resolved_num_threads,
-            suppress_orcid=suppress_orcid,
-        )
     )
 
 

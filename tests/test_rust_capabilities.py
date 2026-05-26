@@ -33,9 +33,6 @@ def _make_core_rust_featurizer(*, supports_from_dataset_paper_preprocess: bool =
         def get_constraint(self, *args, **kwargs):
             return None
 
-        def get_constraints_matrix(self, *args, **kwargs):
-            return []
-
         def get_constraints_matrix_indexed(self, *args, **kwargs):
             return []
 
@@ -200,9 +197,6 @@ def test_detect_rust_runtime_capabilities_requires_json_ingest_telemetry():
 
         def get_constraint(self, *args, **kwargs):
             return None
-
-        def get_constraints_matrix(self, *args, **kwargs):
-            return []
 
         def get_constraints_matrix_indexed(self, *args, **kwargs):
             return []

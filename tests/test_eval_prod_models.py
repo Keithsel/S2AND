@@ -226,9 +226,9 @@ def test_resolve_arrow_dataset_paths_supports_nested_datasets_layout(tmp_path: P
 
 
 def test_resolve_arrow_dataset_paths_supports_release_parent_layout(tmp_path: Path) -> None:
-    dataset_root = tmp_path / "arrow" / "s2and_and_big_blocks_linker_dataset_20260525" / "datasets" / "dummy"
+    dataset_root = tmp_path / "arrow" / "s2and_and_big_blocks_linker_dataset_20260513_arrow" / "datasets" / "dummy"
     dataset_root.mkdir(parents=True)
-    name_counts_index = tmp_path / "arrow" / "s2and_and_big_blocks_linker_dataset_20260525" / "name_counts_index"
+    name_counts_index = tmp_path / "arrow" / "s2and_and_big_blocks_linker_dataset_20260513_arrow" / "name_counts_index"
     name_counts_index.mkdir()
     for filename in (
         "signatures.arrow",

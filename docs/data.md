@@ -23,8 +23,12 @@ aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow s2
 The promoted-linker replay subbundle can also be downloaded by itself:
 
 ```bash
-aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260525 s2and/data/s2and_and_big_blocks_linker_dataset_20260525
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260513_arrow s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow
 ```
+
+`s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow` is the
+canonical local name for the Arrow replay subbundle. Keep that directory name
+when refreshing the contents.
 
 The Arrow release stores runtime signatures, papers, paper authors, and SPECTER
 rows as Arrow IPC files. It intentionally does not duplicate legacy `raw/`,
@@ -77,7 +81,7 @@ Arrow release prefix. Download it when you need to rebuild or audit the
 promoted linker artifact:
 
 ```bash
-aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260525 s2and/data/s2and_and_big_blocks_linker_dataset_20260525
+aws s3 sync --no-sign-request s3://ai2-s2-research-public/s2and-release-arrow/s2and_and_big_blocks_linker_dataset_20260513_arrow s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow
 ```
 
 This source bundle is the default `--source-bundle-root` for

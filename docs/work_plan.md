@@ -81,9 +81,10 @@ converted or explicitly gated behind a compatibility flag.
 Target a new public release prefix:
 `s3://ai2-s2-research-public/s2and-release-arrow`.
 
-This prefix was published and no-auth spot-checked on 2026-05-25. The current
-linker replay subbundle is
-`s2and_and_big_blocks_linker_dataset_20260525/`.
+This prefix was published and no-auth spot-checked on 2026-05-25. The
+canonical Arrow linker replay subbundle name is
+`s2and_and_big_blocks_linker_dataset_20260513_arrow/`; keep that name even when
+the contents are refreshed.
 
 This release should be an Arrow-native data/runtime artifact release, not a
 mirror of the legacy JSON/pickle bucket. It should omit `.feature_cache/`.
@@ -112,7 +113,7 @@ Release contents:
 - Benchmark dataset directories for `aminer`, `arnetminer`, `inspire`, `kisti`,
   `medline`, `pubmed`, `qian`, and `zbmath`, each following the Arrow dataset
   manifest contract.
-- `s2and_and_big_blocks_linker_dataset_20260525/` with Arrow runtime tables under
+- `s2and_and_big_blocks_linker_dataset_20260513_arrow/` with Arrow runtime tables under
   `datasets/<dataset>/` and existing typed offline `components/`, `labels/`,
   and `splits/`.
 
@@ -124,7 +125,7 @@ Release contents:
   - Convert each benchmark embedding payload to the manifest-declared embedding
     filename, for example `specter.arrow` or `specter2.arrow`.
   - Convert linker replay `raw/<dataset>/signatures.json` to
-    `s2and_and_big_blocks_linker_dataset_20260525/datasets/<dataset>/signatures.arrow`.
+    `s2and_and_big_blocks_linker_dataset_20260513_arrow/datasets/<dataset>/signatures.arrow`.
   - Convert linker replay `raw/<dataset>/papers.json` to `papers.arrow` and
     `paper_authors.arrow`.
   - Convert linker replay embeddings to the manifest-declared embedding
@@ -270,9 +271,12 @@ production inference.
     Compare mode and constraint parity remain JSON/`ANDData` reference
     workflows because they compare against the Python object path.
   - Status 2026-05-25: `scripts/_rust_suite/compare_cmd.py` remains
-    Python-vs-Rust `many_pairs_featurize(...)` parity, and
-    `scripts/_rust_suite/big_block_incremental_cmd.py` remains JSON/`ANDData`
-    until its subset/truth-bundle contract is redesigned for Arrow artifacts.
+    Python-vs-Rust `many_pairs_featurize(...)` parity.
+  - Status 2026-05-25: the legacy JSON/`ANDData`
+    `scripts/_rust_suite/big_block_incremental_cmd.py` command was removed
+    rather than partially converted. Use
+    `scripts/rust_suite.py promoted-incremental-arrow-profile` for the
+    Arrow-only promoted incremental profiling path.
   - Redesign follow-up: do not bolt `--input-format arrow` onto
     `scripts/_rust_suite/compare_cmd.py`. Its current contract is
     Python-vs-Rust parity through `many_pairs_featurize(...)`; Arrow parity
@@ -280,15 +284,13 @@ production inference.
     `scripts/verification/compare_full_predict_arrow_parity.py` that compares
     Arrow artifacts against the incumbent oracle without changing the legacy
     feature-parity gate.
-  - Redesign follow-up: do not partially convert
-    `scripts/_rust_suite/big_block_incremental_cmd.py` while it still selects
-    JSON subsets, raw signatures/papers, synthetic seed maps, and parquet truth
-    rows independently. Define an Arrow subset/truth-bundle contract first:
-    how selected query/candidate signatures map to `datasets/<dataset>/`
-    Arrow rows, where `cluster_seeds`, optional `cluster_seed_disallows`,
-    optional `altered_cluster_signatures`, labels, splits, and component
-    parquet live, and which command produces the bounded fixture. Convert the
-    script only after that artifact contract exists.
+  - Redesign follow-up: if a bounded truth-bundle profiler is needed later,
+    define it as a new Arrow artifact contract rather than reviving the deleted
+    JSON command. That contract should specify how selected query/candidate
+    signatures map to `datasets/<dataset>/` Arrow rows, where `cluster_seeds`,
+    optional `cluster_seed_disallows`, optional `altered_cluster_signatures`,
+    labels, splits, and component parquet live, and which command produces the
+    bounded fixture.
   - Convert remaining production/profiling scripts where the Arrow route is a
     direct replacement, and relabel scripts whose purpose is raw/reference
     parity.
@@ -652,17 +654,18 @@ recording in `tests/test_cluster_incremental.py`.
 
 - Next profiling should target Arrow read/summary construction and reusable
   component summaries on a realistic Arrow promoted-incremental workload:
-  raw single-query or small query-batch prediction against a published
-  `s2and_and_big_blocks_linker_dataset_20260525` dataset, after first
+  raw single-query or small query-batch prediction against the canonical
+  `s2and_and_big_blocks_linker_dataset_20260513_arrow` dataset, after first
   sanity-checking the profiler on the tiny Arrow fixture.
   - Status 2026-05-25: tiny promoted-incremental Arrow preflight passed via
     `tests/test_eval_prod_models.py::test_pubmed_specter2_arrow_fixture_incremental_smoke_matches_expected_b3`;
     see
     [rust/profiling/2026-05-25-promoted-incremental-preflight.md](rust/profiling/2026-05-25-promoted-incremental-preflight.md).
-    Full profiling is blocked on choosing the local data source/runner because
-    this checkout has `s2and_and_big_blocks_linker_dataset_20260513_arrow`, not
-    a local `s2and_and_big_blocks_linker_dataset_20260525`, and the existing
-    big-block measurement command is still JSON/`ANDData`-based.
+  - Status 2026-05-25: the local
+    `s2and/data/s2and_and_big_blocks_linker_dataset_20260513_arrow` directory
+    is the canonical Arrow replay/profiling source of truth. Full profiling
+    should use `scripts/rust_suite.py promoted-incremental-arrow-profile`, not
+    the deleted JSON/`ANDData` big-block command.
 - Primary metrics: p50 wall time over at least five isolated runs, peak RSS, and
   summary-construction allocation volume from a stack-level allocation profiler
   (`heaptrack`/`perf` on Linux or ETW allocation tracing on Windows).

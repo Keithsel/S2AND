@@ -110,7 +110,7 @@ from s2and.rust_calls import get_constraint_labels_index_arrays_rust  # noqa: E4
 os.environ.setdefault("S2AND_BACKEND", "rust")
 
 PACKAGE_DATA_ROOT = REPO_ROOT / "s2and" / "data"
-DEFAULT_SOURCE_BUNDLE_ROOT = PACKAGE_DATA_ROOT / "s2and_and_big_blocks_linker_dataset_20260525"
+DEFAULT_SOURCE_BUNDLE_ROOT = PACKAGE_DATA_ROOT / "s2and_and_big_blocks_linker_dataset_20260513_arrow"
 DEFAULT_TARGET_JSON = (
     PACKAGE_DATA_ROOT / "production_model_v1.21" / "reproducibility" / "incremental_linker_training_target.json"
 )

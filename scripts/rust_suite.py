@@ -38,7 +38,7 @@ _MODULE_IMPORTS = {
     "transfer_mini": "_rust_suite.transfer_mini_cmd",
     "prod_inference": "_rust_suite.prod_inference_cmd",
     "largest_block": "_rust_suite.largest_block_cmd",
-    "big_block_incremental": "_rust_suite.big_block_incremental_cmd",
+    "promoted_incremental_arrow_profile": "_rust_suite.promoted_incremental_arrow_profile_cmd",
     "featurizer_reuse": "_rust_suite.featurizer_reuse_cmd",
     "stress_rebuild": "_rust_suite.stress_rebuild_cmd",
     "calibrate_phase_a": "_rust_suite.calibrate_phase_a_cmd",
@@ -249,10 +249,6 @@ _PROXY_EXPORTS: dict[str, tuple[str, str]] = {
         "largest_block",
         "_pairwise_precision_recall_fscore_with_singleton_fix",
     ),
-    "_effective_seed_cluster_count": ("big_block_incremental", "_effective_seed_cluster_count"),
-    "_build_cluster_seeds": ("big_block_incremental", "_build_cluster_seeds"),
-    "_paper_has_block_safe_author_names": ("big_block_incremental", "_paper_has_block_safe_author_names"),
-    "_validate_args": ("big_block_incremental", "_validate_args"),
     "run_rebuild_stress": ("stress_rebuild", "run_rebuild_stress"),
     "_rss_growth_fraction": ("stress_rebuild", "_rss_growth_fraction"),
 }
@@ -287,10 +283,10 @@ _COMMANDS = {
         "help": "Largest-block compare/single profiling workflow.",
         "main_kind": "noargv",
     },
-    "big-block-incremental": {
-        "module": "big_block_incremental",
-        "help": "Big-block incremental baseline/promoted-linker workflow.",
-        "main_kind": "noargv",
+    "promoted-incremental-arrow-profile": {
+        "module": "promoted_incremental_arrow_profile",
+        "help": "Arrow-only promoted incremental linker profiling workflow.",
+        "main_kind": "argv",
     },
     "featurizer-reuse": {
         "module": "featurizer_reuse",

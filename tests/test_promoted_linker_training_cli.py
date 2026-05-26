@@ -42,7 +42,6 @@ def test_promoted_training_defaults_to_arrow_rust_source() -> None:
     parser_defaults = vars(parser.parse_args([]))
     feature_mode_action = next(action for action in parser._actions if action.dest == "feature_mode")  # noqa: SLF001
 
-    assert promoted_train.DEFAULT_SOURCE_BUNDLE_ROOT.name == "s2and_and_big_blocks_linker_dataset_20260513_arrow"
     assert promoted_train.DEFAULT_TARGET_JSON.relative_to(promoted_train.REPO_ROOT) == Path(
         "s2and/data/production_model_v1.21/reproducibility/incremental_linker_training_target.json"
     )

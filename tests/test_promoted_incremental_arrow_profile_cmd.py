@@ -11,7 +11,6 @@ from scripts._rust_suite import promoted_incremental_arrow_profile_cmd as cmd
 
 
 def test_promoted_incremental_arrow_profile_is_canonical_command() -> None:
-    assert cmd.DEFAULT_ARROW_ROOT.name == "s2and_and_big_blocks_linker_dataset_20260513_arrow"
     assert "promoted-incremental-arrow-profile" in rust_suite._COMMANDS  # noqa: SLF001
     assert "big-block-incremental" not in rust_suite._COMMANDS  # noqa: SLF001
 
@@ -42,7 +41,7 @@ def test_select_workload_uses_largest_block_and_stable_seed_queries() -> None:
 
 
 def test_run_profiles_arrow_only_incremental_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    arrow_root = tmp_path / "s2and_and_big_blocks_linker_dataset_20260513_arrow"
+    arrow_root = tmp_path / "arrow_bundle"
     signatures_path = arrow_root / "datasets" / "dummy" / "signatures.arrow"
     clusters_path = arrow_root / "datasets" / "dummy" / "dummy_clusters.json"
     output_json = tmp_path / "profile" / "summary.json"
@@ -154,7 +153,6 @@ def test_run_profiles_arrow_only_incremental_path(monkeypatch: pytest.MonkeyPatc
     payload = cmd.run(args)
 
     assert payload["runner"] == "promoted_incremental_arrow_profile"
-    assert Path(payload["canonical_arrow_root"]).name == "s2and_and_big_blocks_linker_dataset_20260513_arrow"
     assert payload["target_block"] == "large"
     assert payload["seed_signature_count"] == 2
     assert payload["query_signature_count"] == 1

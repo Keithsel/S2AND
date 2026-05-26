@@ -12,7 +12,7 @@ def _write_json(path: Path, payload: dict) -> None:
 
 
 def test_sanitize_arrow_replay_bundle_removes_legacy_runtime_assets(tmp_path: Path) -> None:
-    bundle_root = tmp_path / "s2and_and_big_blocks_linker_dataset_20260513_arrow"
+    bundle_root = tmp_path / "arrow_replay_bundle"
     _write_json(
         bundle_root / "bundle.json",
         {
@@ -74,7 +74,7 @@ def test_sanitize_arrow_replay_bundle_removes_legacy_runtime_assets(tmp_path: Pa
     )
 
     bundle_payload = json.loads((bundle_root / "bundle.json").read_text(encoding="utf-8"))
-    assert bundle_payload["bundle_name"] == "s2and_and_big_blocks_linker_dataset_20260513_arrow"
+    assert bundle_payload["bundle_name"] == "arrow_replay_bundle"
     assert sorted(bundle_payload["assets"]) == ["candidate_members", "featureless_rows", "splits"]
     assert bundle_payload["models"]["classic"] == {"best_params": {"n_estimators": 10}}
     assert bundle_payload["runtime_contract"]["omitted_legacy_assets"] == [

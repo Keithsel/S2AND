@@ -77,9 +77,10 @@ The Rust featurizer has two distinct reuse mechanisms.
 When the same `ANDData` object is reused inside one Python process, S2AND keeps the built Rust
 featurizer in memory and reuses it on later calls. This is always enabled.
 
-Implications:
+Implications for compatibility paths:
 
-- `warm_rust_featurizer(dataset)` is useful for long-lived processes
+- `warm_rust_featurizer(dataset)` is useful for long-lived processes that still
+  run through an `ANDData`/JSON compatibility route
 - `use_cache=False` does not force a rebuild if the same dataset object already has a live cached
   Rust featurizer
 - Rust featurizers are not serialized to disk; process restarts rebuild them from the dataset or
@@ -114,8 +115,13 @@ work even when the cache backend itself is fast.
 
 - Repeated training or repeated inference on the same dataset or pair set: use `use_cache=True`
 - One-shot experiments, one-pass offline jobs, or feature-development work: use `use_cache=False`
-- Long-lived services that want lower cold-start latency in a single process:
-  call `warm_rust_featurizer(dataset)` during startup
+- Long-lived compatibility services that still own an `ANDData` object and want
+  lower cold-start latency in a single process: call
+  `warm_rust_featurizer(dataset)` during startup
+- Production Arrow services should keep Arrow artifacts local and call
+  `Clusterer.predict_from_arrow_paths(...)` or Arrow-routed
+  `Clusterer.predict(...)`; `warm_rust_featurizer(dataset)` is not the Arrow
+  production warmup API
 If a job will not revisit the same pair set, `use_cache=False` is usually the right choice because
 it avoids unnecessary persistent writes.
 

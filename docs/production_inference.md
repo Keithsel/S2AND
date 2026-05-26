@@ -364,23 +364,27 @@ production Rust inference route.
 
 ## Caching
 
-Public cache control:
+Public cache controls for non-Arrow featurization paths:
 
 - `Clusterer.use_cache`
 - `featurize(..., use_cache=...)`
 - `many_pairs_featurize(..., use_cache=...)`
-- `warm_rust_featurizer(...)`
 
 Semantics:
 
 - `use_cache=True` enables the persistent pair-feature SQLite cache.
 - `use_cache=False` skips those persistent cache reads and writes.
-- Same-process Rust featurizer reuse still stays enabled even when `use_cache=False`.
+- Same-process Rust featurizer reuse still stays enabled even when
+  `use_cache=False`.
+- Direct Arrow/Rust production prediction bypasses the pair-feature SQLite
+  cache and reads the request/runtime Arrow artifacts directly.
 
 Recommended defaults:
 
 - Repeated inference on the same dataset or pair set: `use_cache=True`
 - One-shot jobs and experiments: `use_cache=False`
+- Direct Arrow production inference: keep Arrow artifacts local and do not rely
+  on the pair-feature SQLite cache.
 
 Full cache details: [caching.md](caching.md)
 
@@ -525,9 +529,16 @@ Supporting docs:
 - Threading guidance: [threading.md](threading.md)
 - Environment variables: [environment.md](environment.md)
 
-## Warm-starting the Rust featurizer
+## Warm-starting compatibility featurizers
 
-For long-lived services, you can pre-warm once at startup:
+`warm_rust_featurizer(dataset)` preloads the same-process Rust featurizer for
+`ANDData`/JSON compatibility paths. It is not the production Arrow inference
+entrypoint. Production services should keep model bundles and Arrow runtime
+artifacts local, then call `Clusterer.predict_from_arrow_paths(...)` or
+Arrow-routed `Clusterer.predict(...)` with complete artifact paths.
+
+For long-lived compatibility services that still own an `ANDData` object, you
+can pre-warm once at startup:
 
 ```python
 from s2and.feature_port import warm_rust_featurizer

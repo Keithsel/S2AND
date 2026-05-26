@@ -443,26 +443,27 @@ production inference.
       featurizer construction; explicit Python/compatibility routes continue to
       cover state restoration and fallback invariants.
 - Clean up after migration.
-  - Update `docs/production_inference.md` to state that production Rust
-    inference requires Arrow artifacts.
-  - Update `docs/rust/inference_architecture.md` so non-Arrow Rust loaders are
-    described as compatibility, training, or test surfaces only.
-  - Demote compatibility Rust entrypoints from the normal public Python surface
-    after callers are migrated. Keep `RustFeaturizer.from_dataset(...)`,
-    `RustFeaturizer.from_json_paths(...)`, and
-    `RustFeaturizer.from_feature_block(...)` callable for training,
-    fixtures, parity, and legacy scripts, but do not present them as production
-    inference APIs.
-  - Retarget the `s2and/feature_port.py` cleanup at dispatcher behavior, not
-    `__all__`: `build_rust_featurizer(...)` and `_resolve_requested_build_path`
-    should not select non-Arrow production paths once strict Arrow routing is
-    enabled. Keep `__all__` alphabetized and exported for compatibility; do not
-    use export ordering as a production-routing signal. Concrete demotion means
-    production docs and strict production callsites use
-    `build_rust_featurizer_from_arrow_paths(...)`, while
-    `build_rust_featurizer(...)` remains a compatibility/training dispatcher.
-  - Remove or quarantine stale non-Arrow production-inference commands from
-    `scripts/README.md`.
+  - Status 2026-05-25: `docs/production_inference.md` states that production
+    Rust inference requires Arrow artifacts, and dataset-based
+    `warm_rust_featurizer(...)` is compatibility-only warmup.
+  - Status 2026-05-25: `docs/rust/inference_architecture.md` describes
+    non-Arrow Rust loaders as compatibility, training, parity, or test surfaces
+    only.
+  - Status 2026-05-25: compatibility Rust entrypoints remain callable for
+    training, fixtures, parity, and legacy scripts, but production docs no
+    longer present `RustFeaturizer.from_dataset(...)`,
+    `RustFeaturizer.from_json_paths(...)`, or
+    `RustFeaturizer.from_feature_block(...)` as production inference APIs.
+  - Status 2026-05-25: no `s2and/feature_port.py` code change is needed for
+    dispatcher demotion. Strict production call sites use
+    `build_rust_featurizer_from_arrow_paths(...)`; `build_rust_featurizer(...)`
+    and `_resolve_requested_build_path` remain a compatibility/training
+    dispatcher for `ANDData` routes. Keep `__all__` alphabetized and exported
+    for compatibility; do not use export ordering as a production-routing
+    signal.
+  - Status 2026-05-25: `scripts/README.md` labels the remaining JSON/`ANDData`
+    big-block incremental command as a legacy profiling fixture pending the
+    Arrow subset/truth-bundle redesign.
   - Keep training/materialization scripts on `ANDData`; they are not part of
     the production inference removal.
 - Done when: with `backend="rust"` or `S2AND_BACKEND=rust` and the approved

@@ -1,6 +1,6 @@
 # Rust Runtime Contract
 
-Status date: 2026-05-22
+Status date: 2026-05-25
 
 This document defines the operational contract for the Rust extension: backend
 resolution, stage defaults, failure semantics, verification gates, and the risk
@@ -62,8 +62,8 @@ Python path remains available via explicit backend and stage overrides at any ti
 | `constraints` | Rust |
 | `pair_featurization` | Rust |
 
-- Direct Arrow inputs are the preferred production inference boundary when
-  complete Arrow paths are available.
+- Direct Arrow inputs are the production inference boundary. Rust production
+  prediction fails fast when required Arrow paths are incomplete.
 - JSON ingest (`from_json_paths`) remains a compatibility and benchmark surface.
 - Train/eval and non-path compatibility payloads use `from_dataset`.
 - `S2AND_BACKEND` controls all stages uniformly.

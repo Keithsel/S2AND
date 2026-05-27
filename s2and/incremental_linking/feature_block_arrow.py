@@ -905,7 +905,7 @@ def _name_counts_index_manifest_paths(index_dir: Path) -> dict[str, Path] | None
     return resolved
 
 
-def _name_counts_index_complete(index_dir: Path, *, expected_fingerprint: int | None = None) -> bool:
+def _name_counts_index_complete(index_dir: Path, *, expected_fingerprint: int) -> bool:
     manifest_paths = _name_counts_index_manifest_paths(index_dir)
     if manifest_paths is None or not all(path.exists() for path in manifest_paths.values()):
         return False
@@ -913,10 +913,8 @@ def _name_counts_index_complete(index_dir: Path, *, expected_fingerprint: int | 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, Mapping):
         return False
-    if expected_fingerprint is None:
-        return "fingerprint" not in manifest
     if "fingerprint" not in manifest:
-        return True
+        return False
     return manifest.get("fingerprint") == expected_fingerprint
 
 
@@ -968,8 +966,6 @@ def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) 
 
     index_dir = Path(output_dir) / "name_counts_index"
     manifest_path = index_dir / "manifest.json"
-    if not overwrite and _name_counts_index_complete(index_dir):
-        return str(index_dir), {"reused": True}
 
     first_dict, last_dict, first_last_dict, last_first_initial_dict = _load_name_counts_cached()
     fingerprint = _name_counts_arrow_fingerprint(

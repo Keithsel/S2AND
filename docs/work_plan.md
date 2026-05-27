@@ -17,7 +17,8 @@ contracts live in:
 | Topic | Decision |
 |---|---|
 | `ANDData` | Keep as Python reference, training/eval, parity, fixture, and compatibility surface. Do not port all of `ANDData` to Rust. |
-| Production inference | Production Rust inference should enter through Arrow IPC artifacts. JSON, Python objects, and `RustFeaturizer.from_dataset(...)` are compatibility surfaces. |
+| Production inference | Production Rust inference should enter through raw Arrow IPC artifacts. JSON, Python objects, and `RustFeaturizer.from_dataset(...)` are compatibility surfaces. |
+| Arrow preprocessing | Production Arrow rows are runtime inputs, not preprocessed `ANDData` caches. Rust owns local normalization, ngram construction, unidecode, name handling, and language detection from raw Arrow inputs. |
 | Name counts | Use manifest-backed `name_counts_index/` for hot-path lookups. Do not satisfy strict production bundles from ambient package/global fallbacks. |
 | Batch indexes | Filtered production Arrow reads require raw-planner batch lookup indexes. Full scans are explicit test/compatibility opt-ins only. |
 | SPECTER | Missing embedding rows are valid. Present rows are real vectors, including all-zero rows. Select `specter` or `specter2` through the manifest/path mapping. |
@@ -44,8 +45,9 @@ The canonical surface owns:
 - SPECTER path selection, dimensions, all-zero vectors, and missing-vector
   semantics.
 - Manifest-backed `name_counts_index/`, name tuple policy, and alias policy.
-- Text normalization/unidecode, language fallback, name splitting, paper-author
-  ordering, null position, and duplicate-position semantics.
+- Text normalization/unidecode, local language detection from raw titles, name
+  splitting, paper-author ordering, null position, and duplicate-position
+  semantics.
 - Seed sidecars and request-local seed materialization.
 - Subblocking strictness, telemetry keys, and producer hints.
 

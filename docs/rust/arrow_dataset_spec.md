@@ -1,17 +1,19 @@
 # Arrow Dataset Specification
 
-Status date: 2026-05-26
+Status date: 2026-05-27
 
 This document defines the Arrow artifact contract for engineers assembling
 datasets for the direct Rust S2AND inference path. These artifacts are used by
 `Clusterer.predict(...)`, `Clusterer.predict_from_arrow_paths(...)`, and the
 promoted phase of `Clusterer.predict_incremental(...)`.
 
-The goal is parity with the current `ANDData(preprocess=True)` representation
-without requiring production inference to materialize full `ANDData`. Arrow
-paper text columns are runtime preprocessing inputs, not authoritative
-precomputed feature values: Rust normalizes titles, venues, journals, and paper
-author names while building the scoring view.
+Production Arrow is a raw runtime input contract, not a serialized
+`ANDData(preprocess=True)` cache. The goal is feature parity with the current
+`ANDData(preprocess=True)` representation after the local runtime preprocesses
+the Arrow rows. Arrow text/name columns are preprocessing inputs, not
+authoritative precomputed feature values: Rust normalizes titles, venues,
+journals, signature names, paper-author names, and computes language-dependent
+paper state while building the scoring view.
 
 ---
 
@@ -224,9 +226,10 @@ do not change results.
 
 ---
 
-## Source Semantics
+## Runtime Input Semantics
 
-Rows must match the values that S2AND would expose after normal preprocessing:
+Rows must provide the source values needed for the local Rust runtime to produce
+the same feature view that S2AND would expose after normal preprocessing:
 
 - `preprocess=True`
 - `use_sinonym_overwrite=False`
@@ -238,23 +241,27 @@ Rows must match the values that S2AND would expose after normal preprocessing:
 - `name_counts_index/` available when the selected model uses name-count features
 
 Use the script-only `FeatureBlock` conversion writer as the reference
-implementation for table values and Arrow physical layout:
+implementation for Arrow physical layout and for benchmark/replay bundles whose
+inputs are derived from `ANDData`:
 `scripts.arrow_conversion_helpers.write_feature_block_arrow_from_anddata`.
 That writer returns table paths and does not write `manifest.json`; manifests
 are producer-owned. `scripts/convert_to_arrow.py` is the reference producer for
 deployable manifest shape and current batch-index sidecars.
 `scripts/verification/compare_full_predict_arrow_parity.py` is the reference
 bounded parity producer and also writes current batch-index sidecars for its
-temporary Arrow bundle. An independent assembly pipeline is fine, but it must
-produce the same table values as the writer and the same manifest contract as
-this document.
+temporary Arrow bundle. An independent assembly pipeline is fine, but
+production producers should send source/raw text and name inputs plus the same
+manifest contract as this document. Parity is measured after Rust preprocessing,
+not by requiring producer-side Python preprocessing before Arrow construction.
 
 Important parity details:
 
 - Preserve source signature order. The current converter writes
   `signature_ids=list(dataset_obj.signatures)` for this reason.
 - Store ids as strings, even if an upstream source stores numeric ids.
-- Use the same post-preprocessing author and paper fields as `ANDData`.
+- Text/name fields should be source/raw values where practical. Rust owns the
+  normalization, ngram, unidecode, name splitting, and language-detection work
+  needed for production scoring.
 - Keep `abstract` as an abstract-presence signal, not raw abstract text. The
   current `FeatureBlock` encoding writes `"Has Abstract"` when the preprocessed
   paper has an abstract and `""` otherwise.
@@ -274,10 +281,10 @@ One row per signature. Required columns:
 |---|---:|---:|---|
 | `signature_id` | `string` | no | Stable signature id |
 | `paper_id` | `string` | no | Referenced paper id |
-| `author_first` | `string` | yes | Preprocessed author first name |
-| `author_middle` | `string` | yes | Preprocessed author middle name |
-| `author_last` | `string` | yes | Preprocessed author last name |
-| `author_suffix` | `string` | yes | Preprocessed author suffix |
+| `author_first` | `string` | yes | Source author first-name field used as runtime preprocessing input |
+| `author_middle` | `string` | yes | Source author middle-name field used as runtime preprocessing input |
+| `author_last` | `string` | yes | Source author last-name field used as runtime preprocessing input |
+| `author_suffix` | `string` | yes | Source author suffix field used as runtime preprocessing input |
 | `author_affiliations` | `list<string>` | yes | Author affiliations; prefer empty list over null |
 | `author_orcid` | `string` | yes | ORCID value used by S2AND |
 | `author_position` | `int64` | yes | Author position on the paper |
@@ -294,19 +301,22 @@ One row per paper referenced by `signatures.arrow`. Required columns:
 | Column | Arrow type | Nulls | Meaning |
 |---|---:|---:|---|
 | `paper_id` | `string` | no | Stable paper id |
-| `title` | `string` | yes | Paper title text used as runtime preprocessing input. Prefer source/raw title, especially when `predicted_language` is null. |
+| `title` | `string` | yes | Source/raw paper title text used as runtime preprocessing input |
 | `abstract` | `string` | yes | Abstract-presence signal: `"Has Abstract"` or `""` |
 | `venue` | `string` | yes | Venue text used as runtime preprocessing input |
 | `journal_name` | `string` | yes | Journal text used as runtime preprocessing input |
 | `year` | `int64` | yes | Publication year |
-| `predicted_language` | `string` | yes | Predicted language if available |
-| `is_reliable` | `bool` | yes | S2AND reliability flag if available |
+| `predicted_language` | `string` | yes | Optional cached/compatibility language override |
+| `is_reliable` | `bool` | yes | Optional cached/compatibility reliability override paired with `predicted_language` |
 
-`papers.arrow` may be generated from an `ANDData` object whose Python paper
-preprocessing already ran, or from a Rust-deferred conversion where the text is
-still source/raw text. Consumers must not assume the text fields are already
-normalized. If `predicted_language` is null, Rust detects language from
-`title`, so producers should keep raw/source title text in that case.
+Production `papers.arrow` should keep source/raw title, venue, and journal
+text. Consumers must not assume these text fields are already normalized. If
+`predicted_language` is null, Rust detects language locally from the raw title.
+If `predicted_language` is non-null, Rust treats it as a producer-owned
+precomputed override and uses `is_reliable` when present, defaulting a missing
+`is_reliable` to `false`. Offline compatibility bundles may contain these
+precomputed fields, but production producers should leave them null unless the
+same approved local detector already produced them before Arrow handoff.
 
 ### `paper_authors.arrow`
 
@@ -316,7 +326,7 @@ One row per paper-author child row. Required columns:
 |---|---:|---:|---|
 | `paper_id` | `string` | no | Referenced paper id |
 | `position` | `int64` | no | Author position |
-| `author_name` | `string` | no | Post-preprocessing/feature-compatible author name string used by coauthor features |
+| `author_name` | `string` | no | Source paper-author name string used as runtime preprocessing input for coauthor features |
 
 Rows should be ordered by `paper_id` then `position` where practical. Ordering is
 not the identity contract, but stable ordering makes diffs and validation easier.

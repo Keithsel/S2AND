@@ -6,7 +6,7 @@ import os
 import re
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -44,6 +44,7 @@ RUST_CAPABILITY_INDEXED_PAIR_ARRAY_FEATURIZATION_V1 = "indexed_pair_array_featur
 RUST_CAPABILITY_INCREMENTAL_LINKING_PAIR_PLAN_V1 = "incremental_linking_pair_plan_v1"
 RUST_CAPABILITY_INCREMENTAL_LINKING_CONSTRAINT_ARRAYS_V1 = "incremental_linking_constraint_arrays_v1"
 _REQUIRED_INCREMENTAL_PAIR_PLAN_ROW_SIGNALS = ("row_orcid_match",)
+_REQUIRED_INCREMENTAL_PAIR_PLAN_KWARGS = ("query_candidate_component_keys_by_signature_id",)
 
 
 @dataclass(frozen=True)
@@ -106,15 +107,16 @@ def _rust_featurizer_api_score(module: Any) -> int:
     return sum(1 for marker in _FEATURIZER_API_SCORE_MARKERS if hasattr(rust_featurizer_cls, marker))
 
 
-def _callable_signature_mentions(method: Any, parameter_name: str) -> bool:
-    if not callable(method):
-        return False
-    text_signature = str(getattr(method, "__text_signature__", "") or "")
-    return parameter_name in text_signature
+def _rust_build_info(module: Any) -> Mapping[str, Any]:
+    get_build_info = getattr(module, "get_build_info", None)
+    if not callable(get_build_info):
+        return {}
+    build_info = get_build_info()
+    return build_info if isinstance(build_info, Mapping) else {}
 
 
-def _module_sequence_contains_all(module: Any, attr_name: str, required: tuple[str, ...]) -> bool:
-    values = getattr(module, attr_name, None)
+def _build_info_sequence_contains_all(module: Any, key: str, required: tuple[str, ...]) -> bool:
+    values = _rust_build_info(module).get(key)
     if values is None:
         return False
     if isinstance(values, str):
@@ -127,34 +129,18 @@ def _module_sequence_contains_all(module: Any, attr_name: str, required: tuple[s
     return all(value in available for value in required)
 
 
-def _pair_plan_output_probe_has_required_keys(rust_retriever_cls: Any, required: tuple[str, ...]) -> bool:
-    try:
-        import numpy as np
-
-        retriever = rust_retriever_cls([], include_exemplars=True)
-        plan = retriever.top_k_hybrid_centroid_pair_plan(
-            [],
-            np.asarray([], dtype=np.uint32),
-            {},
-            1,
-            1,
-        )
-    except Exception:
-        return False
-    return all(key in plan for key in required)
-
-
-def _has_current_incremental_pair_plan_abi(module: Any, rust_retriever_cls: Any) -> bool:
-    method = getattr(rust_retriever_cls, "top_k_hybrid_centroid_pair_plan", None)
-    if not _callable_signature_mentions(method, "query_candidate_component_keys_by_signature_id"):
-        return False
-    if _module_sequence_contains_all(
+def _has_current_incremental_pair_plan_abi(module: Any) -> bool:
+    if not _build_info_sequence_contains_all(
         module,
-        "INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS",
-        _REQUIRED_INCREMENTAL_PAIR_PLAN_ROW_SIGNALS,
+        "incremental_linking_pair_plan_supported_kwargs",
+        _REQUIRED_INCREMENTAL_PAIR_PLAN_KWARGS,
     ):
-        return True
-    return _pair_plan_output_probe_has_required_keys(rust_retriever_cls, _REQUIRED_INCREMENTAL_PAIR_PLAN_ROW_SIGNALS)
+        return False
+    return _build_info_sequence_contains_all(
+        module,
+        "incremental_linking_pair_plan_row_signals",
+        _REQUIRED_INCREMENTAL_PAIR_PLAN_ROW_SIGNALS,
+    )
 
 
 def _detect_named_rust_capabilities(module: Any) -> tuple[str, ...]:
@@ -169,7 +155,11 @@ def _detect_named_rust_capabilities(module: Any) -> tuple[str, ...]:
         getattr(rust_featurizer_cls, "linker_pair_index_arrays_and_aggregate_stats", None)
     ):
         capabilities.append(RUST_CAPABILITY_INDEXED_PAIR_ARRAY_FEATURIZATION_V1)
-    if rust_retriever_cls is not None and _has_current_incremental_pair_plan_abi(module, rust_retriever_cls):
+    if (
+        rust_retriever_cls is not None
+        and callable(getattr(rust_retriever_cls, "top_k_hybrid_centroid_pair_plan", None))
+        and _has_current_incremental_pair_plan_abi(module)
+    ):
         capabilities.append(RUST_CAPABILITY_INCREMENTAL_LINKING_PAIR_PLAN_V1)
     if (
         rust_featurizer_cls is not None

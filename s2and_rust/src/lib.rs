@@ -294,6 +294,13 @@ const DEFAULT_INITIAL_ONLY_HYBRID_CENTROID_WEIGHTS: [f64; 5] =
     [0.520012, 0.220264, 0.109278, 0.150447, 0.0];
 const DEFAULT_HYBRID_EXEMPLAR_4_WEIGHTS: [f64; 5] = [0.40, 0.23, 0.12, 0.05, 0.07];
 const INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS: [&str; 1] = ["row_orcid_match"];
+const INCREMENTAL_LINKING_PAIR_PLAN_SUPPORTED_KWARGS: [&str; 5] = [
+    "num_threads",
+    "query_signature_ids",
+    "retrieval_subblock_index",
+    "query_candidate_component_keys_by_signature_id",
+    "full_first_global_backfill_count",
+];
 const RETRIEVAL_MIDDLE_INITIAL_CONFLICT_SCORE: f64 = -0.25;
 const RETRIEVAL_YEAR_SCORE_DECAY_YEARS: f64 = 15.0;
 const RETRIEVAL_YEAR_SCORE_RANGE_GAP: i64 = 10;
@@ -1407,12 +1414,12 @@ fn parse_fasttext_label(label: &str) -> String {
     label.rsplit("__").next().unwrap_or(label).to_string()
 }
 
-fn resolve_fasttext_model_path(py: Python<'_>) -> Option<String> {
-    let consts = py.import("s2and.consts").ok()?;
-    let fasttext_path: String = consts.getattr("FASTTEXT_PATH").ok()?.extract().ok()?;
-    let file_cache = py.import("s2and.file_cache").ok()?;
-    let cached_path = file_cache.getattr("cached_path").ok()?;
-    cached_path.call1((fasttext_path,)).ok()?.extract().ok()
+fn resolve_fasttext_model_path(py: Python<'_>) -> PyResult<String> {
+    let consts = py.import("s2and.consts")?;
+    let fasttext_path = consts.getattr("FASTTEXT_PATH")?;
+    let file_cache = py.import("s2and.file_cache")?;
+    let cached_path = file_cache.getattr("cached_path")?;
+    cached_path.call1((&fasttext_path,))?.extract()
 }
 
 fn python_fasttext_loading_enabled(py: Python<'_>) -> bool {
@@ -1423,42 +1430,53 @@ fn python_fasttext_loading_enabled(py: Python<'_>) -> bool {
         .unwrap_or(true)
 }
 
-fn emit_runtime_warning(py: Python<'_>, message: &str) {
-    if let Ok(warnings) = py.import("warnings") {
-        let _ = warnings.call_method1("warn", (message.to_string(),));
-    }
-}
-
 struct LanguageDetectorCompat {
     fasttext: Option<FastText>,
 }
 
+struct LanguageDetectionAudit {
+    fasttext_label: String,
+    cld2_label: String,
+    predicted_language: String,
+    is_reliable: bool,
+    is_english: bool,
+}
+
 impl LanguageDetectorCompat {
-    fn new(py: Python<'_>) -> Self {
+    fn new(py: Python<'_>) -> PyResult<Self> {
         if !python_fasttext_loading_enabled(py) {
-            return Self { fasttext: None };
+            return Ok(Self { fasttext: None });
         }
-        let fasttext = resolve_fasttext_model_path(py).and_then(|model_path| {
-            let mut model = FastText::new();
-            match model.load_model(&model_path) {
-                Ok(()) => Some(model),
-                Err(err) => {
-                    let warning = format!(
-                        "s2and_rust: failed to load fastText model at '{}' ({}); falling back to CLD2-only language detection.",
-                        model_path, err
-                    );
-                    emit_runtime_warning(py, &warning);
-                    eprintln!("{warning}");
-                    None
-                }
-            }
-        });
-        Self { fasttext }
+        let model_path = resolve_fasttext_model_path(py)?;
+        let mut model = FastText::new();
+        model.load_model(&model_path).map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "s2and_rust: failed to load fastText language model at '{model_path}' ({err})"
+            ))
+        })?;
+        Ok(Self {
+            fasttext: Some(model),
+        })
     }
 
-    fn detect(&self, text: &str) -> (bool, bool, String) {
+    fn detect(&self, text: &str) -> PyResult<(bool, bool, String)> {
+        let audit = self.audit(text)?;
+        Ok((
+            audit.is_reliable,
+            audit.is_english,
+            audit.predicted_language,
+        ))
+    }
+
+    fn audit(&self, text: &str) -> PyResult<LanguageDetectionAudit> {
         if text.split_whitespace().count() <= 1 {
-            return (false, false, "un".to_string());
+            return Ok(LanguageDetectionAudit {
+                fasttext_label: "un_ft".to_string(),
+                cld2_label: "un_2".to_string(),
+                predicted_language: "un".to_string(),
+                is_reliable: false,
+                is_english: false,
+            });
         }
 
         let mut alpha_count = 0usize;
@@ -1472,7 +1490,13 @@ impl LanguageDetectorCompat {
             }
         }
         if alpha_count == 0 {
-            return (false, false, "un".to_string());
+            return Ok(LanguageDetectionAudit {
+                fasttext_label: "un_ft".to_string(),
+                cld2_label: "un_2".to_string(),
+                predicted_language: "un".to_string(),
+                is_reliable: false,
+                is_english: false,
+            });
         }
 
         let predicted_language_ft = if let Some(fasttext_model) = &self.fasttext {
@@ -1486,7 +1510,11 @@ impl LanguageDetectorCompat {
                     .first()
                     .map(|prediction| parse_fasttext_label(&prediction.label))
                     .unwrap_or_else(|| "un_ft".to_string()),
-                Err(_) => "un_ft".to_string(),
+                Err(err) => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "s2and_rust: fastText language prediction failed ({err})"
+                    )));
+                }
             }
         } else {
             "un_ft".to_string()
@@ -1505,18 +1533,46 @@ impl LanguageDetectorCompat {
             if predicted_language_ft == "un_ft" && predicted_language_2 == "un_2" {
                 ("un".to_string(), false)
             } else if predicted_language_ft == "un_ft" {
-                (predicted_language_2, true)
+                (predicted_language_2.clone(), true)
             } else if predicted_language_2 == "un_2" {
-                (predicted_language_ft, true)
+                (predicted_language_ft.clone(), true)
             } else if predicted_language_2 != predicted_language_ft {
                 ("un".to_string(), false)
             } else {
-                (predicted_language_2, true)
+                (predicted_language_2.clone(), true)
             };
 
         let is_english = predicted_language == "en";
-        (is_reliable, is_english, predicted_language)
+        Ok(LanguageDetectionAudit {
+            fasttext_label: predicted_language_ft,
+            cld2_label: predicted_language_2,
+            predicted_language,
+            is_reliable,
+            is_english,
+        })
     }
+}
+
+#[cfg(debug_assertions)]
+#[pyfunction]
+fn _debug_language_detector_audit(
+    py: Python<'_>,
+    texts: Vec<String>,
+) -> PyResult<Vec<(String, String, String, bool)>> {
+    let detector = LanguageDetectorCompat::new(py)?;
+    texts
+        .iter()
+        .map(|text| {
+            detector.audit(text).map(|audit| {
+                (
+                    audit.fasttext_label,
+                    audit.cld2_label,
+                    audit.predicted_language,
+                    audit.is_reliable,
+                )
+            })
+        })
+        .collect()
 }
 
 fn counter_data_from_usize_map(counter_map: HashMap<String, usize>) -> Option<CounterData> {
@@ -5518,17 +5574,27 @@ fn normalize_f32_vector(mut vector: Vec<f32>, dimension: usize) -> Vec<f32> {
 }
 
 fn dot_f32(left: &[f32], right: &[f32]) -> f64 {
-    left.iter()
-        .zip(right.iter())
-        .map(|(left_value, right_value)| f64::from(*left_value) * f64::from(*right_value))
-        .sum()
+    f64::from(
+        left.iter()
+            .zip(right.iter())
+            .map(|(left_value, right_value)| *left_value * *right_value)
+            .sum::<f32>(),
+    )
 }
 
 fn jaccard(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
     if left.is_empty() || right.is_empty() {
         return 0.0;
     }
-    let intersection = left.intersection(right).count();
+    let (smaller, larger) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let intersection = smaller
+        .iter()
+        .filter(|value| larger.contains(*value))
+        .count();
     let union = left.len() + right.len() - intersection;
     intersection as f64 / union as f64
 }
@@ -6440,6 +6506,11 @@ fn build_native_graph_evidence_store(
                 "signatures Arrow cannot contain empty paper_id values",
             ));
         }
+        if row.position.is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "signatures Arrow author_position is null for graph subblocking signature_id '{signature_id}'"
+            )));
+        }
         paper_ids.insert(row.paper_id.clone());
     }
     let (paper_authors, paper_author_stats) = read_raw_arrow_paper_authors_with_optional_index(
@@ -6488,25 +6559,26 @@ fn build_native_graph_evidence_store(
             .get(&row.paper_id)
             .cloned()
             .unwrap_or_else(|| vec![0.0; dimension]);
+        let position = row
+            .position
+            .expect("fallback signature row author_position was validated");
         let mut coauthor_blocks = HashSet::new();
-        if let Some(position) = row.position {
-            if let Some(authors) = paper_authors.get(&row.paper_id) {
-                for (author_position, author_name) in authors {
-                    if *author_position == position {
-                        continue;
-                    }
-                    let trimmed = author_name.trim();
-                    if trimmed.is_empty() {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "paper_authors Arrow cannot contain empty author_name values",
-                        ));
-                    }
-                    let normalized =
-                        normalize_text_compat_from_map(trimmed, false, &unidecode_char_map);
-                    let block = compute_block_compat(&normalized);
-                    if !block.is_empty() {
-                        coauthor_blocks.insert(block);
-                    }
+        if let Some(authors) = paper_authors.get(&row.paper_id) {
+            for (author_position, author_name) in authors {
+                if *author_position == position {
+                    continue;
+                }
+                let trimmed = author_name.trim();
+                if trimmed.is_empty() {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "paper_authors Arrow cannot contain empty author_name values",
+                    ));
+                }
+                let normalized =
+                    normalize_text_compat_from_map(trimmed, false, &unidecode_char_map);
+                let block = compute_block_compat(&normalized);
+                if !block.is_empty() {
+                    coauthor_blocks.insert(block);
                 }
             }
         }
@@ -9295,12 +9367,12 @@ impl RustFeaturizer {
             let need_language = in_signatures && predicted_language.is_none();
             if need_language {
                 if language_detector.is_none() {
-                    language_detector = Some(LanguageDetectorCompat::new(py));
+                    language_detector = Some(LanguageDetectorCompat::new(py)?);
                 }
                 let detector = language_detector.as_ref().ok_or_else(|| {
                     pyo3::exceptions::PyRuntimeError::new_err("missing language detector")
                 })?;
-                let (reliable, _is_english, language) = detector.detect(&raw_title);
+                let (reliable, _is_english, language) = detector.detect(&raw_title)?;
                 predicted_language = Some(language);
                 is_reliable = reliable;
             }
@@ -9947,7 +10019,7 @@ impl RustFeaturizer {
                 None => RawNameCountMaps::default(),
             },
         };
-        let language_detector = Some(LanguageDetectorCompat::new(py));
+        let language_detector = Some(LanguageDetectorCompat::new(py)?);
 
         let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
         ensure_unidecode_for_raw_arrow_inputs(
@@ -9963,7 +10035,11 @@ impl RustFeaturizer {
                     "Arrow signatures input is missing signature_id '{signature_id}'"
                 ))
             })?;
-            let position = raw_signature.position.unwrap_or(0);
+            let position = raw_signature.position.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "signatures Arrow author_position is null for signature_id '{signature_id}'"
+                ))
+            })?;
             signature_inputs.push(StageSignatureInput {
                 sig_id: signature_id.clone(),
                 paper_id: raw_signature.paper_id.clone(),
@@ -9994,7 +10070,7 @@ impl RustFeaturizer {
                 let detector = language_detector.as_ref().ok_or_else(|| {
                     pyo3::exceptions::PyRuntimeError::new_err("missing language detector")
                 })?;
-                let (reliable, _is_english, language) = detector.detect(&raw_paper.title);
+                let (reliable, _is_english, language) = detector.detect(&raw_paper.title)?;
                 (reliable, Some(language))
             };
             paper_inputs.push(StagePaperInput {
@@ -11540,6 +11616,10 @@ fn get_build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     build_info.set_item(
         "incremental_linking_pair_plan_row_signals",
         INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS.to_vec(),
+    )?;
+    build_info.set_item(
+        "incremental_linking_pair_plan_supported_kwargs",
+        INCREMENTAL_LINKING_PAIR_PLAN_SUPPORTED_KWARGS.to_vec(),
     )?;
     Ok(build_info.unbind())
 }
@@ -14754,6 +14834,8 @@ fn _s2and_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add_function(wrap_pyfunction!(get_build_info, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_text_compat, m)?)?;
+    #[cfg(debug_assertions)]
+    m.add_function(wrap_pyfunction!(_debug_language_detector_audit, m)?)?;
     m.add_function(wrap_pyfunction!(raw_arrow_labeled_candidate_plan, m)?)?;
     promoted_linker::add_to_module(m)?;
     m.add_function(wrap_pyfunction!(signature_ngrams_batch, m)?)?;

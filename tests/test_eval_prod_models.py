@@ -158,6 +158,50 @@ def test_training_mode_metric_assertion_rejects_different_metrics() -> None:
         )
 
 
+def test_build_pairwise_clusterer_can_disable_hyperopt(monkeypatch: pytest.MonkeyPatch) -> None:
+    import numpy as np
+
+    import s2and.model as model_module
+
+    captured_pairwise_search_spaces: list[dict[str, Any] | None] = []
+    captured_cluster_kwargs: dict[str, Any] = {}
+
+    class FakePairwiseModeler:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_pairwise_search_spaces.append(cast(dict[str, Any] | None, kwargs["search_space"]))
+            self.classifier = None
+
+        def fit(self, *_args: Any) -> None:
+            self.classifier = object()
+
+    class FakeClusterer:
+        def __init__(self, *_args: Any, **kwargs: Any) -> None:
+            captured_cluster_kwargs.update(kwargs)
+
+    monkeypatch.setattr(model_module, "PairwiseModeler", FakePairwiseModeler)
+    monkeypatch.setattr(model_module, "Clusterer", FakeClusterer)
+    info = SimpleNamespace(lightgbm_monotone_constraints=None)
+    train = (np.zeros((2, 3)), np.array([0, 1]), np.zeros((2, 2)))
+    val = (np.zeros((2, 3)), np.array([0, 1]), np.zeros((2, 2)))
+
+    eval_prod_models.build_pairwise_clusterer_from_features(
+        train,
+        val,
+        featurization_info=info,
+        nameless_featurization_info=info,
+        n_jobs=1,
+        random_seed=42,
+        pairwise_n_iter=25,
+        cluster_n_iter=25,
+        fixed_lightgbm_params=True,
+        fixed_cluster_eps=0.5,
+    )
+
+    assert captured_pairwise_search_spaces == [{}, {}]
+    assert captured_cluster_kwargs["search_space"] == {}
+    assert captured_cluster_kwargs["cluster_model"].eps == 0.5
+
+
 def test_read_arrow_s2_blocks_reads_columns_without_row_dicts(tmp_path: Path) -> None:
     import pyarrow as pa
 

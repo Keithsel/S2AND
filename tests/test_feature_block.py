@@ -1005,6 +1005,36 @@ def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert write_name_pairs_arrow({("ada", "a")}, tmp_path)[1] == {"reused": False, "row_count": 1}
 
 
+def test_write_name_counts_index_rebuilds_fingerprintless_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import s2and.data as data_module
+
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"ada": 3}, {"lovelace": 5}, {"ada lovelace": 2}, {"lovelace a": 7}),
+    )
+    index_path, _metrics = write_name_counts_index(tmp_path)
+    manifest_path = Path(index_path) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    original_fingerprint = manifest.pop("fingerprint")
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"grace": 11}, {"hopper": 13}, {"grace hopper": 17}, {"hopper g": 19}),
+    )
+
+    _index_path, metrics = write_name_counts_index(tmp_path, overwrite=False)
+
+    rebuilt_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert metrics["reused"] is False
+    assert rebuilt_manifest["fingerprint"] != original_fingerprint
+
+
 def test_write_name_counts_index_failed_overwrite_keeps_previous_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

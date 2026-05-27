@@ -185,6 +185,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-pairs-size", type=int, default=10000)
     parser.add_argument("--pairwise-n-iter", type=int, default=25)
     parser.add_argument("--cluster-n-iter", type=int, default=25)
+    parser.add_argument(
+        "--fixed-lightgbm-params",
+        action="store_true",
+        help="Disable pairwise LightGBM hyperopt and fit the default deterministic LightGBM parameters.",
+    )
+    parser.add_argument(
+        "--fixed-cluster-eps",
+        type=float,
+        default=None,
+        help="Disable cluster hyperopt and use this fixed FastCluster eps value.",
+    )
     return parser
 
 
@@ -853,35 +864,74 @@ def build_pairwise_clusterer_from_features(
     random_seed: int,
     pairwise_n_iter: int,
     cluster_n_iter: int,
+    fixed_lightgbm_params: bool = False,
+    fixed_cluster_eps: float | None = None,
 ) -> Any:
+    from lightgbm import LGBMClassifier
+
     from s2and.model import Clusterer, PairwiseModeler
+    from s2and.model_pairwise import FastCluster
 
     X_train, y_train, nameless_X_train = train
     X_val, y_val, nameless_X_val = val
     if nameless_X_train is None or nameless_X_val is None:
         raise RuntimeError("Nameless training features are required")
+    pairwise_search_space = None
+    pairwise_estimator = None
+    pairwise_monotone_constraints = featurization_info.lightgbm_monotone_constraints
+    nameless_pairwise_estimator = None
+    nameless_pairwise_monotone_constraints = nameless_featurization_info.lightgbm_monotone_constraints
+    if fixed_lightgbm_params:
+        pairwise_search_space = {}
+        fixed_params: dict[str, Any] = {
+            "objective": "binary",
+            "metric": "auc",
+            "n_jobs": n_jobs,
+            "verbose": -1,
+            "tree_learner": "data",
+            "random_state": random_seed,
+        }
+        pairwise_estimator_params = dict(fixed_params)
+        if pairwise_monotone_constraints is not None:
+            pairwise_estimator_params["monotone_constraints"] = pairwise_monotone_constraints
+            pairwise_estimator_params["monotone_constraints_method"] = "advanced"
+        pairwise_estimator = LGBMClassifier(**pairwise_estimator_params)
+        nameless_estimator_params = dict(fixed_params)
+        if nameless_pairwise_monotone_constraints is not None:
+            nameless_estimator_params["monotone_constraints"] = nameless_pairwise_monotone_constraints
+            nameless_estimator_params["monotone_constraints_method"] = "advanced"
+        nameless_pairwise_estimator = LGBMClassifier(**nameless_estimator_params)
+        pairwise_monotone_constraints = None
+        nameless_pairwise_monotone_constraints = None
 
     pairwise_modeler = PairwiseModeler(
         n_iter=pairwise_n_iter,
-        estimator=None,
-        search_space=None,
-        monotone_constraints=featurization_info.lightgbm_monotone_constraints,
+        estimator=pairwise_estimator,
+        search_space=pairwise_search_space,
+        monotone_constraints=pairwise_monotone_constraints,
         random_state=random_seed,
     )
     pairwise_modeler.fit(X_train, y_train, X_val, y_val)
 
     nameless_pairwise_modeler = PairwiseModeler(
         n_iter=pairwise_n_iter,
-        estimator=None,
-        search_space=None,
-        monotone_constraints=nameless_featurization_info.lightgbm_monotone_constraints,
+        estimator=nameless_pairwise_estimator,
+        search_space=pairwise_search_space,
+        monotone_constraints=nameless_pairwise_monotone_constraints,
         random_state=random_seed,
     )
     nameless_pairwise_modeler.fit(nameless_X_train, y_train, nameless_X_val, y_val)
+    fixed_cluster_model = None
+    fixed_cluster_search_space = None
+    if fixed_cluster_eps is not None:
+        fixed_cluster_model = FastCluster(linkage="average", eps=float(fixed_cluster_eps))
+        fixed_cluster_search_space = {}
 
     return Clusterer(
         featurization_info,
         pairwise_modeler.classifier,
+        cluster_model=fixed_cluster_model,
+        search_space=fixed_cluster_search_space,
         n_jobs=n_jobs,
         n_iter=cluster_n_iter,
         use_cache=False,
@@ -935,6 +985,14 @@ def fit_clusterer_from_arrow_validation(
     )
     best_params = space_eval(clusterer.search_space, clusterer.hyperopt_trials_store.argmin)
     clusterer.best_params = {key: intify(value) for key, value in best_params.items()}
+    clusterer.set_params(clusterer.best_params)
+    return clusterer
+
+
+def apply_fixed_cluster_eps(clusterer: Any, fixed_cluster_eps: float | None) -> Any:
+    if fixed_cluster_eps is None:
+        return clusterer
+    clusterer.best_params = {"eps": float(fixed_cluster_eps)}
     clusterer.set_params(clusterer.best_params)
     return clusterer
 
@@ -1108,13 +1166,18 @@ def main() -> None:
                         random_seed=random_seed,
                         pairwise_n_iter=int(args.pairwise_n_iter),
                         cluster_n_iter=int(args.cluster_n_iter),
+                        fixed_lightgbm_params=bool(args.fixed_lightgbm_params),
+                        fixed_cluster_eps=args.fixed_cluster_eps,
                     )
-                    clusterer = fit_clusterer_from_arrow_validation(
-                        clusterer,
-                        splits,
-                        rust_featurizer,
-                        random_seed=random_seed,
-                    )
+                    if args.fixed_cluster_eps is None:
+                        clusterer = fit_clusterer_from_arrow_validation(
+                            clusterer,
+                            splits,
+                            rust_featurizer,
+                            random_seed=random_seed,
+                        )
+                    else:
+                        clusterer = apply_fixed_cluster_eps(clusterer, args.fixed_cluster_eps)
                     cluster_metrics, _b3_metrics_per_signature = cluster_eval_arrow(
                         arrow_paths,
                         clusterer,
@@ -1176,9 +1239,14 @@ def main() -> None:
                         random_seed=random_seed,
                         pairwise_n_iter=int(args.pairwise_n_iter),
                         cluster_n_iter=int(args.cluster_n_iter),
+                        fixed_lightgbm_params=bool(args.fixed_lightgbm_params),
+                        fixed_cluster_eps=args.fixed_cluster_eps,
                     )
-                    with _temporary_s2and_backend("python"):
-                        clusterer.fit(evaluation_anddata)
+                    if args.fixed_cluster_eps is None:
+                        with _temporary_s2and_backend("python"):
+                            clusterer.fit(evaluation_anddata)
+                    else:
+                        clusterer = apply_fixed_cluster_eps(clusterer, args.fixed_cluster_eps)
                 else:
                     evaluation_anddata = anddata
 

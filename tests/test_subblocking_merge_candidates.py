@@ -341,6 +341,56 @@ def test_arrow_graph_subblocking_fallback_loads_arrow_evidence_and_packs_compone
     assert "artificial intelligence" in s1_affiliation_keys
 
 
+def test_arrow_graph_subblocking_rejects_null_author_position(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signatures_path = tmp_path / "signatures.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter_path = tmp_path / "specter.arrow"
+
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1"], type=pa.string()),
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "author_first": pa.array(["hui"], type=pa.string()),
+                "author_middle": pa.array([""], type=pa.string()),
+                "author_affiliations": pa.array([["lab"]], type=pa.list_(pa.string())),
+                "author_orcid": pa.array([None], type=pa.string()),
+                "author_position": pa.array([None], type=pa.int64()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "position": pa.array([0], type=pa.int64()),
+                "author_name": pa.array(["Hui Wang"], type=pa.string()),
+            }
+        ),
+        paper_authors_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([1.0, 0.0], type=pa.float32()), 2),
+            }
+        ),
+        specter_path,
+    )
+    paths = _add_graph_batch_indexes(
+        {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter": specter_path},
+        tmp_path,
+    )
+    fallback = make_arrow_graph_subblocking_cluster_fn(paths, ["s1"])
+
+    with pytest.raises(ValueError, match="null author_position"):
+        fallback(["s1"], object(), target_subblock_size=2)
+
+
 def test_arrow_graph_subblocking_prepare_limits_loaded_evidence_to_fallback_union(tmp_path) -> None:
     pa = pytest.importorskip("pyarrow")
 
@@ -750,6 +800,8 @@ def test_graph_subblocking_uses_raw_paper_coauthors_when_signature_blocks_are_mi
         specter_embeddings={f"p{index}": np.zeros(2, dtype=np.float32) for index in range(4)},
         random_seed=0,
     )
+    hidden_stats: list[dict[str, object]] = []
+    dataset._graph_subblocking_stats = hidden_stats
 
     subblocks = cluster_with_graph_fallback(
         signature_ids,
@@ -770,3 +822,4 @@ def test_graph_subblocking_uses_raw_paper_coauthors_when_signature_blocks_are_mi
         frozenset({"s1", "s3"}),
         frozenset({"s2", "s4"}),
     }
+    assert hidden_stats == []

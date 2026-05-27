@@ -387,9 +387,15 @@ def _require_rust_arrow_subblocking():
     return rust_module
 
 
-def _write_signatures_arrow(path, rows: list[tuple[str, str, str, str | None]]) -> None:
+def _write_signatures_arrow(
+    path,
+    rows: list[tuple[str, str, str, str | None]],
+    *,
+    author_positions: list[int | None] | None = None,
+) -> None:
     pa = pytest.importorskip("pyarrow")
     ipc = pytest.importorskip("pyarrow.ipc")
+    positions = [0] * len(rows) if author_positions is None else author_positions
     table = pa.table(
         {
             "signature_id": pa.array([row[0] for row in rows], type=pa.string()),
@@ -400,7 +406,7 @@ def _write_signatures_arrow(path, rows: list[tuple[str, str, str, str | None]]) 
             "author_suffix": pa.array([""] * len(rows), type=pa.string()),
             "author_affiliations": pa.array([[] for _row in rows], type=pa.list_(pa.string())),
             "author_orcid": pa.array([row[3] for row in rows], type=pa.string()),
-            "author_position": pa.array([0] * len(rows), type=pa.int64()),
+            "author_position": pa.array(positions, type=pa.int64()),
         }
     )
     with path.open("wb") as sink:
@@ -582,3 +588,88 @@ def test_rust_arrow_native_graph_subblocking_uses_arrow_evidence_without_python_
     assert telemetry["graph_fallback_invocation_count"] == 1
     assert telemetry["graph_fallback_load_metrics"]["paper_authors_rows_loaded"] == 8
     assert telemetry["graph_fallback_stats"][0]["packed_component_count"] == 2
+
+
+def test_rust_arrow_native_graph_subblocking_rejects_null_author_position(tmp_path):
+    _require_rust_arrow_subblocking()
+    signatures_path = tmp_path / "signatures.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter_path = tmp_path / "specter.arrow"
+    _write_signatures_arrow(
+        signatures_path,
+        [
+            ("s1", "hui", "", None),
+            ("s2", "hui", "", None),
+            ("s3", "hui", "", None),
+            ("s4", "hui", "", None),
+        ],
+        author_positions=[None, 0, 0, 0],
+    )
+    _write_ipc(
+        paper_authors_path,
+        pa.table(
+            {
+                "paper_id": pa.array(["p_s1", "p_s1", "p_s2", "p_s2", "p_s3", "p_s3", "p_s4", "p_s4"]),
+                "position": pa.array([0, 1, 0, 1, 0, 1, 0, 1], type=pa.int64()),
+                "author_name": pa.array(
+                    [
+                        "Hui Wang",
+                        "Ada Lovelace",
+                        "Hui Wang",
+                        "Ada Lovelace",
+                        "Hui Wang",
+                        "Grace Hopper",
+                        "Hui Wang",
+                        "Grace Hopper",
+                    ],
+                    type=pa.string(),
+                ),
+            }
+        ),
+    )
+    embeddings = np.asarray([[1.0, 0.0], [0.99, 0.01], [0.0, 1.0], [0.01, 0.99]], dtype=np.float32)
+    _write_ipc(
+        specter_path,
+        pa.table(
+            {
+                "paper_id": pa.array(["p_s1", "p_s2", "p_s3", "p_s4"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array(np.ravel(embeddings), type=pa.float32()), 2),
+            }
+        ),
+    )
+    paths = {
+        "signatures": str(signatures_path),
+        "signatures_batch_index": _add_batch_index(
+            signatures_path,
+            tmp_path / "signatures.signatures_batch_index.bin",
+            key_column="signature_id",
+            table_name="signatures",
+        ),
+        "paper_authors": str(paper_authors_path),
+        "paper_authors_batch_index": _add_batch_index(
+            paper_authors_path,
+            tmp_path / "paper_authors.paper_authors_batch_index.bin",
+            key_column="paper_id",
+            table_name="paper_authors",
+        ),
+        "specter": str(specter_path),
+        "specter_batch_index": _add_batch_index(
+            specter_path,
+            tmp_path / "specter.specter_batch_index.bin",
+            key_column="paper_id",
+            table_name="specter",
+        ),
+    }
+
+    with pytest.raises(ValueError, match="author_position is null"):
+        subblocking._make_subblocks_with_telemetry_arrow_rust(
+            paths,
+            ["s1", "s2", "s3", "s4"],
+            maximum_size=2,
+            first_k_letter_counts_sorted={},
+            graph_subblocking_config=subblocking.GraphSubblockingConfig(
+                neighbor_mode="exact",
+                neighbors=1,
+                min_edge_score=0.8,
+            ),
+        )

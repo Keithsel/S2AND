@@ -697,6 +697,7 @@ def cluster_with_graph_fallback(
     compute_block_fn: Callable[[str], str] = compute_block,
     *,
     config: GraphSubblockingConfig | None = None,
+    stats: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[str]]:
     """Cluster an oversized fallback group with a capacity-constrained graph."""
 
@@ -766,8 +767,7 @@ def cluster_with_graph_fallback(
         ),
         key=lambda values: (-len(values), values[0]),
     )
-    stats = getattr(anddata, "_graph_subblocking_stats", None)
-    if isinstance(stats, list):
+    if stats is not None:
         raw_sizes = [len(values) for values in raw_components]
         sizes = [len(values) for values in ordered_components]
         stats.append(
@@ -1129,7 +1129,6 @@ def _load_arrow_graph_subblocking_dataset(
     signature_ids: Sequence[str],
     *,
     random_seed: int,
-    stats: list[dict[str, Any]],
     load_metrics: dict[str, int],
 ) -> SimpleNamespace:
     paths = _require_arrow_graph_subblocking_artifacts(paths)
@@ -1164,16 +1163,15 @@ def _load_arrow_graph_subblocking_dataset(
     for signature_id in signature_ids:
         row = signatures_by_id[signature_id]
         paper_id = str(row["paper_id"])
-        position = None if row.get("author_position") is None else int(row["author_position"])
-        affiliations = _string_tuple(row.get("author_affiliations"))
-        coauthor_blocks = (
-            ()
-            if position is None
-            else tuple(
-                block
-                for author_position, block in coauthors_by_paper.get(paper_id, ())
-                if int(author_position) != position
+        if row.get("author_position") is None:
+            raise ValueError(
+                "signatures Arrow cannot contain null author_position values for graph subblocking "
+                f"(signature_id={signature_id})"
             )
+        position = int(row["author_position"])
+        affiliations = _string_tuple(row.get("author_affiliations"))
+        coauthor_blocks = tuple(
+            block for author_position, block in coauthors_by_paper.get(paper_id, ()) if int(author_position) != position
         )
         signature_objects[signature_id] = SimpleNamespace(
             signature_id=signature_id,
@@ -1195,7 +1193,6 @@ def _load_arrow_graph_subblocking_dataset(
         papers={},
         specter_embeddings=specter_embeddings,
         random_seed=int(random_seed),
-        _graph_subblocking_stats=stats,
     )
 
 
@@ -1233,7 +1230,6 @@ class ArrowGraphSubblockingFallback:
             self.paths,
             signature_ids,
             random_seed=self.random_seed,
-            stats=self.stats,
             load_metrics=self.load_metrics,
         )
         self.load_seconds = float(time.perf_counter() - start)
@@ -1278,6 +1274,7 @@ class ArrowGraphSubblockingFallback:
             target_subblock_size=target_subblock_size,
             compute_block_fn=compute_block_fn,
             config=self.config,
+            stats=self.stats,
         )
 
 
@@ -1314,22 +1311,14 @@ class DatasetGraphSubblockingFallback:
         target_subblock_size: int = 10000,
         compute_block_fn: Callable[[str], str] = compute_block,
     ) -> dict[str, list[str]]:
-        had_prior_stats = hasattr(anddata, "_graph_subblocking_stats")
-        prior_stats = getattr(anddata, "_graph_subblocking_stats", None)
-        anddata._graph_subblocking_stats = self.stats
-        try:
-            return cluster_with_graph_fallback(
-                signature_ids,
-                anddata,
-                target_subblock_size=target_subblock_size,
-                compute_block_fn=compute_block_fn,
-                config=self.config,
-            )
-        finally:
-            if had_prior_stats:
-                anddata._graph_subblocking_stats = prior_stats
-            else:
-                delattr(anddata, "_graph_subblocking_stats")
+        return cluster_with_graph_fallback(
+            signature_ids,
+            anddata,
+            target_subblock_size=target_subblock_size,
+            compute_block_fn=compute_block_fn,
+            config=self.config,
+            stats=self.stats,
+        )
 
 
 def make_dataset_graph_subblocking_cluster_fn(

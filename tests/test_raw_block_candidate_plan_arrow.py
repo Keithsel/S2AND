@@ -996,6 +996,32 @@ def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tm
     assert tuple(featurizer.signature_ids()) == ("q1", "s1", "s2")
 
 
+def test_rust_featurizer_from_arrow_paths_rejects_null_author_position(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path)
+    with pa.memory_map(paths["signatures"], "r") as source:
+        signatures = pa.ipc.open_file(source).read_all()
+    position_index = signatures.schema.get_field_index("author_position")
+    signatures = signatures.set_column(
+        position_index,
+        "author_position",
+        pa.array([None, 0, 0], type=pa.int64()),
+    )
+    paths["signatures"] = _write_ipc(tmp_path / "signatures_with_null_position.arrow", signatures)
+
+    with pytest.raises(ValueError, match="author_position is null"):
+        s2and_rust.RustFeaturizer.from_arrow_paths(
+            paths,
+            ["q1", "s1"],
+            set(),
+            True,
+            False,
+            0.0,
+            10000.0,
+            1,
+            True,
+        )
+
+
 def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)

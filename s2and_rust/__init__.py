@@ -8,3 +8,6 @@ from .s2and_rust import *  # noqa: F401,F403
 # Note: ``from ... import *`` does not import dunder names like ``__version__``,
 # so we set it explicitly here.
 __version__ = getattr(_s2and_rust_pkg, "__version__", None)
+
+if hasattr(_s2and_rust_pkg, "_debug_language_detector_audit"):
+    _debug_language_detector_audit = _s2and_rust_pkg._debug_language_detector_audit

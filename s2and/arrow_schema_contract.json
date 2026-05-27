@@ -1,0 +1,49 @@
+{
+  "schema_version": "s2and_arrow_schema_contract_v1",
+  "tables": {
+    "altered_cluster_signatures": [
+      {"name": "signature_id", "datatype": "string", "required": true}
+    ],
+    "cluster_seed_disallows": [
+      {"name": "signature_id_1", "datatype": "string", "required": true},
+      {"name": "signature_id_2", "datatype": "string", "required": true}
+    ],
+    "cluster_seeds": [
+      {"name": "signature_id", "datatype": "string", "required": true},
+      {"name": "cluster_id", "datatype": "string", "required": true}
+    ],
+    "paper_authors": [
+      {"name": "paper_id", "datatype": "string", "required": true},
+      {"name": "position", "datatype": "int64", "required": true},
+      {"name": "author_name", "datatype": "string", "required": true}
+    ],
+    "papers": [
+      {"name": "paper_id", "datatype": "string", "required": true},
+      {"name": "title", "datatype": "string", "required": true},
+      {"name": "abstract", "datatype": "string", "required": false},
+      {"name": "venue", "datatype": "string", "required": true},
+      {"name": "journal_name", "datatype": "string", "required": true},
+      {"name": "year", "datatype": "int64", "required": true},
+      {"name": "predicted_language", "datatype": "string", "required": false},
+      {"name": "is_reliable", "datatype": "bool", "required": false}
+    ],
+    "signatures": [
+      {"name": "signature_id", "datatype": "string", "required": true},
+      {"name": "paper_id", "datatype": "string", "required": true},
+      {"name": "author_first", "datatype": "string", "required": true},
+      {"name": "author_middle", "datatype": "string", "required": true},
+      {"name": "author_last", "datatype": "string", "required": true},
+      {"name": "author_suffix", "datatype": "string", "required": true},
+      {"name": "author_affiliations", "datatype": "list<string>", "required": true},
+      {"name": "author_orcid", "datatype": "string", "required": true},
+      {"name": "author_position", "datatype": "int64", "required": true},
+      {"name": "author_block", "datatype": "string", "required": false},
+      {"name": "author_email", "datatype": "string", "required": false},
+      {"name": "source_author_ids", "datatype": "list<string>", "required": false}
+    ],
+    "specter": [
+      {"name": "paper_id", "datatype": "string", "required": true},
+      {"name": "embedding", "datatype": "fixed_size_list<float32>", "required": true}
+    ]
+  }
+}

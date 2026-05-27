@@ -621,12 +621,14 @@ def _specter_arrow_name_for_dataset(dataset: Any) -> str:
     return "specter2.arrow" if "specter2" in specter_name_tokens else "specter.arrow"
 
 
-def _resolve_dataset_arrow_paths(
+def _resolve_dataset_arrow_paths_for_compat_discovery(
     dataset: Any,
     *,
     require_specter: bool,
     require_name_counts_index: bool = False,
 ) -> dict[str, str] | None:
+    """Best-effort Arrow path discovery for compatibility and eval-only callers."""
+
     for attr_name in ("arrow_paths", "feature_block_arrow_paths", "rust_arrow_paths"):
         explicit_value = getattr(dataset, attr_name, None)
         if explicit_value is None:
@@ -741,6 +743,32 @@ def _first_explicit_dataset_arrow_paths(dataset: Any) -> Mapping[str, Any] | Non
         explicit_value = getattr(dataset, attr_name, None)
         if isinstance(explicit_value, Mapping):
             return explicit_value
+    return None
+
+
+def _explicit_dataset_arrow_paths_for_prediction(
+    clusterer: Any,
+    dataset: Any,
+    *,
+    context: str,
+    producer_hint: str,
+) -> dict[str, str] | None:
+    """Return strict production Arrow paths declared directly on the dataset."""
+
+    for attr_name in ("arrow_paths", "feature_block_arrow_paths", "rust_arrow_paths"):
+        explicit_value = getattr(dataset, attr_name, None)
+        if explicit_value is None:
+            continue
+        if not isinstance(explicit_value, Mapping):
+            raise TypeError(f"dataset {attr_name} must be a mapping")
+        return validate_arrow_prediction_artifacts(
+            explicit_value,
+            require_specter=clusterer_uses_embedding_features(clusterer),
+            require_name_counts_index=clusterer_uses_name_count_features(clusterer),
+            require_batch_indexes=True,
+            context=context,
+            producer_hint=producer_hint,
+        )
     return None
 
 
@@ -4111,10 +4139,14 @@ class Clusterer:
                 stage_uses_rust(runtime_context)
                 and not _uses_reference_features(self.featurizer_info)
                 and not _uses_reference_features(self.nameless_featurizer_info)
-                and _resolve_dataset_arrow_paths(
+                and _explicit_dataset_arrow_paths_for_prediction(
+                    self,
                     dataset,
-                    require_specter=clusterer_uses_embedding_features(self),
-                    require_name_counts_index=clusterer_uses_name_count_features(self),
+                    context="Clusterer.predict synthetic incremental Arrow availability",
+                    producer_hint=(
+                        "pass complete explicit dataset.arrow_paths including raw-planner batch indexes; "
+                        "production Rust prediction does not infer sibling Arrow bundles"
+                    ),
                 )
                 is not None
             )
@@ -4568,10 +4600,15 @@ class Clusterer:
             and not _uses_reference_features(self.nameless_featurizer_info)
         )
         if rust_prediction_can_use_arrow:
-            arrow_paths = _resolve_dataset_arrow_paths(
+            arrow_paths = _explicit_dataset_arrow_paths_for_prediction(
+                self,
                 dataset,
-                require_specter=clusterer_uses_embedding_features(self),
-                require_name_counts_index=clusterer_uses_name_count_features(self),
+                context="Clusterer.predict Rust prediction",
+                producer_hint=(
+                    "pass complete explicit dataset.arrow_paths for signatures, papers, paper_authors, "
+                    "selected embeddings, model-required sidecars, and raw-planner batch indexes; "
+                    "Rust production prediction does not infer sibling Arrow bundles"
+                ),
             )
             if arrow_paths is None:
                 raise _missing_arrow_prediction_artifacts_error(
@@ -5522,10 +5559,15 @@ class Clusterer:
             and not _uses_reference_features(self.featurizer_info)
             and not _uses_reference_features(self.nameless_featurizer_info)
         ):
-            resolved_arrow_paths = _resolve_dataset_arrow_paths(
+            resolved_arrow_paths = _explicit_dataset_arrow_paths_for_prediction(
+                self,
                 dataset,
-                require_specter=clusterer_uses_embedding_features(self),
-                require_name_counts_index=clusterer_uses_name_count_features(self),
+                context="Clusterer._predict_incremental_promoted_linker",
+                producer_hint=(
+                    "pass complete explicit dataset.arrow_paths for signatures, papers, paper_authors, "
+                    "selected embeddings, model-required sidecars, and raw-planner batch indexes; "
+                    "promoted incremental Rust prediction does not infer sibling Arrow bundles"
+                ),
             )
         if resolved_arrow_paths is None:
             raise _missing_arrow_prediction_artifacts_error(
@@ -5622,10 +5664,15 @@ class Clusterer:
             and not _uses_reference_features(self.featurizer_info)
             and not _uses_reference_features(self.nameless_featurizer_info)
         ):
-            resolved_arrow_paths_for_incremental = _resolve_dataset_arrow_paths(
+            resolved_arrow_paths_for_incremental = _explicit_dataset_arrow_paths_for_prediction(
+                self,
                 dataset,
-                require_specter=clusterer_uses_embedding_features(self),
-                require_name_counts_index=clusterer_uses_name_count_features(self),
+                context="Clusterer.predict_incremental promoted Rust prediction",
+                producer_hint=(
+                    "pass complete explicit dataset.arrow_paths for signatures, papers, paper_authors, "
+                    "selected embeddings, model-required sidecars, and raw-planner batch indexes; "
+                    "promoted incremental Rust prediction does not infer sibling Arrow bundles"
+                ),
             )
         arrow_paths_available = resolved_arrow_paths_for_incremental is not None
         if use_rust_backend and not arrow_paths_available:

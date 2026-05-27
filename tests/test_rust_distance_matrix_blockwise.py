@@ -996,6 +996,7 @@ def test_predict_auto_routes_to_arrow_paths_when_dataset_advertises_them(tmp_pat
         path = tmp_path / filename
         path.touch()
         arrow_paths[key] = str(path)
+    arrow_paths = _with_fake_batch_indexes(arrow_paths, tmp_path)
     cast(Any, dataset).arrow_paths = arrow_paths
     runtime_context = type(
         "RuntimeContext",
@@ -1196,8 +1197,8 @@ def test_predict_subblocked_rust_requires_arrow_paths(monkeypatch):
     assert error.missing_keys == ("signatures", "papers", "paper_authors")
 
 
-def test_predict_subblocked_rust_requires_subblocking_batch_index(tmp_path, monkeypatch):
-    dataset = _dummy_dataset("dummy_predict_subblocked_missing_subblocking_index")
+def test_predict_rust_requires_explicit_batch_indexes(tmp_path, monkeypatch):
+    dataset = _dummy_dataset("dummy_predict_missing_batch_indexes")
     arrow_paths = {}
     for key, filename in {
         "signatures": "signatures.arrow",
@@ -1232,9 +1233,8 @@ def test_predict_subblocked_rust_requires_subblocking_batch_index(tmp_path, monk
         clusterer.predict({"block": ["0", "1"]}, dataset, batching_threshold=1)
 
     error = exc_info.value
-    assert error.context == "Arrow subblocking"
-    assert error.required_keys == ("signatures", "signatures_batch_index")
-    assert error.missing_keys == ("signatures_batch_index",)
+    assert error.context == "Clusterer.predict Rust prediction"
+    assert error.missing_keys == ("paper_authors_batch_index", "papers_batch_index", "signatures_batch_index")
 
 
 def test_predict_subblocked_uses_arrow_featurizer_for_multiple_letter_groups(tmp_path, monkeypatch):
@@ -1364,7 +1364,7 @@ def test_predict_subblocked_materializes_current_cluster_seeds_without_altered_p
     assert captured["build_signature_ids"] == ("0", "1")
 
 
-def test_arrow_path_discovery_uses_original_signature_path_after_filtering(tmp_path):
+def test_compat_arrow_path_discovery_uses_original_signature_path_after_filtering(tmp_path):
     json_dataset_dir = tmp_path / "s2and_mini" / "demo"
     filtered_dir = tmp_path / "filtered"
     arrow_dataset_dir = tmp_path / "s2and_mini_arrow" / "demo"
@@ -1383,7 +1383,7 @@ def test_arrow_path_discovery_uses_original_signature_path_after_filtering(tmp_p
         },
     )()
 
-    resolved = model_module._resolve_dataset_arrow_paths(
+    resolved = model_module._resolve_dataset_arrow_paths_for_compat_discovery(
         dataset,
         require_specter=True,
     )

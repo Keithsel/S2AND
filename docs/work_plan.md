@@ -66,6 +66,16 @@ The canonical surface owns:
 6. Split oversized Rust and Arrow incremental runtime modules only after the
    production boundary is locked and tested.
 
+## Cleanup Batch Exit Criteria
+
+| Area | Promotion criteria |
+|---|---|
+| Graph subblocking telemetry | Stats are passed explicitly; production code has no `_graph_subblocking_stats` read/mutation path. |
+| Rust pair-plan ABI | `get_build_info()` exposes supported pair-plan kwargs and row signals; Python no longer parses `__text_signature__` or runs a live zero-row probe. |
+| Arrow path authority | Production prediction reads only explicit dataset Arrow path mappings and validates them through `s2and.arrow_inputs`; sibling-bundle and optional-sidecar discovery remain compatibility-only. |
+| Arrow schema contract | `s2and/arrow_schema_contract.json` is checked by Rust/Python tests before any reader policy is centralized. |
+| Performance/quality freeze | Cleanup must stay within 5% of the pre-refactor cleanup baseline for latency/RSS on the selected workload and must not regress maintained parity metrics. |
+
 ## Open Work
 
 ### 1. Production Artifact Generation

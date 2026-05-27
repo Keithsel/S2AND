@@ -701,7 +701,7 @@ def test_predict_incremental_arrow_promoted_linker_requires_raw_planner(
         )
 
 
-def test_resolve_dataset_arrow_paths_discovers_raw_planner_batch_indexes(tmp_path: Path) -> None:
+def test_compat_arrow_path_discovery_discovers_raw_planner_batch_indexes(tmp_path: Path) -> None:
     arrow_paths = {}
     for key, filename in {
         "signatures": "signatures.arrow",
@@ -722,7 +722,7 @@ def test_resolve_dataset_arrow_paths_discovers_raw_planner_batch_indexes(tmp_pat
     (tmp_path / "altered_cluster_signatures.arrow").touch()
 
     dataset = SimpleNamespace(arrow_paths=arrow_paths)
-    resolved = model_module._resolve_dataset_arrow_paths(
+    resolved = model_module._resolve_dataset_arrow_paths_for_compat_discovery(
         dataset,
         require_specter=False,
     )
@@ -784,7 +784,7 @@ def test_specter_arrow_name_uses_declared_suffix_not_substring() -> None:
     )
 
 
-def test_resolve_dataset_arrow_paths_discovers_name_counts_index_from_manifest(
+def test_compat_arrow_path_discovery_discovers_name_counts_index_from_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -797,7 +797,7 @@ def test_resolve_dataset_arrow_paths_discovers_name_counts_index_from_manifest(
     )
 
     dataset = SimpleNamespace(arrow_paths=arrow_paths)
-    resolved = model_module._resolve_dataset_arrow_paths(
+    resolved = model_module._resolve_dataset_arrow_paths_for_compat_discovery(
         dataset,
         require_specter=False,
         require_name_counts_index=True,
@@ -807,7 +807,7 @@ def test_resolve_dataset_arrow_paths_discovers_name_counts_index_from_manifest(
     assert resolved["name_counts_index"] == name_counts_index
 
 
-def test_resolve_dataset_arrow_paths_rejects_bad_manifest_name_counts_index(tmp_path: Path) -> None:
+def test_compat_arrow_path_discovery_rejects_bad_manifest_name_counts_index(tmp_path: Path) -> None:
     arrow_paths = _minimal_arrow_paths(tmp_path)
     (tmp_path / "name_counts_index").mkdir()
     (tmp_path / "manifest.json").write_text(
@@ -817,14 +817,14 @@ def test_resolve_dataset_arrow_paths_rejects_bad_manifest_name_counts_index(tmp_
 
     dataset = SimpleNamespace(arrow_paths=arrow_paths)
     with pytest.raises(FileNotFoundError, match="specifies name_counts_index path that does not exist"):
-        model_module._resolve_dataset_arrow_paths(
+        model_module._resolve_dataset_arrow_paths_for_compat_discovery(
             dataset,
             require_specter=False,
             require_name_counts_index=True,
         )
 
 
-def test_resolve_dataset_arrow_paths_declines_missing_required_name_counts_index(
+def test_compat_arrow_path_discovery_declines_missing_required_name_counts_index(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -842,7 +842,7 @@ def test_resolve_dataset_arrow_paths_declines_missing_required_name_counts_index
         arrow_paths[key] = str(path)
 
     dataset = SimpleNamespace(arrow_paths=arrow_paths)
-    resolved = model_module._resolve_dataset_arrow_paths(
+    resolved = model_module._resolve_dataset_arrow_paths_for_compat_discovery(
         dataset,
         require_specter=False,
         require_name_counts_index=True,
@@ -851,7 +851,7 @@ def test_resolve_dataset_arrow_paths_declines_missing_required_name_counts_index
     assert resolved is None
 
 
-def test_resolve_dataset_arrow_paths_reports_explicit_missing_file_with_structured_error(tmp_path: Path) -> None:
+def test_compat_arrow_path_discovery_reports_explicit_missing_file_with_structured_error(tmp_path: Path) -> None:
     signatures_path = tmp_path / "signatures.arrow"
     paper_authors_path = tmp_path / "paper_authors.arrow"
     signatures_path.touch()
@@ -866,7 +866,7 @@ def test_resolve_dataset_arrow_paths_reports_explicit_missing_file_with_structur
     )
 
     with pytest.raises(model_module.MissingArrowArtifactError) as exc_info:
-        model_module._resolve_dataset_arrow_paths(
+        model_module._resolve_dataset_arrow_paths_for_compat_discovery(
             dataset,
             require_specter=False,
             require_name_counts_index=False,

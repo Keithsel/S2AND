@@ -51,7 +51,7 @@ def normalize_orcid_for_subblocking(value: Any) -> str | None:
 
 @dataclass(frozen=True)
 class GraphSubblockingConfig:
-    """Configuration for the experimental graph fallback used by subblocking."""
+    """Configuration for the graph fallback used by subblocking."""
 
     neighbor_mode: str = "projection"
     neighbors: int = 16
@@ -65,12 +65,12 @@ class GraphSubblockingConfig:
     max_candidate_edges: int = 5_000_000
     pack_components: bool = True
     component_pack_strategy: str = "edge-greedy"
-    sparse_evidence_edges: bool = False
-    sparse_evidence_max_posting_size: int = 64
-    sparse_evidence_neighbors: int = 4
-    sparse_evidence_min_weight: float = 0.20
+    sparse_evidence_edges: bool = True
+    sparse_evidence_max_posting_size: int = 8
+    sparse_evidence_neighbors: int = 1
+    sparse_evidence_min_weight: float = 0.40
     sparse_evidence_include_coauthors: bool = True
-    sparse_evidence_include_affiliations: bool = True
+    sparse_evidence_include_affiliations: bool = False
     component_pack_top_k: int = 8
     local_move_passes: int = 0
     adaptive_projection: bool = False

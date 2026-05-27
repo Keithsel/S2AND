@@ -34,9 +34,15 @@ def test_compare_graph_subblocking_parser_accepts_limit(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", [*_base_argv(), "--limit", "20"])
 
     args = script.parse_args()
+    default_config = script.GraphSubblockingConfig()
 
     assert args.limit == 20
     assert args.python_source == "raw"
+    assert args.sparse_evidence_edges == default_config.sparse_evidence_edges
+    assert args.sparse_evidence_max_posting_size == default_config.sparse_evidence_max_posting_size
+    assert args.sparse_evidence_neighbors == default_config.sparse_evidence_neighbors
+    assert args.sparse_evidence_min_weight == default_config.sparse_evidence_min_weight
+    assert args.sparse_evidence_include_affiliations == default_config.sparse_evidence_include_affiliations
 
 
 def test_compare_graph_subblocking_parser_accepts_arrow_python_source_without_raw_inputs(monkeypatch) -> None:

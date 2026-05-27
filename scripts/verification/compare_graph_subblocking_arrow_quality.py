@@ -36,6 +36,8 @@ from s2and.subblocking import (  # noqa: E402
 )
 from s2and.text import compute_block, normalize_text  # noqa: E402
 
+_DEFAULT_GRAPH_CONFIG = GraphSubblockingConfig()
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -68,12 +70,36 @@ def parse_args() -> argparse.Namespace:
         choices=("edge-greedy", "aggregate-greedy", "size"),
         default="edge-greedy",
     )
-    parser.add_argument("--sparse-evidence-edges", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--sparse-evidence-max-posting-size", type=int, default=64)
-    parser.add_argument("--sparse-evidence-neighbors", type=int, default=4)
-    parser.add_argument("--sparse-evidence-min-weight", type=float, default=0.20)
-    parser.add_argument("--sparse-evidence-include-coauthors", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--sparse-evidence-include-affiliations", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--sparse-evidence-edges",
+        action=argparse.BooleanOptionalAction,
+        default=_DEFAULT_GRAPH_CONFIG.sparse_evidence_edges,
+    )
+    parser.add_argument(
+        "--sparse-evidence-max-posting-size",
+        type=int,
+        default=_DEFAULT_GRAPH_CONFIG.sparse_evidence_max_posting_size,
+    )
+    parser.add_argument(
+        "--sparse-evidence-neighbors",
+        type=int,
+        default=_DEFAULT_GRAPH_CONFIG.sparse_evidence_neighbors,
+    )
+    parser.add_argument(
+        "--sparse-evidence-min-weight",
+        type=float,
+        default=_DEFAULT_GRAPH_CONFIG.sparse_evidence_min_weight,
+    )
+    parser.add_argument(
+        "--sparse-evidence-include-coauthors",
+        action=argparse.BooleanOptionalAction,
+        default=_DEFAULT_GRAPH_CONFIG.sparse_evidence_include_coauthors,
+    )
+    parser.add_argument(
+        "--sparse-evidence-include-affiliations",
+        action=argparse.BooleanOptionalAction,
+        default=_DEFAULT_GRAPH_CONFIG.sparse_evidence_include_affiliations,
+    )
     parser.add_argument("--component-pack-top-k", type=int, default=8)
     parser.add_argument("--local-move-passes", type=int, default=0)
     parser.add_argument("--adaptive-projection", action=argparse.BooleanOptionalAction, default=False)

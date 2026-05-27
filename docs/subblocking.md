@@ -60,8 +60,10 @@ Default `GraphSubblockingConfig` behavior:
 - `min_edge_score=0.30`.
 - `component_pack_strategy="edge-greedy"` and `pack_components=True`.
 - Exact kNN remains available with `neighbor_mode="exact"`, but it is capped by `max_exact_knn_group_size`.
-- Sparse-evidence edges, adaptive projection, aggregate packing, and local moves are still experimental knobs and are
-  off by default.
+- Sparse coauthor evidence is enabled by default with `sparse_evidence_max_posting_size=8`,
+  `sparse_evidence_neighbors=1`, `sparse_evidence_min_weight=0.40`, and affiliations excluded. This adds only
+  bounded coauthor-posting edges after projection edges have been scored.
+- Adaptive projection, aggregate packing, and local moves are still experimental knobs and are off by default.
 
 When Arrow paths are available, the graph fallback is Arrow-backed. Before fallback calls, `prepare(...)` receives the
 actual fallback-signature groups and loads the union of required `signatures`, `paper_authors`, and selected embedding rows

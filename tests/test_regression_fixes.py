@@ -68,7 +68,11 @@ def test_predict_arrow_full_predict_rewrites_stale_cluster_seed_sidecar(monkeypa
     }
     captured: dict[str, Any] = {}
 
-    monkeypatch.setattr(model_module, "_resolve_dataset_arrow_paths", lambda *_args, **_kwargs: arrow_paths)
+    monkeypatch.setattr(
+        model_module,
+        "_explicit_dataset_arrow_paths_for_prediction",
+        lambda *_args, **_kwargs: arrow_paths,
+    )
     monkeypatch.setattr(model_module, "_cluster_seeds_require_from_arrow_paths", lambda _paths: {"s1": "stale"})
 
     @contextmanager

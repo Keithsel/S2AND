@@ -112,9 +112,16 @@ Notes:
   current writer uses `pyarrow.ipc.new_file(...)`; readers use
   `pyarrow.ipc.open_file(...)` and memory maps.
 
+The machine-readable column contract lives at
+`s2and/arrow_schema_contract.json`. It is a parity guard for producer/consumer
+drift; runtime readers still enforce their local validation rules directly.
+
 The Python API may also pass explicit paths through `dataset.arrow_paths`,
-`dataset.feature_block_arrow_paths`, or `dataset.rust_arrow_paths`. In that case
-the path mapping should use these keys:
+`dataset.feature_block_arrow_paths`, or `dataset.rust_arrow_paths`. Production
+Rust routes treat those mappings as authoritative: they do not infer sibling
+`<data_root>_arrow/<dataset>` directories, and they do not auto-declare optional
+sidecars merely because files are present on disk. In that case the path mapping
+should use these keys:
 
 | Key | Meaning |
 |---|---|

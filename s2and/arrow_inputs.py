@@ -40,10 +40,9 @@ DECLARED_ARROW_SIDECAR_KEYS = (
     "cluster_seeds",
     "cluster_seed_disallows",
     "altered_cluster_signatures",
-    "name_pairs",
-    "name_tuples",
     "name_counts_index",
 )
+UNSUPPORTED_ARROW_NAME_ALIAS_KEYS = frozenset({"name_pairs", "name_tuples"})
 DIRECTORY_ARTIFACT_KEYS = frozenset({"name_counts_index"})
 NAME_COUNTS_INDEX_MANIFEST_FILES = ("first", "last", "first_last", "last_first_initial")
 
@@ -273,6 +272,8 @@ def validate_arrow_prediction_artifacts(
 
     missing_keys = sorted(key for key in required if key not in arrow_paths)
     normalized, invalid_paths = _normalize_arrow_path_values(arrow_paths)
+    for key in UNSUPPORTED_ARROW_NAME_ALIAS_KEYS.intersection(normalized):
+        invalid_paths[key] = "name aliases must be supplied via the name_tuples argument, not Arrow path bundles"
 
     if require_specter and "specter" not in normalized and "specter2" in normalized:
         normalized["specter"] = normalized["specter2"]

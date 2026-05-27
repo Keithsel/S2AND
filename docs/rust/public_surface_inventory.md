@@ -16,18 +16,17 @@ cleanup risk, not a user-facing API promise.
 | `raw_arrow_labeled_candidate_plan(...)` | `scripts/production/model/linker_train_calibrate_eval.py` | Training/materialization replay surface, not request-time inference. |
 | `promoted_linker_non_pairwise_features(...)` | `s2and/incremental_linking/row_features.py` | Production promoted-linker row feature builder. |
 | `make_subblocks_with_telemetry_arrow_native_graph(...)` | `s2and/subblocking.py` | Arrow-native graph subblocking helper used by large-block prediction. |
-| `signature_ngrams_batch(...)` | `s2and/feature_port.py` and `s2and/data.py` preprocessing | Training/eval preprocessing accelerator, not Arrow production inference. |
 | `get_build_info(...)` | `scripts/_rust_suite/common.py`, capability tests | Diagnostics and ABI metadata. |
 
 ## `RustFeaturizer`
 
 | Method | Owner / caller | Status |
 |---|---|---|
-| `from_arrow_paths(...)` | `feature_port.build_rust_featurizer_from_arrow_paths(...)`; full predict, subblocked predict, raw Arrow scoring | Production Arrow constructor. Filtered reads require batch indexes by default; explicit full-scan opt-in is compatibility/testing only. |
+| `from_arrow_paths(...)` | `feature_port.build_rust_featurizer_from_arrow_paths(...)`; full predict, subblocked predict, raw Arrow scoring | Production Arrow constructor. The Python production wrapper requires batch indexes for filtered reads. |
 | `from_dataset(...)` | `feature_port.build_rust_featurizer(...)`, `_get_rust_featurizer(...)`; training/eval, parity, classic `ANDData` callers | Keep callable for `ANDData` paths; do not present as the production inference boundary. |
 | `update_cluster_seeds(...)` and `update_signature_name_counts(...)` | cache/seed update helpers in `feature_port.py` and tests | Compatibility/training lifecycle helpers. |
 | `signature_ids(...)` | pairwise matrix wrappers, promoted incremental runtime, parity scripts | Shared index-order contract; keep. |
-| `signature_rule_metadata(...)`, `signature_name_counts_present(...)`, `cluster_seeds_require(...)` | parity/debug tests and state restoration checks | Debug/parity metadata; not production routing. |
+| `signature_rule_metadata(...)`, `signature_name_counts_present(...)`, `cluster_seeds_require(...)` | `predict_from_rust_featurizer(...)`, parity tests, and state restoration checks | Required metadata for direct Rust-featurizer prediction and parity. |
 | `get_constraint(...)` | `s2and/model.py`, `s2and/rust_calls.py`, tests | Single-pair `ANDData` Rust constraint helper used by compatibility/full-predict plumbing. |
 | `get_constraints_matrix_indexed(...)` | `model.py`, `rust_calls.py`, parity tests | Maintained indexed constraint API. |
 | `get_constraints_block_upper_triangle_indexed(...)` | `model.py`, Arrow parity script | Maintained blockwise constraint API. |
@@ -107,10 +106,15 @@ cleanup risk, not a user-facing API promise.
   Lower-level Python `FeatureBlock` builders remain only for fixture,
   compatibility-conversion, and parity-helper tests; production Rust scoring
   uses Arrow request tables.
+- Status 2026-05-27: `signature_ngrams_batch(...)`,
+  `normalize_text_compat(...)`, and the debug language-detector audit export
+  were removed from the Python-visible Rust module. Their implementation
+  helpers remain internal where production constructors need them.
+- Status 2026-05-27: Arrow name-alias override paths are no longer a production
+  input. Runtime aliases come from the explicit `name_tuples` argument.
 - Status 2026-05-25: Arrow string columns are strict at the Rust boundary.
   ID, text/language, and alias columns must be Arrow string types; integer
-  coercion is not accepted. Declared alias override paths (`name_pairs` or
-  `name_tuples`) are preflighted like other optional sidecars.
+  coercion is not accepted.
 - Status 2026-05-25: Arrow graph subblocking uses raw-planner batch lookup
   indexes for filtered evidence reads and no longer exposes the unused Python
   full-table graph loader.

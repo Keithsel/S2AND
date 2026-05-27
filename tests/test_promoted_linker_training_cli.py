@@ -57,6 +57,57 @@ def test_promoted_training_defaults_to_arrow_rust_source() -> None:
     assert parser_defaults["hyperopt_metric"] == "weighted_average_error"
 
 
+@pytest.mark.parametrize("retrieval_rank", [-1, 0, 65536])
+def test_arrow_rust_materialization_rejects_invalid_retrieval_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    retrieval_rank: int,
+) -> None:
+    class RustModule:
+        @staticmethod
+        def raw_arrow_labeled_candidate_plan(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("rank validation should run before Rust planning")
+
+    monkeypatch.setattr(promoted_train.feature_port, "_require_rust_runtime", lambda: RustModule)
+    context = promoted_train.ArrowRustDatasetContext(
+        dataset_name="dummy",
+        row_component_scope="block-local",
+        pairwise_component_scope="block-local",
+        runtime_context=SimpleNamespace(),
+        arrow_paths={},
+        component_members={},
+        cluster_seeds_require={},
+        cluster_seeds_disallow=frozenset(),
+        seed_constrained_signature_ids=frozenset(),
+        max_block_component_size=1,
+    )
+    rows = pd.DataFrame(
+        [
+            {
+                "query_signature_id": "q1",
+                "query_view": "full",
+                "query_group_id": "g1",
+                "candidate_component_key": "c1",
+                "retrieval_rank": retrieval_rank,
+                "label": 0,
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="retrieval_rank"):
+        promoted_train._materialize_arrow_rust_dataset_rows(  # noqa: SLF001
+            context=context,
+            rows=rows,
+            target_features=[],
+            clusterer=SimpleNamespace(),
+            n_jobs=1,
+            total_ram_bytes=1,
+            max_exemplars=1,
+            pairwise_model_nan_value=0.0,
+            pairwise_aggregate_nan_value=0.0,
+            row_nan_policy="zero",
+        )
+
+
 def test_finalized_arrow_materialization_bundle_creates_corrected_feature_asset_group(tmp_path: Path) -> None:
     source_root = tmp_path / "source"
     output_root = tmp_path / "output"

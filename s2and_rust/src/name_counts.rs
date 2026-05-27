@@ -1,6 +1,5 @@
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,10 +18,6 @@ pub(crate) struct NameCountsData {
 
 #[derive(Default)]
 pub(crate) struct RawNameCountMaps {
-    pub(crate) first: HashMap<String, f64>,
-    pub(crate) last: HashMap<String, f64>,
-    pub(crate) first_last: HashMap<String, f64>,
-    pub(crate) last_first_initial: HashMap<String, f64>,
     pub(crate) index: Option<RawNameCountIndex>,
 }
 
@@ -279,34 +274,15 @@ impl RawNameCountIndexFile {
 
 impl RawNameCountMaps {
     pub(crate) fn from_index(index: RawNameCountIndex) -> Self {
-        Self {
-            first: HashMap::new(),
-            last: HashMap::new(),
-            first_last: HashMap::new(),
-            last_first_initial: HashMap::new(),
-            index: Some(index),
-        }
+        Self { index: Some(index) }
     }
 
     pub(crate) fn has_data(&self) -> bool {
         self.index.is_some()
-            || !self.first.is_empty()
-            || !self.last.is_empty()
-            || !self.first_last.is_empty()
-            || !self.last_first_initial.is_empty()
     }
 
     pub(crate) fn get(&self, kind: RawNameCountKind, name: &str) -> Option<f64> {
-        if let Some(index) = self.index.as_ref() {
-            return index.get(kind, name);
-        }
-        match kind {
-            RawNameCountKind::First => self.first.get(name),
-            RawNameCountKind::Last => self.last.get(name),
-            RawNameCountKind::FirstLast => self.first_last.get(name),
-            RawNameCountKind::LastFirstInitial => self.last_first_initial.get(name),
-        }
-        .copied()
+        self.index.as_ref().and_then(|index| index.get(kind, name))
     }
 }
 

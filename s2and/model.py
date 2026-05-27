@@ -51,6 +51,9 @@ from s2and.incremental_linking.feature_block import (
     temporary_arrow_paths_with_cluster_seeds,
 )
 from s2and.incremental_linking.feature_block import (
+    read_altered_cluster_signatures_arrow as _read_altered_cluster_signatures_arrow_file,
+)
+from s2and.incremental_linking.feature_block import (
     read_cluster_seeds_arrow as _read_cluster_seeds_arrow_file,
 )
 from s2and.incremental_linking.policy import (
@@ -1021,29 +1024,7 @@ def _read_nonempty_text_lines(path: Path) -> list[str]:
 
 
 def _read_altered_cluster_signatures_arrow(path: Path) -> list[str]:
-    import pyarrow as pa
-
-    with pa.memory_map(str(path), "r") as source:
-        table = pa.ipc.open_file(source).read_all()
-        if "signature_id" not in table.column_names:
-            raise ValueError("altered cluster signatures Arrow is missing required column: signature_id")
-        signature_type = table["signature_id"].type
-        if not (pa.types.is_string(signature_type) or pa.types.is_large_string(signature_type)):
-            raise ValueError(
-                f"altered cluster signatures Arrow column signature_id expected string, got {signature_type}"
-            )
-        signature_values = table["signature_id"].to_pylist()
-    values: list[str] = []
-    seen: set[str] = set()
-    for value in signature_values:
-        if value is None or not str(value):
-            raise ValueError("altered cluster signatures Arrow cannot contain null or empty signature_id values")
-        signature_id = str(value)
-        if signature_id in seen:
-            raise ValueError(f"altered cluster signatures Arrow contains duplicate signature_id: {signature_id!r}")
-        seen.add(signature_id)
-        values.append(signature_id)
-    return values
+    return list(_read_altered_cluster_signatures_arrow_file(path))
 
 
 def _read_altered_cluster_signatures_file(path: Path) -> list[str]:
@@ -3688,7 +3669,8 @@ class Clusterer:
         signature_ids = list(
             dict.fromkeys(str(signature_id) for signatures in block_dict.values() for signature_id in signatures)
         )
-        cluster_seed_disallows = _cluster_seed_disallows_from_arrow_paths(arrow_path_payload)
+        arrow_cluster_seed_disallows = _cluster_seed_disallows_from_arrow_paths(arrow_path_payload)
+        cluster_seed_disallows = set(arrow_cluster_seed_disallows)
         if cluster_seeds_disallow is not None:
             cluster_seed_disallows.update(normalize_cluster_seed_disallow_pairs(cluster_seeds_disallow))
         if dists is not None and cluster_seed_disallows:
@@ -3696,6 +3678,13 @@ class Clusterer:
                 "cluster_seeds_disallow cannot be used with precomputed dists because disallow pairs "
                 "would not be injected into the distance matrix"
             )
+        effective_partial_supervision = _partial_supervision_with_cluster_seed_disallows(
+            signature_ids,
+            self,
+            partial_supervision or {},
+            arrow_path_payload,
+            cluster_seed_disallows=arrow_cluster_seed_disallows,
+        )
         featurizer_start = time.perf_counter()
         rust_featurizer = build_rust_featurizer_from_arrow_paths(
             arrow_path_payload,
@@ -3705,7 +3694,6 @@ class Clusterer:
                 clusterer_uses_name_count_features(self) if load_name_counts is None else load_name_counts
             ),
             preprocess=True,
-            compute_reference_features=False,
             num_threads=self.n_jobs,
         )
         arrow_featurizer_seconds = time.perf_counter() - featurizer_start
@@ -3715,7 +3703,7 @@ class Clusterer:
             rust_featurizer,
             dists=dists,
             cluster_model_params=cluster_model_params,
-            partial_supervision=partial_supervision,
+            partial_supervision=effective_partial_supervision,
             incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
             runtime_context=runtime_context,
             total_ram_bytes=total_ram_bytes,
@@ -4488,7 +4476,6 @@ class Clusterer:
                         name_tuples=getattr(dataset, "name_tuples", "filtered"),
                         load_name_counts=clusterer_uses_name_count_features(self),
                         preprocess=True,
-                        compute_reference_features=False,
                         num_threads=self.n_jobs,
                     )
                     logger.info(

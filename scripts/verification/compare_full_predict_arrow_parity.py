@@ -312,7 +312,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     from s2and.incremental_linking.feature_block import (
         write_name_counts_arrow,
         write_name_counts_index,
-        write_name_pairs_arrow,
     )
     from s2and.production_model import load_production_model
     from s2and.text import set_fasttext_loading_enabled
@@ -406,15 +405,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     timings["write_name_counts_index_seconds"] = time.perf_counter() - start
 
     start = time.perf_counter()
-    name_pairs_artifact_dir = name_artifact_dir
-    name_pairs_arrow_path, name_pairs_arrow_metrics = write_name_pairs_arrow(
-        getattr(dataset, "name_tuples", set()),
-        name_pairs_artifact_dir,
-    )
-    arrow_paths["name_pairs"] = name_pairs_arrow_path
-    timings["write_name_pairs_arrow_seconds"] = time.perf_counter() - start
-
-    start = time.perf_counter()
     clusterer = load_production_model(args.model_path)
     clusterer.n_jobs = int(args.n_jobs)
     clusterer.use_cache = False
@@ -438,10 +428,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     arrow_featurizer = build_rust_featurizer_from_arrow_paths(
         arrow_paths,
         signature_ids=selected_signature_ids,
-        name_tuples=None,
+        name_tuples=getattr(dataset, "name_tuples", "filtered"),
         load_name_counts=True,
         preprocess=True,
-        compute_reference_features=False,
         num_threads=int(args.n_jobs),
     )
     timings["arrow_featurizer_seconds"] = time.perf_counter() - start
@@ -516,7 +505,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "raw_planner_batch_indexes": raw_planner_index_metrics,
         "name_counts_arrow_metrics": name_counts_arrow_metrics,
         "name_counts_index_metrics": name_counts_index_metrics,
-        "name_pairs_arrow_metrics": name_pairs_arrow_metrics,
         "timings_seconds": {key: float(value) for key, value in timings.items()},
         "distance_comparison": distance_comparison,
         "feature_constraint_comparison": feature_constraint_comparison,

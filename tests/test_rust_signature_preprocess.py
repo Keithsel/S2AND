@@ -9,11 +9,10 @@ import pytest
 from s2and import feature_port
 from s2and.featurizer import _single_pair_featurize
 from s2and.subblocking import make_subblocks
-from s2and.text import AFFILIATIONS_STOP_WORDS, get_text_ngrams, get_text_ngrams_words
 from tests.helpers import build_dummy_dataset, equalish
 
-if not feature_port.rust_signature_preprocess_available():
-    raise pytest.skip.Exception("s2and_rust signature preprocessing API is unavailable", allow_module_level=True)
+if not feature_port.rust_featurizer_available():
+    raise pytest.skip.Exception("s2and_rust featurizer API is unavailable", allow_module_level=True)
 
 
 @contextmanager
@@ -30,11 +29,6 @@ def _temporary_env(name: str, value: str | None):
             os.environ.pop(name, None)
         else:
             os.environ[name] = original
-
-
-def _prefilter_affiliation_text(text: str) -> str:
-    tokens = [word for word in text.split() if word not in AFFILIATIONS_STOP_WORDS and len(word) > 1]
-    return " ".join(tokens)
 
 
 def _signature_scalar_fields(signature) -> dict[str, object]:
@@ -58,49 +52,6 @@ def _sample_pairs(signature_ids: list[str], limit: int = 8) -> list[tuple[str, s
         if len(pairs) >= limit:
             break
     return pairs
-
-
-@pytest.mark.parametrize(
-    "coauthor_text,affiliation_text",
-    [
-        ("", ""),
-        ("Alice Smith Bob Jones", "University of Washington Seattle"),
-        ("Renaud Séguier Abdul Sattar", "Department of Computer Science"),
-        ("A.B. C-D", "A I lab"),
-        (
-            " ".join([f"Author{i}" for i in range(80)]),
-            " ".join([f"Institute{i}" for i in range(30)]),
-        ),
-    ],
-)
-def test_signature_ngrams_batch_rust_parity(coauthor_text: str, affiliation_text: str):
-    filtered_affiliation_text = _prefilter_affiliation_text(affiliation_text)
-    rust_coauthor, rust_affiliation = feature_port.signature_ngrams_batch_rust(
-        [coauthor_text],
-        [filtered_affiliation_text],
-        num_threads=1,
-    )
-    assert len(rust_coauthor) == 1
-    assert len(rust_affiliation) == 1
-
-    expected_coauthor = get_text_ngrams(coauthor_text, stopwords=None, use_bigrams=True)
-    expected_affiliation = get_text_ngrams_words(filtered_affiliation_text, stopwords=set())
-
-    assert rust_coauthor[0] == expected_coauthor
-    assert rust_affiliation[0] == expected_affiliation
-
-
-def test_signature_ngrams_batch_rust_filters_affiliation_stopwords() -> None:
-    filtered_affiliation_text = _prefilter_affiliation_text("A I lab of computer science")
-    rust_coauthor, rust_affiliation = feature_port.signature_ngrams_batch_rust(
-        [""],
-        ["A I lab of computer science"],
-        num_threads=1,
-    )
-
-    assert filtered_affiliation_text == "computer science"
-    assert rust_coauthor == [get_text_ngrams("", stopwords=None, use_bigrams=True)]
-    assert rust_affiliation == [get_text_ngrams_words(filtered_affiliation_text, stopwords=set())]
 
 
 def test_signature_preprocess_dataset_rust_defers_signature_fields():

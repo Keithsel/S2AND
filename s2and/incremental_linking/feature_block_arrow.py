@@ -163,6 +163,56 @@ def read_cluster_seed_disallows_arrow(path: Path) -> tuple[tuple[str, str], ...]
     return tuple(rows)
 
 
+def write_altered_cluster_signatures_arrow(path: Path, signature_ids: Iterable[Any]) -> None:
+    """Write the canonical Arrow altered-cluster-signature table."""
+
+    import pyarrow as pa
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    normalized = _normalize_unique_signature_ids(
+        signature_ids,
+        table_name="altered cluster signatures",
+    )
+    table = pa.table({"signature_id": pa.array(normalized, type=pa.string())})
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+
+
+def read_altered_cluster_signatures_arrow(path: Path) -> tuple[str, ...]:
+    """Read and validate a canonical Arrow altered-cluster-signature table."""
+
+    import pyarrow as pa
+
+    with pa.memory_map(str(path), "r") as source:
+        table = pa.ipc.open_file(source).read_all()
+    _require_arrow_string_columns(table, "altered cluster signatures", {"signature_id"})
+    return _normalize_unique_signature_ids(
+        table["signature_id"].to_pylist(),
+        table_name="altered cluster signatures",
+    )
+
+
+def _normalize_unique_signature_ids(
+    signature_ids: Iterable[Any],
+    *,
+    table_name: str,
+) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in signature_ids:
+        if value is None:
+            raise ValueError(f"{table_name} Arrow cannot contain null signature_id values")
+        signature_id = str(value)
+        if not signature_id:
+            raise ValueError(f"{table_name} Arrow cannot contain empty signature_id values")
+        if signature_id in seen:
+            raise ValueError(f"{table_name} Arrow contains duplicate signature_id: {signature_id!r}")
+        seen.add(signature_id)
+        normalized.append(signature_id)
+    return tuple(normalized)
+
+
 def cluster_seed_disallows_path_from_arrow_paths(arrow_paths: Mapping[str, Any] | None) -> Path | None:
     """Return the explicit cluster-seed disallow sidecar path, if configured."""
 

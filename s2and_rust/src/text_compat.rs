@@ -61,6 +61,7 @@ pub(crate) fn normalize_ascii_text_compat(text: &str, special_case_apostrophes: 
     normalized
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_text_compat_native(text: &str, special_case_apostrophes: bool) -> String {
     normalize_text_compat_with_map(text, special_case_apostrophes, None)
 }

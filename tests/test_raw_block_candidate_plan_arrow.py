@@ -324,7 +324,6 @@ def _raw_candidate_plan_arrow(
     orcid_enabled: bool = True,
     num_threads: int | None = None,
     max_exemplars: int = 4,
-    include_component_members: bool = True,
     full_scan_without_index: bool = True,
 ) -> dict[str, Any]:
     planner = s2and_rust.RawBlockQueryCandidatePlanner(
@@ -335,7 +334,6 @@ def _raw_candidate_plan_arrow(
         orcid_enabled=orcid_enabled,
         num_threads=num_threads,
         max_exemplars=max_exemplars,
-        include_component_members=include_component_members,
         full_scan_without_index=full_scan_without_index,
     )
     plan = planner.plan(list(query_signature_ids))
@@ -429,7 +427,6 @@ def test_raw_arrow_candidate_planner_matches_one_shot_plan(tmp_path: Path) -> No
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        include_component_members=True,
         full_scan_without_index=True,
     )
     planner = s2and_rust.RawBlockQueryCandidatePlanner(
@@ -439,7 +436,6 @@ def test_raw_arrow_candidate_planner_matches_one_shot_plan(tmp_path: Path) -> No
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        include_component_members=True,
         full_scan_without_index=True,
     )
     planned = planner.plan(["q1"])
@@ -471,7 +467,6 @@ def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: 
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        include_component_members=True,
         full_scan_without_index=True,
     )
     planner = s2and_rust.RawBlockQueryCandidatePlanner(
@@ -481,7 +476,6 @@ def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: 
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        include_component_members=True,
         full_scan_without_index=True,
     )
     planned = planner.plan(["q1"])
@@ -499,7 +493,6 @@ def test_raw_arrow_candidate_planner_rejects_multi_query_seed_overlap(tmp_path: 
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        include_component_members=False,
         full_scan_without_index=True,
     )
 
@@ -817,7 +810,6 @@ def test_rust_featurizer_from_arrow_paths_empty_indexed_keep_set_skips_stale_val
         [],
         set(),
         True,
-        False,
         0.0,
         10000.0,
         1,
@@ -951,7 +943,6 @@ def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tm
             ["q1", "s1"],
             set(),
             True,
-            False,
             0.0,
             10000.0,
             1,
@@ -962,7 +953,6 @@ def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tm
         ["q1", "s1", "q1", "s2", "s1"],
         set(),
         True,
-        False,
         0.0,
         10000.0,
         1,
@@ -990,12 +980,44 @@ def test_rust_featurizer_from_arrow_paths_rejects_null_author_position(tmp_path:
             ["q1", "s1"],
             set(),
             True,
-            False,
             0.0,
             10000.0,
             1,
             True,
         )
+
+
+def test_rust_featurizer_from_arrow_paths_reuses_cached_language_without_fasttext(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import s2and.file_cache as file_cache
+
+    paths = _base_arrow_paths(tmp_path)
+    with pa.memory_map(paths["papers"], "r") as source:
+        papers = pa.ipc.open_file(source).read_all()
+    papers = papers.append_column("predicted_language", pa.array(["en", "en", "en"], type=pa.string()))
+    papers = papers.append_column("is_reliable", pa.array([True, True, True], type=pa.bool_()))
+    paths["papers"] = _write_ipc(tmp_path / "papers_with_language.arrow", papers)
+    monkeypatch.delenv("S2AND_SKIP_FASTTEXT", raising=False)
+    monkeypatch.setattr(
+        file_cache,
+        "cached_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("fastText path should not be resolved")),
+    )
+
+    featurizer = s2and_rust.RustFeaturizer.from_arrow_paths(
+        paths,
+        ["q1", "s1"],
+        set(),
+        True,
+        0.0,
+        10000.0,
+        1,
+        True,
+    )
+
+    assert tuple(featurizer.signature_ids()) == ("q1", "s1")
 
 
 def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> None:
@@ -1007,7 +1029,6 @@ def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> 
         ["q1", "s1"],
         set(),
         True,
-        False,
         0.0,
         10000.0,
         1,
@@ -1018,7 +1039,6 @@ def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> 
         ["q1", "s1"],
         set(),
         True,
-        False,
         0.0,
         10000.0,
         1,
@@ -1040,7 +1060,6 @@ def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> 
             ["q1", "s1"],
             set(),
             True,
-            False,
             0.0,
             10000.0,
             1,
@@ -1846,7 +1865,6 @@ def test_rust_featurizer_from_arrow_paths_applies_cluster_seed_disallows(tmp_pat
         list(signature_order.signature_ids),
         set(),
         True,
-        False,
         0.0,
         10000.0,
         1,
@@ -1872,7 +1890,6 @@ def test_rust_featurizer_missing_name_counts_presence_is_consistent(
         signature_ids,
         set(),
         True,
-        False,
         0.0,
         10000.0,
         1,
@@ -1888,7 +1905,6 @@ def test_rust_featurizer_missing_name_counts_presence_is_consistent(
         signature_ids,
         set(),
         True,
-        False,
         0.0,
         10000.0,
         1,
@@ -1938,7 +1954,6 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
         signature_ids,
         set(),
         True,
-        False,
         0.0,
         10000.0,
         1,
@@ -1949,7 +1964,6 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
         signature_ids,
         set(),
         True,
-        False,
         0.0,
         10000.0,
         1,
@@ -1970,7 +1984,6 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
             signature_ids,
             set(),
             True,
-            False,
             0.0,
             10000.0,
             1,
@@ -1985,7 +1998,6 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
             signature_ids,
             set(),
             True,
-            False,
             0.0,
             10000.0,
             1,
@@ -2007,7 +2019,6 @@ def test_rust_featurizer_rejects_unsorted_name_counts_index(
             ["q1", "s1", "s2"],
             set(),
             True,
-            False,
             0.0,
             10000.0,
             1,
@@ -2029,105 +2040,6 @@ def test_rust_featurizer_rejects_out_of_bounds_name_counts_index_record(
             ["q1", "s1", "s2"],
             set(),
             True,
-            False,
-            0.0,
-            10000.0,
-            1,
-            True,
-        )
-
-
-def test_rust_featurizer_from_arrow_paths_uses_arrow_name_pairs(tmp_path: Path) -> None:
-    signatures = pa.table(
-        {
-            "signature_id": pa.array(["q1", "s1"], type=pa.string()),
-            "paper_id": pa.array(["p_q", "p1"], type=pa.string()),
-            "author_first": pa.array(["Qi-Xin", "Qadir"], type=pa.string()),
-            "author_middle": pa.array(["", ""], type=pa.string()),
-            "author_last": pa.array(["Ou Yang", "Ou Yang"], type=pa.string()),
-            "author_suffix": pa.array([None, None], type=pa.string()),
-            "author_affiliations": pa.array([[], []], type=pa.list_(pa.string())),
-            "author_orcid": pa.array([None, None], type=pa.string()),
-            "author_position": pa.array([0, 0], type=pa.int64()),
-        }
-    )
-    papers = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1"], type=pa.string()),
-            "title": pa.array(["", ""], type=pa.string()),
-            "venue": pa.array(["", ""], type=pa.string()),
-            "journal_name": pa.array(["", ""], type=pa.string()),
-            "year": pa.array([2020, 2020], type=pa.int64()),
-        }
-    )
-    paper_authors = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p1"], type=pa.string()),
-            "position": pa.array([0, 0], type=pa.int64()),
-            "author_name": pa.array(["Qi-Xin Ou Yang", "Qadir Ou Yang"], type=pa.string()),
-        }
-    )
-    paths = {
-        "signatures": _write_ipc(tmp_path / "signatures.arrow", signatures),
-        "papers": _write_ipc(tmp_path / "papers.arrow", papers),
-        "paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors),
-        "name_pairs": _write_ipc(
-            tmp_path / "name_pairs.arrow",
-            pa.table(
-                {
-                    "name_1": pa.array(["qi xin"], type=pa.string()),
-                    "name_2": pa.array(["qadir"], type=pa.string()),
-                }
-            ),
-        ),
-    }
-
-    from_pairs_arrow = s2and_rust.RustFeaturizer.from_arrow_paths(
-        paths,
-        ["q1", "s1"],
-        None,
-        True,
-        False,
-        0.0,
-        10000.0,
-        1,
-        True,
-    )
-    from_python_set = s2and_rust.RustFeaturizer.from_arrow_paths(
-        {key: value for key, value in paths.items() if key != "name_pairs"},
-        ["q1", "s1"],
-        {("qi xin", "qadir")},
-        True,
-        False,
-        0.0,
-        10000.0,
-        1,
-        True,
-    )
-
-    assert from_pairs_arrow.get_constraint("q1", "s1") == from_python_set.get_constraint("q1", "s1")
-    assert from_pairs_arrow.get_constraint("q1", "s1") is None
-
-
-def test_rust_featurizer_from_arrow_paths_rejects_integer_name_pairs(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    paths["name_pairs"] = _write_ipc(
-        tmp_path / "name_pairs.arrow",
-        pa.table(
-            {
-                "name_1": pa.array([1], type=pa.int64()),
-                "name_2": pa.array(["alice"], type=pa.string()),
-            }
-        ),
-    )
-
-    with pytest.raises(TypeError, match="name_pairs.name_1 must be a string column"):
-        s2and_rust.RustFeaturizer.from_arrow_paths(
-            paths,
-            ["q1", "s1"],
-            None,
-            True,
-            False,
             0.0,
             10000.0,
             1,

@@ -17,26 +17,8 @@ def test_python_backend_always_returns_python_only_policy():
             backend="python",
             mode=mode,
             preprocess=True,
-            use_rust=False,
         )
         assert policy == PYTHON_ONLY_POLICY
-
-
-@pytest.mark.parametrize(
-    ("backend", "use_rust"),
-    [
-        ("python", True),
-        ("rust", False),
-    ],
-)
-def test_backend_use_rust_mismatch_raises(backend: str, use_rust: bool):
-    with pytest.raises(ValueError, match="Inconsistent backend/use_rust configuration"):
-        build_rust_lifecycle_policy(
-            backend=backend,  # type: ignore[arg-type]
-            mode="train",
-            preprocess=True,
-            use_rust=use_rust,
-        )
 
 
 def test_rust_inference_does_not_skip_python_paper_preprocess():
@@ -44,9 +26,7 @@ def test_rust_inference_does_not_skip_python_paper_preprocess():
         backend="rust",
         mode="inference",
         preprocess=True,
-        use_rust=True,
     )
-    assert policy.rust_build_path == "from_dataset"
     assert policy.skip_python_paper_preprocess is False
 
 
@@ -69,7 +49,6 @@ def test_rust_training_from_dataset_skip_preprocess_semantics(
         mode="train",
         preprocess=True,
         compute_reference_features=compute_reference_features,
-        use_rust=True,
         from_dataset_paper_preprocess_available=from_dataset_paper_preprocess_available,
     )
     assert policy.mode == expected_mode
@@ -84,7 +63,6 @@ def test_defer_signature_ngrams_requires_preprocess_and_rust(preprocess: bool, u
         backend=backend,
         mode="train",
         preprocess=preprocess,
-        use_rust=use_rust,
     )
     assert policy.defer_signature_ngrams_to_rust is (preprocess and use_rust)
 
@@ -100,7 +78,6 @@ def test_defer_signature_fields_requires_rust_and_non_inference(
         backend=backend,
         mode=mode,
         preprocess=True,
-        use_rust=use_rust,
     )
     expected = bool(mode == "train" and use_rust)
     assert policy.defer_signature_fields_to_rust is expected

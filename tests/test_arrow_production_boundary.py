@@ -25,10 +25,6 @@ class ArrowOnlyRustFeaturizer:
     def from_dataset(cls, *_args: Any, **_kwargs: Any) -> ArrowOnlyRustFeaturizer:
         raise AssertionError("production Arrow build must not call RustFeaturizer.from_dataset")
 
-    @classmethod
-    def from_json_paths(cls, *_args: Any, **_kwargs: Any) -> ArrowOnlyRustFeaturizer:
-        raise AssertionError("production Arrow build must not call RustFeaturizer.from_json_paths")
-
     def signature_ids(self) -> list[str]:
         return []
 
@@ -79,7 +75,6 @@ def test_arrow_production_builder_calls_only_arrow_constructor(tmp_path: Path) -
         signature_ids=[1, "2"],
         name_tuples={("ada", "a")},
         preprocess=False,
-        compute_reference_features=False,
         cluster_seed_require_value=7.0,
         cluster_seed_disallow_value=9.0,
         num_threads=1,
@@ -94,11 +89,9 @@ def test_arrow_production_builder_calls_only_arrow_constructor(tmp_path: Path) -
         ["1", "2"],
         {("ada", "a")},
         False,
-        False,
         7.0,
         9.0,
         1,
-        False,
     )
 
 

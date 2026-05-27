@@ -1991,8 +1991,6 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
             orcid_enabled=resolved_orcid_enabled,
             num_threads=n_jobs_resolved,
             max_exemplars=int(max_exemplars),
-            include_component_members=True,
-            full_scan_without_index=False,
         )
         raw_candidate_plan_mapping = raw_planner.plan(list(query_signature_id_strings))
         if not isinstance(raw_candidate_plan_mapping, MutableMapping):
@@ -2015,10 +2013,58 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
         raw_candidate_plan_mapping = source_plan
         raw_arrow_retrieval_seconds = 0.0
 
-    raw_plan_bundle = RawArrowPlanBundle.from_mapping(raw_candidate_plan_mapping)
+    return predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+        clusterer,
+        artifact,
+        arrow_paths=arrow_path_payload,
+        query_signature_ids=query_signature_id_strings,
+        raw_candidate_plan=raw_candidate_plan_mapping,
+        rust_featurizer=rust_featurizer,
+        allow_featurizer_build=not provided_raw_candidate_plan,
+        raw_arrow_retrieval_seconds=raw_arrow_retrieval_seconds,
+        partial_supervision=partial_supervision,
+        runtime_context=resolved_runtime_context,
+        n_jobs=n_jobs_resolved,
+        total_ram_bytes=total_ram_bytes,
+        top_k=top_k_resolved,
+        load_name_counts=load_name_counts,
+        name_tuples=name_tuples,
+        partial_supervision_seed_signature_to_component=partial_supervision_seed_signature_to_component,
+    )
+
+
+def predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+    clusterer: Any,
+    artifact: IncrementalLinkingArtifact,
+    *,
+    arrow_paths: Mapping[str, Any],
+    query_signature_ids: Sequence[Any],
+    raw_candidate_plan: Mapping[str, Any] | RawArrowPlanBundle,
+    rust_featurizer: Any | None,
+    allow_featurizer_build: bool = False,
+    raw_arrow_retrieval_seconds: float = 0.0,
+    partial_supervision: Mapping[tuple[Any, Any], int | float] | None = None,
+    runtime_context: Any | None = None,
+    n_jobs: int | None = None,
+    total_ram_bytes: int | None = None,
+    top_k: int | None = None,
+    load_name_counts: bool | None | dict[str, Any] = None,
+    name_tuples: set[tuple[str, str]] | str | None = "filtered",
+    partial_supervision_seed_signature_to_component: Mapping[str, Any] | None = None,
+) -> LinkOrAbstainProductionResult:
+    """Score a preplanned raw Arrow candidate plan without `ANDData`."""
+
+    resolved_runtime_context = runtime_context or build_runtime_context("incremental_link_or_abstain_raw_arrow")
+    n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
+    top_k_resolved = int(artifact.metadata.retrieval_top_k if top_k is None else top_k)
+    arrow_path_payload = normalize_arrow_paths(arrow_paths)
+    require_arrow_name_counts_index_for_clusterer(clusterer, arrow_path_payload, context="raw Arrow scoring")
+    query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
+    source_plan = raw_candidate_plan.plan if isinstance(raw_candidate_plan, RawArrowPlanBundle) else raw_candidate_plan
+    raw_plan_bundle = RawArrowPlanBundle.from_mapping(source_plan)
     _validate_raw_plan_query_signature_ids(raw_plan_bundle.plan, query_signature_id_strings)
     _raw_plan_query_views(raw_plan_bundle.plan, len(query_signature_id_strings))
-    if provided_raw_candidate_plan and rust_featurizer is None:
+    if rust_featurizer is None and not allow_featurizer_build:
         raise ValueError(
             "raw Arrow scoring with a provided raw_candidate_plan requires rust_featurizer; "
             "use the planner path or pass the featurizer built for the same candidate plan to avoid "
@@ -2038,7 +2084,6 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
             name_tuples=name_tuples,
             load_name_counts=resolved_load_name_counts,
             preprocess=True,
-            compute_reference_features=False,
             num_threads=n_jobs_resolved,
         )
         raw_arrow_featurizer_reused = 0

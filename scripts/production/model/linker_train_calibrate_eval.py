@@ -46,6 +46,7 @@ from s2and import text as s2and_text  # noqa: E402
 from s2and.arrow_inputs import validate_arrow_prediction_artifacts  # noqa: E402
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER  # noqa: E402
 from s2and.data import ANDData  # noqa: E402
+from s2and.incremental_linking.array_validation import as_uint16_1d  # noqa: E402
 from s2and.incremental_linking.artifact import save_incremental_linking_artifact  # noqa: E402
 from s2and.incremental_linking.contracts import (  # noqa: E402
     INCREMENTAL_LINKING_RUST_CAPABILITIES,
@@ -1228,7 +1229,6 @@ def _build_minimal_raw_dataset_context(
     featurizer = feature_port._get_rust_featurizer(  # noqa: SLF001
         dataset,
         runtime_context=runtime_context,
-        rust_build_path="from_dataset",
     )
     constraint_backend = _build_incremental_constraint_backend(
         dataset,
@@ -2821,13 +2821,19 @@ def _materialize_arrow_rust_dataset_rows(
             "rebuild/install the current s2and-rust extension."
         )
     plan_started = time.perf_counter()
+    retrieval_ranks = as_uint16_1d(
+        "retrieval_rank",
+        pd.to_numeric(dataset_rows["retrieval_rank"], errors="raise").to_numpy(),
+    )
+    if np.any(retrieval_ranks == 0):
+        raise ValueError("retrieval_rank values must be in uint16 range [1, 65535]")
     raw_plan = plan_fn(
         context.arrow_paths,
         dataset_rows["query_signature_id"].astype(str).tolist(),
         dataset_rows["query_view"].astype(str).tolist(),
         dataset_rows["query_group_id"].astype(str).tolist(),
         dataset_rows["candidate_component_key"].astype(str).tolist(),
-        pd.to_numeric(dataset_rows["retrieval_rank"], errors="raise").astype(np.uint16).tolist(),
+        retrieval_ranks.tolist(),
         context.component_members,
         orcid_enabled=False,
         num_threads=max(1, int(n_jobs)),
@@ -2843,7 +2849,6 @@ def _materialize_arrow_rust_dataset_rows(
         name_tuples="filtered",
         load_name_counts=True,
         preprocess=True,
-        compute_reference_features=False,
         num_threads=max(1, int(n_jobs)),
     )
     featurizer_seconds = float(time.perf_counter() - featurizer_started)

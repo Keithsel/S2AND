@@ -23,9 +23,11 @@ from s2and.incremental_linking.feature_block import (
     feature_block_for_signature_order,
     feature_block_signature_order_from_raw_candidate_plan,
     raw_planner_arrow_physical_layout,
+    read_altered_cluster_signatures_arrow,
     read_cluster_seed_disallows_arrow,
     read_cluster_seeds_arrow,
     temporary_arrow_paths_with_cluster_seeds,
+    write_altered_cluster_signatures_arrow,
     write_arrow_batch_lookup_index,
     write_arrow_ipc_table,
     write_feature_block_arrow_tables,
@@ -46,6 +48,7 @@ from s2and.incremental_linking.runtime import (
     LinkOrAbstainCompactResult,
     LinkOrAbstainProductionResult,
     LinkOrAbstainRetrievedCandidatesResult,
+    predict_incremental_link_or_abstain_from_preplanned_raw_arrow,
     predict_incremental_link_or_abstain_from_raw_arrow_paths,
 )
 from s2and.model import Clusterer
@@ -190,9 +193,9 @@ def _raw_plan() -> dict[str, Any]:
         "row_query_first_tokens": np.asarray(["ada", "ada"], dtype=object),
         "row_query_years": np.asarray([1843, 1843], dtype=np.int32),
         "row_query_year_missing": np.asarray([0, 0], dtype=np.uint8),
-        "row_query_has_affiliations": np.asarray([1, 1], dtype=np.float32),
-        "row_query_has_coauthors": np.asarray([1, 1], dtype=np.float32),
-        "row_orcid_match": np.asarray([0, 0], dtype=np.float32),
+        "row_query_has_affiliations": np.asarray([1, 1], dtype=np.uint8),
+        "row_query_has_coauthors": np.asarray([1, 1], dtype=np.uint8),
+        "row_orcid_match": np.asarray([0, 0], dtype=np.uint8),
         "middle_initial_compatibility": np.asarray([1, 0], dtype=np.float32),
         "affiliation_overlap": np.asarray([1, 0], dtype=np.float32),
         "coauthor_overlap": np.asarray([1, 0], dtype=np.float32),
@@ -581,6 +584,24 @@ def test_read_cluster_seed_disallows_arrow_rejects_integer_id_columns(tmp_path: 
 
     with pytest.raises(ValueError, match="signature_id_1 expected string"):
         read_cluster_seed_disallows_arrow(path)
+
+
+def test_altered_cluster_signatures_arrow_round_trips_and_rejects_duplicates(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "altered_cluster_signatures.arrow"
+
+    write_altered_cluster_signatures_arrow(path, ["seed0", "seed2"])
+
+    assert read_altered_cluster_signatures_arrow(path) == ("seed0", "seed2")
+
+    duplicate_path = tmp_path / "duplicate_altered_cluster_signatures.arrow"
+    write_arrow_ipc_table(
+        pa.table({"signature_id": pa.array(["seed0", "seed0"], type=pa.string())}),
+        duplicate_path,
+    )
+
+    with pytest.raises(ValueError, match="duplicate signature_id"):
+        read_altered_cluster_signatures_arrow(duplicate_path)
 
 
 @pytest.mark.parametrize(
@@ -1584,6 +1605,75 @@ def test_raw_arrow_scoring_requires_planner_build_telemetry(monkeypatch: pytest.
             load_name_counts=False,
             name_tuples=set(),
         )
+
+
+def test_preplanned_raw_arrow_scoring_surface_uses_provided_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeFeaturizer:
+        def signature_ids(self) -> list[str]:
+            return ["q", "s1", "s2", "s3", "window-only"]
+
+    def fail_build_rust_featurizer_from_arrow_paths(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("preplanned raw Arrow scoring should reuse the supplied featurizer")
+
+    def fake_from_retrieval(**kwargs: Any) -> LinkOrAbstainProductionResult:
+        retrieval_batch = kwargs["retrieval_batch"]
+        captured["dataset"] = kwargs["dataset"]
+        captured["retrieval_left_indices"] = retrieval_batch.candidate_batch.left_signature_indices.tolist()
+        captured["retrieval_right_indices"] = retrieval_batch.candidate_batch.right_signature_indices.tolist()
+        captured["queries"] = kwargs["queries"]
+        return LinkOrAbstainProductionResult(
+            feature_matrix=LinkerFeatureMatrix(
+                matrix=np.empty((2, 0), dtype=np.float32),
+                feature_columns=(),
+                candidate_batch=retrieval_batch.candidate_batch,
+            ),
+            compact_result=LinkOrAbstainCompactResult(
+                probabilities=np.asarray([0.8, 0.2], dtype=np.float32),
+                decisions=(),
+            ),
+            telemetry={"pairwise_feature_seconds": 0.5, "constraint_api_mode": "rust_index_arrays"},
+            retrieval_batch=retrieval_batch,
+            pairwise_model_result=CandidateBatchPairwiseModelResult(
+                row_signals={},
+                pairwise_stats=cast(Any, None),
+                telemetry={},
+            ),
+            linked_signature_clusters={"q": "c_ada"},
+        )
+
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port.build_rust_featurizer_from_arrow_paths",
+        fail_build_rust_featurizer_from_arrow_paths,
+    )
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime._predict_incremental_link_or_abstain_production_from_retrieval_private",
+        lambda *args, **kwargs: fake_from_retrieval(**kwargs),
+    )
+
+    result = predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+        _raw_test_clusterer(),
+        _raw_test_artifact(),
+        arrow_paths={},
+        query_signature_ids=["q"],
+        raw_candidate_plan=RawArrowPlanBundle.from_mapping(_raw_plan()),
+        rust_featurizer=FakeFeaturizer(),
+        top_k=2,
+        n_jobs=1,
+        load_name_counts=False,
+        name_tuples=set(),
+    )
+
+    assert captured["dataset"] is None
+    assert captured["retrieval_left_indices"] == [0, 0, 0]
+    assert captured["retrieval_right_indices"] == [1, 2, 3]
+    assert captured["queries"][0].query_author == "Ada Lovelace"
+    assert result.linked_signature_clusters == {"q": "c_ada"}
+    assert result.telemetry["raw_arrow_featurizer_reused"] == 1
+    assert result.telemetry["raw_arrow_retrieval_seconds"] == 0.0
 
 
 @pytest.mark.parametrize(

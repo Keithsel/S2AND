@@ -32,8 +32,7 @@ use name_counts::{NameCountsData, RawNameCountIndex, RawNameCountKind, RawNameCo
 use text_compat::{
     compute_block_compat, contains_name_dash, contains_non_ascii_name_dash,
     ensure_unidecode_for_text, first_normalized_token_python_compat,
-    normalize_text_compat_from_map, normalize_text_compat_native,
-    split_first_middle_hyphen_aware_compat,
+    normalize_text_compat_from_map, split_first_middle_hyphen_aware_compat,
 };
 
 fn py_len(s: &str) -> usize {
@@ -214,8 +213,6 @@ struct RustFeaturizer {
     compute_reference_features: bool,
     cluster_seed_require_value: f64,
     cluster_seed_disallow_value: f64,
-    #[serde(skip)]
-    cached_signature_id_order: OnceLock<Vec<String>>,
     #[serde(skip)]
     cluster_seeds_disallow_index: OnceLock<HashMap<String, HashSet<String>>>,
 }
@@ -1410,6 +1407,14 @@ fn resolve_fasttext_model_path(py: Python<'_>) -> PyResult<String> {
 }
 
 fn python_fasttext_loading_enabled(py: Python<'_>) -> bool {
+    if let Ok(value) = std::env::var("S2AND_SKIP_FASTTEXT") {
+        if matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        ) {
+            return false;
+        }
+    }
     py.import("s2and.text")
         .and_then(|text_module| text_module.getattr("fasttext_loading_enabled"))
         .and_then(|enabled_fn| enabled_fn.call0())
@@ -1422,8 +1427,6 @@ struct LanguageDetectorCompat {
 }
 
 struct LanguageDetectionAudit {
-    fasttext_label: String,
-    cld2_label: String,
     predicted_language: String,
     is_reliable: bool,
     is_english: bool,
@@ -1458,8 +1461,6 @@ impl LanguageDetectorCompat {
     fn audit(&self, text: &str) -> PyResult<LanguageDetectionAudit> {
         if text.split_whitespace().count() <= 1 {
             return Ok(LanguageDetectionAudit {
-                fasttext_label: "un_ft".to_string(),
-                cld2_label: "un_2".to_string(),
                 predicted_language: "un".to_string(),
                 is_reliable: false,
                 is_english: false,
@@ -1478,8 +1479,6 @@ impl LanguageDetectorCompat {
         }
         if alpha_count == 0 {
             return Ok(LanguageDetectionAudit {
-                fasttext_label: "un_ft".to_string(),
-                cld2_label: "un_2".to_string(),
                 predicted_language: "un".to_string(),
                 is_reliable: false,
                 is_english: false,
@@ -1531,35 +1530,11 @@ impl LanguageDetectorCompat {
 
         let is_english = predicted_language == "en";
         Ok(LanguageDetectionAudit {
-            fasttext_label: predicted_language_ft,
-            cld2_label: predicted_language_2,
             predicted_language,
             is_reliable,
             is_english,
         })
     }
-}
-
-#[cfg(debug_assertions)]
-#[pyfunction]
-fn _debug_language_detector_audit(
-    py: Python<'_>,
-    texts: Vec<String>,
-) -> PyResult<Vec<(String, String, String, bool)>> {
-    let detector = LanguageDetectorCompat::new(py)?;
-    texts
-        .iter()
-        .map(|text| {
-            detector.audit(text).map(|audit| {
-                (
-                    audit.fasttext_label,
-                    audit.cld2_label,
-                    audit.predicted_language,
-                    audit.is_reliable,
-                )
-            })
-        })
-        .collect()
 }
 
 fn counter_data_from_usize_map(counter_map: HashMap<String, usize>) -> Option<CounterData> {
@@ -1797,21 +1772,6 @@ fn arrow_column_index(batch: &RecordBatch, name: &str, path: &str) -> PyResult<u
 
 fn arrow_optional_column_index(batch: &RecordBatch, name: &str) -> Option<usize> {
     batch.schema().index_of(name).ok()
-}
-
-fn arrow_first_existing_column_index(
-    batch: &RecordBatch,
-    path: &str,
-    names: &[&str],
-) -> PyResult<usize> {
-    for name in names {
-        if let Ok(index) = batch.schema().index_of(name) {
-            return Ok(index);
-        }
-    }
-    Err(pyo3::exceptions::PyKeyError::new_err(format!(
-        "missing Arrow column in '{path}'; expected one of {names:?}"
-    )))
 }
 
 enum ArrowStringColumn<'a> {
@@ -2522,36 +2482,6 @@ fn read_raw_name_counts_index(path: &str) -> PyResult<RawNameCountMaps> {
     Ok(RawNameCountMaps::from_index(RawNameCountIndex::open(path)?))
 }
 
-fn read_raw_arrow_name_tuples(path: &str) -> PyResult<HashMap<String, HashSet<String>>> {
-    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
-    for batch in read_arrow_batches(path)? {
-        let left_col = batch.column(arrow_first_existing_column_index(
-            &batch,
-            path,
-            &["name_1", "left", "name_a", "first_name"],
-        )?);
-        let right_col = batch.column(arrow_first_existing_column_index(
-            &batch,
-            path,
-            &["name_2", "right", "name_b", "second_name"],
-        )?);
-        let left_values =
-            ArrowStringColumn::from_string_array(left_col.as_ref(), "name_pairs.name_1")?;
-        let right_values =
-            ArrowStringColumn::from_string_array(right_col.as_ref(), "name_pairs.name_2")?;
-        for row in 0..batch.num_rows() {
-            let left = left_values
-                .required_value(row, "name_pairs.name_1")?
-                .into_owned();
-            let right = right_values
-                .required_value(row, "name_pairs.name_2")?
-                .into_owned();
-            insert_name_tuple_alias(&mut out, left, right);
-        }
-    }
-    Ok(out)
-}
-
 fn extract_path_mapping_string(
     paths: &Bound<'_, PyAny>,
     key: &str,
@@ -2964,7 +2894,7 @@ fn build_raw_arrow_feature(
         signature
             .orcid
             .as_ref()
-            .and_then(|value| normalize_orcid_str(value).map(|orcid| fnv64(orcid.as_bytes())))
+            .and_then(|value| normalize_orcid_owned(value).map(|orcid| fnv64(orcid.as_bytes())))
     } else {
         None
     };
@@ -3434,9 +3364,7 @@ fn raw_arrow_name_count_rarity_row(
     let mut first_prefix_match = 0.0f64;
     if py_len(&query.first) > 1 && summary.size > 0 {
         for (candidate_first, count) in summary.first_name_counts.iter() {
-            if py_len(candidate_first) > 1
-                && same_prefix_tokens_compat(&query.first, candidate_first)
-            {
+            if py_len(candidate_first) > 1 && same_prefix_tokens(&query.first, candidate_first) {
                 first_prefix_match =
                     first_prefix_match.max((*count as f64) / (summary.size as f64));
             }
@@ -3741,10 +3669,6 @@ fn extract_string_hashes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
     Ok(hashes)
 }
 
-fn normalize_orcid_str(value: &str) -> Option<String> {
-    normalize_orcid_owned(value)
-}
-
 fn extract_orcid_hashes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
     if obj.is_none() {
         return Ok(Vec::new());
@@ -3752,7 +3676,7 @@ fn extract_orcid_hashes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
     let mut hashes = Vec::new();
     for item in PyIterator::from_object(obj)? {
         let value: String = item?.extract()?;
-        if let Some(orcid) = normalize_orcid_str(&value) {
+        if let Some(orcid) = normalize_orcid_owned(&value) {
             hashes.push(fnv64(orcid.as_bytes()));
         }
     }
@@ -3783,18 +3707,7 @@ fn extract_optional_orcid_hash(obj: &Bound<'_, PyAny>) -> PyResult<Option<u64>> 
         return Ok(None);
     }
     let value: String = obj.extract()?;
-    Ok(normalize_orcid_str(&value).map(|orcid| fnv64(orcid.as_bytes())))
-}
-
-fn same_prefix_tokens_compat(a: &str, b: &str) -> bool {
-    let ta: Vec<&str> = a.split_whitespace().collect();
-    let tb: Vec<&str> = b.split_whitespace().collect();
-    for (x, y) in ta.iter().zip(tb.iter()) {
-        if !(x.starts_with(y) || y.starts_with(x)) {
-            return false;
-        }
-    }
-    true
+    Ok(normalize_orcid_owned(&value).map(|orcid| fnv64(orcid.as_bytes())))
 }
 
 fn exact_name_match_compat(a: &str, b: &str) -> bool {
@@ -3938,7 +3851,7 @@ fn first_name_score_mode(
         let share = (*count as f64) / (size as f64);
         let candidate = match mode {
             RetrievalFirstNameMode::Prefix => {
-                if same_prefix_tokens_compat(query_first, first_name) {
+                if same_prefix_tokens(query_first, first_name) {
                     share
                 } else {
                     0.0
@@ -3947,7 +3860,7 @@ fn first_name_score_mode(
             RetrievalFirstNameMode::ExactThenPrefixHalf => {
                 if exact_name_match_compat(query_first, first_name) {
                     share
-                } else if same_prefix_tokens_compat(query_first, first_name) {
+                } else if same_prefix_tokens(query_first, first_name) {
                     share * 0.5
                 } else {
                     0.0
@@ -7194,15 +7107,6 @@ fn make_subblocks_with_telemetry_from_rows_native_graph(
 }
 
 #[pyfunction]
-#[pyo3(signature = (text, special_case_apostrophes = false))]
-fn normalize_text_compat(text: Option<String>, special_case_apostrophes: bool) -> String {
-    match text {
-        Some(value) => normalize_text_compat_native(&value, special_case_apostrophes),
-        None => String::new(),
-    }
-}
-
-#[pyfunction]
 #[pyo3(signature = (
     paths,
     signature_ids,
@@ -7469,50 +7373,6 @@ fn word_ngrams_counter(text: &str) -> HashMap<String, usize> {
         }
     }
     out
-}
-
-#[pyfunction]
-#[pyo3(signature = (coauthor_texts, affiliation_texts, num_threads = None))]
-fn signature_ngrams_batch(
-    py: Python<'_>,
-    coauthor_texts: Vec<String>,
-    affiliation_texts: Vec<String>,
-    num_threads: Option<usize>,
-) -> PyResult<(Vec<HashMap<String, usize>>, Vec<HashMap<String, usize>>)> {
-    if coauthor_texts.len() != affiliation_texts.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "coauthor_texts and affiliation_texts must have equal length",
-        ));
-    }
-    let n = coauthor_texts.len();
-    let text_module = py.import("s2and.text")?;
-    let affiliation_stopwords =
-        extract_required_string_set(&text_module.getattr("AFFILIATIONS_STOP_WORDS")?)?;
-
-    let pairs = py.allow_threads(|| {
-        let compute = || {
-            (0..n)
-                .into_par_iter()
-                .map(|idx| {
-                    let coauthors = char_ngrams_counter(&coauthor_texts[idx]);
-                    let affiliations = word_ngrams_counter_python_compat(
-                        &affiliation_texts[idx],
-                        &affiliation_stopwords,
-                    );
-                    (coauthors, affiliations)
-                })
-                .collect::<Vec<_>>()
-        };
-        install_with_optional_rayon_pool(num_threads, compute)
-    });
-
-    let mut coauthor_out: Vec<HashMap<String, usize>> = Vec::with_capacity(n);
-    let mut affiliation_out: Vec<HashMap<String, usize>> = Vec::with_capacity(n);
-    for (coauthors, affiliations) in pairs {
-        coauthor_out.push(coauthors);
-        affiliation_out.push(affiliations);
-    }
-    Ok((coauthor_out, affiliation_out))
 }
 
 fn counter_jaccard_data(
@@ -7802,8 +7662,7 @@ fn year_diff(year1: Option<i64>, year2: Option<i64>) -> f64 {
 }
 
 fn position_diff(p1: i64, p2: i64) -> f64 {
-    let diff = (p1 - p2).abs() as f64;
-    diff.min(50.0)
+    p1.abs_diff(p2).min(50) as f64
 }
 
 fn cosine_sim_vec_f32(a: &[f32], b: &[f32]) -> f64 {
@@ -8630,16 +8489,8 @@ impl RustFeaturizer {
     }
 
     fn signature_id_order(&self) -> &[String] {
-        if !self.signature_ids.is_empty() {
-            return self.signature_ids.as_slice();
-        }
-        self.cached_signature_id_order
-            .get_or_init(|| {
-                let mut ids: Vec<String> = self.signatures.keys().cloned().collect();
-                ids.sort_unstable();
-                ids
-            })
-            .as_slice()
+        debug_assert_eq!(self.signature_ids.len(), self.signatures.len());
+        self.signature_ids.as_slice()
     }
 
     fn full_feature_count(&self) -> usize {
@@ -9590,7 +9441,6 @@ impl RustFeaturizer {
             compute_reference_features,
             cluster_seed_require_value,
             cluster_seed_disallow_value,
-            cached_signature_id_order: OnceLock::new(),
             cluster_seeds_disallow_index: OnceLock::new(),
         })
     }
@@ -9602,7 +9452,6 @@ impl RustFeaturizer {
             signature_ids = None,
             name_tuples = None,
             preprocess = true,
-            compute_reference_features = false,
             cluster_seed_require_value = 0.0,
             cluster_seed_disallow_value = 10000.0,
             num_threads = None,
@@ -9615,18 +9464,11 @@ impl RustFeaturizer {
         signature_ids: Option<&Bound<'_, PyAny>>,
         name_tuples: Option<&Bound<'_, PyAny>>,
         preprocess: bool,
-        compute_reference_features: bool,
         cluster_seed_require_value: f64,
         cluster_seed_disallow_value: f64,
         num_threads: Option<usize>,
         full_scan_without_index: bool,
     ) -> PyResult<Self> {
-        if compute_reference_features {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "RustFeaturizer.from_arrow_paths does not support reference features",
-            ));
-        }
-
         let signatures_path =
             extract_path_mapping_string(paths, "signatures", true)?.ok_or_else(|| {
                 pyo3::exceptions::PyKeyError::new_err("missing signatures Arrow path")
@@ -9643,11 +9485,6 @@ impl RustFeaturizer {
         let specter_path = extract_path_mapping_string(paths, "specter", false)?;
         let name_counts_arrow_path = extract_path_mapping_string(paths, "name_counts", false)?;
         let name_counts_index_path = extract_name_counts_index_path(paths)?;
-        let name_tuples_arrow_path = match extract_path_mapping_string(paths, "name_pairs", false)?
-        {
-            Some(path) => Some(path),
-            None => extract_path_mapping_string(paths, "name_tuples", false)?,
-        };
         let signatures_batch_index_path =
             extract_path_mapping_string(paths, "signatures_batch_index", false)?;
         let papers_batch_index_path =
@@ -9765,7 +9602,7 @@ impl RustFeaturizer {
                 None => RawNameCountMaps::default(),
             },
         };
-        let language_detector = Some(LanguageDetectorCompat::new(py)?);
+        let mut language_detector: Option<LanguageDetectorCompat> = None;
 
         let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
         ensure_unidecode_for_raw_arrow_inputs(
@@ -9817,9 +9654,12 @@ impl RustFeaturizer {
                     raw_paper.predicted_language.clone(),
                 )
             } else {
-                let detector = language_detector.as_ref().ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err("missing language detector")
-                })?;
+                if language_detector.is_none() {
+                    language_detector = Some(LanguageDetectorCompat::new(py)?);
+                }
+                let detector = language_detector
+                    .as_ref()
+                    .expect("language detector was just initialized");
                 let (reliable, _is_english, language) = detector.detect(&raw_paper.title)?;
                 (reliable, Some(language))
             };
@@ -9908,10 +9748,7 @@ impl RustFeaturizer {
                 },
             );
         }
-        let name_tuples = match name_tuples_arrow_path.as_ref() {
-            Some(path) => read_raw_arrow_name_tuples(path)?,
-            None => extract_name_tuples_argument(py, name_tuples)?,
-        };
+        let name_tuples = extract_name_tuples_argument(py, name_tuples)?;
 
         Ok(RustFeaturizer {
             signatures,
@@ -9920,10 +9757,9 @@ impl RustFeaturizer {
             name_tuples,
             cluster_seeds_disallow,
             cluster_seeds_require,
-            compute_reference_features,
+            compute_reference_features: false,
             cluster_seed_require_value,
             cluster_seed_disallow_value,
-            cached_signature_id_order: OnceLock::new(),
             cluster_seeds_disallow_index: OnceLock::new(),
         })
     }
@@ -11906,7 +11742,6 @@ struct RawBlockQueryCandidatePlanner {
     orcid_enabled: bool,
     num_threads: Option<usize>,
     max_exemplars: usize,
-    include_component_members: bool,
     full_scan_without_index: bool,
 }
 
@@ -11921,7 +11756,6 @@ impl RawBlockQueryCandidatePlanner {
         orcid_enabled = true,
         num_threads = None,
         max_exemplars = 4,
-        include_component_members = false,
         full_scan_without_index = false
     ))]
     fn new(
@@ -11933,7 +11767,6 @@ impl RawBlockQueryCandidatePlanner {
         orcid_enabled: bool,
         num_threads: Option<usize>,
         max_exemplars: usize,
-        include_component_members: bool,
         full_scan_without_index: bool,
     ) -> PyResult<Self> {
         validate_retrieval_rank_top_k(top_k)?;
@@ -12237,7 +12070,6 @@ impl RawBlockQueryCandidatePlanner {
             orcid_enabled,
             num_threads,
             max_exemplars,
-            include_component_members,
             full_scan_without_index,
         })
     }
@@ -12775,21 +12607,16 @@ impl RawBlockQueryCandidatePlanner {
         let pair_signature_ids_secs = pair_signature_ids_start.elapsed().as_secs_f64();
 
         let component_members_payload_start = Instant::now();
-        let component_members = if self.include_component_members {
-            let component_members = PyDict::new(py);
-            for component_key in component_order.iter() {
-                component_members.set_item(
-                    component_key,
-                    members_by_component
-                        .get(component_key)
-                        .cloned()
-                        .unwrap_or_default(),
-                )?;
-            }
-            Some(component_members)
-        } else {
-            None
-        };
+        let component_members = PyDict::new(py);
+        for component_key in component_order.iter() {
+            component_members.set_item(
+                component_key,
+                members_by_component
+                    .get(component_key)
+                    .cloned()
+                    .unwrap_or_default(),
+            )?;
+        }
         let component_members_payload_secs =
             component_members_payload_start.elapsed().as_secs_f64();
 
@@ -12929,9 +12756,7 @@ impl RawBlockQueryCandidatePlanner {
         payload.set_item("query_views", query_views)?;
         payload.set_item("query_authors", query_authors)?;
         payload.set_item("seed_signature_ids", Vec::<String>::new())?;
-        if let Some(component_members) = component_members {
-            payload.set_item("component_members", component_members)?;
-        }
+        payload.set_item("component_members", component_members)?;
         payload.set_item("left_signature_ids", left_signature_ids)?;
         payload.set_item("right_signature_ids", right_signature_ids)?;
         payload.set_item("pair_row_indices", pair_row_indices.to_pyarray(py))?;
@@ -14425,6 +14250,8 @@ mod tests {
     fn i64_author_position_distance_handles_extreme_values() {
         assert!(i64::MIN.abs_diff(0) > 10);
         assert_eq!(10_i64.abs_diff(0), 10);
+        assert_eq!(position_diff(i64::MIN, 0), 50.0);
+        assert_eq!(position_diff(i64::MIN, i64::MAX), 50.0);
     }
 
     #[test]
@@ -14506,14 +14333,17 @@ mod tests {
     #[test]
     fn normalize_text_compat_uses_native_unidecode() {
         assert_eq!(
-            normalize_text_compat_native("te'\u{6F22}\u{5B57}xt", false),
+            text_compat::normalize_text_compat_native("te'\u{6F22}\u{5B57}xt", false),
             "te han zi xt",
         );
         assert_eq!(
-            normalize_text_compat_native("O\u{2019}Neil", false),
+            text_compat::normalize_text_compat_native("O\u{2019}Neil", false),
             "o neil",
         );
-        assert_eq!(normalize_text_compat_native("O\u{2019}Neil", true), "oneil",);
+        assert_eq!(
+            text_compat::normalize_text_compat_native("O\u{2019}Neil", true),
+            "oneil",
+        );
     }
 
     #[test]
@@ -14631,12 +14461,8 @@ fn _s2and_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS.to_vec(),
     )?;
     m.add_function(wrap_pyfunction!(get_build_info, m)?)?;
-    m.add_function(wrap_pyfunction!(normalize_text_compat, m)?)?;
-    #[cfg(debug_assertions)]
-    m.add_function(wrap_pyfunction!(_debug_language_detector_audit, m)?)?;
     m.add_function(wrap_pyfunction!(raw_arrow_labeled_candidate_plan, m)?)?;
     promoted_linker::add_to_module(m)?;
-    m.add_function(wrap_pyfunction!(signature_ngrams_batch, m)?)?;
     m.add_function(wrap_pyfunction!(
         make_subblocks_with_telemetry_arrow_native_graph,
         m

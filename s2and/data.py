@@ -253,7 +253,7 @@ def _ordered_coauthors_for_signature(signature: "Signature", papers: dict[str, "
             signature.paper_id,
         )
         return []
-    # Rust JSON ingest can skip Python paper preprocessing, so `paper.authors` may still hold raw names here.
+    # Rust deferred paper preprocessing can leave `paper.authors` as raw names here.
     return [
         normalize_text(author.author_name)
         for author in paper.authors
@@ -497,7 +497,6 @@ class ANDData:
             mode=mode,
             preprocess=preprocess,
             compute_reference_features=compute_reference_features,
-            use_rust=self.runtime_context.use_rust,
             from_dataset_paper_preprocess_available=rust_capabilities.from_dataset_paper_preprocess_available,
         )
         pair_sampling_mode = _resolve_pair_sampling_mode(

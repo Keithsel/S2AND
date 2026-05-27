@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 import s2and.incremental_linking.production as production_module
+from s2and.incremental_linking.feature_block import feature_block_signature_order_from_raw_candidate_plan
+
+
+def test_promoted_incremental_window_signature_order_uses_feature_block_contract() -> None:
+    assert (
+        production_module.feature_block_signature_order_from_raw_candidate_plan
+        is feature_block_signature_order_from_raw_candidate_plan
+    )
 
 
 def test_raw_arrow_plan_window_enabled_when_query_batch_is_smaller_than_query_count() -> None:

@@ -264,7 +264,6 @@ def _run_dataset(args: argparse.Namespace, dataset_name: str) -> dict[str, Any]:
         name_tuples="filtered",
         load_name_counts=True,
         preprocess=True,
-        compute_reference_features=False,
         num_threads=int(args.n_jobs),
     )
     arrow_featurizer_seconds = time.perf_counter() - started

@@ -708,7 +708,6 @@ def _build_arrow_featurizer(clusterer: Any, arrow_paths: Mapping[str, str], sign
         name_tuples="filtered",
         load_name_counts="name_counts_index" in arrow_paths,
         preprocess=True,
-        compute_reference_features=False,
         num_threads=int(clusterer.n_jobs),
     )
 

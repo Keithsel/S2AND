@@ -51,7 +51,7 @@ Offline evaluation datasets may also include:
 Do not create per-dataset `name_pairs.arrow` files for production datasets.
 Name aliases are a shared runtime resource.
 Do not include `name_pairs` or `name_tuples` path keys in production manifests
-or runtime path bundles unless an alias override is intentional.
+or runtime path bundles.
 
 ---
 
@@ -243,7 +243,6 @@ the same feature view that S2AND would expose after normal preprocessing:
 - `use_orcid_id=True`
 - `block_type="s2"`
 - `name_tuples="filtered"`
-- `compute_reference_features=False`
 - `name_counts_last_first_initial_semantics="initial_char"`
 - `name_counts_index/` available when the selected model uses name-count features
 
@@ -462,10 +461,8 @@ s2and_name_tuples_filtered.txt
 ```
 
 If a non-default alias set is ever needed, make it an explicit shared/global
-runtime artifact, not something duplicated into every dataset directory. Runtime
-path bundles that include `name_pairs` or `name_tuples` override the packaged
-filtered aliases, so production callers should pass those keys only when the
-override is intentional.
+runtime artifact passed through the Python `name_tuples` argument, not something
+duplicated into every dataset directory or hidden in path bundles.
 
 ---
 
@@ -514,9 +511,9 @@ Conditional `paths` entries:
 - `clusters` is eval-only ground truth.
 - `name_counts_index` is required when the selected model uses name-count
   features.
-- `paths.name_pairs` or `paths.name_tuples` must not be present in production
-  manifests unless the alias override is intentional. Top-level `name_tuples`
-  metadata is allowed to describe how the artifact was produced.
+- `paths.name_pairs` or `paths.name_tuples` must not be present in manifests.
+  Top-level `name_tuples` metadata is allowed to describe how the artifact was
+  produced.
 
 Large-block optimized artifacts should also include:
 

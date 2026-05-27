@@ -5,7 +5,6 @@ from typing import Literal
 
 from s2and.runtime import Backend
 
-RustBuildPath = Literal["from_dataset"]
 RustLifecycleMode = Literal[
     "python_only",
     "rust_from_dataset_no_preprocess",
@@ -41,12 +40,6 @@ class RustLifecyclePolicy:
     mode: RustLifecycleMode
 
     @property
-    def rust_build_path(self) -> RustBuildPath:
-        """Return the Rust featurizer build path implied by this mode."""
-
-        return "from_dataset"
-
-    @property
     def skip_python_paper_preprocess(self) -> bool:
         """Return whether Python paper preprocessing is deferred to Rust."""
 
@@ -78,16 +71,8 @@ def build_rust_lifecycle_policy(
     mode: str,
     preprocess: bool,
     compute_reference_features: bool = False,
-    use_rust: bool,
     from_dataset_paper_preprocess_available: bool = False,
 ) -> RustLifecyclePolicy:
-    expected_use_rust = backend == "rust"
-    if use_rust is not expected_use_rust:
-        raise ValueError(
-            "Inconsistent backend/use_rust configuration: "
-            f"backend={backend!r} implies use_rust={expected_use_rust}, got use_rust={use_rust}."
-        )
-
     if backend == "python":
         return PYTHON_ONLY_POLICY
 

@@ -19,6 +19,7 @@ from s2and.arrow_inputs import validate_arrow_prediction_artifacts
 from s2and.data import ANDData
 from s2and.incremental_linking.feature_block import (
     cluster_seed_disallows_from_arrow_paths,
+    feature_block_signature_order_from_raw_candidate_plan,
     read_cluster_seeds_arrow,
     temporary_arrow_paths_with_cluster_seeds,
 )
@@ -675,7 +676,6 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                 orcid_enabled=bool(orcid_enabled),
                 num_threads=clusterer.n_jobs,
                 max_exemplars=4,
-                include_component_members=True,
             )
             raw_window_plan_seconds += time.perf_counter() - raw_window_start
             raw_window_plan_count += 1
@@ -706,7 +706,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             raw_window_planner_plan_call_count += 1
             raw_window_planner_plan_seconds += time.perf_counter() - raw_window_planner_plan_start
             raw_window_featurizer_start = time.perf_counter()
-            signature_order = runtime_module.feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
+            signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
             signature_ids = signature_order.signature_ids
             raw_window_featurizer = feature_port.build_rust_featurizer_from_arrow_paths(
                 arrow_path_payload,
@@ -714,7 +714,6 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                 name_tuples=name_tuples,
                 load_name_counts=clusterer_uses_name_count_features(clusterer),
                 preprocess=True,
-                compute_reference_features=False,
                 num_threads=clusterer.n_jobs,
             )
             raw_window_featurizer_seconds += time.perf_counter() - raw_window_featurizer_start

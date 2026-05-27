@@ -945,13 +945,17 @@ def cleanup_stale_name_counts_generations(index_dir: str | Path) -> dict[str, in
     generations_dir = index_path / "generations"
     if not generations_dir.exists():
         return {"removed_generation_count": 0}
+    current_generation_name = _current_name_counts_generation_name(index_path)
+    if current_generation_name is None:
+        raise ValueError(
+            f"refusing to clean name-count generations without a resolvable current manifest: {index_path}"
+        )
     removed = 0
     for child in generations_dir.iterdir():
         if child.name.startswith(".") or not child.is_dir():
             continue
         if not (child / ".published").exists():
             continue
-        current_generation_name = _current_name_counts_generation_name(index_path)
         if child.name == current_generation_name:
             continue
         shutil.rmtree(child)
@@ -1028,8 +1032,8 @@ def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) 
             path = index_dir / str(entry["path"])
             if not path.exists():
                 raise FileNotFoundError(f"name-count index generation is incomplete: {path}")
-        tmp_manifest_path.replace(manifest_path)
         (generation_dir / ".published").write_text("", encoding="utf-8")
+        tmp_manifest_path.replace(manifest_path)
         manifest_published = True
     finally:
         if tmp_manifest_path.exists():
@@ -1155,8 +1159,6 @@ def _require_arrow_string_list_columns(table: Any, table_name: str, required_col
             value_type is not None and (pa.types.is_string(value_type) or pa.types.is_large_string(value_type))
         ):
             raise ValueError(f"{table_name} Arrow column {column_name} expected list<string>, got {column_type}")
-        if int(table[column_name].null_count) > 0:
-            raise ValueError(f"{table_name} Arrow column {column_name} cannot contain null list values")
 
 
 def feature_block_from_arrow_paths(

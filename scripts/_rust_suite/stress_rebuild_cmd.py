@@ -73,7 +73,7 @@ def _dataset_paths(dataset_name: str) -> dict[str, str | None]:
             "specter": None,
         }
 
-    dataset_root = project_root / "data" / dataset
+    dataset_root = project_root / "s2and" / "data" / dataset
     signatures = dataset_root / f"{dataset}_signatures.json"
     papers = dataset_root / f"{dataset}_papers.json"
     clusters = dataset_root / f"{dataset}_clusters.json"

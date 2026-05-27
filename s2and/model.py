@@ -854,11 +854,11 @@ def _cluster_seed_maps_match(left: Mapping[Any, Any], right: Mapping[Any, Any]) 
 
 def _arrow_paths_need_current_cluster_seeds(dataset: Any, arrow_paths: Mapping[str, Any]) -> bool:
     current_cluster_seeds = getattr(dataset, "cluster_seeds_require", {}) or {}
-    if not current_cluster_seeds:
-        return False
     cluster_seeds_path = arrow_paths.get("cluster_seeds")
-    if cluster_seeds_path is None or not Path(str(cluster_seeds_path)).exists():
-        return True
+    if cluster_seeds_path is None:
+        return bool(current_cluster_seeds)
+    if not Path(str(cluster_seeds_path)).exists():
+        return bool(current_cluster_seeds)
     return not _cluster_seed_maps_match(
         _cluster_seeds_require_from_arrow_paths(arrow_paths),
         current_cluster_seeds,
@@ -3372,9 +3372,9 @@ class Clusterer:
                         local_j_array = np.asarray(local_j, dtype=np.intp)
                         upper_triangle_index_seconds += time.perf_counter() - stage_start
                     label_count = int(len(constraint_values))
-                    if uses_fastcluster and label_count != chunk_pair_count:
+                    if label_count != chunk_pair_count:
                         raise RuntimeError(
-                            "Rust constraint row count mismatch for FastCluster vector write: "
+                            "Rust constraint row count mismatch for vector write: "
                             f"block={block_key} start_offset={offset} "
                             f"expected={chunk_pair_count} got={label_count}"
                         )
@@ -3547,8 +3547,9 @@ class Clusterer:
                 "cluster_seeds_require cannot be used with precomputed dists because require pairs "
                 "would not be injected into the distance matrix"
             )
+        effective_cluster_seeds_require = {} if incremental_dont_use_cluster_seeds else resolved_cluster_seeds_require
         proxy_dataset = _RustFeaturizerPredictDataset(
-            cluster_seeds_require=resolved_cluster_seeds_require,
+            cluster_seeds_require=effective_cluster_seeds_require,
             cluster_seeds_disallow=resolved_cluster_seeds_disallow,
             signatures=_signature_rule_metadata_from_rust_featurizer(rust_featurizer),
         )
@@ -3659,7 +3660,6 @@ class Clusterer:
         runtime_context: RuntimeContext | None = None,
         total_ram_bytes: int | None = None,
         load_name_counts: bool | None = None,
-        name_counts_path: str | None = None,
         name_tuples: set[tuple[str, str]] | str | None = "filtered",
         cluster_seeds_disallow: Iterable[tuple[Any, Any]] | None = None,
     ) -> tuple[dict[str, list[str]], dict[str, np.ndarray] | None]:
@@ -3704,24 +3704,18 @@ class Clusterer:
             load_name_counts=bool(
                 clusterer_uses_name_count_features(self) if load_name_counts is None else load_name_counts
             ),
-            name_counts_path=name_counts_path,
             preprocess=True,
             compute_reference_features=False,
             num_threads=self.n_jobs,
         )
         arrow_featurizer_seconds = time.perf_counter() - featurizer_start
-        signature_id_set = set(signature_ids)
-        effective_partial_supervision = dict(partial_supervision or {})
-        for left, right in cluster_seed_disallows:
-            if left in signature_id_set and right in signature_id_set:
-                effective_partial_supervision.setdefault((left, right), LARGE_DISTANCE)
         predict_start = time.perf_counter()
         result = self.predict_from_rust_featurizer(
             block_dict,
             rust_featurizer,
             dists=dists,
             cluster_model_params=cluster_model_params,
-            partial_supervision=effective_partial_supervision,
+            partial_supervision=partial_supervision,
             incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
             runtime_context=runtime_context,
             total_ram_bytes=total_ram_bytes,

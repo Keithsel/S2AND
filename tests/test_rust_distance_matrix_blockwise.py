@@ -977,7 +977,6 @@ def test_predict_from_arrow_paths_merges_explicit_disallows(monkeypatch):
     assert captured["partial_supervision"] == {
         ("0", "1"): 0,
         ("0", "2"): 0,
-        ("1", "2"): LARGE_DISTANCE,
     }
     assert captured["cluster_seeds_disallow"] == {("0", "1"), ("1", "2")}
 

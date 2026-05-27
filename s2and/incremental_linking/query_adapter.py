@@ -215,7 +215,18 @@ def _signature_coauthor_blocks(signature: Any, dataset: ANDData) -> frozenset[st
         paper = dataset.papers.get(str(signature.paper_id))
         if paper is None:
             return EMPTY_STRING_SET
-        coauthors = [author.author_name for author in paper.authors if int(author.position) != author_position]
+        coauthors = []
+        for author in paper.authors:
+            raw_position = author.get("position") if isinstance(author, Mapping) else getattr(author, "position", None)
+            try:
+                position = int(raw_position)
+            except (TypeError, ValueError):
+                position = None
+            if position != author_position:
+                raw_name = (
+                    author.get("author_name") if isinstance(author, Mapping) else getattr(author, "author_name", None)
+                )
+                coauthors.append(raw_name)
     return _nonempty_feature_values([_safe_compute_block(str(author or "")) for author in coauthors])
 
 
@@ -247,12 +258,6 @@ def _signature_query_author(signature: Any) -> str:
         getattr(signature, "author_info_suffix", None),
     ]
     return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
-
-
-def _apply_orcid_feature_policy(features: QueryFeatures, *, orcid_enabled: bool) -> QueryFeatures:
-    if orcid_enabled or features.orcid is None:
-        return features
-    return replace(features, orcid=None)
 
 
 def extract_query_features(
@@ -580,8 +585,6 @@ def raw_paper_evidence_features(query: QueryFeatures, summary: ClusterSummary) -
         strict=True,
     ):
         same_signature = query_signature_id and query_signature_id == str(candidate_signature_id)
-        if same_signature:
-            continue
         intersection = len(query_author_names & candidate_names)
         union = len(query_author_names | candidate_names)
         jaccard = float(intersection / union) if union else 0.0
@@ -591,16 +594,18 @@ def raw_paper_evidence_features(query: QueryFeatures, summary: ClusterSummary) -
         best_author_containment = max(best_author_containment, containment)
         best_author_overlap = max(best_author_overlap, float(intersection))
 
+        count_delta = abs(math.log1p(query_author_count) - math.log1p(int(candidate_count)))
+        best_author_count_log_absdiff = (
+            count_delta if best_author_count_log_absdiff is None else min(best_author_count_log_absdiff, count_delta)
+        )
+
+        if same_signature:
+            continue
         local10_intersection = len(query_local10_names & candidate_local10_names)
         local10_union = len(query_local10_names | candidate_local10_names)
         if local10_union:
             best_local10_jaccard = max(best_local10_jaccard, float(local10_intersection / local10_union))
         best_local10_overlap_count = max(best_local10_overlap_count, float(local10_intersection))
-
-        count_delta = abs(math.log1p(query_author_count) - math.log1p(int(candidate_count)))
-        best_author_count_log_absdiff = (
-            count_delta if best_author_count_log_absdiff is None else min(best_author_count_log_absdiff, count_delta)
-        )
 
     return {
         "paper_author_list_max_jaccard": round(best_author_jaccard, 6),

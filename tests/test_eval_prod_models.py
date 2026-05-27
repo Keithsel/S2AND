@@ -418,11 +418,30 @@ def test_resolve_arrow_dataset_paths_supports_release_parent_layout(
         json.dumps({"paths": {"name_counts_index": "../../name_counts_index"}}),
         encoding="utf-8",
     )
+    (tmp_path / "arrow" / "release_parent" / "manifest.json").write_text(
+        json.dumps({"dataset_manifests": [{"manifest_path": "datasets/dummy/manifest.json"}]}),
+        encoding="utf-8",
+    )
 
     resolved = eval_prod_models.resolve_arrow_dataset_paths(str(tmp_path / "arrow"), "dummy", "_specter2.pkl")
 
     assert resolved["signatures"] == str(dataset_root / "signatures.arrow")
     assert resolved["name_counts_index"] == str(Path(name_counts_index).resolve())
+
+
+def test_resolve_arrow_dataset_root_rejects_ambiguous_release_parent(tmp_path: Path) -> None:
+    for release_name in ("release_20260525", "release_20260526"):
+        release_root = tmp_path / "arrow" / release_name
+        dataset_root = release_root / "datasets" / "dummy"
+        dataset_root.mkdir(parents=True)
+        (release_root / "manifest.json").write_text(
+            json.dumps({"dataset_manifests": [{"manifest_path": "datasets/dummy/manifest.json"}]}),
+            encoding="utf-8",
+        )
+        (dataset_root / "manifest.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Ambiguous Arrow release parent"):
+        eval_prod_models.resolve_arrow_dataset_root(str(tmp_path / "arrow"), "dummy")
 
 
 def test_resolve_arrow_dataset_paths_requires_eval_name_counts_index(tmp_path: Path) -> None:

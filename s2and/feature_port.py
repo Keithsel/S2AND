@@ -60,8 +60,8 @@ class _InFlightFeaturizerBuild:
         self.build_path = build_path
 
 
-_RustFeaturizerCacheKey = tuple[RustBuildPath, bool, int, str | None, str | None]
-_RustFeaturizerBuildCountKey = tuple[RustBuildPath, bool, str | None, str | None]
+_RustFeaturizerCacheKey = tuple[RustBuildPath, int]
+_RustFeaturizerBuildCountKey = tuple[RustBuildPath]
 
 # Single WeakKeyDictionary eliminates desync risk between separate weak dicts.
 _RUST_FEATURIZER_CACHE: "weakref.WeakKeyDictionary[ANDData, dict[_RustFeaturizerCacheKey, _CacheEntry]]" = (
@@ -127,40 +127,9 @@ def _rust_featurizer_empty_wait_backoff_seconds() -> float:
 
 def _rust_featurizer_cache_key(
     requested_build_path: RustBuildPath,
-    allow_normalization_version_mismatch: bool,
     cluster_seeds_version: int = 0,
-    name_counts_path: str | None = None,
-    expected_normalization_version: str | None = None,
 ) -> _RustFeaturizerCacheKey:
-    return (
-        requested_build_path,
-        bool(allow_normalization_version_mismatch),
-        int(cluster_seeds_version),
-        _normalize_name_counts_path(name_counts_path),
-        _normalize_normalization_version(expected_normalization_version),
-    )
-
-
-def _normalize_name_counts_path(name_counts_path: str | None) -> str | None:
-    if name_counts_path is None:
-        return None
-    return str(name_counts_path).strip() or None
-
-
-def _normalize_normalization_version(normalization_version: str | None) -> str | None:
-    if normalization_version is None:
-        return None
-    return str(normalization_version).strip() or None
-
-
-def _effective_name_counts_cache_inputs(
-    dataset: Any,
-    *,
-    requested_build_path: RustBuildPath,
-    name_counts_path: str | None,
-) -> tuple[str | None, str | None]:
-    del dataset, requested_build_path
-    return _normalize_name_counts_path(name_counts_path), None
+    return (requested_build_path, int(cluster_seeds_version))
 
 
 def _cluster_seeds_version_for_cache(dataset: Any) -> int:
@@ -179,7 +148,7 @@ def _prune_stale_cluster_seed_cache_entries_locked(dataset: ANDData, current_see
     entries = _RUST_FEATURIZER_CACHE.get(dataset)
     if not entries:
         return 0
-    stale_keys = [cache_key for cache_key in entries if cache_key[2] != current_seed_version]
+    stale_keys = [cache_key for cache_key in entries if cache_key[1] != current_seed_version]
     for cache_key in stale_keys:
         del entries[cache_key]
     return len(stale_keys)
@@ -199,25 +168,9 @@ def _get_cached_rust_featurizer_for_cluster_seed_update(
         dataset_mode=dataset_mode,
         rust_build_path=None,
     )
-    effective_name_counts_path, effective_normalization_version = _effective_name_counts_cache_inputs(
-        dataset,
-        requested_build_path=requested_build_path,
-        name_counts_path=None,
-    )
-    cache_family = (
-        requested_build_path,
-        False,
-        _normalize_name_counts_path(effective_name_counts_path),
-        _normalize_normalization_version(effective_normalization_version),
-    )
+    cache_family = (requested_build_path,)
     current_seed_version = _cluster_seeds_version_for_cache(dataset)
-    current_cache_key = _rust_featurizer_cache_key(
-        requested_build_path,
-        False,
-        current_seed_version,
-        effective_name_counts_path,
-        effective_normalization_version,
-    )
+    current_cache_key = _rust_featurizer_cache_key(requested_build_path, current_seed_version)
     with _RUST_FEATURIZER_CACHE_LOCK:
         entries = _RUST_FEATURIZER_CACHE.get(dataset)
         if entries:
@@ -225,9 +178,7 @@ def _get_cached_rust_featurizer_for_cluster_seed_update(
             if current_entry is not None:
                 return current_entry.featurizer
             stale_matches = [
-                (cache_key[2], entry)
-                for cache_key, entry in entries.items()
-                if (cache_key[0], cache_key[1], cache_key[3], cache_key[4]) == cache_family
+                (cache_key[1], entry) for cache_key, entry in entries.items() if (cache_key[0],) == cache_family
             ]
             if stale_matches:
                 stale_version, stale_entry = max(stale_matches, key=lambda item: item[0])
@@ -258,24 +209,18 @@ def _promote_cached_rust_featurizer_cluster_seed_version(
         entries = _RUST_FEATURIZER_CACHE.get(dataset)
         if not entries:
             return False
-        promoted_families: set[tuple[str, bool, str | None, str | None]] = set()
+        promoted_families: set[tuple[str]] = set()
         for cache_key, entry in list(entries.items()):
             if entry.featurizer is featurizer:
-                promoted_families.add((cache_key[0], cache_key[1], cache_key[3], cache_key[4]))
-                new_cache_key = (
-                    cache_key[0],
-                    cache_key[1],
-                    int(target_seed_version),
-                    cache_key[3],
-                    cache_key[4],
-                )
+                promoted_families.add((cache_key[0],))
+                new_cache_key = (cache_key[0], int(target_seed_version))
                 entries[new_cache_key] = entry
                 if new_cache_key != cache_key:
                     del entries[cache_key]
                 promoted = True
         for cache_key in list(entries):
-            cache_family = (cache_key[0], cache_key[1], cache_key[3], cache_key[4])
-            if cache_family in promoted_families and cache_key[2] != int(target_seed_version):
+            cache_family = (cache_key[0],)
+            if cache_family in promoted_families and cache_key[1] != int(target_seed_version):
                 del entries[cache_key]
     return promoted
 
@@ -284,9 +229,9 @@ def _rust_featurizer_build_count_key(
     cache_key: _RustFeaturizerCacheKey | None,
 ) -> _RustFeaturizerBuildCountKey:
     if cache_key is None:
-        cache_key = _rust_featurizer_cache_key("from_dataset", False)
-    path, allow, _seed_version, name_counts_path, expected_normalization_version = cache_key
-    return (path, allow, name_counts_path, expected_normalization_version)
+        cache_key = _rust_featurizer_cache_key("from_dataset")
+    path, _seed_version = cache_key
+    return (path,)
 
 
 def _increment_rust_featurizer_build_count(
@@ -336,7 +281,6 @@ def build_rust_featurizer_from_arrow_paths(
     signature_ids: Sequence[Any] | None = None,
     name_tuples: Any = "filtered",
     load_name_counts: bool = False,
-    name_counts_path: str | None = None,
     preprocess: bool = True,
     compute_reference_features: bool = False,
     cluster_seed_require_value: float = 0.0,
@@ -347,12 +291,6 @@ def build_rust_featurizer_from_arrow_paths(
     """Build a Rust featurizer directly from Arrow IPC FeatureBlock paths."""
 
     method = _rust_featurizer_method("from_arrow_paths", "raw Arrow scoring")
-    configured_name_counts_path = _normalize_name_counts_path(name_counts_path)
-    if configured_name_counts_path is not None:
-        raise ValueError(
-            "RustFeaturizer.from_arrow_paths does not accept name_counts_path; "
-            "pass the Arrow name-count index directory in paths['name_counts_index']."
-        )
     path_keys = {str(key) for key in paths}
     normalized_paths = validate_arrow_prediction_artifacts(
         paths,
@@ -382,15 +320,11 @@ def build_rust_featurizer(
     dataset: ANDData,
     *,
     path: RustBuildPath,
-    allow_normalization_version_mismatch: bool = False,
-    name_counts_path: str | None = None,
-    expected_normalization_version: str | None = None,
 ) -> tuple[Any, RustBuildPath, dict[str, float]]:
     """Build a Rust featurizer through the requested ingest path."""
     pre_build_start = time.perf_counter()
     rust_module = _require_rust_runtime()
     num_threads = resolve_n_jobs(getattr(dataset, "n_jobs", 1))
-    del allow_normalization_version_mismatch, name_counts_path, expected_normalization_version
     if path != "from_dataset":
         raise ValueError(f"rust_build_path must be from_dataset; got {path!r}.")
     pre_build_seconds = time.perf_counter() - pre_build_start
@@ -434,27 +368,15 @@ def _build_rust_featurizer_strict(
     dataset: ANDData,
     *,
     requested_build_path: RustBuildPath,
-    allow_normalization_version_mismatch: bool = False,
-    name_counts_path: str | None = None,
-    expected_normalization_version: str | None = None,
 ) -> tuple[Any, RustBuildPath, dict[str, float], int, float]:
     build_start = time.perf_counter()
     featurizer, build_path, build_timings = build_rust_featurizer(
         dataset,
         path=requested_build_path,
-        allow_normalization_version_mismatch=allow_normalization_version_mismatch,
-        name_counts_path=name_counts_path,
-        expected_normalization_version=expected_normalization_version,
     )
     build_count = _increment_rust_featurizer_build_count(
         dataset,
-        _rust_featurizer_cache_key(
-            requested_build_path,
-            allow_normalization_version_mismatch,
-            _cluster_seeds_version_for_cache(dataset),
-            name_counts_path,
-            expected_normalization_version,
-        ),
+        _rust_featurizer_cache_key(requested_build_path, _cluster_seeds_version_for_cache(dataset)),
     )
     return featurizer, build_path, build_timings, build_count, time.perf_counter() - build_start
 
@@ -466,9 +388,6 @@ class _RustFeaturizerBuildContext:
     dataset_mode: str
     dataset_name_for_logs: str
     requested_build_path: RustBuildPath
-    allow_normalization_version_mismatch: bool
-    name_counts_path: str | None
-    expected_normalization_version: str | None
     cluster_seeds_version: int
     cache_key: _RustFeaturizerCacheKey
 
@@ -480,30 +399,16 @@ def _rust_featurizer_build_context(
     dataset_mode: str,
     dataset_name_for_logs: str,
     requested_build_path: RustBuildPath,
-    allow_normalization_version_mismatch: bool,
-    name_counts_path: str | None,
-    expected_normalization_version: str | None,
     cluster_seeds_version: int,
 ) -> _RustFeaturizerBuildContext:
-    normalized_name_counts_path = _normalize_name_counts_path(name_counts_path)
-    normalized_normalization_version = _normalize_normalization_version(expected_normalization_version)
     return _RustFeaturizerBuildContext(
         operation=operation,
         run_id=run_id,
         dataset_mode=dataset_mode,
         dataset_name_for_logs=dataset_name_for_logs,
         requested_build_path=requested_build_path,
-        allow_normalization_version_mismatch=bool(allow_normalization_version_mismatch),
-        name_counts_path=normalized_name_counts_path,
-        expected_normalization_version=normalized_normalization_version,
         cluster_seeds_version=cluster_seeds_version,
-        cache_key=_rust_featurizer_cache_key(
-            requested_build_path,
-            allow_normalization_version_mismatch,
-            cluster_seeds_version,
-            normalized_name_counts_path,
-            normalized_normalization_version,
-        ),
+        cache_key=_rust_featurizer_cache_key(requested_build_path, cluster_seeds_version),
     )
 
 
@@ -555,18 +460,13 @@ def _get_or_wait_for_cached(
         if entries:
             logger.info(
                 "Telemetry: rust_featurizer_cache cache=option_miss dataset=%s mode=%s op=%s run=%s "
-                "requested_path=%s requested_allow_normalization_mismatch=%s cached_options=%s",
+                "requested_path=%s cached_options=%s",
                 build_context.dataset_name_for_logs,
                 build_context.dataset_mode,
                 build_context.operation,
                 build_context.run_id,
                 build_context.requested_build_path,
-                build_context.allow_normalization_version_mismatch,
-                sorted(
-                    f"{path}:{allow}:seeds={seed_version}:name_counts={name_counts_path}:"
-                    f"normalization={expected_normalization_version}"
-                    for path, allow, seed_version, name_counts_path, expected_normalization_version in entries
-                ),
+                sorted(f"{path}:seeds={seed_version}" for path, seed_version in entries),
             )
 
         inflight_entries = _RUST_FEATURIZER_INFLIGHT_BUILDS.get(dataset)
@@ -601,6 +501,19 @@ def _get_or_wait_for_cached(
 
     inflight_build.event.wait()
     with _RUST_FEATURIZER_CACHE_LOCK:
+        current_seed_version = _cluster_seeds_version_for_cache(dataset)
+        if current_seed_version != build_context.cluster_seeds_version:
+            logger.info(
+                "Telemetry: rust_featurizer_cache cache=retry_seed_version_after_wait dataset=%s mode=%s op=%s run=%s "
+                "snapshotted_seed_version=%d current_seed_version=%d",
+                build_context.dataset_name_for_logs,
+                build_context.dataset_mode,
+                build_context.operation,
+                build_context.run_id,
+                build_context.cluster_seeds_version,
+                current_seed_version,
+            )
+            return None, None
         entries = _RUST_FEATURIZER_CACHE.get(dataset)
         entry = None if entries is None else entries.get(cache_key)
         if entry is not None:
@@ -626,9 +539,6 @@ def _build_and_cache_rust_featurizer(
         featurizer, build_path, build_timings, build_count, build_seconds = _build_rust_featurizer_strict(
             dataset,
             requested_build_path=build_context.requested_build_path,
-            allow_normalization_version_mismatch=build_context.allow_normalization_version_mismatch,
-            name_counts_path=build_context.name_counts_path,
-            expected_normalization_version=build_context.expected_normalization_version,
         )
         logger.info(
             "Telemetry: rust_core_build seconds=%.3f dataset=%s path=%s count=%d pre=%.3f ffi=%.3f post=%.3f",
@@ -642,6 +552,27 @@ def _build_and_cache_rust_featurizer(
         )
 
         with _RUST_FEATURIZER_CACHE_LOCK:
+            current_seed_version = _cluster_seeds_version_for_cache(dataset)
+            if current_seed_version != build_context.cluster_seeds_version:
+                logger.info(
+                    "Telemetry: rust_featurizer_cache cache=discard_stale_build dataset=%s mode=%s op=%s run=%s "
+                    "snapshotted_seed_version=%d current_seed_version=%d",
+                    build_context.dataset_name_for_logs,
+                    build_context.dataset_mode,
+                    build_context.operation,
+                    build_context.run_id,
+                    build_context.cluster_seeds_version,
+                    current_seed_version,
+                )
+                _prune_stale_cluster_seed_cache_entries_locked(dataset, current_seed_version)
+                inflight_build.error = None
+                inflight_build.event.set()
+                inflight_entries = _RUST_FEATURIZER_INFLIGHT_BUILDS.get(dataset)
+                if inflight_entries is not None and inflight_entries.get(cache_key) is inflight_build:
+                    del inflight_entries[cache_key]
+                    if not inflight_entries:
+                        del _RUST_FEATURIZER_INFLIGHT_BUILDS[dataset]
+                return None
             _prune_stale_cluster_seed_cache_entries_locked(dataset, build_context.cluster_seeds_version)
             entries = _RUST_FEATURIZER_CACHE.get(dataset)
             if entries is None:
@@ -682,8 +613,6 @@ def _get_rust_featurizer(
     dataset: ANDData,
     runtime_context: Any | None = None,
     rust_build_path: RustBuildPath | None = None,
-    allow_normalization_version_mismatch: bool = False,
-    name_counts_path: str | None = None,
 ) -> Any:
     _require_rust_runtime()
     operation, run_id = _runtime_callsite_for_logs(dataset, runtime_context)
@@ -692,11 +621,6 @@ def _get_rust_featurizer(
         dataset,
         dataset_mode=dataset_mode,
         rust_build_path=rust_build_path,
-    )
-    effective_name_counts_path, effective_normalization_version = _effective_name_counts_cache_inputs(
-        dataset,
-        requested_build_path=requested_build_path,
-        name_counts_path=name_counts_path,
     )
     ds_log = _dataset_name_for_logs(dataset)
     max_empty_wait_retries = _rust_featurizer_empty_wait_max_retries()
@@ -710,9 +634,6 @@ def _get_rust_featurizer(
             dataset_mode=dataset_mode,
             dataset_name_for_logs=ds_log,
             requested_build_path=requested_build_path,
-            allow_normalization_version_mismatch=allow_normalization_version_mismatch,
-            name_counts_path=effective_name_counts_path,
-            expected_normalization_version=effective_normalization_version,
             cluster_seeds_version=_cluster_seeds_version_for_cache(dataset),
         )
         featurizer, inflight_build = _get_or_wait_for_cached(dataset, build_context=build_context)
@@ -741,7 +662,15 @@ def _get_rust_featurizer(
             if backoff_seconds > 0:
                 time.sleep(backoff_seconds)
             continue
-        return _build_and_cache_rust_featurizer(dataset, inflight_build=inflight_build, build_context=build_context)
+        featurizer = _build_and_cache_rust_featurizer(
+            dataset,
+            inflight_build=inflight_build,
+            build_context=build_context,
+        )
+        if featurizer is not None:
+            return featurizer
+        empty_wait_attempt = 0
+        continue
 
 
 def evict_rust_featurizer(dataset: ANDData) -> bool:
@@ -772,16 +701,12 @@ def warm_rust_featurizer(
     dataset: ANDData,
     runtime_context: Any | None = None,
     rust_build_path: RustBuildPath | None = None,
-    allow_normalization_version_mismatch: bool = False,
-    name_counts_path: str | None = None,
 ) -> None:
     """Preload the Rust featurizer into memory for low-latency inference."""
     _get_rust_featurizer(
         dataset,
         runtime_context=runtime_context,
         rust_build_path=rust_build_path,
-        allow_normalization_version_mismatch=allow_normalization_version_mismatch,
-        name_counts_path=name_counts_path,
     )
 
 

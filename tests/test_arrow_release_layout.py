@@ -63,10 +63,38 @@ def _validate_required_release_files(release_root: Path, dataset_name: str) -> N
             assert pa.ipc.open_file(source).read_all().num_rows >= 1
 
 
-def test_docs_work_plan_arrow_release_layout_required_files(tmp_path: Path) -> None:
+def _write_root_manifest(release_root: Path, dataset_name: str, *, replay_bundles: list[dict] | None = None) -> None:
+    dataset_manifest_path = release_root / dataset_name / "manifest.json"
+    dataset_manifest_bytes = dataset_manifest_path.read_bytes()
+    root_manifest = {
+        "schema": "inference_arrow_bundle_v1",
+        "datasets": [dataset_name],
+        "dataset_manifests": [
+            {
+                "dataset": dataset_name,
+                "dataset_dir": dataset_name,
+                "manifest_path": f"{dataset_name}/manifest.json",
+                "manifest_size_bytes": len(dataset_manifest_bytes),
+                "manifest_sha256": hashlib.sha256(dataset_manifest_bytes).hexdigest(),
+                "validation_requirements": {
+                    "require_embeddings": True,
+                    "require_name_counts_index": True,
+                },
+            }
+        ],
+        "audit": {
+            "dataset_count": 1,
+            "total_signature_count": 1,
+        },
+    }
+    if replay_bundles is not None:
+        root_manifest["replay_bundles"] = replay_bundles
+    _touch_json(release_root / "manifest.json", root_manifest)
+
+
+def _build_arrow_release_fixture(tmp_path: Path, dataset_name: str = "s2and_mini") -> tuple[Path, str]:
     pa = pytest.importorskip("pyarrow")
     release_root = tmp_path / "release"
-    dataset_name = "s2and_mini"
 
     _touch_json(release_root / "production_model_v1.21" / "manifest.json")
     name_counts_index = release_root / "name_counts_index"
@@ -149,31 +177,20 @@ def test_docs_work_plan_arrow_release_layout_required_files(tmp_path: Path) -> N
         },
     }
     _touch_json(dataset_root / "manifest.json", dataset_manifest)
-    dataset_manifest_bytes = (dataset_root / "manifest.json").read_bytes()
-    _touch_json(
-        release_root / "manifest.json",
-        {
-            "schema": "inference_arrow_bundle_v1",
-            "datasets": [dataset_name],
-            "dataset_manifests": [
-                {
-                    "dataset": dataset_name,
-                    "dataset_dir": dataset_name,
-                    "manifest_path": f"{dataset_name}/manifest.json",
-                    "manifest_size_bytes": len(dataset_manifest_bytes),
-                    "manifest_sha256": hashlib.sha256(dataset_manifest_bytes).hexdigest(),
-                    "validation_requirements": {
-                        "require_embeddings": True,
-                        "require_name_counts_index": True,
-                    },
-                }
-            ],
-            "audit": {
-                "dataset_count": 1,
-                "total_signature_count": 1,
-            },
-        },
-    )
+    _write_root_manifest(release_root, dataset_name)
+    return release_root, dataset_name
+
+
+def _rewrite_dataset_manifest_paths(release_root: Path, dataset_name: str, paths: dict[str, str]) -> None:
+    dataset_manifest_path = release_root / dataset_name / "manifest.json"
+    dataset_manifest = json.loads(dataset_manifest_path.read_text(encoding="utf-8"))
+    dataset_manifest["paths"] = paths
+    _touch_json(dataset_manifest_path, dataset_manifest)
+    _write_root_manifest(release_root, dataset_name)
+
+
+def test_docs_work_plan_arrow_release_layout_required_files(tmp_path: Path) -> None:
+    release_root, dataset_name = _build_arrow_release_fixture(tmp_path)
 
     _validate_required_release_files(release_root, dataset_name)
     assert validate_release_root(release_root, include_replay_bundles=False) == {
@@ -183,3 +200,48 @@ def test_docs_work_plan_arrow_release_layout_required_files(tmp_path: Path) -> N
         "name_counts_index": str(release_root.resolve() / "name_counts_index"),
         "network_access": False,
     }
+
+
+def test_validate_release_root_reports_dataset_manifest_checksum_mismatch(tmp_path: Path) -> None:
+    release_root, dataset_name = _build_arrow_release_fixture(tmp_path)
+    root_manifest_path = release_root / "manifest.json"
+    root_manifest = json.loads(root_manifest_path.read_text(encoding="utf-8"))
+    root_manifest["dataset_manifests"][0]["manifest_sha256"] = "0" * 64
+    _touch_json(root_manifest_path, root_manifest)
+
+    with pytest.raises(ValueError, match=f"root dataset {dataset_name} manifest_sha256 mismatch"):
+        validate_release_root(release_root, include_replay_bundles=False)
+
+
+def test_validate_release_root_reports_missing_required_dataset_file(tmp_path: Path) -> None:
+    release_root, dataset_name = _build_arrow_release_fixture(tmp_path)
+    (release_root / dataset_name / "signatures.arrow").unlink()
+
+    with pytest.raises(ValueError, match=r"root dataset s2and_mini paths\.signatures is missing"):
+        validate_release_root(release_root, include_replay_bundles=False)
+
+
+def test_validate_release_root_reports_missing_batch_index_path(tmp_path: Path) -> None:
+    release_root, dataset_name = _build_arrow_release_fixture(tmp_path)
+    dataset_manifest = json.loads((release_root / dataset_name / "manifest.json").read_text(encoding="utf-8"))
+    paths = dataset_manifest["paths"]
+    del paths["papers_batch_index"]
+    _rewrite_dataset_manifest_paths(release_root, dataset_name, paths)
+
+    with pytest.raises(
+        ValueError,
+        match="root dataset s2and_mini is missing batch-index path keys: papers_batch_index",
+    ):
+        validate_release_root(release_root, include_replay_bundles=False)
+
+
+def test_validate_release_root_reports_missing_replay_manifest_when_included(tmp_path: Path) -> None:
+    release_root, dataset_name = _build_arrow_release_fixture(tmp_path)
+    _write_root_manifest(
+        release_root,
+        dataset_name,
+        replay_bundles=[{"bundle": "mini-replay", "manifest_path": "replay/manifest.json"}],
+    )
+
+    with pytest.raises(ValueError, match=r"replay bundle 0 manifest is missing: .*replay.*manifest\.json"):
+        validate_release_root(release_root, include_replay_bundles=True)

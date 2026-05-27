@@ -297,7 +297,7 @@ fn linker_derive_group_features(
                     && dominant_first_alpha[*index] == dominant_first_alpha[best_top5],
             );
             same_family_as_heuristic_choice[*index] = linker_round(
-                dominant_first_top1_match[*index] * retrieval_score[*index]
+                dominant_first_top1_match[*index] * linker_clip01(retrieval_score[*index])
                     + same_dominant_first_as_best_top5[*index] * (1.0 - top5_mean_distance[*index]),
                 1_000_000.0,
             );

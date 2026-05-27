@@ -132,8 +132,11 @@ class FeatureBlockPaper:
             raise ValueError("FeatureBlockPaper.paper_id must be non-empty")
         if self.year is not None:
             object.__setattr__(self, "year", int(self.year))
-        if self.is_reliable is not None:
-            object.__setattr__(self, "is_reliable", bool(self.is_reliable))
+        object.__setattr__(
+            self,
+            "is_reliable",
+            _optional_bool(self.is_reliable, field_name="FeatureBlockPaper.is_reliable"),
+        )
 
 
 @dataclass(frozen=True)

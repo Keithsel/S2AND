@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+from scripts.production.model import clean_linker_dataset_bundles as clean_module
 from scripts.production.model.clean_linker_dataset_bundles import _bundle_child_path, migrate_bundle
 
 
@@ -194,3 +196,29 @@ def test_migrate_bundle_drops_singleton_orcid_and_refreshes_split_metadata(tmp_p
     assert refreshed_assignments["split"].value_counts().to_dict() == {"test": 1, "calibration_fit": 1}
     gate_groups = pd.read_csv(bundle_root / "splits" / "classic_gate_internal_eval_base_groups.csv")
     assert gate_groups["base_group_id"].tolist() == ["b_gate_keep"]
+
+
+def test_main_dry_run_does_not_write_report_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report_path = tmp_path / "report.json"
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "clean_linker_dataset_bundles.py",
+            "--dry-run",
+            "--report-path",
+            str(report_path),
+            str(bundle_root),
+        ],
+    )
+    monkeypatch.setattr(
+        clean_module,
+        "migrate_bundle",
+        lambda root, write: {"bundle_root": str(root), "mode": "dry-run" if not write else "write"},
+    )
+
+    clean_module.main()
+
+    assert not report_path.exists()

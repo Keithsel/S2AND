@@ -47,20 +47,26 @@ def _build_anddata(dataset_name: str, data_dir: str, n_jobs: int = 1):
     from s2and.data import ANDData
 
     dataset_root = os.path.join(data_dir, dataset_name)
-    sig_path = None
-    papers_path = None
-    specter_path = None
-    clusters_path = None
-    for f in os.listdir(dataset_root):
-        fl = f.lower()
-        if "signature" in fl and fl.endswith(".json"):
-            sig_path = os.path.join(dataset_root, f)
-        elif "paper" in fl and fl.endswith(".json"):
-            papers_path = os.path.join(dataset_root, f)
-        elif "specter" in fl or "specter2" in fl:
-            specter_path = os.path.join(dataset_root, f)
-        elif "cluster" in fl and fl.endswith(".json"):
-            clusters_path = os.path.join(dataset_root, f)
+    dataset = dataset_name.strip().lower()
+
+    def first_existing(*names: str) -> str | None:
+        for name in names:
+            path = os.path.join(dataset_root, name)
+            if os.path.exists(path):
+                return path
+        return None
+
+    sig_path = first_existing(f"{dataset}_signatures.json", "signatures.json")
+    papers_path = first_existing(f"{dataset}_papers.json", "papers.json")
+    specter_path = first_existing(
+        f"{dataset}_specter2.pkl",
+        f"{dataset}_specter.pkl",
+        f"{dataset}_specter.pickle",
+        "specter2.pkl",
+        "specter.pkl",
+        "specter.pickle",
+    )
+    clusters_path = first_existing(f"{dataset}_clusters.json", "clusters.json")
     if sig_path is None or papers_path is None:
         raise FileNotFoundError(f"Could not find signatures/papers in {dataset_root}: {os.listdir(dataset_root)}")
     anddata = ANDData(

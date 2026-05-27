@@ -38,6 +38,7 @@ from s2and.incremental_linking.feature_block_arrow import feature_block_from_arr
 from s2and.incremental_linking.features import LinkerFeatureMatrix
 from s2and.incremental_linking.retrieval import (
     RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
+    RawArrowPlanBundle,
     build_linker_retrieval_batch_from_raw_candidate_plan,
 )
 from s2and.incremental_linking.runtime import (
@@ -68,6 +69,20 @@ def _raw_test_clusterer(
 
 def _raw_test_artifact(*, retrieval_top_k: int = 25) -> Any:
     return SimpleNamespace(metadata=SimpleNamespace(retrieval_top_k=retrieval_top_k))
+
+
+def test_feature_block_paper_is_reliable_parses_false_string() -> None:
+    paper = FeatureBlockPaper(
+        paper_id="p1",
+        title="",
+        abstract="",
+        venue="",
+        journal_name="",
+        year=None,
+        is_reliable="false",
+    )
+
+    assert paper.is_reliable is False
 
 
 def _signature_payload(
@@ -160,8 +175,6 @@ def _raw_plan() -> dict[str, Any]:
         "query_signature_ids": ["q"],
         "query_views": ["full"],
         "row_query_signature_indices": np.asarray([0, 0], dtype=np.uint32),
-        "left_signature_indices": np.asarray([0, 0, 0], dtype=np.uint32),
-        "right_signature_indices": np.asarray([1, 2, 3], dtype=np.uint32),
         "left_signature_ids": ["q", "q", "q"],
         "right_signature_ids": ["s1", "s2", "s3"],
         "pair_row_indices": np.asarray([0, 1, 1], dtype=np.uint32),
@@ -750,6 +763,22 @@ def test_name_counts_generation_cleanup_skips_unpublished_generation(tmp_path: P
     assert not old_published.exists()
 
 
+def test_feature_block_from_arrow_paths_accepts_null_string_list_values(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    arrow_paths = _write_feature_block_arrow_paths(tmp_path)
+    with pa.memory_map(arrow_paths["signatures"], "r") as source:
+        signatures = pa.ipc.open_file(source).read_all()
+        signature_rows = signatures.to_pylist()
+        signature_schema = signatures.schema
+    signature_rows[0]["source_author_ids"] = None
+    signatures = pa.Table.from_pylist(signature_rows, schema=signature_schema)
+    write_arrow_ipc_table(signatures, Path(arrow_paths["signatures"]))
+
+    feature_block = feature_block_from_arrow_paths(arrow_paths, raw_candidate_plan=_raw_plan())
+
+    assert feature_block.signatures[0].source_author_ids == ()
+
+
 def test_feature_block_from_arrow_paths_reads_specter_when_requested(tmp_path: Path) -> None:
     feature_block = _feature_block_for_plan(
         specter_paper_ids=("p_q", "p1"),
@@ -1072,6 +1101,43 @@ def test_write_name_counts_index_failed_overwrite_keeps_previous_manifest(
     assert original_first_path.exists()
 
 
+def test_write_name_counts_index_published_marker_failure_keeps_previous_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import s2and.data as data_module
+
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"ada": 3}, {"lovelace": 5}, {"ada lovelace": 2}, {"lovelace a": 7}),
+    )
+    index_path, _metrics = write_name_counts_index(tmp_path)
+    manifest_path = Path(index_path) / "manifest.json"
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+    original_first_path = Path(index_path) / json.loads(original_manifest)["files"]["first"]["path"]
+
+    real_write_text = Path.write_text
+
+    def fail_published_write(path: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if path.name == ".published":
+            raise RuntimeError("simulated published marker failure")
+        return real_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_published_write)
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"alan": 11}, {"turing": 13}, {"alan turing": 17}, {"turing a": 19}),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated published marker failure"):
+        write_name_counts_index(tmp_path, overwrite=True)
+
+    assert manifest_path.read_text(encoding="utf-8") == original_manifest
+    assert original_first_path.exists()
+
+
 def test_feature_block_from_anddata_filters_one_sided_disallow_pair() -> None:
     feature_block = feature_block_from_anddata(
         _tiny_anddata(),
@@ -1249,6 +1315,18 @@ def test_raw_candidate_plan_bridge_accepts_feature_block_signature_order() -> No
     np.testing.assert_allclose(retrieval_batch.row_signals["retrieval_score"], [0.9, 0.2])
 
 
+def test_raw_candidate_plan_bridge_accepts_raw_arrow_plan_bundle() -> None:
+    bundle = RawArrowPlanBundle.from_mapping(_raw_plan())
+
+    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(bundle)
+
+    candidate_batch = retrieval_batch.candidate_batch
+    assert bundle.signature_order.signature_ids == ("q", "s1", "s2", "s3")
+    assert cast(Any, candidate_batch.row_query_signature_indices).tolist() == [0, 0]
+    assert candidate_batch.left_signature_indices.tolist() == [0, 0, 0]
+    assert candidate_batch.right_signature_indices.tolist() == [1, 2, 3]
+
+
 def test_raw_candidate_plan_bridge_reports_missing_signature_id() -> None:
     with pytest.raises(KeyError, match="right_signature_ids contains signature_id not present"):
         build_linker_retrieval_batch_from_raw_candidate_plan(
@@ -1380,7 +1458,7 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     assert captured["retrieval_query_signature_ids"] == ("q",)
     assert captured["retrieval_kwargs"]["top_k"] == 2
     assert captured["retrieval_plan_query_signature_ids"] == ("q",)
-    assert captured["retrieval_plan_kwargs"]["top_k"] == 2
+    assert captured["retrieval_plan_kwargs"] == {}
     assert captured["featurizer_signature_ids"] == ("q", "s1", "s2", "s3")
     assert captured["retrieval_left_indices"] == [0, 0, 0]
     assert captured["retrieval_right_indices"] == [1, 2, 3]
@@ -1580,8 +1658,10 @@ def test_raw_arrow_scoring_resolves_orcid_enabled_from_clusterer(
     assert captured["orcid_enabled"] is expected_orcid_enabled
 
 
+@pytest.mark.parametrize("bundle_raw_plan", (False, True))
 def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
     monkeypatch: pytest.MonkeyPatch,
+    bundle_raw_plan: bool,
 ) -> None:
     captured: dict[str, Any] = {}
 
@@ -1627,12 +1707,15 @@ def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
         lambda *args, **kwargs: fake_from_retrieval(**kwargs),
     )
 
+    raw_plan = _raw_plan()
+    raw_candidate_plan = RawArrowPlanBundle.from_mapping(raw_plan) if bundle_raw_plan else raw_plan
+
     result = predict_incremental_link_or_abstain_from_raw_arrow_paths(
         _raw_test_clusterer(),
         _raw_test_artifact(),
         arrow_paths={},
         query_signature_ids=["q"],
-        raw_candidate_plan=_raw_plan(),
+        raw_candidate_plan=raw_candidate_plan,
         rust_featurizer=fake_featurizer,
         top_k=2,
         n_jobs=1,
@@ -1759,17 +1842,6 @@ def test_raw_candidate_plan_bridge_rejects_missing_schema_version() -> None:
     del raw_plan["schema_version"]
 
     with pytest.raises(KeyError, match="schema_version"):
-        build_linker_retrieval_batch_from_raw_candidate_plan(
-            raw_plan,
-            feature_block_signature_order=feature_block_signature_order_from_raw_candidate_plan(_raw_plan()),
-        )
-
-
-def test_raw_candidate_plan_bridge_rejects_wrapped_signature_indices() -> None:
-    raw_plan = _raw_plan()
-    raw_plan["left_signature_indices"] = [-1, 0, 0]
-
-    with pytest.raises(ValueError, match="uint32 range"):
         build_linker_retrieval_batch_from_raw_candidate_plan(
             raw_plan,
             feature_block_signature_order=feature_block_signature_order_from_raw_candidate_plan(_raw_plan()),

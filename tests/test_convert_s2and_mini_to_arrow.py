@@ -538,6 +538,7 @@ def test_validate_manifest_require_embeddings_reports_missing_specter_rows(tmp_p
             {
                 "paper_id": pa.array(["p1", "p2"], type=pa.string()),
                 "position": pa.array([0, 0], type=pa.int64()),
+                "author_name": pa.array(["Ada Lovelace", "Bob Smith"], type=pa.string()),
             }
         ),
         paper_authors_path,
@@ -574,6 +575,105 @@ def test_validate_manifest_require_embeddings_reports_missing_specter_rows(tmp_p
     assert metrics["missing_specter_paper_examples"] == ["p2"]
 
 
+def test_validate_arrow_dataset_manifest_accepts_specter2_only_manifest(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    signatures_path = tmp_path / "signatures.arrow"
+    papers_path = tmp_path / "papers.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter2_path = tmp_path / "specter2.arrow"
+    write_arrow_ipc_table(
+        pa.table({"signature_id": pa.array(["s1"], type=pa.string()), "paper_id": pa.array(["p1"], type=pa.string())}),
+        signatures_path,
+    )
+    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), papers_path)
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "position": pa.array([0], type=pa.int64()),
+                "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
+            }
+        ),
+        paper_authors_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([0.1, 0.2], type=pa.float32()), 2),
+            }
+        ),
+        specter2_path,
+    )
+
+    metrics = convert_to_arrow.validate_arrow_dataset_manifest(
+        {
+            "paths": {
+                "signatures": str(signatures_path),
+                "papers": str(papers_path),
+                "paper_authors": str(paper_authors_path),
+                "specter2": str(specter2_path),
+            }
+        },
+        require_embeddings=True,
+        require_name_counts_index=False,
+    )
+
+    assert metrics["specter_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("signature_id", "author_name", "message"),
+    [
+        (None, "Ada Lovelace", "signatures.signature_id contains null value"),
+        ("s1", "", "paper_authors.author_name contains empty value"),
+    ],
+)
+def test_validate_arrow_dataset_manifest_rejects_null_or_empty_required_strings(
+    tmp_path: Path,
+    signature_id: str | None,
+    author_name: str,
+    message: str,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    signatures_path = tmp_path / "signatures.arrow"
+    papers_path = tmp_path / "papers.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array([signature_id], type=pa.string()),
+                "paper_id": pa.array(["p1"], type=pa.string()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), papers_path)
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "position": pa.array([0], type=pa.int64()),
+                "author_name": pa.array([author_name], type=pa.string()),
+            }
+        ),
+        paper_authors_path,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        convert_to_arrow.validate_arrow_dataset_manifest(
+            {
+                "paths": {
+                    "signatures": str(signatures_path),
+                    "papers": str(papers_path),
+                    "paper_authors": str(paper_authors_path),
+                }
+            },
+            require_embeddings=False,
+            require_name_counts_index=False,
+        )
+
+
 def test_validate_manifest_can_require_complete_specter_rows(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
 
@@ -596,6 +696,7 @@ def test_validate_manifest_can_require_complete_specter_rows(tmp_path: Path) -> 
             {
                 "paper_id": pa.array(["p1", "p2"], type=pa.string()),
                 "position": pa.array([0, 0], type=pa.int64()),
+                "author_name": pa.array(["Ada Lovelace", "Bob Smith"], type=pa.string()),
             }
         ),
         paper_authors_path,
@@ -726,6 +827,7 @@ def test_validate_arrow_dataset_manifest_rejects_incomplete_name_counts_index(tm
             {
                 "paper_id": pa.array(["p1"], type=pa.string()),
                 "position": pa.array([0], type=pa.int64()),
+                "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
             }
         ),
         paper_authors_path,
@@ -766,6 +868,7 @@ def test_validate_arrow_dataset_manifest_rejects_integer_id_columns(tmp_path: Pa
             {
                 "paper_id": pa.array(["p1"], type=pa.string()),
                 "position": pa.array([0], type=pa.int64()),
+                "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
             }
         ),
         paper_authors_path,
@@ -805,6 +908,7 @@ def test_validate_arrow_dataset_manifest_requires_batch_index_sidecar(tmp_path: 
             {
                 "paper_id": pa.array(["p1"], type=pa.string()),
                 "position": pa.array([0], type=pa.int64()),
+                "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
             }
         ),
         paper_authors_path,

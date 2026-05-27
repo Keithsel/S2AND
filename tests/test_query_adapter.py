@@ -106,6 +106,27 @@ def test_signature_coauthor_blocks_uses_explicit_coauthors_without_position() ->
     ) == frozenset({"a lovelace"})
 
 
+def test_signature_coauthor_blocks_tolerates_null_paper_author_position() -> None:
+    signature = _signature("paper")
+    signature.author_info_coauthor_blocks = None
+    signature.author_info_coauthors = None
+    dataset = SimpleNamespace(
+        papers={
+            "paper": SimpleNamespace(
+                authors=[
+                    SimpleNamespace(position=0, author_name="Alice Query"),
+                    SimpleNamespace(position=None, author_name="Grace Hopper"),
+                ],
+            )
+        }
+    )
+
+    assert query_adapter_module._signature_coauthor_blocks(  # noqa: SLF001
+        signature,
+        _dataset_arg(dataset),
+    ) == frozenset({"g hopper"})
+
+
 def test_mask_query_features_keeps_orcid_only_when_enabled() -> None:
     base = build_query_features(
         first="alice",
@@ -420,7 +441,8 @@ def test_local10_evidence_ignores_query_signature_member() -> None:
 
     features = raw_paper_evidence_features(query, summary)
 
-    assert features["paper_author_list_max_jaccard"] == pytest.approx(0.0)
-    assert features["paper_author_list_max_overlap_count"] == pytest.approx(0.0)
+    assert features["paper_author_list_max_jaccard"] == pytest.approx(1.0)
+    assert features["paper_author_list_max_overlap_count"] == pytest.approx(3.0)
+    assert features["best_author_count_log_absdiff"] == pytest.approx(0.0)
     assert features["local_author_window10_jaccard_max"] == pytest.approx(0.0)
     assert features["local_author_window10_overlap_count_max"] == pytest.approx(0.0)

@@ -107,6 +107,29 @@ def _pair_count_with_singleton_fix(cluster_size: int) -> int:
     return cluster_size * (cluster_size - 1) // 2
 
 
+def _sample_unique_pair_indices(n: int, sample_pairs: int, rng: random.Random) -> list[tuple[int, int]]:
+    if sample_pairs <= 0:
+        return []
+    max_pairs = n * (n - 1) // 2
+    if sample_pairs >= max_pairs:
+        return [(i, j) for i in range(n) for j in range(i + 1, n)]
+    seen: set[tuple[int, int]] = set()
+    pairs: list[tuple[int, int]] = []
+    while len(pairs) < sample_pairs:
+        i = rng.randrange(n)
+        j = rng.randrange(n - 1)
+        if j >= i:
+            j += 1
+        if i > j:
+            i, j = j, i
+        pair = (i, j)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        pairs.append(pair)
+    return pairs
+
+
 def _pairwise_precision_recall_fscore_with_singleton_fix(
     true_clusters: dict[str, list[str]],
     pred_clusters: dict[str, list[str]],
@@ -455,6 +478,11 @@ def _run_single(
         signature_to_true_cluster_id: dict[str, str] = {}
         existing_map = getattr(anddata, "signature_to_cluster_id", None)
         if isinstance(existing_map, dict) and len(existing_map) > 0:
+            missing = [sig for sig in block_sigs if sig not in existing_map]
+            if missing:
+                raise RuntimeError(
+                    f"Quality check failed: {len(missing)}/{len(block_sigs)} signatures missing from clusters.json"
+                )
             signature_to_true_cluster_id = {sig: existing_map[sig] for sig in block_sigs}
         else:
             for cluster_id, cluster_info in anddata.clusters.items():
@@ -500,13 +528,7 @@ def _run_single(
             examples: list[dict[str, Any]] = []
 
             dont_merge = bool(getattr(clusterer, "dont_merge_cluster_seeds", True))
-            for _ in range(sample_pairs):
-                i = rng.randrange(n)
-                j = rng.randrange(n - 1)
-                if j >= i:
-                    j += 1
-                if i > j:
-                    i, j = j, i
+            for i, j in _sample_unique_pair_indices(n, sample_pairs, rng):
                 sig_a = block_sigs[i]
                 sig_b = block_sigs[j]
 

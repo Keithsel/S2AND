@@ -18,15 +18,16 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+mod arrow_batch_lookup;
 mod name_counts;
 mod promoted_linker;
 mod text_compat;
 
+use arrow_batch_lookup::{read_indexed_arrow_batches, IndexedArrowReadStats};
 use name_counts::{NameCountsData, RawNameCountIndex, RawNameCountKind, RawNameCountMaps};
 use text_compat::{
     compute_block_compat, contains_name_dash, contains_non_ascii_name_dash,
@@ -49,12 +50,6 @@ const DROPPED_AFFIXES: [&str; 48] = [
 
 const FNV_OFFSET: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
-const ARROW_BATCH_LOOKUP_INDEX_MAGIC: &[u8; 8] = b"S2ABI001";
-const ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN: usize = 48;
-const ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN: usize = 16;
-const ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN: &[u8] =
-    b"s2and-arrow-batch-lookup-index-source\0";
-
 fn is_dropped_affix(token: &str) -> bool {
     DROPPED_AFFIXES.contains(&token)
 }
@@ -350,19 +345,12 @@ fn default_candidate_indices(
 #[derive(Clone, Copy)]
 enum RetrievalFirstNameMode {
     Prefix,
-    ExactOnly,
     ExactThenPrefixHalf,
-    PrefixLengthRatio,
-    ExactThenPrefixLengthRatio,
 }
 
 #[derive(Clone, Copy)]
 enum RetrievalSpecterMode {
     Centroid,
-    ExemplarMax,
-    CentroidExemplar50_50,
-    CentroidExemplar25_75,
-    CentroidExemplar75_25,
     MaxOfCentroidExemplar,
 }
 
@@ -1785,29 +1773,6 @@ fn arrow_error_to_py(context: &str, path: &str, err: impl std::fmt::Display) -> 
     pyo3::exceptions::PyValueError::new_err(format!("{context} '{}': {err}", path))
 }
 
-fn source_file_fingerprint(path: &str, source_size: u64) -> PyResult<u64> {
-    let mut file = File::open(path).map_err(|err| {
-        io_error_to_py(
-            "failed to open Arrow IPC file for fingerprinting",
-            path,
-            err,
-        )
-    })?;
-    let mut digest = fnv64(ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN);
-    digest = fnv64_update(digest, &source_size.to_le_bytes());
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
-        let read_len = file.read(&mut buffer).map_err(|err| {
-            io_error_to_py("failed to read Arrow IPC file fingerprint bytes", path, err)
-        })?;
-        if read_len == 0 {
-            break;
-        }
-        digest = fnv64_update(digest, &buffer[..read_len]);
-    }
-    Ok(digest)
-}
-
 fn read_arrow_batches(path: &str) -> PyResult<Vec<RecordBatch>> {
     let file = File::open(path)
         .map_err(|err| io_error_to_py("failed to open Arrow IPC file", path, err))?;
@@ -1820,207 +1785,6 @@ fn read_arrow_batches(path: &str) -> PyResult<Vec<RecordBatch>> {
             })
         })
         .collect()
-}
-
-struct ArrowBatchLookupIndex {
-    bytes: Box<[u8]>,
-    record_count: usize,
-}
-
-impl ArrowBatchLookupIndex {
-    fn open(path: &str, source_arrow_path: &str, key_column: &str) -> PyResult<Self> {
-        let bytes = fs::read(path)
-            .map_err(|err| io_error_to_py("failed to read Arrow batch lookup index", path, err))?
-            .into_boxed_slice();
-        if bytes.len() < ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Arrow batch lookup index '{path}' is shorter than its header"
-            )));
-        }
-        let magic = &bytes[0..8];
-        if magic != ARROW_BATCH_LOOKUP_INDEX_MAGIC {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Arrow batch lookup index '{path}' has invalid magic bytes"
-            )));
-        }
-        let source_metadata = fs::metadata(source_arrow_path).map_err(|err| {
-            io_error_to_py(
-                "failed to stat Arrow IPC file for batch lookup index validation",
-                source_arrow_path,
-                err,
-            )
-        })?;
-        let source_size = source_metadata.len();
-        let record_count = u64::from_le_bytes(
-            bytes[8..16]
-                .try_into()
-                .expect("slice length is checked by fixed header length"),
-        ) as usize;
-        let indexed_source_size = u64::from_le_bytes(
-            bytes[16..24]
-                .try_into()
-                .expect("indexed source-size slice has fixed length"),
-        );
-        let _indexed_source_mtime_ns = u64::from_le_bytes(
-            bytes[24..32]
-                .try_into()
-                .expect("indexed source-mtime slice has fixed length"),
-        );
-        let indexed_key_column_hash = u64::from_le_bytes(
-            bytes[32..40]
-                .try_into()
-                .expect("indexed key-column hash slice has fixed length"),
-        );
-        let expected_key_column_hash = fnv64(key_column.as_bytes());
-        if indexed_key_column_hash != expected_key_column_hash {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Arrow batch lookup index '{path}' was built for a different key column: \
-                 indexed hash={indexed_key_column_hash} expected hash={expected_key_column_hash} \
-                 key_column='{key_column}'"
-            )));
-        }
-        let indexed_source_fingerprint = u64::from_le_bytes(
-            bytes[40..48]
-                .try_into()
-                .expect("indexed source fingerprint slice has fixed length"),
-        );
-        let source_fingerprint = source_file_fingerprint(source_arrow_path, source_size)?;
-        if indexed_source_size != source_size || indexed_source_fingerprint != source_fingerprint {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Arrow batch lookup index '{path}' is stale for '{source_arrow_path}': \
-                 indexed size/fingerprint=({indexed_source_size}, {indexed_source_fingerprint}) \
-                 current size/fingerprint=({source_size}, {source_fingerprint})"
-            )));
-        }
-        let expected_len = ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN
-            .checked_add(
-                record_count
-                    .checked_mul(ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN)
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyOverflowError::new_err(
-                            "Arrow batch lookup index record count overflows usize",
-                        )
-                    })?,
-            )
-            .ok_or_else(|| {
-                pyo3::exceptions::PyOverflowError::new_err(
-                    "Arrow batch lookup index length overflows usize",
-                )
-            })?;
-        if bytes.len() != expected_len {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Arrow batch lookup index '{path}' length {} does not match expected length {expected_len} \
-                 (record_count={record_count}, header_len={ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN}, \
-                 record_len={ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN})",
-                bytes.len()
-            )));
-        }
-        Ok(Self {
-            bytes,
-            record_count,
-        })
-    }
-
-    fn record_offset(&self, index: usize) -> usize {
-        ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN + index * ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN
-    }
-
-    fn record_hash(&self, index: usize) -> u64 {
-        let offset = self.record_offset(index);
-        u64::from_le_bytes(
-            self.bytes[offset..offset + 8]
-                .try_into()
-                .expect("record hash slice has fixed length"),
-        )
-    }
-
-    fn record_batch_index(&self, index: usize) -> u32 {
-        let offset = self.record_offset(index) + 8;
-        u32::from_le_bytes(
-            self.bytes[offset..offset + 4]
-                .try_into()
-                .expect("record batch-index slice has fixed length"),
-        )
-    }
-
-    fn lower_bound(&self, hash: u64) -> usize {
-        let mut lo = 0usize;
-        let mut hi = self.record_count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.record_hash(mid) < hash {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
-
-    fn batch_indices_for_keys(&self, keys: &HashSet<String>) -> HashSet<usize> {
-        let mut out = HashSet::new();
-        for key in keys {
-            let hash = fnv64(key.as_bytes());
-            let mut index = self.lower_bound(hash);
-            while index < self.record_count && self.record_hash(index) == hash {
-                out.insert(self.record_batch_index(index) as usize);
-                index += 1;
-            }
-        }
-        out
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-struct IndexedArrowReadStats {
-    batches_read: usize,
-    rows_scanned: usize,
-}
-
-fn read_indexed_arrow_batches(
-    path: &str,
-    index_path: &str,
-    key_column: &str,
-    keep_ids: &HashSet<String>,
-) -> PyResult<(Vec<RecordBatch>, IndexedArrowReadStats)> {
-    if keep_ids.is_empty() {
-        return Ok((Vec::new(), IndexedArrowReadStats::default()));
-    }
-    let index = ArrowBatchLookupIndex::open(index_path, path, key_column)?;
-    let mut batch_indices: Vec<usize> =
-        index.batch_indices_for_keys(keep_ids).into_iter().collect();
-    batch_indices.sort_unstable();
-    let file = File::open(path)
-        .map_err(|err| io_error_to_py("failed to open Arrow IPC file", path, err))?;
-    let mut reader = ArrowFileReader::try_new(file, None)
-        .map_err(|err| arrow_error_to_py("failed to read Arrow IPC schema from", path, err))?;
-    let mut batches = Vec::with_capacity(batch_indices.len());
-    let mut rows_scanned = 0usize;
-    for batch_index in batch_indices {
-        reader.set_index(batch_index).map_err(|err| {
-            arrow_error_to_py("failed to seek Arrow IPC record batch in", path, err)
-        })?;
-        let batch = reader
-            .next()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "Arrow IPC file '{path}' is missing indexed record batch {batch_index}"
-                ))
-            })?
-            .map_err(|err| {
-                arrow_error_to_py("failed to read Arrow IPC record batch from", path, err)
-            })?;
-        rows_scanned += batch.num_rows();
-        batches.push(batch);
-    }
-    let batches_read = batches.len();
-    Ok((
-        batches,
-        IndexedArrowReadStats {
-            batches_read,
-            rows_scanned,
-        },
-    ))
 }
 
 fn arrow_column_index(batch: &RecordBatch, name: &str, path: &str) -> PyResult<usize> {
@@ -4180,38 +3944,11 @@ fn first_name_score_mode(
                     0.0
                 }
             }
-            RetrievalFirstNameMode::ExactOnly => {
-                if exact_name_match_compat(query_first, first_name) {
-                    share
-                } else {
-                    0.0
-                }
-            }
             RetrievalFirstNameMode::ExactThenPrefixHalf => {
                 if exact_name_match_compat(query_first, first_name) {
                     share
                 } else if same_prefix_tokens_compat(query_first, first_name) {
                     share * 0.5
-                } else {
-                    0.0
-                }
-            }
-            RetrievalFirstNameMode::PrefixLengthRatio => {
-                if same_prefix_tokens_compat(query_first, first_name) {
-                    let query_len = py_len(query_first) as f64;
-                    let candidate_len = py_len(first_name) as f64;
-                    share * (query_len.min(candidate_len) / query_len.max(candidate_len))
-                } else {
-                    0.0
-                }
-            }
-            RetrievalFirstNameMode::ExactThenPrefixLengthRatio => {
-                if exact_name_match_compat(query_first, first_name) {
-                    share
-                } else if same_prefix_tokens_compat(query_first, first_name) {
-                    let query_len = py_len(query_first) as f64;
-                    let candidate_len = py_len(first_name) as f64;
-                    share * (query_len.min(candidate_len) / query_len.max(candidate_len)) * 0.75
                 } else {
                     0.0
                 }
@@ -4420,10 +4157,7 @@ fn default_overlap_config() -> RetrievalOverlapConfig {
 fn parse_first_name_mode(mode: &str) -> PyResult<RetrievalFirstNameMode> {
     match mode {
         "prefix" => Ok(RetrievalFirstNameMode::Prefix),
-        "exact_only" => Ok(RetrievalFirstNameMode::ExactOnly),
         "exact_then_prefix_half" => Ok(RetrievalFirstNameMode::ExactThenPrefixHalf),
-        "prefix_length_ratio" => Ok(RetrievalFirstNameMode::PrefixLengthRatio),
-        "exact_then_prefix_length_ratio" => Ok(RetrievalFirstNameMode::ExactThenPrefixLengthRatio),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Unknown first_name_mode: {mode}"
         ))),
@@ -4433,10 +4167,6 @@ fn parse_first_name_mode(mode: &str) -> PyResult<RetrievalFirstNameMode> {
 fn parse_specter_mode(mode: &str) -> PyResult<RetrievalSpecterMode> {
     match mode {
         "centroid" => Ok(RetrievalSpecterMode::Centroid),
-        "exemplar_max" => Ok(RetrievalSpecterMode::ExemplarMax),
-        "centroid_exemplar_50_50" => Ok(RetrievalSpecterMode::CentroidExemplar50_50),
-        "centroid_exemplar_25_75" => Ok(RetrievalSpecterMode::CentroidExemplar25_75),
-        "centroid_exemplar_75_25" => Ok(RetrievalSpecterMode::CentroidExemplar75_25),
         "max_centroid_exemplar" => Ok(RetrievalSpecterMode::MaxOfCentroidExemplar),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Unknown specter_mode: {mode}"
@@ -4628,14 +4358,6 @@ fn score_experimental_hybrid_centroid_query(
     let exemplar_score = specter_exemplar_score(query, summary);
     let specter_score = match config.specter_mode {
         RetrievalSpecterMode::Centroid => centroid_score,
-        RetrievalSpecterMode::ExemplarMax => exemplar_score,
-        RetrievalSpecterMode::CentroidExemplar50_50 => 0.5 * centroid_score + 0.5 * exemplar_score,
-        RetrievalSpecterMode::CentroidExemplar25_75 => {
-            0.25 * centroid_score + 0.75 * exemplar_score
-        }
-        RetrievalSpecterMode::CentroidExemplar75_25 => {
-            0.75 * centroid_score + 0.25 * exemplar_score
-        }
         RetrievalSpecterMode::MaxOfCentroidExemplar => centroid_score.max(exemplar_score),
     };
     (weights.centroid * specter_score
@@ -10084,7 +9806,11 @@ impl RustFeaturizer {
                     "Arrow signatures reference missing paper_id '{paper_id}'"
                 )));
             };
-            let raw_authors = raw_authors_by_paper.remove(paper_id).unwrap_or_default();
+            let raw_authors = raw_authors_by_paper.remove(paper_id).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Arrow paper_authors are missing rows for paper_id '{paper_id}'"
+                ))
+            })?;
             let (is_reliable, predicted_language) = if raw_paper.predicted_language.is_some() {
                 (
                     raw_paper.is_reliable.unwrap_or(false),
@@ -12589,11 +12315,7 @@ impl RawBlockQueryCandidatePlanner {
     }
 
     #[pyo3(signature = (query_signature_ids))]
-    fn plan(
-        &mut self,
-        py: Python<'_>,
-        query_signature_ids: Vec<String>,
-    ) -> PyResult<Py<PyDict>> {
+    fn plan(&mut self, py: Python<'_>, query_signature_ids: Vec<String>) -> PyResult<Py<PyDict>> {
         validate_raw_arrow_query_signature_ids(&query_signature_ids)?;
         let missing: Vec<&String> = query_signature_ids
             .iter()
@@ -13194,16 +12916,13 @@ impl RawBlockQueryCandidatePlanner {
             query_inputs.specter_index_stats.rows_scanned,
         )?;
         telemetry.set_item("unidecode_char_count", self.state.unidecode_char_map.len())?;
-        telemetry.set_item(
-            "payload_seed_signature_count",
-            0usize,
-        )?;
+        telemetry.set_item("payload_seed_signature_count", 0usize)?;
         telemetry.set_item("planner_seed_state_reused", 1)?;
         telemetry.set_item("timings", &timings)?;
 
         let payload_start = Instant::now();
         let payload = PyDict::new(py);
-        payload.set_item("schema_version", "raw_arrow_candidate_plan_v1")?;
+        payload.set_item("schema_version", "raw_arrow_candidate_plan_v2")?;
         payload.set_item("row_count", row_component_keys.len())?;
         payload.set_item("pair_count", left_signature_indices.len())?;
         payload.set_item("query_signature_ids", query_signature_ids)?;
@@ -14421,8 +14140,16 @@ mod tests {
         ("specter", "embedding", "fixed_size_list<float32>", true),
     ];
 
-    fn py_err_message(err: PyErr) -> String {
+    fn prepare_python_for_test() {
+        #[cfg(windows)]
+        if let Some(python_home) = option_env!("S2AND_RUST_PYTHONHOME") {
+            std::env::set_var("PYTHONHOME", python_home);
+        }
         pyo3::prepare_freethreaded_python();
+    }
+
+    fn py_err_message(err: PyErr) -> String {
+        prepare_python_for_test();
         Python::with_gil(|py| {
             err.value(py)
                 .str()
@@ -14484,58 +14211,6 @@ mod tests {
     }
 
     #[test]
-    fn arrow_batch_lookup_index_rejects_same_size_middle_rewrite() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "s2and_arrow_index_digest_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after Unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&temp_root).expect("create temp test dir");
-        let source_path = temp_root.join("source.arrow");
-        let index_path = temp_root.join("source.index.bin");
-        let mut source_bytes = vec![b'a'; 200_000];
-        source_bytes[100_000..100_016].copy_from_slice(b"middle-key-00000");
-        fs::write(&source_path, &source_bytes).expect("write source bytes");
-        let source_path_str = source_path
-            .to_str()
-            .expect("temp path should be valid unicode")
-            .to_string();
-        let source_fingerprint =
-            source_file_fingerprint(&source_path_str, source_bytes.len() as u64)
-                .expect("hash source");
-        fs::write(
-            &index_path,
-            ARROW_BATCH_LOOKUP_INDEX_MAGIC
-                .iter()
-                .copied()
-                .chain(0_u64.to_le_bytes())
-                .chain((source_bytes.len() as u64).to_le_bytes())
-                .chain(0_u64.to_le_bytes())
-                .chain(fnv64(b"signature_id").to_le_bytes())
-                .chain(source_fingerprint.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        )
-        .expect("write index bytes");
-        source_bytes[100_000..100_016].copy_from_slice(b"middle-key-99999");
-        fs::write(&source_path, &source_bytes).expect("rewrite source bytes");
-
-        let index_path_str = index_path
-            .to_str()
-            .expect("temp path should be valid unicode");
-        let error =
-            match ArrowBatchLookupIndex::open(index_path_str, &source_path_str, "signature_id") {
-                Ok(_) => panic!("same-size middle rewrite must stale the index"),
-                Err(err) => err,
-            };
-        assert!(py_err_message(error).contains("is stale"));
-
-        fs::remove_dir_all(&temp_root).ok();
-    }
-
-    #[test]
     fn feature_index_resolution_preserves_order_and_duplicates() {
         assert_eq!(
             resolve_feature_indices("selected_indices", Some(vec![2, 2, 3]), 5)
@@ -14589,7 +14264,7 @@ mod tests {
 
     #[test]
     fn reference_details_extraction_errors_are_not_silenced() {
-        pyo3::prepare_freethreaded_python();
+        prepare_python_for_test();
         Python::with_gil(|py| {
             let non_tuple = PyString::new(py, "not-a-tuple");
             let result = extract_reference_details_counters(py, non_tuple.as_any());
@@ -14645,6 +14320,105 @@ mod tests {
         );
         assert!(year_signal_value(Some(i64::from(i32::MAX) + 1), "query year").is_err());
         assert!(year_signal_value(Some(i64::from(i32::MIN)), "query year").is_err());
+    }
+
+    #[test]
+    fn sorted_subblock_merge_candidates_keeps_exact_maximum_size_pair() {
+        let mut output = OrderedSubblocks::default();
+        output.insert(
+            "alex|middle=a".to_string(),
+            vec!["s1".to_string(), "s2".to_string()],
+        );
+        output.insert(
+            "alex|middle=b".to_string(),
+            vec!["s3".to_string(), "s4".to_string(), "s5".to_string()],
+        );
+
+        let candidates = sorted_subblock_merge_candidates(&output, 5, &HashMap::new())
+            .expect("merge candidates");
+
+        assert_eq!(
+            candidates,
+            vec![(
+                ("alex|middle=a".to_string(), "alex|middle=b".to_string()),
+                1e10
+            )]
+        );
+    }
+
+    #[test]
+    fn orcid_subblocking_skips_oversized_connected_component_without_partial_merge() {
+        let mut output = OrderedSubblocks::default();
+        output.insert("a".to_string(), vec!["s1".to_string()]);
+        output.insert("b".to_string(), vec!["s2".to_string(), "s3".to_string()]);
+        output.insert("c".to_string(), vec!["s4".to_string()]);
+        let rows = HashMap::from([
+            (
+                "s1".to_string(),
+                SubblockingSignatureRow {
+                    signature_id: "s1".to_string(),
+                    paper_id: "p1".to_string(),
+                    first: "aa".to_string(),
+                    middle: String::new(),
+                    affiliations: Vec::new(),
+                    orcid: Some("0000-0000-0000-0001".to_string()),
+                    position: None,
+                },
+            ),
+            (
+                "s2".to_string(),
+                SubblockingSignatureRow {
+                    signature_id: "s2".to_string(),
+                    paper_id: "p2".to_string(),
+                    first: "bb".to_string(),
+                    middle: String::new(),
+                    affiliations: Vec::new(),
+                    orcid: Some("0000-0000-0000-0001".to_string()),
+                    position: None,
+                },
+            ),
+            (
+                "s3".to_string(),
+                SubblockingSignatureRow {
+                    signature_id: "s3".to_string(),
+                    paper_id: "p3".to_string(),
+                    first: "bb".to_string(),
+                    middle: String::new(),
+                    affiliations: Vec::new(),
+                    orcid: Some("0000-0000-0000-0002".to_string()),
+                    position: None,
+                },
+            ),
+            (
+                "s4".to_string(),
+                SubblockingSignatureRow {
+                    signature_id: "s4".to_string(),
+                    paper_id: "p4".to_string(),
+                    first: "cc".to_string(),
+                    middle: String::new(),
+                    affiliations: Vec::new(),
+                    orcid: Some("0000-0000-0000-0002".to_string()),
+                    position: None,
+                },
+            ),
+        ]);
+        let mut telemetry = SubblockingTelemetry::default();
+
+        apply_orcid_subblocking(&mut output, &rows, 3, &mut telemetry);
+
+        assert_eq!(
+            output.to_hashmap(),
+            HashMap::from([
+                ("a".to_string(), vec!["s1".to_string()]),
+                ("b".to_string(), vec!["s2".to_string(), "s3".to_string()]),
+                ("c".to_string(), vec!["s4".to_string()]),
+            ])
+        );
+        assert_eq!(telemetry.orcid_merge_skipped_due_to_capacity_count, 2);
+        assert_eq!(
+            telemetry.orcid_merge_skipped_due_to_capacity_signature_count,
+            4
+        );
     }
 
     #[test]

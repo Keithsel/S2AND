@@ -144,6 +144,14 @@ def test_subdivide_helper_accepts_prefix_exactly_at_capacity() -> None:
     }
 
 
+def test_union_find_find_compresses_long_parent_chain_without_recursion() -> None:
+    union_find = subblocking._UnionFind(1500)  # noqa: SLF001
+    union_find.parent = list(range(1, 1500)) + [1499]
+
+    assert union_find.find(0) == 1499
+    assert union_find.parent[0] == 1499
+
+
 def test_normalize_orcid_for_subblocking_matches_rust_arrow_canonical_form() -> None:
     assert (
         subblocking.normalize_orcid_for_subblocking(" https://orcid.org/0000-0002-1825-0097 ") == "0000-0002-1825-0097"
@@ -416,6 +424,43 @@ def test_make_subblocks_does_not_merge_orcid_components_past_capacity(monkeypatc
         ["s3", "s4"],
         ["s5", "s6"],
     ]
+    assert telemetry["orcid_merge_skipped_due_to_capacity_count"] == 2
+    assert telemetry["orcid_merge_skipped_due_to_capacity_signature_count"] == 4
+
+
+def test_make_subblocks_orcid_repair_skips_oversized_connected_component_without_partial_merge(monkeypatch):
+    dataset = SimpleNamespace(
+        signatures={
+            "s1": _signature("s1", first="aa", middle="", orcid="0000-0000-0000-0001"),
+            "s2": _signature("s2", first="bb", middle="", orcid="0000-0000-0000-0001"),
+            "s3": _signature("s3", first="bb", middle="", orcid="0000-0000-0000-0002"),
+            "s4": _signature("s4", first="cc", middle="", orcid="0000-0000-0000-0002"),
+        },
+        random_seed=0,
+    )
+
+    def fake_subdivide_helper(names, sig_ids, maximum_size, starting_k=2):
+        del names, sig_ids, maximum_size, starting_k
+        return {
+            "a": np.array(["s1"]),
+            "b": np.array(["s2", "s3"]),
+            "c": np.array(["s4"]),
+        }, {}
+
+    monkeypatch.setattr(subblocking, "subdivide_helper", fake_subdivide_helper)
+
+    subblocks, telemetry = subblocking.make_subblocks_with_telemetry(
+        ["s1", "s2", "s3", "s4"],
+        dataset,
+        maximum_size=3,
+        first_k_letter_counts_sorted={},
+    )
+
+    assert subblocks == {
+        "a": ["s1"],
+        "b": ["s2", "s3"],
+        "c": ["s4"],
+    }
     assert telemetry["orcid_merge_skipped_due_to_capacity_count"] == 2
     assert telemetry["orcid_merge_skipped_due_to_capacity_signature_count"] == 4
 

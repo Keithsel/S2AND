@@ -87,10 +87,14 @@ class _UnionFind:
         self.component_size = [1] * size
 
     def find(self, item: int) -> int:
-        parent = self.parent[item]
-        if parent != item:
-            self.parent[item] = self.find(parent)
-        return self.parent[item]
+        root = item
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[item] != item:
+            parent = self.parent[item]
+            self.parent[item] = root
+            item = parent
+        return root
 
     def union_if_capacity(self, left: int, right: int, maximum_size: int) -> bool:
         left_root = self.find(left)
@@ -443,25 +447,6 @@ def _component_adjacency(
             adjacency[left_component][right_component] = score
             adjacency[right_component][left_component] = score
     return adjacency
-
-
-def _component_bin_affinity(
-    component_id: int,
-    bin_component_ids: Sequence[int],
-    adjacency: Mapping[int, Mapping[int, float]],
-    *,
-    top_k: int,
-) -> float:
-    scores = [
-        float(score)
-        for neighbor_component_id, score in adjacency.get(component_id, {}).items()
-        if neighbor_component_id in bin_component_ids
-    ]
-    if not scores:
-        return 0.0
-    if top_k > 0 and len(scores) > top_k:
-        scores = sorted(scores, reverse=True)[:top_k]
-    return float(sum(scores))
 
 
 def _component_affinities_to_bins(
@@ -1657,31 +1642,6 @@ def _make_subblocks_with_telemetry_arrow_rust(
     return {str(key): list(values) for key, values in dict(subblocks).items()}, dict(telemetry)
 
 
-def make_subblocks_arrow_rust(
-    arrow_paths: Mapping[str, Any],
-    signature_ids,
-    maximum_size=15000,
-    first_k_letter_counts_sorted=FIRST_K_LETTER_COUNTS,
-    graph_subblocking_config: GraphSubblockingConfig | None = None,
-    graph_subblocking_random_seed: int = 0,
-    use_orcid_subblocking: bool = True,
-    full_scan_without_index: bool = False,
-):
-    """Return Rust Arrow-backed subblocks without telemetry."""
-
-    output, _ = _make_subblocks_with_telemetry_arrow_rust(
-        arrow_paths,
-        signature_ids,
-        maximum_size=maximum_size,
-        first_k_letter_counts_sorted=first_k_letter_counts_sorted,
-        graph_subblocking_config=graph_subblocking_config,
-        graph_subblocking_random_seed=graph_subblocking_random_seed,
-        use_orcid_subblocking=use_orcid_subblocking,
-        full_scan_without_index=full_scan_without_index,
-    )
-    return output
-
-
 def make_subblocks_with_telemetry(
     signature_ids,
     anddata,
@@ -1970,18 +1930,26 @@ def make_subblocks_with_telemetry(
         subblock_ids = list(output)
         subblock_index = {subblock_id: index for index, subblock_id in enumerate(subblock_ids)}
         parent = list(range(len(subblock_ids)))
+        subblock_component_size = [1] * len(subblock_ids)
 
         def find_subblock_root(index: int) -> int:
-            parent_index = parent[index]
-            if parent_index != index:
-                parent[index] = find_subblock_root(parent_index)
-            return parent[index]
+            root = index
+            while parent[root] != root:
+                root = parent[root]
+            while parent[index] != index:
+                parent_index = parent[index]
+                parent[index] = root
+                index = parent_index
+            return root
 
         def union_subblocks(left: str, right: str) -> None:
             left_root = find_subblock_root(subblock_index[left])
             right_root = find_subblock_root(subblock_index[right])
             if left_root != right_root:
+                if subblock_component_size[left_root] < subblock_component_size[right_root]:
+                    left_root, right_root = right_root, left_root
                 parent[right_root] = left_root
+                subblock_component_size[left_root] += subblock_component_size[right_root]
 
         orcid_to_subblock_ids: dict[str, list[str]] = {}
         for orcid, orcid_sig_ids in orcid_to_sig_ids.items():

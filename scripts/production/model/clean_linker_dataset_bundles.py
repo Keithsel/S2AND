@@ -409,7 +409,8 @@ def main() -> None:
         "policy": f"drop_supervision_type:{UNLABELED_SINGLETON_ORCID_SUPERVISION_TYPE}",
         "bundles": reports,
     }
-    _write_json(args.report_path.resolve(), report)
+    if not args.dry_run:
+        _write_json(args.report_path.resolve(), report)
     print(json.dumps(report, indent=2, sort_keys=True))
 
 

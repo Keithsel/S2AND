@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from s2and.incremental_linking.feature_block import (
     cleanup_stale_name_counts_generations,
     write_name_counts_index,
@@ -34,6 +36,35 @@ def test_write_name_counts_index_does_not_delete_previous_published_generation(t
     assert all((path / ".published").exists() for path in generations)
 
 
+def test_write_name_counts_index_does_not_publish_manifest_when_marker_write_fails(tmp_path, monkeypatch) -> None:
+    import s2and.data as data_module
+
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"ada": 1}, {"lovelace": 1}, {"ada lovelace": 1}, {"lovelace a": 1}),
+    )
+    original_write_text = Path.write_text
+
+    def fail_published_marker(path: Path, *args, **kwargs):
+        if path.name == ".published":
+            raise OSError("marker write failed")
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_published_marker)
+
+    try:
+        write_name_counts_index(tmp_path, overwrite=True)
+    except OSError as exc:
+        assert "marker write failed" in str(exc)
+    else:  # pragma: no cover - assertion guard
+        raise AssertionError("write_name_counts_index should fail when .published cannot be written")
+
+    assert not (tmp_path / "manifest.json").exists()
+    generation_root = tmp_path / "generations"
+    assert not generation_root.exists() or not any(path.is_dir() for path in generation_root.iterdir())
+
+
 def test_cleanup_stale_name_counts_generations_keeps_manifest_generation(tmp_path: Path) -> None:
     index_dir = tmp_path / "name_counts_index"
     _write_generation(index_dir, "gen-old")
@@ -53,3 +84,36 @@ def test_cleanup_stale_name_counts_generations_keeps_manifest_generation(tmp_pat
     assert metrics == {"removed_generation_count": 1}
     assert not (index_dir / "generations" / "gen-old").exists()
     assert (index_dir / "generations" / "gen-current").exists()
+
+
+def test_cleanup_stale_name_counts_generations_refuses_missing_manifest(tmp_path: Path) -> None:
+    index_dir = tmp_path / "name_counts_index"
+    _write_generation(index_dir, "gen-old")
+
+    with pytest.raises(ValueError, match="without a resolvable current manifest"):
+        cleanup_stale_name_counts_generations(index_dir)
+
+    assert (index_dir / "generations" / "gen-old").exists()
+
+
+def test_cleanup_stale_name_counts_generations_refuses_manifest_outside_generations(tmp_path: Path) -> None:
+    index_dir = tmp_path / "name_counts_index"
+    _write_generation(index_dir, "gen-old")
+    external = tmp_path / "external"
+    external.mkdir()
+    for filename in ("first.bin", "last.bin", "first_last.bin", "last_first_initial.bin"):
+        (external / filename).write_bytes(b"index")
+    manifest = {
+        "files": {
+            "first": {"path": str(external / "first.bin")},
+            "last": {"path": str(external / "last.bin")},
+            "first_last": {"path": str(external / "first_last.bin")},
+            "last_first_initial": {"path": str(external / "last_first_initial.bin")},
+        }
+    }
+    (index_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="without a resolvable current manifest"):
+        cleanup_stale_name_counts_generations(index_dir)
+
+    assert (index_dir / "generations" / "gen-old").exists()

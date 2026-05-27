@@ -1312,6 +1312,19 @@ def _table_values(table: Any, column: str) -> list[Any]:
     return table[column].to_pylist()
 
 
+def _required_string_values(table: Any, column: str, *, label: str) -> list[str]:
+    values = _table_values(table, column)
+    out: list[str] = []
+    for row_index, value in enumerate(values):
+        if value is None:
+            raise ValueError(f"{label} contains null value at row {row_index}")
+        text = str(value)
+        if not text:
+            raise ValueError(f"{label} contains empty value at row {row_index}")
+        out.append(text)
+    return out
+
+
 def _duplicate_values(values: Sequence[Any]) -> list[str]:
     seen: set[str] = set()
     duplicates: set[str] = set()
@@ -1350,6 +1363,8 @@ def validate_arrow_dataset_manifest(
     paths = {str(key): str(_resolve_manifest_path(value, base_dir)) for key, value in manifest["paths"].items()}
     required_paths = ["signatures", "papers", "paper_authors"]
     if require_embeddings:
+        if "specter" not in paths and "specter2" in paths:
+            paths["specter"] = paths["specter2"]
         required_paths.append("specter")
     if require_name_counts_index:
         required_paths.append("name_counts_index")
@@ -1364,11 +1379,13 @@ def validate_arrow_dataset_manifest(
     _ensure_string_column(signatures, "paper_id")
     _ensure_string_column(papers, "paper_id")
     _ensure_string_column(paper_authors, "paper_id")
+    _ensure_string_column(paper_authors, "author_name")
     _ensure_integer_column(paper_authors, "position")
-    signature_ids = [str(value) for value in _table_values(signatures, "signature_id")]
-    signature_paper_ids = [str(value) for value in _table_values(signatures, "paper_id")]
-    paper_ids = [str(value) for value in _table_values(papers, "paper_id")]
-    paper_author_paper_ids = [str(value) for value in _table_values(paper_authors, "paper_id")]
+    signature_ids = _required_string_values(signatures, "signature_id", label="signatures.signature_id")
+    signature_paper_ids = _required_string_values(signatures, "paper_id", label="signatures.paper_id")
+    paper_ids = _required_string_values(papers, "paper_id", label="papers.paper_id")
+    paper_author_paper_ids = _required_string_values(paper_authors, "paper_id", label="paper_authors.paper_id")
+    _required_string_values(paper_authors, "author_name", label="paper_authors.author_name")
     paper_author_positions = _table_values(paper_authors, "position")
     _ensure_unique(signature_ids, label="signatures.signature_id")
     _ensure_unique(paper_ids, label="papers.paper_id")
@@ -1399,7 +1416,7 @@ def validate_arrow_dataset_manifest(
         specter = _read_arrow_table(paths["specter"])
         _ensure_string_column(specter, "paper_id")
         _ensure_specter_embedding_column(specter)
-        specter_paper_ids = [str(value) for value in _table_values(specter, "paper_id")]
+        specter_paper_ids = _required_string_values(specter, "paper_id", label="specter.paper_id")
         _ensure_unique(specter_paper_ids, label="specter.paper_id")
         missing_embeddings = sorted(set(signature_paper_ids) - set(specter_paper_ids))
         metrics["specter_count"] = int(specter.num_rows)

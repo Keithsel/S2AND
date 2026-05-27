@@ -162,14 +162,20 @@ def test_rust_featurizer_cache_tracks_cluster_seed_version():
     assert DummyRustFeaturizer.created == ["seed_version_cache_dataset", "seed_version_cache_dataset"]
     assert _cache_size() == 1
     assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
-        feature_port._rust_featurizer_cache_key("from_dataset", False, 1)
+        feature_port._rust_featurizer_cache_key("from_dataset", 1)
     ]
 
 
 def test_rust_featurizer_cache_retries_when_seed_version_changes_during_lookup(monkeypatch):
     dataset = DummyDataset("seed_version_race_dataset", mode="train")
-    versions = iter([0, 1, 1, 1, 1])
-    monkeypatch.setattr(feature_port, "_cluster_seeds_version_for_cache", lambda _dataset: next(versions))
+    versions = [0, 1]
+
+    def next_seed_version(_dataset):
+        if versions:
+            return versions.pop(0)
+        return 1
+
+    monkeypatch.setattr(feature_port, "_cluster_seeds_version_for_cache", next_seed_version)
     monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_BACKOFF_SECONDS", 0.0)
     monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_MAX_RETRIES", 3)
 
@@ -178,7 +184,38 @@ def test_rust_featurizer_cache_retries_when_seed_version_changes_during_lookup(m
     assert featurizer.dataset_name == "seed_version_race_dataset"
     assert DummyRustFeaturizer.created == ["seed_version_race_dataset"]
     assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
-        feature_port._rust_featurizer_cache_key("from_dataset", False, 1)
+        feature_port._rust_featurizer_cache_key("from_dataset", 1)
+    ]
+
+
+def test_rust_featurizer_cache_retries_when_seed_version_changes_during_build(monkeypatch):
+    dataset = DummyDataset("seed_version_build_race_dataset", mode="train")
+    dataset._cluster_seeds_version = 0
+    build_calls = {"count": 0}
+
+    def _build_stub(dataset_arg, *, requested_build_path):
+        build_calls["count"] += 1
+        if build_calls["count"] == 1:
+            dataset_arg._cluster_seeds_version = 1
+            featurizer_name = "stale"
+        else:
+            featurizer_name = "fresh"
+        return (
+            DummyRustFeaturizer(featurizer_name),
+            requested_build_path,
+            {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
+            build_calls["count"],
+            0.0,
+        )
+
+    monkeypatch.setattr(feature_port, "_build_rust_featurizer_strict", _build_stub)
+
+    featurizer = feature_port._get_rust_featurizer(dataset)
+
+    assert featurizer.dataset_name == "fresh"
+    assert build_calls["count"] == 2
+    assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
+        feature_port._rust_featurizer_cache_key("from_dataset", 1)
     ]
 
 
@@ -196,7 +233,7 @@ def test_update_rust_cluster_seeds_reuses_cached_featurizer_after_version_bump()
     assert DummyRustFeaturizer.created == ["direct_seed_update_dataset"]
     assert feature_port._get_rust_featurizer(dataset) is first
     assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
-        feature_port._rust_featurizer_cache_key("from_dataset", False, 2)
+        feature_port._rust_featurizer_cache_key("from_dataset", 2)
     ]
 
 
@@ -217,7 +254,7 @@ def test_update_rust_cluster_seeds_leaves_version_unchanged_on_ffi_failure():
 
     assert int(dataset._cluster_seeds_version) == 1
     assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [
-        feature_port._rust_featurizer_cache_key("from_dataset", False, 1)
+        feature_port._rust_featurizer_cache_key("from_dataset", 1)
     ]
 
 
@@ -285,9 +322,6 @@ def test_build_rust_featurizer_from_arrow_paths_requires_index_for_name_counts(m
             full_scan_without_index=True,
         )
     assert exc_info.value.missing_keys == ("name_counts_index",)
-
-    with pytest.raises(ValueError, match="does not accept name_counts_path"):
-        feature_port.build_rust_featurizer_from_arrow_paths(paths, name_counts_path="name_counts.json")
 
     patch_tiny_name_counts_loader(monkeypatch)
     index_path, _metrics = write_name_counts_index(tmp_path / "name_counts_index")
@@ -368,13 +402,7 @@ def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
         dataset,
         *,
         requested_build_path,
-        allow_normalization_version_mismatch,
-        name_counts_path=None,
-        expected_normalization_version=None,
     ):
-        assert allow_normalization_version_mismatch is False
-        assert name_counts_path is None
-        assert expected_normalization_version is None
         ready.wait(timeout=2)
         build_start = time.perf_counter()
         time.sleep(0.25)
@@ -427,13 +455,7 @@ def test_concurrent_builds_for_same_dataset_share_single_inflight_build(monkeypa
         dataset_arg,
         *,
         requested_build_path,
-        allow_normalization_version_mismatch,
-        name_counts_path=None,
-        expected_normalization_version=None,
     ):
-        assert allow_normalization_version_mismatch is False
-        assert name_counts_path is None
-        assert expected_normalization_version is None
         build_calls["count"] += 1
         ready.wait(timeout=2)
         time.sleep(0.25)
@@ -473,7 +495,7 @@ def test_concurrent_builds_for_same_dataset_share_single_inflight_build(monkeypa
 
 def test_increment_rust_featurizer_build_count_is_thread_safe():
     dataset = DummyDataset("build_count_threadsafe", mode="train")
-    cache_key = feature_port._rust_featurizer_cache_key("from_dataset", False)  # noqa: SLF001
+    cache_key = feature_port._rust_featurizer_cache_key("from_dataset")  # noqa: SLF001
     with feature_port._RUST_FEATURIZER_CACHE_LOCK:
         feature_port._RUST_FEATURIZER_CACHE[dataset] = {
             cache_key: feature_port._CacheEntry(
@@ -618,7 +640,7 @@ def test_explicit_evict_and_clear_api():
 
 def test_evict_rust_featurizer_clears_build_counts():
     dataset = DummyDataset("evict_build_counts", mode="train")
-    cache_key = feature_port._rust_featurizer_cache_key("from_dataset", False)  # noqa: SLF001
+    cache_key = feature_port._rust_featurizer_cache_key("from_dataset")  # noqa: SLF001
 
     feature_port._get_rust_featurizer(dataset)
 

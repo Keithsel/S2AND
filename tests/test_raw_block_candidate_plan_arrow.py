@@ -21,6 +21,7 @@ from s2and.incremental_linking.retrieval import (
     RAW_CANDIDATE_PLAN_ROW_KEYS,
     RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS,
     RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
+    RawArrowPlanBundle,
     build_linker_retrieval_batch_from_raw_candidate_plan,
 )
 from s2and.incremental_linking.runtime import (
@@ -38,11 +39,7 @@ if _RUST_FEATURIZER is None:
     _MISSING_RUST_RAW_APIS.append("RustFeaturizer")
 elif not hasattr(_RUST_FEATURIZER, "from_arrow_paths"):
     _MISSING_RUST_RAW_APIS.append("RustFeaturizer.from_arrow_paths")
-if _MISSING_RUST_RAW_APIS:
-    pytest.skip(
-        f"s2and_rust is missing required raw Arrow APIs: {_MISSING_RUST_RAW_APIS}",
-        allow_module_level=True,
-    )
+assert not _MISSING_RUST_RAW_APIS, f"s2and_rust is missing required raw Arrow APIs: {_MISSING_RUST_RAW_APIS}"
 
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
@@ -74,9 +71,8 @@ def _minimal_raw_candidate_plan(**overrides: Any) -> dict[str, Any]:
         "retrieval_scores": np.zeros(row_count, dtype=np.float32),
         "retrieval_ranks": np.arange(1, row_count + 1, dtype=np.uint16),
         "pair_row_indices": np.zeros(pair_count, dtype=np.uint32),
-        "left_signature_indices": np.zeros(pair_count, dtype=np.uint32),
-        "right_signature_indices": np.zeros(pair_count, dtype=np.uint32),
-        "seed_signature_ids": [],
+        "left_signature_ids": [(query_signature_ids[0] if query_signature_ids else "")] * pair_count,
+        "right_signature_ids": [f"s{index}" for index in range(pair_count)],
         "component_members": {},
         "telemetry": {},
     }
@@ -89,7 +85,7 @@ def _minimal_raw_candidate_plan(**overrides: Any) -> dict[str, Any]:
     return plan
 
 
-def test_subset_raw_candidate_plan_fast_path_rejects_out_of_range_query_index() -> None:
+def test_subset_raw_candidate_plan_rejects_pair_left_id_that_disagrees_with_row_query() -> None:
     raw_plan = _minimal_raw_candidate_plan(
         query_signature_ids=["q0", "q1", "q2"],
         query_views=["full", "full", "full"],
@@ -99,13 +95,12 @@ def test_subset_raw_candidate_plan_fast_path_rejects_out_of_range_query_index() 
         row_query_signature_indices=np.asarray([1], dtype=np.uint32),
         row_component_keys=["c1"],
         pair_row_indices=np.asarray([0], dtype=np.uint32),
-        left_signature_indices=np.asarray([0], dtype=np.uint32),
-        right_signature_indices=np.asarray([3], dtype=np.uint32),
-        seed_signature_ids=["s1"],
+        left_signature_ids=["q0"],
+        right_signature_ids=["s1"],
         component_members={"c1": ["s1"]},
     )
 
-    with pytest.raises(ValueError, match="outside the selected contiguous query range"):
+    with pytest.raises(ValueError, match="left_signature_ids must match"):
         subset_raw_candidate_plan_for_query_ids(raw_plan, ["q1"])
 
 
@@ -329,7 +324,6 @@ def _raw_candidate_plan_arrow(
     orcid_enabled: bool = True,
     num_threads: int | None = None,
     max_exemplars: int = 4,
-    include_pair_signature_ids: bool = True,
     include_component_members: bool = True,
     full_scan_without_index: bool = True,
 ) -> dict[str, Any]:
@@ -341,17 +335,10 @@ def _raw_candidate_plan_arrow(
         orcid_enabled=orcid_enabled,
         num_threads=num_threads,
         max_exemplars=max_exemplars,
-        include_pair_signature_ids=include_pair_signature_ids,
         include_component_members=include_component_members,
         full_scan_without_index=full_scan_without_index,
     )
-    plan = planner.plan(
-        list(query_signature_ids),
-        top_k=top_k,
-        query_view=query_view,
-        include_pair_signature_ids=include_pair_signature_ids,
-        include_component_members=include_component_members,
-    )
+    plan = planner.plan(list(query_signature_ids))
     _merge_raw_arrow_planner_build_telemetry(plan, planner.build_telemetry())
     return plan
 
@@ -442,7 +429,6 @@ def test_raw_arrow_candidate_planner_matches_one_shot_plan(tmp_path: Path) -> No
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        include_pair_signature_ids=True,
         include_component_members=True,
         full_scan_without_index=True,
     )
@@ -453,17 +439,10 @@ def test_raw_arrow_candidate_planner_matches_one_shot_plan(tmp_path: Path) -> No
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        include_pair_signature_ids=True,
         include_component_members=True,
         full_scan_without_index=True,
     )
-    planned = planner.plan(
-        ["q1"],
-        top_k=2,
-        query_view="full",
-        include_pair_signature_ids=True,
-        include_component_members=True,
-    )
+    planned = planner.plan(["q1"])
 
     _assert_raw_candidate_plans_equal(planned, one_shot)
     assert planner.build_telemetry()["query_signature_count"] == 1
@@ -492,7 +471,6 @@ def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: 
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        include_pair_signature_ids=True,
         include_component_members=True,
         full_scan_without_index=True,
     )
@@ -503,17 +481,10 @@ def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: 
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        include_pair_signature_ids=True,
         include_component_members=True,
         full_scan_without_index=True,
     )
-    planned = planner.plan(
-        ["q1"],
-        top_k=2,
-        query_view="full",
-        include_pair_signature_ids=True,
-        include_component_members=True,
-    )
+    planned = planner.plan(["q1"])
 
     _assert_raw_candidate_plans_equal(planned, one_shot)
     assert "q1" not in planned["component_members"].get("c_query", [])
@@ -528,27 +499,14 @@ def test_raw_arrow_candidate_planner_rejects_multi_query_seed_overlap(tmp_path: 
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        include_pair_signature_ids=True,
         include_component_members=False,
         full_scan_without_index=True,
     )
 
     with pytest.raises(ValueError, match="singleton query windows"):
-        planner.plan(
-            ["q1", "s1"],
-            top_k=2,
-            query_view="full",
-            include_pair_signature_ids=True,
-            include_component_members=False,
-        )
+        planner.plan(["q1", "s1"])
 
-    planned = planner.plan(
-        ["q1"],
-        top_k=2,
-        query_view="full",
-        include_pair_signature_ids=True,
-        include_component_members=False,
-    )
+    planned = planner.plan(["q1"])
     assert planned["row_component_keys"] == ["c_match", "c_other"]
     assert planned["right_signature_ids"] == ["s1", "s2"]
 
@@ -1486,8 +1444,6 @@ def test_raw_arrow_candidate_plan_matches_multi_query_auto_views_and_specter(tmp
         "row_query_signature_indices",
         "retrieval_scores",
         "retrieval_ranks",
-        "left_signature_indices",
-        "right_signature_indices",
         "pair_row_indices",
         "row_orcid_match",
         "specter_centroid_similarity",
@@ -1584,6 +1540,34 @@ def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metada
     assert narrow_plan["component_members"]["c_other"] == ["s2"]
 
 
+def test_raw_arrow_candidate_plan_accepts_missing_papers_year_column(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path)
+    papers = pa.table(
+        {
+            "paper_id": pa.array(["p_q", "p1", "p2"], type=pa.string()),
+            "title": pa.array(["Graph Models", "Graph Models", "Different Topic"], type=pa.string()),
+            "venue": pa.array(["NeurIPS", "NeurIPS", "ICML"], type=pa.string()),
+            "journal_name": pa.array(["", "", ""], type=pa.string()),
+        }
+    )
+    paths["papers"] = _write_ipc(tmp_path / "papers_without_year.arrow", papers)
+
+    raw_plan = _raw_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+
+    np.testing.assert_array_equal(raw_plan["row_query_year_missing"], np.ones(raw_plan["row_count"], dtype=np.uint8))
+    np.testing.assert_array_equal(
+        raw_plan["row_candidate_year_range_missing"],
+        np.ones(raw_plan["row_count"], dtype=np.uint8),
+    )
+
+
 def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
 
@@ -1614,6 +1598,29 @@ def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tm
     assert "candidate_cluster_max_paper_author_count" in retrieval_batch.row_signals
 
 
+def test_raw_arrow_candidate_plan_bridge_accepts_bundle_from_rust_plan(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path)
+
+    raw_plan = _raw_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+    bundle = RawArrowPlanBundle.from_mapping(raw_plan)
+    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(bundle)
+
+    candidate_batch = retrieval_batch.candidate_batch
+    assert bundle.row_count == raw_plan["row_count"]
+    assert bundle.pair_count == raw_plan["pair_count"]
+    assert bundle.signature_order.signature_ids == ("q1", "s1", "s2")
+    assert cast(Any, candidate_batch.row_query_signature_indices).tolist() == [0, 0]
+    assert candidate_batch.left_signature_indices.tolist() == [0, 0]
+    assert candidate_batch.right_signature_indices.tolist() == [1, 2]
+
+
 def test_raw_arrow_labeled_candidate_plan_scores_frozen_rows_without_cluster_seeds(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_arrow_labeled_candidate_plan"):
         raise pytest.skip.Exception("raw_arrow_labeled_candidate_plan is unavailable")
@@ -1628,7 +1635,6 @@ def test_raw_arrow_labeled_candidate_plan_scores_frozen_rows_without_cluster_see
         ["c_other", "c_match"],
         np.asarray([1, 2], dtype=np.uint16),
         {"c_match": ["s1"], "c_other": ["s2"]},
-        component_scope="block-local",
         orcid_enabled=False,
         num_threads=1,
         full_scan_without_index=True,
@@ -1648,29 +1654,6 @@ def test_raw_arrow_labeled_candidate_plan_scores_frozen_rows_without_cluster_see
     assert raw_plan["telemetry"]["component_scope"] == "block-local"
 
 
-def test_raw_arrow_labeled_candidate_plan_rejects_compact_pair_payload(tmp_path: Path) -> None:
-    if not hasattr(s2and_rust, "raw_arrow_labeled_candidate_plan"):
-        raise pytest.skip.Exception("raw_arrow_labeled_candidate_plan is unavailable")
-    paths = _base_arrow_paths(tmp_path)
-    paths.pop("cluster_seeds")
-
-    with pytest.raises(ValueError, match="requires include_pair_signature_ids=True"):
-        s2and_rust.raw_arrow_labeled_candidate_plan(
-            paths,
-            ["q1"],
-            ["full"],
-            ["q1-full"],
-            ["c_match"],
-            np.asarray([1], dtype=np.uint16),
-            {"c_match": ["s1"]},
-            component_scope="block-local",
-            orcid_enabled=False,
-            num_threads=1,
-            include_pair_signature_ids=False,
-            full_scan_without_index=True,
-        )
-
-
 def test_raw_arrow_labeled_candidate_plan_scores_use_all_components_for_global_df(tmp_path: Path) -> None:
     if not hasattr(s2and_rust, "raw_arrow_labeled_candidate_plan"):
         raise pytest.skip.Exception("raw_arrow_labeled_candidate_plan is unavailable")
@@ -1686,7 +1669,6 @@ def test_raw_arrow_labeled_candidate_plan_scores_use_all_components_for_global_d
         ["c_match"],
         np.asarray([1], dtype=np.uint16),
         component_members,
-        component_scope="block-local",
         orcid_enabled=False,
         num_threads=1,
         full_scan_without_index=True,
@@ -1699,7 +1681,6 @@ def test_raw_arrow_labeled_candidate_plan_scores_use_all_components_for_global_d
         ["c_match", "c_other"],
         np.asarray([1, 2], dtype=np.uint16),
         component_members,
-        component_scope="block-local",
         orcid_enabled=False,
         num_threads=1,
         full_scan_without_index=True,
@@ -1724,7 +1705,6 @@ def test_raw_arrow_labeled_candidate_plan_initial_view_keeps_full_first_token(tm
         ["c_match"],
         np.asarray([1], dtype=np.uint16),
         {"c_match": ["s1"]},
-        component_scope="block-local",
         orcid_enabled=False,
         num_threads=1,
         full_scan_without_index=True,
@@ -1782,7 +1762,6 @@ def test_raw_arrow_labeled_candidate_plan_applies_block_local_members(tmp_path: 
         ["block-a::c"],
         np.asarray([1], dtype=np.uint16),
         {"block-a::c": ["q1", "s1", "s2"]},
-        component_scope="block-local",
         orcid_enabled=False,
         num_threads=1,
         full_scan_without_index=True,
@@ -1791,41 +1770,6 @@ def test_raw_arrow_labeled_candidate_plan_applies_block_local_members(tmp_path: 
     assert raw_plan["left_signature_ids"] == ["q1"]
     assert raw_plan["right_signature_ids"] == ["s1"]
     assert raw_plan["row_component_sizes"].tolist() == [1]
-
-
-def test_raw_arrow_candidate_plan_bridge_maps_compact_numeric_indices(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-
-    raw_plan = _raw_candidate_plan_arrow(
-        paths,
-        ["q1"],
-        top_k=1,
-        query_view="full",
-        orcid_enabled=False,
-        num_threads=1,
-        include_pair_signature_ids=False,
-        include_component_members=False,
-    )
-    assert "left_signature_ids" not in raw_plan
-    assert "right_signature_ids" not in raw_plan
-    assert "component_members" not in raw_plan
-    assert raw_plan["seed_signature_ids"] == ["s1"]
-    assert raw_plan["telemetry"]["seed_signature_count"] == 2
-    assert raw_plan["telemetry"]["payload_seed_signature_count"] == 1
-
-    signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_plan)
-    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
-        raw_plan,
-        feature_block_signature_order=signature_order,
-    )
-
-    candidate_batch = retrieval_batch.candidate_batch
-    assert signature_order.signature_ids == ("q1", "s1")
-    assert cast(Any, candidate_batch.row_query_signature_indices).tolist() == [0]
-    assert candidate_batch.left_signature_indices.tolist() == [0]
-    assert candidate_batch.right_signature_indices.tolist() == [1]
-    assert candidate_batch.pair_row_indices.tolist() == [0]
-    assert candidate_batch.row_component_keys == ("c_match",)
 
 
 def test_raw_arrow_candidate_plan_emits_native_row_signals_from_name_counts_index(

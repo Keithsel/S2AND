@@ -121,9 +121,9 @@ impl RawNameCountIndexFile {
                 kind.key(),
             )));
         }
-        let record_count = read_u64_le(&bytes, 8)? as usize;
-        let blob_offset = read_u64_le(&bytes, 16)? as usize;
-        let blob_len = read_u64_le(&bytes, 24)? as usize;
+        let record_count = read_u64_usize(&bytes, 8, path, "record_count")?;
+        let blob_offset = read_u64_usize(&bytes, 16, path, "blob_offset")?;
+        let blob_len = read_u64_usize(&bytes, 24, path, "blob_len")?;
         let records_end = NAME_COUNTS_INDEX_HEADER_LEN
             .checked_add(
                 record_count
@@ -255,7 +255,11 @@ impl RawNameCountIndexFile {
                 break;
             }
             let offset = self.record_offset(index);
-            let name_offset = read_u64_le_unchecked(&self.bytes, offset + 16) as usize;
+            let name_offset = match usize::try_from(read_u64_le_unchecked(&self.bytes, offset + 16))
+            {
+                Ok(value) => value,
+                Err(_) => break,
+            };
             let name_len = read_u32_le_unchecked(&self.bytes, offset + 24) as usize;
             if name_offset
                 .checked_add(name_len)
@@ -407,4 +411,16 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> PyResult<u64> {
         pyo3::exceptions::PyValueError::new_err("u64 offset is outside name-count index")
     })?;
     Ok(read_u64_le_unchecked(slice, 0))
+}
+
+fn read_u64_usize(bytes: &[u8], offset: usize, path: &Path, field_name: &str) -> PyResult<usize> {
+    let raw = read_u64_le(bytes, offset)?;
+    usize::try_from(raw).map_err(|_| {
+        pyo3::exceptions::PyOverflowError::new_err(format!(
+            "name-count index file {} field {} overflows usize: {}",
+            path.display(),
+            field_name,
+            raw
+        ))
+    })
 }

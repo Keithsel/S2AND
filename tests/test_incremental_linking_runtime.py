@@ -173,9 +173,8 @@ def test_subset_raw_candidate_plan_preserves_unretrieved_component_members() -> 
         "retrieval_scores": np.asarray([0.9], dtype=np.float32),
         "retrieval_ranks": np.asarray([1], dtype=np.uint16),
         "pair_row_indices": np.asarray([0], dtype=np.uint32),
-        "left_signature_indices": np.asarray([0], dtype=np.uint32),
-        "right_signature_indices": np.asarray([2], dtype=np.uint32),
-        "seed_signature_ids": ["s1"],
+        "left_signature_ids": ["q0"],
+        "right_signature_ids": ["s1"],
         "component_members": {"c1": ["s1"], "c2": ["s2"]},
         "telemetry": {},
     }
@@ -201,9 +200,8 @@ def _minimal_raw_candidate_plan(**overrides: Any) -> dict[str, Any]:
         "retrieval_scores": np.asarray([0.9], dtype=np.float32),
         "retrieval_ranks": np.asarray([1], dtype=np.uint16),
         "pair_row_indices": np.asarray([0], dtype=np.uint32),
-        "left_signature_indices": np.asarray([0], dtype=np.uint32),
-        "right_signature_indices": np.asarray([1], dtype=np.uint32),
-        "seed_signature_ids": ["s1"],
+        "left_signature_ids": ["q0"],
+        "right_signature_ids": ["s1"],
     }
     for raw_key, _signal_key, dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS:
         raw_plan[raw_key] = np.asarray([""] if dtype is object else [0], dtype=dtype)
@@ -216,6 +214,26 @@ def test_raw_candidate_plan_rejects_pair_row_index_outside_row_count() -> None:
 
     with pytest.raises(ValueError, match="pair_row_indices.*row_count=1"):
         runtime_module.subset_raw_candidate_plan_for_query_ids(raw_plan, ["q0"])
+
+
+def test_raw_candidate_plan_rejects_legacy_numeric_pair_indices() -> None:
+    raw_plan = _minimal_raw_candidate_plan(left_signature_indices=np.asarray([0], dtype=np.uint32))
+
+    with pytest.raises(ValueError, match="legacy numeric pair indices"):
+        build_linker_retrieval_batch_from_raw_candidate_plan(
+            raw_plan,
+            signature_id_to_index={"q0": 0, "s1": 1},
+        )
+
+
+def test_raw_candidate_plan_rejects_pair_left_id_that_disagrees_with_row_query() -> None:
+    raw_plan = _minimal_raw_candidate_plan(left_signature_ids=["other-query"])
+
+    with pytest.raises(ValueError, match="left_signature_ids must match"):
+        build_linker_retrieval_batch_from_raw_candidate_plan(
+            raw_plan,
+            signature_id_to_index={"q0": 0, "other-query": 1, "s1": 2},
+        )
 
 
 def test_raw_candidate_plan_rejects_row_query_index_outside_query_count() -> None:
@@ -241,8 +259,6 @@ def test_raw_candidate_plan_rejects_negative_retrieval_rank() -> None:
         "retrieval_scores": np.asarray([0.9], dtype=np.float32),
         "retrieval_ranks": [-1],
         "pair_row_indices": np.asarray([0], dtype=np.uint32),
-        "left_signature_indices": np.asarray([0], dtype=np.uint32),
-        "right_signature_indices": np.asarray([1], dtype=np.uint32),
         "left_signature_ids": ["q0"],
         "right_signature_ids": ["s1"],
     }
@@ -251,6 +267,16 @@ def test_raw_candidate_plan_rejects_negative_retrieval_rank() -> None:
 
     with pytest.raises(ValueError, match="retrieval_ranks"):
         build_linker_retrieval_batch_from_raw_candidate_plan(raw_plan, signature_id_to_index={"q0": 0, "s1": 1})
+
+
+def test_raw_candidate_plan_rejects_invalid_uint8_flag() -> None:
+    raw_plan = _minimal_raw_candidate_plan(row_query_year_missing=[-1])
+
+    with pytest.raises(ValueError, match="row_query_year_missing.*non-0/1"):
+        build_linker_retrieval_batch_from_raw_candidate_plan(
+            raw_plan,
+            signature_id_to_index={"q0": 0, "s1": 1},
+        )
 
 
 def test_subset_row_signals_rejects_non_1d_signals() -> None:
@@ -527,13 +553,17 @@ def test_raw_arrow_runtime_rejects_mismatched_query_view_length_before_featurize
         nameless_featurizer_info=None,
     )
 
-    with pytest.raises(ValueError, match="query_views length must match query count"):
+    with pytest.raises(ValueError, match="query_views length must match query_signature_ids"):
         runtime_module.predict_incremental_link_or_abstain_from_raw_arrow_paths(
             clusterer,
             _static_artifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0)),
             arrow_paths={"signatures": tmp_path / "signatures.arrow"},
             query_signature_ids=["q"],
-            raw_candidate_plan={"query_signature_ids": ["q"], "query_views": []},
+            raw_candidate_plan=_minimal_raw_candidate_plan(
+                query_signature_ids=["q"],
+                left_signature_ids=["q"],
+                query_views=[],
+            ),
         )
 
 
@@ -561,7 +591,11 @@ def test_raw_arrow_runtime_rejects_unknown_query_view_before_featurizer(
             _static_artifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0)),
             arrow_paths={"signatures": tmp_path / "signatures.arrow"},
             query_signature_ids=["q"],
-            raw_candidate_plan={"query_signature_ids": ["q"], "query_views": ["typo"]},
+            raw_candidate_plan=_minimal_raw_candidate_plan(
+                query_signature_ids=["q"],
+                left_signature_ids=["q"],
+                query_views=["typo"],
+            ),
         )
 
 
@@ -2001,7 +2035,7 @@ def test_private_production_slice_keeps_seed_disallow_constraints(
     assert result.linked_signature_clusters == {}
 
 
-def test_private_production_slice_records_require_outside_retrieval_window(
+def test_private_production_slice_rejects_require_outside_retrieval_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dataset = SimpleNamespace()
@@ -2017,18 +2051,17 @@ def test_private_production_slice_records_require_outside_retrieval_window(
         ),
     )
 
-    result = _predict_incremental_link_or_abstain_production_private(
-        clusterer,
-        artifact,
-        dataset=dataset,
-        featurizer=featurizer,
-        retriever=object(),
-        queries=[object()],
-        query_signature_ids=["q1"],
-        partial_supervision={("q1", "s1"): 0},
-    )
-
-    assert result.telemetry["partial_supervision_require_outside_retrieval_window"] == 1
+    with pytest.raises(ValueError, match="partial_supervision_require_outside_retrieval_window"):
+        _predict_incremental_link_or_abstain_production_private(
+            clusterer,
+            artifact,
+            dataset=dataset,
+            featurizer=featurizer,
+            retriever=object(),
+            queries=[object()],
+            query_signature_ids=["q1"],
+            partial_supervision={("q1", "s1"): 0},
+        )
 
 
 def test_from_retrieval_validates_partial_supervision_against_full_seed_map() -> None:
@@ -2040,20 +2073,19 @@ def test_from_retrieval_validates_partial_supervision_against_full_seed_map() ->
         row_component_keys=(),
     )
 
-    result = runtime_module._predict_incremental_link_or_abstain_production_from_retrieval_private(  # noqa: SLF001
-        clusterer,
-        artifact,
-        dataset=None,
-        featurizer=featurizer,
-        retrieval_batch=retrieval_batch,
-        queries=[object()],
-        query_signature_ids=["q1"],
-        partial_supervision={("q1", "s2"): 0},
-        seed_setup=({"s1": "c1"}, {}, {"c1": ["s1"]}),
-        partial_supervision_seed_signature_to_component={"s1": "c1", "s2": "c2"},
-    )
-
-    assert result.telemetry["partial_supervision_require_outside_retrieval_window"] == 1
+    with pytest.raises(ValueError, match="partial_supervision_require_outside_retrieval_window"):
+        runtime_module._predict_incremental_link_or_abstain_production_from_retrieval_private(  # noqa: SLF001
+            clusterer,
+            artifact,
+            dataset=None,
+            featurizer=featurizer,
+            retrieval_batch=retrieval_batch,
+            queries=[object()],
+            query_signature_ids=["q1"],
+            partial_supervision={("q1", "s2"): 0},
+            seed_setup=({"s1": "c1"}, {}, {"c1": ["s1"]}),
+            partial_supervision_seed_signature_to_component={"s1": "c1", "s2": "c2"},
+        )
 
 
 def test_from_retrieval_records_artifact_retrieval_top_k_when_not_passed(

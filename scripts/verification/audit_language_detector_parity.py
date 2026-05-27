@@ -170,7 +170,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default="s2and/data-backup", type=Path)
     parser.add_argument("--dataset", default="qian")
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=1000, help="Number of titles to audit by default; use 0 for all.")
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument(
         "--rust-extension-path",
@@ -190,7 +190,9 @@ def main() -> None:
         raise RuntimeError("s2and_rust._debug_language_detector_audit is unavailable; rebuild the Rust extension.")
 
     rows = _load_in_signature_titles(args.data_root, args.dataset)
-    if args.limit is not None:
+    if args.limit < 0:
+        raise ValueError("--limit must be non-negative")
+    if args.limit > 0:
         rows = rows[: args.limit]
     titles = [title for _paper_id, title in rows]
 

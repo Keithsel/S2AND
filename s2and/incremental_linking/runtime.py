@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import time
 import warnings
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
@@ -19,7 +18,6 @@ from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.array_validation import as_uint32_1d
 from s2and.incremental_linking.artifact import IncrementalLinkingArtifact
-from s2and.incremental_linking.feature_block import feature_block_signature_order_from_raw_candidate_plan
 from s2and.incremental_linking.features import LinkerFeatureMatrix, assemble_linker_feature_matrix
 from s2and.incremental_linking.gate_buckets import validate_query_view
 from s2and.incremental_linking.linker_pairwise import (
@@ -50,6 +48,7 @@ from s2and.incremental_linking.retrieval import (
     RAW_CANDIDATE_PLAN_PAIR_ID_KEYS,
     RAW_CANDIDATE_PLAN_ROW_KEYS,
     LinkerRetrievalBatch,
+    RawArrowPlanBundle,
     build_linker_retrieval_batch_from_raw_candidate_plan,
     build_linker_retrieval_batch_rust,
     validate_raw_candidate_plan_schema,
@@ -1184,7 +1183,10 @@ def _validate_partial_supervision_window(
             continue
         if kind == "require":
             telemetry["partial_supervision_require_outside_retrieval_window"] += 1
-            continue
+            raise ValueError(
+                "partial_supervision_require_outside_retrieval_window: "
+                f"query_signature_id={query_signature_id!r} seed_signature_id={seed_signature_id!r}"
+            )
         if kind == "disallow":
             telemetry["partial_supervision_disallow_outside_retrieval_window"] += 1
         else:
@@ -1941,7 +1943,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     load_name_counts: bool | None | dict[str, Any] = None,
     name_tuples: set[tuple[str, str]] | str | None = "filtered",
     orcid_enabled: bool | None = None,
-    raw_candidate_plan: Mapping[str, Any] | None = None,
+    raw_candidate_plan: Mapping[str, Any] | RawArrowPlanBundle | None = None,
     rust_featurizer: Any | None = None,
     partial_supervision_seed_signature_to_component: Mapping[str, Any] | None = None,
 ) -> LinkOrAbstainProductionResult:
@@ -1972,6 +1974,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     resolved_orcid_enabled = (
         not bool(getattr(clusterer, "suppress_orcid", False)) if orcid_enabled is None else bool(orcid_enabled)
     )
+    raw_candidate_plan_mapping: Mapping[str, Any]
     if raw_candidate_plan is None:
         stage_start = time.perf_counter()
         rust_module = feature_port._require_rust_runtime()  # noqa: SLF001
@@ -1991,21 +1994,30 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
             include_component_members=True,
             full_scan_without_index=False,
         )
-        raw_candidate_plan = raw_planner.plan(list(query_signature_id_strings))
+        raw_candidate_plan_mapping = raw_planner.plan(list(query_signature_id_strings))
+        if not isinstance(raw_candidate_plan_mapping, MutableMapping):
+            raise RuntimeError(
+                "RawBlockQueryCandidatePlanner.plan returned a non-mutable raw candidate plan; "
+                "rebuild the Rust extension"
+            )
         build_telemetry = getattr(raw_planner, "build_telemetry", None)
         if not callable(build_telemetry):
             raise RuntimeError(
                 "raw Arrow scoring requires RawBlockQueryCandidatePlanner.build_telemetry; "
                 "rebuild the Rust extension"
             )
-        _merge_raw_arrow_planner_build_telemetry(raw_candidate_plan, build_telemetry())
+        _merge_raw_arrow_planner_build_telemetry(raw_candidate_plan_mapping, build_telemetry())
         raw_arrow_retrieval_seconds = time.perf_counter() - stage_start
     else:
-        raw_candidate_plan = copy.deepcopy(raw_candidate_plan)
-        _validate_raw_plan_query_signature_ids(raw_candidate_plan, query_signature_id_strings)
+        source_plan = (
+            raw_candidate_plan.plan if isinstance(raw_candidate_plan, RawArrowPlanBundle) else raw_candidate_plan
+        )
+        raw_candidate_plan_mapping = source_plan
         raw_arrow_retrieval_seconds = 0.0
 
-    _raw_plan_query_views(raw_candidate_plan, len(query_signature_id_strings))
+    raw_plan_bundle = RawArrowPlanBundle.from_mapping(raw_candidate_plan_mapping)
+    _validate_raw_plan_query_signature_ids(raw_plan_bundle.plan, query_signature_id_strings)
+    _raw_plan_query_views(raw_plan_bundle.plan, len(query_signature_id_strings))
     if provided_raw_candidate_plan and rust_featurizer is None:
         raise ValueError(
             "raw Arrow scoring with a provided raw_candidate_plan requires rust_featurizer; "
@@ -2013,7 +2025,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
             "unbounded Arrow scans"
         )
     stage_start = time.perf_counter()
-    signature_order = feature_block_signature_order_from_raw_candidate_plan(raw_candidate_plan)
+    signature_order = raw_plan_bundle.signature_order
     resolved_load_name_counts = _resolve_load_name_counts_policy(
         clusterer,
         load_name_counts,
@@ -2041,14 +2053,14 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     )
 
     retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
-        raw_candidate_plan,
+        raw_plan_bundle,
         signature_id_to_index=featurizer_signature_id_to_index,
     )
     stage_start = time.perf_counter()
-    query_placeholders = _raw_candidate_plan_query_placeholders(raw_candidate_plan, query_signature_id_strings)
-    seed_setup = _raw_candidate_plan_seed_setup(raw_candidate_plan)
+    query_placeholders = _raw_candidate_plan_query_placeholders(raw_plan_bundle.plan, query_signature_id_strings)
+    seed_setup = _raw_candidate_plan_seed_setup(raw_plan_bundle.plan)
     seed_signature_count = sum(len(members) for members in seed_setup[2].values())
-    plan_telemetry = raw_candidate_plan.get("telemetry")
+    plan_telemetry = raw_plan_bundle.plan.get("telemetry")
     if seed_signature_count == 0 and isinstance(plan_telemetry, Mapping):
         seed_signature_count = int(plan_telemetry.get("seed_signature_count", 0) or 0)
     seed_component_count = len(seed_setup[1])
@@ -2074,7 +2086,7 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
         total_ram_bytes=total_ram_bytes,
         retrieval_top_k=top_k_resolved,
     )
-    raw_plan_telemetry_fields = _raw_candidate_plan_telemetry_fields(raw_candidate_plan)
+    raw_plan_telemetry_fields = _raw_candidate_plan_telemetry_fields(raw_plan_bundle.plan)
     telemetry = {
         **result.telemetry,
         **raw_plan_telemetry_fields,

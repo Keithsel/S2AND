@@ -359,17 +359,6 @@ def test_minimal_raw_component_members_default_to_block_local_component_keys(tmp
     assert details["m muller::284283"].signature_indices.tolist() == [1, 2]
     assert details["other::1"].signature_ids == ("d",)
 
-    frozen_details = _component_member_details_by_key(
-        members_path,
-        {"a": 0, "b": 1, "c": 2, "d": 3},
-        dataset=cast(Any, dataset),
-        component_scope="frozen",
-    )
-
-    assert frozen_details["m muller::284283"].signature_ids == ("a", "b", "c")
-    assert frozen_details["m muller::284283"].signature_indices.tolist() == [0, 1, 2]
-    assert frozen_details["other::1"].signature_ids == ("d",)
-
 
 def test_minimal_raw_structural_cleaning_drops_self_only_candidates(tmp_path) -> None:
     components_dir = tmp_path / "components"

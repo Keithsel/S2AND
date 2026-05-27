@@ -115,7 +115,7 @@ uses the native graph fallback. It is used only when all of these are true:
 - `arrow_paths["signatures"]` is present.
 - `arrow_paths["signatures_batch_index"]` is present.
 
-That path calls `make_subblocks_arrow_rust(...)`, so Rust loads the name and ORCID rows needed for subblocking from
+That path calls `_make_subblocks_with_telemetry_arrow_rust(...)`, so Rust loads the name and ORCID rows needed for subblocking from
 Arrow. If an Arrow-backed Rust production prediction is missing either artifact, prediction raises a structured
 missing-artifact error instead of silently using `ANDData` partitioning. Python subblocking orchestration remains
 available through explicit Python/compatibility routes and direct `make_subblocks(...)` calls.

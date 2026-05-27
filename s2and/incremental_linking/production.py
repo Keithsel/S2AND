@@ -23,6 +23,9 @@ from s2and.incremental_linking.feature_block import (
     read_cluster_seeds_arrow,
     temporary_arrow_paths_with_cluster_seeds,
 )
+from s2and.incremental_linking.feature_block_arrow import (
+    temporary_arrow_paths_with_incremental_query_signatures,
+)
 from s2and.incremental_linking.policy import (
     clusterer_uses_embedding_features,
     clusterer_uses_name_count_features,
@@ -655,6 +658,11 @@ def predict_incremental_promoted_linker_from_arrow_paths(
         raw_window_plan_telemetry: dict[str, int | float | str] = {}
 
         rust_module = feature_port._require_rust_runtime() if unassigned_signature_ids else None
+        if rust_module is not None:
+            runtime_module._require_raw_arrow_query_signature_planner_capability(  # noqa: SLF001
+                rust_module,
+                context="raw Arrow promoted incremental linking",
+            )
         raw_window_planner_count = 0
         raw_window_planner_batch_plan_count = 0
         raw_window_planner_plan_call_count = 0
@@ -667,16 +675,26 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                     "raw Arrow promoted incremental linking requires "
                     "s2and_rust.RawBlockQueryCandidatePlanner; rebuild the Rust extension"
                 )
+            from_query_signatures = getattr(raw_planner_cls, "from_query_signatures", None)
+            if not callable(from_query_signatures):
+                raise RuntimeError(
+                    "raw Arrow promoted incremental linking requires "
+                    "RawBlockQueryCandidatePlanner.from_query_signatures; rebuild the Rust extension"
+                )
             raw_window_start = time.perf_counter()
-            raw_request_planner = raw_planner_cls(
+            with temporary_arrow_paths_with_incremental_query_signatures(
                 arrow_path_payload,
-                list(unassigned_signature_ids),
-                top_k=retrieval_top_k,
+                unassigned_signature_ids,
+                prefix="s2and_arrow_incremental_query_signatures_",
                 query_view="auto",
-                orcid_enabled=bool(orcid_enabled),
-                num_threads=clusterer.n_jobs,
-                max_exemplars=4,
-            )
+            ) as planner_arrow_path_payload:
+                raw_request_planner = from_query_signatures(
+                    planner_arrow_path_payload,
+                    top_k=retrieval_top_k,
+                    orcid_enabled=bool(orcid_enabled),
+                    num_threads=clusterer.n_jobs,
+                    max_exemplars=4,
+                )
             raw_window_plan_seconds += time.perf_counter() - raw_window_start
             raw_window_plan_count += 1
             raw_window_plan_query_count += len(unassigned_signature_ids)
@@ -753,7 +771,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                 raw_window_planner_batch_plan_count += 1
                 raw_window_subset_seconds += time.perf_counter() - raw_window_subset_start
                 raw_window_featurizer_reused_batch_count += int(raw_window_featurizer is not None)
-                result = runtime_module.predict_incremental_link_or_abstain_from_raw_arrow_paths(
+                result = runtime_module._predict_incremental_link_or_abstain_from_preplanned_raw_arrow(  # noqa: SLF001
                     clusterer,
                     artifact,
                     arrow_paths=arrow_path_payload,
@@ -763,11 +781,11 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                     runtime_context=runtime_context,
                     n_jobs=clusterer.n_jobs,
                     total_ram_bytes=resolved_total_ram_bytes,
-                    load_name_counts=clusterer_uses_name_count_features(clusterer),
-                    name_tuples=name_tuples,
-                    orcid_enabled=orcid_enabled,
                     raw_candidate_plan=batch_raw_candidate_plan,
                     rust_featurizer=raw_window_featurizer,
+                    allow_featurizer_build=False,
+                    load_name_counts=None,
+                    name_tuples=None,
                     partial_supervision_seed_signature_to_component=cluster_seeds_require,
                 )
                 linked_signature_clusters.update(dict(result.linked_signature_clusters))

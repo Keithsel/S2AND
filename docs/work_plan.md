@@ -74,7 +74,6 @@ The canonical surface owns:
 | Rust pair-plan ABI | `get_build_info()` exposes supported pair-plan kwargs and row signals; Python no longer parses `__text_signature__` or runs a live zero-row probe. |
 | Arrow path authority | Production prediction reads only explicit dataset Arrow path mappings and validates them through `s2and.arrow_inputs`; sibling-bundle and optional-sidecar discovery remain compatibility-only. |
 | Arrow schema contract | `s2and/arrow_schema_contract.json` is checked by Rust/Python tests before any reader policy is centralized. |
-| Performance/quality freeze | Cleanup must stay within 5% of the pre-refactor cleanup baseline for latency/RSS on the selected workload and must not regress maintained parity metrics. |
 
 ## Open Work
 
@@ -210,19 +209,15 @@ Remaining:
 
 - Prefer `Clusterer.predict_from_arrow_paths(...)` or Arrow-routed
   `predict(...)` for production inference.
-- Prefer `RawBlockQueryCandidatePlanner.plan(...)` plus typed Arrow request
-  tables for single-query/seeded incremental requests.
 - Use `scripts/verification/compare_graph_subblocking_arrow_quality.py` for
   Python graph vs Rust graph subblocking checks. It no longer compares against
   the old SPECTER fallback or any Rust-calls-Python callback path.
-- Split the broad raw-Arrow incremental runtime entrypoint into narrow
-  planner-owned execution and preplanned scoring surfaces. Use a typed
-  `RawArrowPlanBundle` or equivalent only after typed Arrow request-table
-  fixtures pin the boundary and prove the split does not revive raw payload /
-  mini-`ANDData` bridges.
+- Keep the raw-Arrow incremental runtime split between planner-owned execution
+  and strict preplanned scoring. Query request fields should stay in typed
+  Arrow sidecars; production batch scoring should continue to call the
+  preplanned surface with a supplied raw candidate plan and Rust featurizer.
 - Keep `feature_block_from_arrow_paths(...)` implementation-only for
-  fixture/parity validation until typed Arrow request-table coverage makes it
-  unnecessary. Do not re-export it as public production API.
+  fixture/parity validation. Do not re-export it as public production API.
 - Keep `RustFeaturizer.from_dataset(...)` as the Python-reference,
   training/eval, parity, and fixture surface.
 - Keep text `altered_cluster_signatures.txt` fallback only for training/legacy
@@ -268,21 +263,23 @@ Already landed:
   `RawNameCountMaps` / `NameCountsData` contract.
 - Extracted Python-compatible text/name normalization helpers into
   `s2and_rust/src/text_compat.rs`.
+- Extracted raw-planner Arrow batch lookup reading into
+  `s2and_rust/src/arrow_batch_lookup.rs`.
+- Relabeled remaining JSON-backed compatibility references; active Python
+  constructors reject `RustFeaturizer.from_json_paths(...)`.
 - Current inventory:
   [rust/public_surface_inventory.md](rust/public_surface_inventory.md).
 
 Remaining:
 
-- Remove or isolate JSON ingest helpers once their remaining parity and
-  benchmark uses are explicitly labeled compatibility-only.
 - Keep the indexed pairwise feature API as the Python Rust batching boundary.
   The Python `featurize_pair_rust(...)` and string-pair matrix wrappers have
   been removed; direct Rust `featurize_pair(...)`, `featurize_pairs(...)`, and
   `featurize_pairs_matrix(...)` PyO3 debug methods have also been removed.
 - Split `s2and_rust/src/lib.rs` mechanically, one low-coupling module at a
   time. Completed extractions: `promoted_linker`, `name_counts`,
-  `text_compat`. Candidate next modules: `arrow_io`, `ingest_arrow`,
-  `ingest_json`, `ingest_dataset`, `features`, `constraints`, `retrieval`,
+  `text_compat`, `arrow_batch_lookup`. Candidate next modules:
+  `ingest_arrow`, `ingest_dataset`, `features`, `constraints`, `retrieval`,
   `linker`, and `subblocking`.
 - Move focused tests with extracted modules where that preserves private
   visibility without unnecessary `pub(crate)` churn.
@@ -320,20 +317,22 @@ Done when:
 
 ### 7. Incremental Helper Shim
 
-Current decision:
+Current state:
 
 - Treat `Clusterer._predict_incremental_helper(...)` as internal-only test
   plumbing for now. It is not an external compatibility API.
+- Focused tests no longer monkeypatch `_predict_incremental_helper(...)`;
+  return-contract coverage goes through `Clusterer.predict_incremental(...)`.
 
 Remaining:
 
-- Before any rename/removal, migrate tests that monkeypatch the helper to a
-  public routing surface, dependency parameter, or explicit test hook.
+- Before any rename/removal, do a final scoped search for helper monkeypatches
+  and keep new tests on public routing surfaces or explicit test hooks.
 
 Done when:
 
-- Monkeypatched tests use the chosen call surface and focused incremental tests
-  pass.
+- No tests monkeypatch `_predict_incremental_helper(...)`, and focused
+  incremental tests pass.
 
 ### 8. Performance Targets
 

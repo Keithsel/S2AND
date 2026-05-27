@@ -4,19 +4,21 @@ Scripts in this directory create or validate checked-in production artifacts
 under `s2and/data/`. The model release artifact is a native
 `production_model_vX.Y/` directory. Do not create production pickles.
 
+Examples below use `X.Y` as the target production bundle version.
+
 ## 1. Train Pairwise
 
 ```powershell
 uv run python scripts/production/model/train_pairwise.py `
-  --production-version 1.3 `
-  --output-dir s2and/data/production_model_v1.3 `
+  --production-version X.Y `
+  --output-dir s2and/data/production_model_vX.Y `
   --run-full
 ```
 
 This writes the pairwise-only bundle stage:
 
 ```text
-production_model_v1.3/
+production_model_vX.Y/
   clusterer.json
   manifest.json
   pairwise/
@@ -37,19 +39,19 @@ runtime production model until the linker is added.
 
 ```powershell
 uv run python scripts/production/model/train_linker_and_finalize.py `
-  --production-bundle-version 1.3 `
-  --target-json s2and/data/production_model_v1.3/reproducibility/incremental_linker_training_target.json `
-  --pairwise-model-path s2and/data/production_model_v1.3 `
-  --save-production-bundle-to s2and/data/production_model_v1.3 `
-  --linker-artifact-version v1.3 `
-  --output-dir scratch/production_linker_v1.3 `
+  --production-bundle-version X.Y `
+  --target-json s2and/data/production_model_vX.Y/reproducibility/incremental_linker_training_target.json `
+  --pairwise-model-path s2and/data/production_model_vX.Y `
+  --save-production-bundle-to s2and/data/production_model_vX.Y `
+  --linker-artifact-version vX.Y `
+  --output-dir scratch/production_linker_vX.Y `
   --run-full
 ```
 
 This writes:
 
 ```text
-production_model_v1.3/
+production_model_vX.Y/
   incremental_linker/
     booster.lgb
     metadata.json
@@ -63,7 +65,7 @@ After this step, users load the model with:
 ```python
 from s2and.production_model import load_production_model
 
-clusterer = load_production_model("s2and/data/production_model_v1.3")
+clusterer = load_production_model("s2and/data/production_model_vX.Y")
 ```
 
 ## Arrow Release Validation

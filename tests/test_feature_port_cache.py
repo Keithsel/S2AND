@@ -28,9 +28,6 @@ class DummyRustFeaturizer:
     def signature_ids(self):
         return []
 
-    def get_constraint(self, *_args, **_kwargs):
-        return None
-
     def get_constraints_matrix_indexed(self, *_args, **_kwargs):
         return []
 

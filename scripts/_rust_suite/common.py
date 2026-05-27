@@ -196,7 +196,9 @@ def collect_rust_extension_identity(
     fail_if_unavailable: bool = False,
 ) -> dict[str, Any]:
     try:
-        import s2and_rust
+        from s2and.runtime import load_s2and_rust_extension
+
+        s2and_rust = load_s2and_rust_extension()
     except Exception as exc:
         if fail_if_unavailable or require_release:
             raise RuntimeError(f"Failed to import s2and_rust: {exc}") from exc
@@ -205,6 +207,11 @@ def collect_rust_extension_identity(
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
+    if s2and_rust is None:
+        message = "s2and_rust native extension is unavailable"
+        if fail_if_unavailable or require_release:
+            raise RuntimeError(message)
+        return {"available": False, "error_type": "MissingNativeExtension", "error": message}
 
     module_path_raw = getattr(s2and_rust, "__file__", None)
     if module_path_raw is None:

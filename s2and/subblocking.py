@@ -1617,7 +1617,6 @@ def _make_subblocks_with_telemetry_arrow_rust(
     graph_subblocking_config: GraphSubblockingConfig | None = None,
     graph_subblocking_random_seed: int = 0,
     use_orcid_subblocking: bool = True,
-    full_scan_without_index: bool = False,
 ):
     """Run native Rust graph subblocking with signature rows loaded from Arrow."""
 
@@ -1637,7 +1636,6 @@ def _make_subblocks_with_telemetry_arrow_rust(
         graph_subblocking_config,
         int(graph_subblocking_random_seed),
         bool(use_orcid_subblocking),
-        bool(full_scan_without_index),
     )
     return {str(key): list(values) for key, values in dict(subblocks).items()}, dict(telemetry)
 

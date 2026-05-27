@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from s2and.incremental_linking.array_validation import as_uint16_1d, as_uint32_1d
+from s2and.incremental_linking.array_validation import as_retrieval_rank_uint16_1d, as_uint32_1d
 from s2and.incremental_linking.feature_block import FeatureBlockSignatureOrder
 from s2and.incremental_linking.gate_buckets import first_name_bucket_array, normalize_query_views
 from s2and.incremental_linking.linker_pairwise import LinkerCandidateBatch
@@ -379,7 +379,7 @@ def _signature_id_to_index_from_order(
 
 
 def build_linker_retrieval_batch_from_raw_candidate_plan(
-    plan: Mapping[str, Any] | RawArrowPlanBundle,
+    plan: Mapping[str, Any],
     *,
     signature_id_to_index: Mapping[str, int] | None = None,
     feature_block_signature_order: FeatureBlockSignatureOrder | Sequence[Any] | None = None,
@@ -392,7 +392,7 @@ def build_linker_retrieval_batch_from_raw_candidate_plan(
     it does not rerun retrieval.
     """
 
-    bundle = plan if isinstance(plan, RawArrowPlanBundle) else RawArrowPlanBundle.from_mapping(plan)
+    bundle = RawArrowPlanBundle.from_mapping(plan)
     raw_plan = bundle.plan
     if signature_id_to_index is None:
         if feature_block_signature_order is None:
@@ -441,7 +441,10 @@ def build_linker_retrieval_batch_from_raw_candidate_plan(
         )
 
     retrieval_scores = _raw_plan_array(raw_plan, "retrieval_scores", np.float32, row_count)
-    retrieval_ranks = as_uint16_1d("retrieval_ranks", _required_raw_plan_value(raw_plan, "retrieval_ranks"))
+    retrieval_ranks = as_retrieval_rank_uint16_1d(
+        "retrieval_ranks",
+        _required_raw_plan_value(raw_plan, "retrieval_ranks"),
+    )
     if len(retrieval_ranks) != row_count:
         raise ValueError(
             "raw candidate plan key 'retrieval_ranks' must be 1D with length "
@@ -556,7 +559,7 @@ def build_linker_retrieval_batch_rust(
         ),
         row_component_keys=tuple(str(value) for value in plan["row_component_keys"]),
         retrieval_scores=np.asarray(plan["retrieval_scores"], dtype=np.float32),
-        retrieval_ranks=np.asarray(plan["retrieval_ranks"], dtype=np.uint16),
+        retrieval_ranks=as_retrieval_rank_uint16_1d("retrieval_ranks", plan["retrieval_ranks"]),
     )
     if isinstance(normalized_query_views, str):
         query_views: Any = np.full(row_count, normalized_query_views, dtype=object)

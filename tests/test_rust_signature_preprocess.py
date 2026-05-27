@@ -106,7 +106,11 @@ def test_signature_preprocess_pair_features_and_constraints_parity_with_deferred
             )
 
         python_constraint = dataset_python.get_constraint(s1, s2)
-        rust_constraint = feature_port.get_constraint_rust(dataset_rust, s1, s2)
+        rust_constraint = feature_port.get_constraints_matrix_indexed_rust(
+            dataset_rust,
+            [(rust_signature_id_to_index[str(s1)], rust_signature_id_to_index[str(s2)])],
+            featurizer=rust_featurizer,
+        )[0]
         if python_constraint is None or rust_constraint is None:
             assert python_constraint is None and rust_constraint is None
         else:

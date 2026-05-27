@@ -19,7 +19,6 @@ from s2and.rust_calls import (
     build_linker_pair_distance_accumulators_rust,
     build_linker_pair_features_and_aggregate_stats_arrays_rust,
     get_constraint_labels_index_arrays_rust,
-    get_constraint_rust,
     get_constraints_block_upper_triangle_indexed_rust,
     get_constraints_matrix_indexed_rust,
     update_rust_cluster_seeds,
@@ -296,6 +295,7 @@ def build_rust_featurizer_from_arrow_paths(
             "model-required name_counts_index, and any declared optional sidecars in the Arrow bundle"
         ),
     )
+    normalized_paths.pop("query_signatures", None)
     return method(
         normalized_paths,
         None if signature_ids is None else [str(value) for value in signature_ids],
@@ -691,7 +691,6 @@ __all__ = [
     "clear_rust_featurizer_cache",
     "evict_rust_featurizer",
     "get_constraint_labels_index_arrays_rust",
-    "get_constraint_rust",
     "get_constraints_block_upper_triangle_indexed_rust",
     "get_constraints_matrix_indexed_rust",
     "rust_featurizer_available",

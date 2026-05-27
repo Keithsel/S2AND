@@ -149,7 +149,6 @@ def _build_dataset(
 def _build_from_arrow_paths(
     *,
     paths: dict[str, str],
-    compute_reference_features: bool,
     preprocess: bool,
     num_threads: int,
 ) -> Any:
@@ -160,7 +159,6 @@ def _build_from_arrow_paths(
         name_tuples="filtered",
         load_name_counts=True,
         preprocess=bool(preprocess),
-        compute_reference_features=bool(compute_reference_features),
         cluster_seed_require_value=0.0,
         cluster_seed_disallow_value=10000.0,
         num_threads=max(1, int(num_threads)),
@@ -214,6 +212,8 @@ def run_rebuild_stress(
         raise ValueError(f"build_path must be one of: {', '.join(BUILD_PATH_CHOICES)}")
     if int(rss_sample_ms) <= 0:
         raise ValueError("rss_sample_ms must be positive")
+    if build_path == "from_arrow_paths" and compute_reference_features:
+        raise ValueError("compute_reference_features is only supported with build_path='from_dataset'")
 
     os.environ.setdefault("S2AND_BACKEND", "rust")
     from s2and.text import set_fasttext_loading_enabled
@@ -259,7 +259,6 @@ def run_rebuild_stress(
                 if build_path == "from_arrow_paths":
                     featurizer = _build_from_arrow_paths(
                         paths=cast(dict[str, str], paths),
-                        compute_reference_features=compute_reference_features,
                         preprocess=preprocess,
                         num_threads=num_threads,
                     )

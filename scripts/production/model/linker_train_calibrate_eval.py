@@ -46,7 +46,7 @@ from s2and import text as s2and_text  # noqa: E402
 from s2and.arrow_inputs import validate_arrow_prediction_artifacts  # noqa: E402
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER  # noqa: E402
 from s2and.data import ANDData  # noqa: E402
-from s2and.incremental_linking.array_validation import as_uint16_1d  # noqa: E402
+from s2and.incremental_linking.array_validation import as_retrieval_rank_uint16_1d  # noqa: E402
 from s2and.incremental_linking.artifact import save_incremental_linking_artifact  # noqa: E402
 from s2and.incremental_linking.contracts import (  # noqa: E402
     INCREMENTAL_LINKING_RUST_CAPABILITIES,
@@ -1105,9 +1105,7 @@ def _candidate_batch_from_rows(
             if "retrieval_score" in rows.columns
             else None
         ),
-        retrieval_ranks=(
-            rows["retrieval_rank"].to_numpy(dtype=np.uint16, copy=False) if "retrieval_rank" in rows.columns else None
-        ),
+        retrieval_ranks=rows["retrieval_rank"].to_numpy(copy=False) if "retrieval_rank" in rows.columns else None,
     )
 
 
@@ -1449,7 +1447,10 @@ def _arrow_labeled_plan_to_batch_and_row_signals(
             "raw Arrow labeled plan row_component_keys length mismatch: " f"{len(row_component_keys)} != {row_count}"
         )
     retrieval_scores = _row_signal_from_plan(plan, "retrieval_scores", np.float32, row_count)
-    retrieval_ranks = _row_signal_from_plan(plan, "retrieval_ranks", np.uint16, row_count)
+    retrieval_ranks = as_retrieval_rank_uint16_1d(
+        "retrieval_ranks",
+        _row_signal_from_plan(plan, "retrieval_ranks", object, row_count),
+    )
     batch = LinkerCandidateBatch(
         row_count=row_count,
         left_signature_indices=left,
@@ -2821,12 +2822,10 @@ def _materialize_arrow_rust_dataset_rows(
             "rebuild/install the current s2and-rust extension."
         )
     plan_started = time.perf_counter()
-    retrieval_ranks = as_uint16_1d(
+    retrieval_ranks = as_retrieval_rank_uint16_1d(
         "retrieval_rank",
         pd.to_numeric(dataset_rows["retrieval_rank"], errors="raise").to_numpy(),
     )
-    if np.any(retrieval_ranks == 0):
-        raise ValueError("retrieval_rank values must be in uint16 range [1, 65535]")
     raw_plan = plan_fn(
         context.arrow_paths,
         dataset_rows["query_signature_id"].astype(str).tolist(),
@@ -2838,7 +2837,6 @@ def _materialize_arrow_rust_dataset_rows(
         orcid_enabled=False,
         num_threads=max(1, int(n_jobs)),
         max_exemplars=int(max_exemplars),
-        full_scan_without_index=False,
     )
     raw_plan_seconds = float(time.perf_counter() - plan_started)
     signature_ids = tuple(str(signature_id) for signature_id in raw_plan["signature_ids"])

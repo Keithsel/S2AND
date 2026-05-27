@@ -19,11 +19,10 @@ RuntimeSource = Literal["S2AND_BACKEND", "argument", "default"]
 _STARTUP_WARNING_EMITTED = False
 _STARTUP_WARNING_LOCK = threading.Lock()
 
-MIN_SUPPORTED_RUST_EXTENSION_VERSION = (0, 50, 0)
+MIN_SUPPORTED_RUST_EXTENSION_VERSION = (0, 51, 0)
 _CORE_REQUIRED_FEATURIZER_MARKERS = (
     "from_arrow_paths",
     "signature_ids",
-    "get_constraint",
     "get_constraints_matrix_indexed",
     "featurize_pairs_matrix_indexed",
     "update_signature_name_counts",
@@ -43,8 +42,14 @@ RUST_CAPABILITY_HYBRID_CENTROID_RETRIEVER_V1 = "hybrid_centroid_retriever_v1"
 RUST_CAPABILITY_INDEXED_PAIR_ARRAY_FEATURIZATION_V1 = "indexed_pair_array_featurization_v1"
 RUST_CAPABILITY_INCREMENTAL_LINKING_PAIR_PLAN_V1 = "incremental_linking_pair_plan_v1"
 RUST_CAPABILITY_INCREMENTAL_LINKING_CONSTRAINT_ARRAYS_V1 = "incremental_linking_constraint_arrays_v1"
+RUST_CAPABILITY_RAW_ARROW_QUERY_SIGNATURE_PLANNER_V1 = "raw_arrow_query_signature_planner_v1"
 _REQUIRED_INCREMENTAL_PAIR_PLAN_ROW_SIGNALS = ("row_orcid_match",)
 _REQUIRED_INCREMENTAL_PAIR_PLAN_KWARGS = ("query_candidate_component_keys_by_signature_id",)
+_REQUIRED_RAW_ARROW_QUERY_SIGNATURE_PLANNER_METHODS = (
+    "from_query_signatures",
+    "plan_query_signatures",
+    "build_telemetry",
+)
 
 
 @dataclass(frozen=True)
@@ -143,6 +148,17 @@ def _has_current_incremental_pair_plan_abi(module: Any) -> bool:
     )
 
 
+def _has_current_raw_arrow_query_signature_planner_abi(module: Any) -> bool:
+    raw_planner_cls = getattr(module, "RawBlockQueryCandidatePlanner", None)
+    if raw_planner_cls is None or not callable(getattr(raw_planner_cls, "from_query_signatures", None)):
+        return False
+    return _build_info_sequence_contains_all(
+        module,
+        "raw_arrow_query_signature_planner_methods",
+        _REQUIRED_RAW_ARROW_QUERY_SIGNATURE_PLANNER_METHODS,
+    )
+
+
 def _detect_named_rust_capabilities(module: Any) -> tuple[str, ...]:
     capabilities: list[str] = []
     rust_featurizer_cls = getattr(module, "RustFeaturizer", None)
@@ -167,6 +183,8 @@ def _detect_named_rust_capabilities(module: Any) -> tuple[str, ...]:
         and callable(getattr(rust_featurizer_cls, "linker_pair_distance_accumulators", None))
     ):
         capabilities.append(RUST_CAPABILITY_INCREMENTAL_LINKING_CONSTRAINT_ARRAYS_V1)
+    if _has_current_raw_arrow_query_signature_planner_abi(module):
+        capabilities.append(RUST_CAPABILITY_RAW_ARROW_QUERY_SIGNATURE_PLANNER_V1)
     return tuple(capabilities)
 
 

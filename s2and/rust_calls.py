@@ -76,31 +76,6 @@ def update_rust_cluster_seeds(
     )
 
 
-def get_constraint_rust(
-    dataset: ANDData,
-    sig_id_1: str,
-    sig_id_2: str,
-    low_value: float = 0.0,
-    high_value: float = LARGE_DISTANCE,
-    dont_merge_cluster_seeds: bool = True,
-    incremental_dont_use_cluster_seeds: bool = False,
-    featurizer: Any | None = None,
-    runtime_context: Any | None = None,
-    suppress_orcid: bool = False,
-):
-    if featurizer is None:
-        featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
-    return featurizer.get_constraint(
-        sig_id_1,
-        sig_id_2,
-        low_value,
-        high_value,
-        dont_merge_cluster_seeds,
-        incremental_dont_use_cluster_seeds,
-        suppress_orcid=suppress_orcid,
-    )
-
-
 def get_constraints_matrix_indexed_rust(
     dataset: ANDData,
     pairs: list[tuple[int, int]],

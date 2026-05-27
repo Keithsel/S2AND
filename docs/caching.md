@@ -80,11 +80,10 @@ featurizer in memory and reuses it on later calls. This is always enabled.
 Implications for compatibility paths:
 
 - `warm_rust_featurizer(dataset)` is useful for long-lived processes that still
-  run through an `ANDData`/JSON compatibility route
+  run through an `ANDData` compatibility route
 - `use_cache=False` does not force a rebuild if the same dataset object already has a live cached
   Rust featurizer
-- Rust featurizers are not serialized to disk; process restarts rebuild them from the dataset or
-  JSON ingest paths
+- Rust featurizers are not serialized to disk; process restarts rebuild them from the dataset
 
 ## Artifact Download Cache
 

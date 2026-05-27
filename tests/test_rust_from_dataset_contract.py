@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 import s2and.featurizer as featurizer_mod
+import s2and.text as text_mod
 from s2and.data import ANDData, Author, NameCounts
 from s2and.featurizer import _single_pair_featurize
 from tests.helpers import equalish, import_s2and_rust
@@ -149,6 +150,21 @@ def _indexed_pair_matrix(
     )
 
 
+def _indexed_constraint(rust_featurizer: Any, left_signature_id: str, right_signature_id: str) -> float | None:
+    signature_id_to_index = _signature_id_to_index(rust_featurizer)
+    return rust_featurizer.get_constraints_matrix_indexed(
+        [(signature_id_to_index[left_signature_id], signature_id_to_index[right_signature_id])]
+    )[0]
+
+
+def test_from_dataset_requires_boundary_option_attributes() -> None:
+    dataset = _build_minimal_dataset("rust_contract_requires_boundary_options")
+    delattr(dataset, "compute_reference_features")
+
+    with pytest.raises(AttributeError, match="compute_reference_features"):
+        _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
+
+
 def test_from_dataset_fastpath_parity_for_field_sensitive_values():
     dataset = _build_minimal_dataset("rust_contract_fastpath_parity")
 
@@ -197,7 +213,7 @@ def test_from_dataset_raw_papers_match_preprocessed_for_language_names_and_ngram
 
     rust_preprocessed = _S2AND_RUST.RustFeaturizer.from_dataset(dataset_preprocessed, 0.0, 10000.0, 1)
     expected_features = _indexed_pair_matrix(rust_preprocessed, "s1", "s2")[0]
-    expected_constraint = rust_preprocessed.get_constraint("s1", "s2")
+    expected_constraint = _indexed_constraint(rust_preprocessed, "s1", "s2")
 
     dataset_raw = copy.deepcopy(dataset_preprocessed)
     dataset_raw.preprocess = True
@@ -254,7 +270,7 @@ def test_from_dataset_raw_papers_match_preprocessed_for_language_names_and_ngram
 
     rust_raw = _S2AND_RUST.RustFeaturizer.from_dataset(dataset_raw, 0.0, 10000.0, 1)
     observed_features = _indexed_pair_matrix(rust_raw, "s1", "s2")[0]
-    observed_constraint = rust_raw.get_constraint("s1", "s2")
+    observed_constraint = _indexed_constraint(rust_raw, "s1", "s2")
 
     assert len(expected_features) == len(observed_features)
     for idx, (expected, observed) in enumerate(zip(expected_features, observed_features, strict=True)):
@@ -265,6 +281,67 @@ def test_from_dataset_raw_papers_match_preprocessed_for_language_names_and_ngram
     else:
         assert equalish(expected_constraint, observed_constraint)
         assert not math.isnan(float(expected_constraint))
+
+
+def test_from_dataset_raw_language_detection_uses_fasttext_sensitive_outputs(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("S2AND_SKIP_FASTTEXT", raising=False)
+    text_mod.set_fasttext_loading_enabled(True)
+    if text_mod._get_fasttext_model() is None:
+        pytest.skip("fastText language model is unavailable")
+
+    dataset_raw = _build_minimal_dataset("rust_contract_raw_fasttext_language")
+    raw_titles = {
+        "1": "SPortS: Semantic + Portal + Service",
+        "2": "Vom lokalen Hypertext zum verteilten Hypermediasystem",
+    }
+    expected_language = {}
+    for paper_id, title in raw_titles.items():
+        is_reliable, _is_english, predicted_language = text_mod.detect_language(title)
+        expected_language[paper_id] = (predicted_language, is_reliable)
+        dataset_raw.papers[paper_id] = dataset_raw.papers[paper_id]._replace(
+            title=title,
+            predicted_language=None,
+            is_reliable=None,
+            title_ngrams_words=None,
+            title_ngrams_chars=None,
+        )
+
+    assert expected_language == {"1": ("en", True), "2": ("de", True)}
+
+    rust_raw = _S2AND_RUST.RustFeaturizer.from_dataset(dataset_raw, 0.0, 10000.0, 1)
+    feature_names = featurizer_mod.FeaturizationInfo().get_feature_names()
+    english_count_idx = feature_names.index("english_count")
+    same_language_idx = feature_names.index("same_language")
+    language_reliability_idx = feature_names.index("language_reliability_count")
+
+    sports_features = _indexed_pair_matrix(rust_raw, "s1", "s1")[0]
+    german_features = _indexed_pair_matrix(rust_raw, "s2", "s2")[0]
+
+    assert sports_features[english_count_idx] == 2.0
+    assert sports_features[same_language_idx] == 1.0
+    assert sports_features[language_reliability_idx] == 2.0
+    assert german_features[english_count_idx] == 0.0
+    assert german_features[same_language_idx] == 1.0
+    assert german_features[language_reliability_idx] == 2.0
+
+
+def test_from_dataset_specter_cosine_matches_python_float64_path():
+    dataset = _build_minimal_dataset("rust_contract_specter_float64_parity")
+    dataset.specter_embeddings = {
+        "1": np.array([0.1234567, 0.7654321, 0.3333333, 0.9999999], dtype=np.float32),
+        "2": np.array([0.2222222, 0.4444444, 0.8888888, 0.1111111], dtype=np.float32),
+    }
+    for paper_id in ("1", "2"):
+        dataset.papers[paper_id] = dataset.papers[paper_id]._replace(predicted_language="en", is_reliable=True)
+
+    python_features, _ = _single_pair_featurize(("s1", "s2"), dataset=dataset)
+    rust_featurizer = _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
+    rust_features = _indexed_pair_matrix(rust_featurizer, "s1", "s2")[0]
+    feature_names = featurizer_mod.FeaturizationInfo().get_feature_names()
+    specter_idx = feature_names.index("specter_cosine_sim")
+
+    assert python_features[specter_idx] == pytest.approx(1.5781916063205044, abs=1e-15)
+    assert rust_features[specter_idx] == pytest.approx(python_features[specter_idx], abs=1e-15)
 
 
 def test_matrix_entrypoints_preserve_duplicate_selected_indices_and_empty_early_return():

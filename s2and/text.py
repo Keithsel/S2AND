@@ -520,6 +520,8 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     -------
     float: the cosine similarity of the two vectors
     """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
     a_norm = norm(a)
     b_norm = norm(b)
     if a_norm == 0 or b_norm == 0:

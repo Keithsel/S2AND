@@ -19,6 +19,7 @@ from s2and.incremental_linking.feature_block import (
     FeatureBlockPaperAuthor,
     FeatureBlockSignature,
     FeatureBlockSignatureOrder,
+    IncrementalQuerySignatureRequest,
     arrow_ipc_physical_layout,
     feature_block_for_signature_order,
     feature_block_signature_order_from_raw_candidate_plan,
@@ -26,11 +27,13 @@ from s2and.incremental_linking.feature_block import (
     read_altered_cluster_signatures_arrow,
     read_cluster_seed_disallows_arrow,
     read_cluster_seeds_arrow,
+    read_incremental_query_signatures_arrow,
     temporary_arrow_paths_with_cluster_seeds,
     write_altered_cluster_signatures_arrow,
     write_arrow_batch_lookup_index,
     write_arrow_ipc_table,
     write_feature_block_arrow_tables,
+    write_incremental_query_signatures_arrow,
     write_name_counts_arrow,
     write_name_counts_index,
     write_name_pairs_arrow,
@@ -358,6 +361,26 @@ def _with_fake_batch_indexes(arrow_paths: dict[str, str], tmp_path: Path) -> dic
     return indexed
 
 
+def _with_query_signatures(
+    arrow_paths: dict[str, str],
+    tmp_path: Path,
+    *,
+    query_signature_ids: tuple[str, ...] = ("q",),
+    query_view: str = "full",
+    query_author: str = "Ada Lovelace",
+) -> dict[str, str]:
+    request_paths = dict(arrow_paths)
+    query_signatures_path = tmp_path / "incremental_query_signatures.arrow"
+    write_incremental_query_signatures_arrow(
+        query_signatures_path,
+        query_signature_ids,
+        query_views=[query_view] * len(query_signature_ids),
+        query_authors=[query_author] * len(query_signature_ids),
+    )
+    request_paths["query_signatures"] = str(query_signatures_path)
+    return request_paths
+
+
 def _strict_signature_arrow_table(**overrides: Any) -> Any:
     pa = pytest.importorskip("pyarrow")
     row_count = len(overrides.get("signature_id", ["q", "s1", "s2", "s3"]))
@@ -514,6 +537,132 @@ def test_write_feature_block_arrow_from_anddata_skips_empty_seed_table(tmp_path:
         signatures = pa.ipc.open_file(source).read_all()
     assert "name_count_first" not in signatures.column_names
     assert signatures.to_pydict()["signature_id"] == ["q"]
+
+
+def test_incremental_query_signatures_arrow_round_trips_typed_rows(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "incremental_query_signatures.arrow"
+
+    write_incremental_query_signatures_arrow(
+        path,
+        ["q1", "q2"],
+        query_views=["full", "initial_only"],
+        query_authors=["Ada Lovelace", "Grace Hopper"],
+    )
+
+    assert read_incremental_query_signatures_arrow(path) == (
+        IncrementalQuerySignatureRequest(
+            signature_id="q1",
+            query_view="full",
+            query_author="Ada Lovelace",
+        ),
+        IncrementalQuerySignatureRequest(
+            signature_id="q2",
+            query_view="initial_only",
+            query_author="Grace Hopper",
+        ),
+    )
+    with pa.memory_map(str(path), "r") as source:
+        table = pa.ipc.open_file(source).read_all()
+    assert table.schema.field("signature_id").type == pa.string()
+    assert table.schema.field("query_view").type == pa.string()
+    assert table.schema.field("query_author").type == pa.string()
+    assert table.to_pydict() == {
+        "signature_id": ["q1", "q2"],
+        "query_view": ["full", "initial_only"],
+        "query_author": ["Ada Lovelace", "Grace Hopper"],
+    }
+
+
+def test_incremental_query_signatures_arrow_keeps_empty_table_typed(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "empty_incremental_query_signatures.arrow"
+
+    write_incremental_query_signatures_arrow(path, [])
+
+    assert read_incremental_query_signatures_arrow(path) == ()
+    with pa.memory_map(str(path), "r") as source:
+        table = pa.ipc.open_file(source).read_all()
+    assert table.num_rows == 0
+    assert table.schema.field("signature_id").type == pa.string()
+    assert table.schema.field("query_view").type == pa.string()
+    assert table.schema.field("query_author").type == pa.string()
+
+
+def test_incremental_query_signatures_arrow_rejects_duplicate_rows(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "duplicate_incremental_query_signatures.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["q1", "q1"], type=pa.string()),
+                "query_view": pa.array(["full", "initial_only"], type=pa.string()),
+                "query_author": pa.array(["Ada Lovelace", "Ada Lovelace"], type=pa.string()),
+            }
+        ),
+        path,
+    )
+
+    with pytest.raises(ValueError, match="duplicate signature_id"):
+        read_incremental_query_signatures_arrow(path)
+
+
+def test_incremental_query_signatures_arrow_rejects_unknown_query_view(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "unknown_query_view_incremental_query_signatures.arrow"
+
+    with pytest.raises(ValueError, match="unknown query_view"):
+        write_incremental_query_signatures_arrow(path, ["q1"], query_views=["profile"])
+
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["q1"], type=pa.string()),
+                "query_view": pa.array(["profile"], type=pa.string()),
+                "query_author": pa.array(["Ada Lovelace"], type=pa.string()),
+            }
+        ),
+        path,
+    )
+
+    with pytest.raises(ValueError, match="unknown query_view"):
+        read_incremental_query_signatures_arrow(path)
+
+
+def test_incremental_query_signatures_arrow_rejects_null_request_values(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "null_incremental_query_signatures.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["q1"], type=pa.string()),
+                "query_view": pa.array(["full"], type=pa.string()),
+                "query_author": pa.array([None], type=pa.string()),
+            }
+        ),
+        path,
+    )
+
+    with pytest.raises(ValueError, match="null query_author"):
+        read_incremental_query_signatures_arrow(path)
+
+
+def test_incremental_query_signatures_arrow_rejects_integer_id_columns(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    path = tmp_path / "integer_incremental_query_signatures.arrow"
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array([1], type=pa.int64()),
+                "query_view": pa.array(["full"], type=pa.string()),
+                "query_author": pa.array(["Ada Lovelace"], type=pa.string()),
+            }
+        ),
+        path,
+    )
+
+    with pytest.raises(ValueError, match="signature_id expected string"):
+        read_incremental_query_signatures_arrow(path)
 
 
 def test_feature_block_from_arrow_paths_reads_cluster_seed_disallows(tmp_path: Path) -> None:
@@ -1085,6 +1234,30 @@ def test_write_name_counts_index_rebuilds_fingerprintless_manifest(
     assert rebuilt_manifest["fingerprint"] != original_fingerprint
 
 
+def test_write_name_counts_index_rebuilds_manifest_with_missing_schema_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import s2and.data as data_module
+
+    monkeypatch.setattr(
+        data_module,
+        "_load_name_counts_cached",
+        lambda: ({"ada": 3}, {"lovelace": 5}, {"ada lovelace": 2}, {"lovelace a": 7}),
+    )
+    index_path, _metrics = write_name_counts_index(tmp_path)
+    manifest_path = Path(index_path) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("schema_version")
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+
+    _index_path, metrics = write_name_counts_index(tmp_path, overwrite=False)
+
+    rebuilt_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert metrics["reused"] is False
+    assert rebuilt_manifest["schema_version"] == "name_counts_index_v1"
+
+
 def test_write_name_counts_index_failed_overwrite_keeps_previous_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1393,7 +1566,10 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    arrow_paths = _with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path)
+    arrow_paths = _with_query_signatures(
+        _with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path),
+        tmp_path,
+    )
     captured: dict[str, Any] = {}
 
     class FakePlanner:
@@ -1406,6 +1582,15 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
             captured["retrieval_paths"] = paths_arg
             captured["retrieval_query_signature_ids"] = tuple(query_signature_ids)
             captured["retrieval_kwargs"] = kwargs
+            self._query_signature_ids = list(query_signature_ids)
+
+        @classmethod
+        def from_query_signatures(cls, paths_arg: dict[str, str], **kwargs: Any) -> FakePlanner:
+            rows = read_incremental_query_signatures_arrow(Path(paths_arg["query_signatures"]))
+            return cls(paths_arg, [row.signature_id for row in rows], **kwargs)
+
+        def plan_query_signatures(self) -> dict[str, Any]:
+            return self.plan(self._query_signature_ids)
 
         def plan(self, query_signature_ids: list[str], **kwargs: Any) -> dict[str, Any]:
             captured["retrieval_plan_query_signature_ids"] = tuple(query_signature_ids)
@@ -1469,7 +1654,6 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
         _raw_test_clusterer(),
         _raw_test_artifact(),
         arrow_paths=arrow_paths,
-        query_signature_ids=["q"],
         top_k=2,
         n_jobs=1,
         load_name_counts=False,
@@ -1477,6 +1661,7 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     )
 
     assert captured["retrieval_query_signature_ids"] == ("q",)
+    assert "query_signatures" in captured["retrieval_paths"]
     assert captured["retrieval_kwargs"]["top_k"] == 2
     assert captured["retrieval_plan_query_signature_ids"] == ("q",)
     assert captured["retrieval_plan_kwargs"] == {}
@@ -1494,14 +1679,109 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     assert result.telemetry["raw_arrow_plan_signature_count"] == 4
     assert result.telemetry["raw_arrow_seed_signature_count"] == 3
     assert "raw_arrow_retrieval_seconds" in result.telemetry
-    assert captured["retrieval_paths"] == captured["featurizer_paths"]
+    retrieval_paths_without_query_request = dict(captured["retrieval_paths"])
+    retrieval_paths_without_query_request.pop("query_signatures")
+    assert retrieval_paths_without_query_request == captured["featurizer_paths"]
+
+
+def test_raw_arrow_scoring_uses_provided_query_signatures_arrow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arrow_paths = _with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path)
+    query_signatures_path = tmp_path / "incremental_query_signatures.arrow"
+    write_incremental_query_signatures_arrow(
+        query_signatures_path,
+        ["q"],
+        query_views=["full"],
+        query_authors=["Ada Lovelace"],
+    )
+    arrow_paths["query_signatures"] = str(query_signatures_path)
+    captured: dict[str, Any] = {}
+
+    class StopAfterPlanner(RuntimeError):
+        pass
+
+    class FakePlanner:
+        def __init__(self, paths_arg: dict[str, str], query_signature_ids: list[str], **_kwargs: Any) -> None:
+            captured["retrieval_paths"] = dict(paths_arg)
+            self._query_signature_ids = list(query_signature_ids)
+
+        @classmethod
+        def from_query_signatures(cls, paths_arg: dict[str, str], **kwargs: Any) -> FakePlanner:
+            rows = read_incremental_query_signatures_arrow(Path(paths_arg["query_signatures"]))
+            return cls(paths_arg, [row.signature_id for row in rows], **kwargs)
+
+        def plan_query_signatures(self) -> dict[str, Any]:
+            captured["planned_query_signature_ids"] = tuple(self._query_signature_ids)
+            return _raw_plan()
+
+        def build_telemetry(self) -> dict[str, Any]:
+            return {"timings": {}}
+
+    class FakeRustModule:
+        RawBlockQueryCandidatePlanner = FakePlanner
+
+    def stop_before_featurizer_build(paths_arg: Any, **_kwargs: Any) -> Any:
+        captured["featurizer_paths"] = dict(paths_arg)
+        raise StopAfterPlanner("captured planner boundary")
+
+    monkeypatch.setattr("s2and.incremental_linking.runtime.feature_port._require_rust_runtime", lambda: FakeRustModule)
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port.build_rust_featurizer_from_arrow_paths",
+        stop_before_featurizer_build,
+    )
+
+    with pytest.raises(StopAfterPlanner):
+        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            _raw_test_clusterer(),
+            _raw_test_artifact(),
+            arrow_paths=arrow_paths,
+            top_k=2,
+            n_jobs=1,
+            load_name_counts=False,
+            name_tuples=set(),
+        )
+
+    assert captured["planned_query_signature_ids"] == ("q",)
+    assert captured["retrieval_paths"]["query_signatures"] == str(query_signatures_path)
+    assert "query_signatures" not in captured["featurizer_paths"]
+
+
+def test_raw_arrow_scoring_requires_query_signatures_before_planner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arrow_paths = _with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path)
+
+    monkeypatch.setattr(
+        "s2and.incremental_linking.runtime.feature_port._require_rust_runtime",
+        lambda: (_ for _ in ()).throw(AssertionError("planner should not be loaded before validation")),
+    )
+
+    with pytest.raises(MissingArrowArtifactError) as exc_info:
+        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+            _raw_test_clusterer(),
+            _raw_test_artifact(),
+            arrow_paths=arrow_paths,
+            top_k=2,
+            n_jobs=1,
+            load_name_counts=False,
+            name_tuples=set(),
+        )
+
+    assert exc_info.value.context == "Raw Arrow scoring"
+    assert exc_info.value.missing_keys == ("query_signatures",)
 
 
 def test_raw_arrow_scoring_requires_planner_artifacts_before_planner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    arrow_paths = _with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path)
+    arrow_paths = _with_query_signatures(
+        _with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path),
+        tmp_path,
+    )
     del arrow_paths["cluster_seeds"]
 
     monkeypatch.setattr(
@@ -1514,7 +1794,6 @@ def test_raw_arrow_scoring_requires_planner_artifacts_before_planner(
             _raw_test_clusterer(),
             _raw_test_artifact(),
             arrow_paths=arrow_paths,
-            query_signature_ids=["q"],
             top_k=2,
             n_jobs=1,
             load_name_counts=False,
@@ -1534,7 +1813,7 @@ def test_raw_arrow_partial_supervision_require_unknown_seed_rejected() -> None:
     raw_plan["component_members"] = {}
 
     with pytest.raises(ValueError, match="partial_supervision_require_unknown_seed_signature"):
-        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+        predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
             _raw_test_clusterer(),
             _raw_test_artifact(),
             arrow_paths={},
@@ -1542,8 +1821,6 @@ def test_raw_arrow_partial_supervision_require_unknown_seed_rejected() -> None:
             raw_candidate_plan=raw_plan,
             rust_featurizer=FakeFeaturizer(),
             partial_supervision={("q", "s1"): 0},
-            load_name_counts=False,
-            name_tuples=set(),
         )
 
 
@@ -1558,15 +1835,14 @@ def test_raw_arrow_scoring_requires_featurizer_with_provided_raw_plan(
         fail_build_rust_featurizer_from_arrow_paths,
     )
 
-    with pytest.raises(ValueError, match="provided raw_candidate_plan requires rust_featurizer"):
-        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+    with pytest.raises(ValueError, match="preplanned raw Arrow scoring requires rust_featurizer"):
+        predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
             _raw_test_clusterer(),
             _raw_test_artifact(),
             arrow_paths={},
             query_signature_ids=["q"],
             raw_candidate_plan=_raw_plan(),
-            load_name_counts=False,
-            name_tuples=set(),
+            rust_featurizer=None,
         )
 
 
@@ -1574,6 +1850,13 @@ def test_raw_arrow_scoring_requires_planner_build_telemetry(monkeypatch: pytest.
     class FakePlanner:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             pass
+
+        @classmethod
+        def from_query_signatures(cls, *_args: Any, **_kwargs: Any) -> FakePlanner:
+            return cls()
+
+        def plan_query_signatures(self) -> dict[str, Any]:
+            return _raw_plan()
 
         def plan(self, _query_signature_ids: list[str], **_kwargs: Any) -> dict[str, Any]:
             return _raw_plan()
@@ -1598,8 +1881,10 @@ def test_raw_arrow_scoring_requires_planner_build_telemetry(monkeypatch: pytest.
         predict_incremental_link_or_abstain_from_raw_arrow_paths(
             _raw_test_clusterer(),
             _raw_test_artifact(),
-            arrow_paths=_with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path),
-            query_signature_ids=["q"],
+            arrow_paths=_with_query_signatures(
+                _with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path),
+                tmp_path,
+            ),
             top_k=2,
             n_jobs=1,
             load_name_counts=False,
@@ -1659,12 +1944,10 @@ def test_preplanned_raw_arrow_scoring_surface_uses_provided_plan(
         _raw_test_artifact(),
         arrow_paths={},
         query_signature_ids=["q"],
-        raw_candidate_plan=RawArrowPlanBundle.from_mapping(_raw_plan()),
+        raw_candidate_plan=_raw_plan(),
         rust_featurizer=FakeFeaturizer(),
         top_k=2,
         n_jobs=1,
-        load_name_counts=False,
-        name_tuples=set(),
     )
 
     assert captured["dataset"] is None
@@ -1705,6 +1988,15 @@ def test_raw_arrow_scoring_resolves_orcid_enabled_from_clusterer(
             **kwargs: Any,
         ) -> None:
             captured["orcid_enabled"] = kwargs["orcid_enabled"]
+            self._query_signature_ids = list(_query_signature_ids)
+
+        @classmethod
+        def from_query_signatures(cls, paths_arg: dict[str, str], **kwargs: Any) -> FakePlanner:
+            rows = read_incremental_query_signatures_arrow(Path(paths_arg["query_signatures"]))
+            return cls(paths_arg, [row.signature_id for row in rows], **kwargs)
+
+        def plan_query_signatures(self) -> dict[str, Any]:
+            return self.plan(self._query_signature_ids)
 
         def plan(self, _query_signature_ids: list[str], **_kwargs: Any) -> dict[str, Any]:
             return _raw_plan()
@@ -1736,8 +2028,10 @@ def test_raw_arrow_scoring_resolves_orcid_enabled_from_clusterer(
         predict_incremental_link_or_abstain_from_raw_arrow_paths(
             _raw_test_clusterer(suppress_orcid=suppress_orcid),
             _raw_test_artifact(),
-            arrow_paths=_with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path),
-            query_signature_ids=["q"],
+            arrow_paths=_with_query_signatures(
+                _with_fake_batch_indexes(_write_feature_block_arrow_paths(tmp_path), tmp_path),
+                tmp_path,
+            ),
             top_k=2,
             n_jobs=1,
             load_name_counts=False,
@@ -1748,10 +2042,8 @@ def test_raw_arrow_scoring_resolves_orcid_enabled_from_clusterer(
     assert captured["orcid_enabled"] is expected_orcid_enabled
 
 
-@pytest.mark.parametrize("bundle_raw_plan", (False, True))
-def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
+def test_preplanned_raw_arrow_scoring_uses_provided_rust_featurizer(
     monkeypatch: pytest.MonkeyPatch,
-    bundle_raw_plan: bool,
 ) -> None:
     captured: dict[str, Any] = {}
 
@@ -1797,20 +2089,15 @@ def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
         lambda *args, **kwargs: fake_from_retrieval(**kwargs),
     )
 
-    raw_plan = _raw_plan()
-    raw_candidate_plan = RawArrowPlanBundle.from_mapping(raw_plan) if bundle_raw_plan else raw_plan
-
-    result = predict_incremental_link_or_abstain_from_raw_arrow_paths(
+    result = predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
         _raw_test_clusterer(),
         _raw_test_artifact(),
         arrow_paths={},
         query_signature_ids=["q"],
-        raw_candidate_plan=raw_candidate_plan,
+        raw_candidate_plan=_raw_plan(),
         rust_featurizer=fake_featurizer,
         top_k=2,
         n_jobs=1,
-        load_name_counts=False,
-        name_tuples=set(),
     )
 
     assert captured["featurizer"] is fake_featurizer
@@ -1822,13 +2109,13 @@ def test_raw_arrow_scoring_wrapper_uses_provided_rust_featurizer(
     assert isinstance(result.telemetry["raw_arrow_featurizer_seconds"], float)
 
 
-def test_raw_arrow_scoring_wrapper_rejects_mismatched_raw_plan_query_ids() -> None:
+def test_preplanned_raw_arrow_scoring_rejects_mismatched_raw_plan_query_ids() -> None:
     class FakeFeaturizer:
         def signature_ids(self) -> list[str]:
             return ["q", "s1", "s2", "s3"]
 
     with pytest.raises(ValueError, match="must exactly match requested query_signature_ids"):
-        predict_incremental_link_or_abstain_from_raw_arrow_paths(
+        predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
             _raw_test_clusterer(),
             _raw_test_artifact(),
             arrow_paths={},
@@ -1837,8 +2124,6 @@ def test_raw_arrow_scoring_wrapper_rejects_mismatched_raw_plan_query_ids() -> No
             rust_featurizer=FakeFeaturizer(),
             top_k=2,
             n_jobs=1,
-            load_name_counts=False,
-            name_tuples=set(),
         )
 
 

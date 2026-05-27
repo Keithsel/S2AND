@@ -246,7 +246,8 @@ def test_raw_candidate_plan_rejects_row_query_index_outside_query_count() -> Non
         )
 
 
-def test_raw_candidate_plan_rejects_negative_retrieval_rank() -> None:
+@pytest.mark.parametrize("retrieval_rank", [-1, 0])
+def test_raw_candidate_plan_rejects_invalid_retrieval_rank(retrieval_rank: int) -> None:
     raw_plan = {
         "schema_version": RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
         "query_signature_ids": ["q0"],
@@ -257,7 +258,7 @@ def test_raw_candidate_plan_rejects_negative_retrieval_rank() -> None:
         "row_query_signature_indices": np.asarray([0], dtype=np.uint32),
         "row_component_keys": ["c1"],
         "retrieval_scores": np.asarray([0.9], dtype=np.float32),
-        "retrieval_ranks": [-1],
+        "retrieval_ranks": [retrieval_rank],
         "pair_row_indices": np.asarray([0], dtype=np.uint32),
         "left_signature_ids": ["q0"],
         "right_signature_ids": ["s1"],
@@ -531,7 +532,6 @@ def test_raw_arrow_runtime_rejects_none_path_before_rust_planner(monkeypatch: py
             clusterer,
             _static_artifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0)),
             arrow_paths={"signatures": None, "papers": "papers.arrow", "paper_authors": "paper_authors.arrow"},
-            query_signature_ids=["q"],
         )
 
 
@@ -554,7 +554,7 @@ def test_raw_arrow_runtime_rejects_mismatched_query_view_length_before_featurize
     )
 
     with pytest.raises(ValueError, match="query_views length must match query_signature_ids"):
-        runtime_module.predict_incremental_link_or_abstain_from_raw_arrow_paths(
+        runtime_module.predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
             clusterer,
             _static_artifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0)),
             arrow_paths={"signatures": tmp_path / "signatures.arrow"},
@@ -564,6 +564,7 @@ def test_raw_arrow_runtime_rejects_mismatched_query_view_length_before_featurize
                 left_signature_ids=["q"],
                 query_views=[],
             ),
+            rust_featurizer=None,
         )
 
 
@@ -586,7 +587,7 @@ def test_raw_arrow_runtime_rejects_unknown_query_view_before_featurizer(
     )
 
     with pytest.raises(ValueError, match="Unknown retrieval query_view"):
-        runtime_module.predict_incremental_link_or_abstain_from_raw_arrow_paths(
+        runtime_module.predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
             clusterer,
             _static_artifact(np.asarray([], dtype=np.float64), gate_config=_promoted_gate_config(0.0)),
             arrow_paths={"signatures": tmp_path / "signatures.arrow"},
@@ -596,6 +597,7 @@ def test_raw_arrow_runtime_rejects_unknown_query_view_before_featurizer(
                 left_signature_ids=["q"],
                 query_views=["typo"],
             ),
+            rust_featurizer=None,
         )
 
 

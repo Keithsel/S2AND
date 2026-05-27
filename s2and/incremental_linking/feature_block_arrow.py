@@ -10,6 +10,7 @@ import tempfile
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -41,6 +42,7 @@ NAME_COUNTS_ARROW_MANIFEST_SCHEMA_VERSION = "name_counts_arrow_v1"
 NAME_PAIRS_ARROW_MANIFEST_SCHEMA_VERSION = "name_pairs_arrow_v1"
 ARROW_PHYSICAL_LAYOUT_SCHEMA_VERSION = "s2and_arrow_physical_v1"
 ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION = "arrow_batch_lookup_index"
+INCREMENTAL_QUERY_SIGNATURE_VIEWS = frozenset({"auto", "full", "initial_only"})
 _NAME_COUNTS_INDEX_MAGIC = b"S2NCI001"
 _ARROW_BATCH_LOOKUP_INDEX_MAGIC = b"S2ABI001"
 _NAME_COUNTS_INDEX_HASH_DOMAIN = b"s2and-name-counts-index-v1\x00"
@@ -52,6 +54,160 @@ _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQQQ")
 _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT = struct.Struct("<QII")
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
+
+
+@dataclass(frozen=True)
+class IncrementalQuerySignatureRequest:
+    """Typed query-signature request row for raw Arrow incremental scoring."""
+
+    signature_id: str
+    query_view: str
+    query_author: str
+
+
+def write_incremental_query_signatures_arrow(
+    path: Path,
+    signature_ids: Iterable[Any],
+    *,
+    query_views: Iterable[Any] | None = None,
+    query_authors: Iterable[Any] | None = None,
+) -> None:
+    """Write the canonical Arrow incremental query-signature request table."""
+
+    import pyarrow as pa
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = _normalize_incremental_query_signature_requests(
+        signature_ids,
+        query_views=query_views,
+        query_authors=query_authors,
+    )
+    table = pa.table(
+        {
+            "signature_id": pa.array([row.signature_id for row in rows], type=pa.string()),
+            "query_view": pa.array([row.query_view for row in rows], type=pa.string()),
+            "query_author": pa.array([row.query_author for row in rows], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+
+
+def read_incremental_query_signatures_arrow(path: Path) -> tuple[IncrementalQuerySignatureRequest, ...]:
+    """Read and validate a canonical Arrow incremental query-signature request table."""
+
+    import pyarrow as pa
+
+    with pa.memory_map(str(path), "r") as source:
+        table = pa.ipc.open_file(source).read_all()
+    _require_arrow_string_columns(
+        table,
+        "incremental query signatures",
+        {"signature_id", "query_view", "query_author"},
+    )
+    return _normalize_incremental_query_signature_requests(
+        table["signature_id"].to_pylist(),
+        query_views=table["query_view"].to_pylist(),
+        query_authors=table["query_author"].to_pylist(),
+    )
+
+
+@contextmanager
+def temporary_arrow_paths_with_incremental_query_signatures(
+    arrow_paths: Mapping[str, Any],
+    signature_ids: Iterable[Any],
+    *,
+    prefix: str,
+    query_view: str | Sequence[Any] = "auto",
+    query_authors: Iterable[Any] | None = None,
+) -> Iterator[dict[str, str]]:
+    """Yield Arrow paths with a request-scoped incremental query-signature sidecar."""
+
+    paths = normalize_arrow_paths(arrow_paths)
+    signature_id_values = tuple(signature_ids)
+    query_views: Iterable[Any]
+    if isinstance(query_view, str):
+        query_views = (query_view,) * len(signature_id_values)
+    else:
+        query_views = tuple(query_view)
+    with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
+        query_signatures_path = Path(tmpdir) / "incremental_query_signatures.arrow"
+        write_incremental_query_signatures_arrow(
+            query_signatures_path,
+            signature_id_values,
+            query_views=query_views,
+            query_authors=query_authors,
+        )
+        paths["query_signatures"] = str(query_signatures_path)
+        yield paths
+
+
+def _normalize_incremental_query_signature_requests(
+    signature_ids: Iterable[Any],
+    *,
+    query_views: Iterable[Any] | None = None,
+    query_authors: Iterable[Any] | None = None,
+) -> tuple[IncrementalQuerySignatureRequest, ...]:
+    signature_id_values = tuple(signature_ids)
+    if query_views is None:
+        query_view_values: tuple[Any, ...] = ("auto",) * len(signature_id_values)
+    else:
+        query_view_values = tuple(query_views)
+    if query_authors is None:
+        query_author_values: tuple[Any, ...] = ("",) * len(signature_id_values)
+    else:
+        query_author_values = tuple(query_authors)
+    if len(query_view_values) != len(signature_id_values):
+        raise ValueError(
+            "incremental query signatures Arrow query_view length must match signature_id length: "
+            f"{len(query_view_values)} != {len(signature_id_values)}"
+        )
+    if len(query_author_values) != len(signature_id_values):
+        raise ValueError(
+            "incremental query signatures Arrow query_author length must match signature_id length: "
+            f"{len(query_author_values)} != {len(signature_id_values)}"
+        )
+
+    rows: list[IncrementalQuerySignatureRequest] = []
+    seen_signature_ids: set[str] = set()
+    for signature_id_value, query_view_value, query_author_value in zip(
+        signature_id_values,
+        query_view_values,
+        query_author_values,
+        strict=True,
+    ):
+        if signature_id_value is None:
+            raise ValueError("incremental query signatures Arrow cannot contain null signature_id values")
+        if query_view_value is None:
+            raise ValueError("incremental query signatures Arrow cannot contain null query_view values")
+        if query_author_value is None:
+            raise ValueError("incremental query signatures Arrow cannot contain null query_author values")
+        signature_id = str(signature_id_value)
+        query_view = str(query_view_value)
+        query_author = str(query_author_value)
+        if not signature_id:
+            raise ValueError("incremental query signatures Arrow cannot contain empty signature_id values")
+        if not query_view:
+            raise ValueError(
+                f"incremental query signatures Arrow cannot contain empty query_view values: {signature_id!r}"
+            )
+        if query_view not in INCREMENTAL_QUERY_SIGNATURE_VIEWS:
+            raise ValueError(
+                "incremental query signatures Arrow contains unknown query_view "
+                f"{query_view!r}; expected one of {sorted(INCREMENTAL_QUERY_SIGNATURE_VIEWS)!r}"
+            )
+        if signature_id in seen_signature_ids:
+            raise ValueError(f"incremental query signatures Arrow contains duplicate signature_id: {signature_id!r}")
+        seen_signature_ids.add(signature_id)
+        rows.append(
+            IncrementalQuerySignatureRequest(
+                signature_id=signature_id,
+                query_view=query_view,
+                query_author=query_author,
+            )
+        )
+    return tuple(rows)
 
 
 def write_cluster_seeds_arrow(path: Path, cluster_seeds_require: Mapping[Any, Any]) -> None:
@@ -962,6 +1118,8 @@ def _name_counts_index_complete(index_dir: Path, *, expected_fingerprint: int) -
     manifest_path = index_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, Mapping):
+        return False
+    if manifest.get("schema_version") != NAME_COUNTS_INDEX_SCHEMA_VERSION:
         return False
     if "fingerprint" not in manifest:
         return False

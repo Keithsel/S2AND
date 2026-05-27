@@ -137,6 +137,55 @@ def test_rust_prewarm_happens_before_rss_sampling(monkeypatch: pytest.MonkeyPatc
     assert state["rss_called"] is True
 
 
+def test_many_pairs_featurize_uses_lazy_rust_loader_before_unavailable_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = cast(ANDData, SimpleNamespace(name="dummy", mode="train", compute_reference_features=False))
+    featurizer_info = FeaturizationInfo(features_to_use=["year_diff"])
+    runtime_context = RuntimeContext(
+        operation="featurization_run",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="run-lazy-load",
+        source="default",
+    )
+    state = {"prewarm_called": False}
+
+    class FakeRustFeaturizer:
+        def signature_ids(self) -> list[str]:
+            return ["a", "b"]
+
+        def featurize_pairs_matrix_indexed(
+            self,
+            pairs: object,
+            selected_indices: object,
+            num_threads: object,
+            nan_value: object,
+        ) -> np.ndarray:
+            del selected_indices, num_threads, nan_value
+            return np.zeros((len(cast(Any, pairs)), NUM_FEATURES), dtype=np.float64)
+
+    def fake_get_rust_featurizer(*_args: object, **_kwargs: object) -> object:
+        state["prewarm_called"] = True
+        return FakeRustFeaturizer()
+
+    monkeypatch.setattr(feature_port, "s2and_rust", None)
+    monkeypatch.setattr(feature_port, "_get_rust_featurizer", fake_get_rust_featurizer)
+
+    many_pairs_featurize(
+        [("a", "b", -1)],
+        dataset,
+        featurizer_info,
+        n_jobs=1,
+        use_cache=False,
+        chunk_size=1,
+        runtime_context=runtime_context,
+    )
+
+    assert state["prewarm_called"] is True
+
+
 def test_featurizer_without_reference_features_raises() -> None:
     dataset_no_ref = _dummy_dataset(
         "dummy_no_ref",

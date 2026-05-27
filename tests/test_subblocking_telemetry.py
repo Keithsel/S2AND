@@ -533,12 +533,19 @@ def test_rust_arrow_make_subblocks_matches_python_orcid_repair(tmp_path):
         first_k_letter_counts_sorted={},
     )
     rust_subblocks, rust_telemetry = subblocking._make_subblocks_with_telemetry_arrow_rust(
-        {"signatures": str(signatures_path)},
+        {
+            "signatures": str(signatures_path),
+            "signatures_batch_index": _add_batch_index(
+                signatures_path,
+                tmp_path / "signatures.signatures_batch_index.bin",
+                key_column="signature_id",
+                table_name="signatures",
+            ),
+        },
         ["s1", "s2", "s3", "s4"],
         maximum_size=3,
         first_k_letter_counts_sorted={},
         graph_subblocking_config=subblocking.GraphSubblockingConfig(),
-        full_scan_without_index=True,
     )
 
     assert sorted(sorted(signature_ids) for signature_ids in rust_subblocks.values()) == sorted(
@@ -565,12 +572,19 @@ def test_rust_arrow_orcid_repair_merges_whole_subblocks(tmp_path):
     )
 
     rust_subblocks, telemetry = subblocking._make_subblocks_with_telemetry_arrow_rust(
-        {"signatures": str(signatures_path)},
+        {
+            "signatures": str(signatures_path),
+            "signatures_batch_index": _add_batch_index(
+                signatures_path,
+                tmp_path / "signatures.signatures_batch_index.bin",
+                key_column="signature_id",
+                table_name="signatures",
+            ),
+        },
         ["s1", "s2", "s3", "s4", "s5", "s6"],
         maximum_size=6,
         first_k_letter_counts_sorted={},
         graph_subblocking_config=subblocking.GraphSubblockingConfig(),
-        full_scan_without_index=True,
     )
 
     assert sorted(sorted(signature_ids) for signature_ids in rust_subblocks.values()) == [
@@ -594,12 +608,19 @@ def test_rust_arrow_orcid_repair_does_not_extract_from_oversized_whole_merge(tmp
     )
 
     rust_subblocks, telemetry = subblocking._make_subblocks_with_telemetry_arrow_rust(
-        {"signatures": str(signatures_path)},
+        {
+            "signatures": str(signatures_path),
+            "signatures_batch_index": _add_batch_index(
+                signatures_path,
+                tmp_path / "signatures.signatures_batch_index.bin",
+                key_column="signature_id",
+                table_name="signatures",
+            ),
+        },
         ["s1", "s2", "s3", "s4", "s5"],
         maximum_size=4,
         first_k_letter_counts_sorted={},
         graph_subblocking_config=subblocking.GraphSubblockingConfig(),
-        full_scan_without_index=True,
     )
 
     assert sorted(sorted(signature_ids) for signature_ids in rust_subblocks.values()) == [

@@ -6,18 +6,22 @@ import time
 import warnings
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 
 import numpy as np
 
 from s2and import feature_port
-from s2and.arrow_inputs import normalize_arrow_paths, validate_arrow_prediction_artifacts
+from s2and.arrow_inputs import normalize_arrow_paths, require_arrow_artifacts, validate_arrow_prediction_artifacts
 from s2and.consts import LARGE_DISTANCE, LARGE_INTEGER
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.array_validation import as_uint32_1d
 from s2and.incremental_linking.artifact import IncrementalLinkingArtifact
+from s2and.incremental_linking.feature_block import (
+    read_incremental_query_signatures_arrow,
+)
 from s2and.incremental_linking.features import LinkerFeatureMatrix, assemble_linker_feature_matrix
 from s2and.incremental_linking.gate_buckets import validate_query_view
 from s2and.incremental_linking.linker_pairwise import (
@@ -54,7 +58,11 @@ from s2and.incremental_linking.retrieval import (
     validate_raw_candidate_plan_schema,
 )
 from s2and.incremental_linking.row_features import build_promoted_non_pairwise_row_features_with_telemetry
-from s2and.runtime import build_runtime_context
+from s2and.runtime import (
+    RUST_CAPABILITY_RAW_ARROW_QUERY_SIGNATURE_PLANNER_V1,
+    build_runtime_context,
+    detect_rust_runtime_capabilities,
+)
 from s2and.thread_config import resolve_n_jobs
 
 LinkAction = Literal["link", "abstain"]
@@ -1586,15 +1594,8 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
     )
 
 
-def _raw_plan_query_view_values(raw_candidate_plan: Mapping[str, Any]) -> Any:
-    raw_views = raw_candidate_plan.get("query_views", raw_candidate_plan.get("query_views_resolved"))
-    if raw_views is None:
-        raise KeyError("raw candidate plan is missing query_views")
-    return raw_views
-
-
 def _raw_plan_query_views(raw_candidate_plan: Mapping[str, Any], query_count: int) -> tuple[str, ...]:
-    raw_views = _raw_plan_query_view_values(raw_candidate_plan)
+    raw_views = raw_candidate_plan["query_views"]
     views = tuple(validate_query_view(value) for value in raw_views)
     if len(views) != int(query_count):
         raise ValueError(f"raw candidate plan query_views length must match query count: {len(views)} != {query_count}")
@@ -1611,6 +1612,25 @@ def _validate_raw_plan_query_signature_ids(
         raise ValueError(
             "raw candidate plan query_signature_ids must exactly match requested query_signature_ids: "
             f"plan={list(plan_query_ids[:10])} requested={list(expected_query_ids[:10])}"
+        )
+
+
+def _strip_raw_query_signature_sidecar(arrow_paths: Mapping[str, Any]) -> dict[str, str]:
+    """Return scoring Arrow paths without request-local raw-planner inputs."""
+
+    scoring_paths = normalize_arrow_paths(arrow_paths)
+    scoring_paths.pop("query_signatures", None)
+    return scoring_paths
+
+
+def _require_raw_arrow_query_signature_planner_capability(rust_module: Any, *, context: str) -> None:
+    capabilities = detect_rust_runtime_capabilities(extension_module=rust_module)
+    if not capabilities.core_runtime_available:
+        return
+    if RUST_CAPABILITY_RAW_ARROW_QUERY_SIGNATURE_PLANNER_V1 not in capabilities.named_capabilities:
+        raise RuntimeError(
+            f"{context} requires Rust capability {RUST_CAPABILITY_RAW_ARROW_QUERY_SIGNATURE_PLANNER_V1}; "
+            "rebuild the Rust extension"
         )
 
 
@@ -1932,8 +1952,6 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     artifact: IncrementalLinkingArtifact,
     *,
     arrow_paths: Mapping[str, Any],
-    query_signature_ids: Sequence[Any],
-    query_view: str = "auto",
     top_k: int | None = None,
     partial_supervision: Mapping[tuple[Any, Any], int | float] | None = None,
     runtime_context: Any | None = None,
@@ -1943,84 +1961,87 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     load_name_counts: bool | None | dict[str, Any] = None,
     name_tuples: set[tuple[str, str]] | str | None = "filtered",
     orcid_enabled: bool | None = None,
-    raw_candidate_plan: Mapping[str, Any] | RawArrowPlanBundle | None = None,
-    rust_featurizer: Any | None = None,
     partial_supervision_seed_signature_to_component: Mapping[str, Any] | None = None,
 ) -> LinkOrAbstainProductionResult:
-    """Retrieve and score raw Arrow IPC inputs through Rust without `ANDData`."""
+    """Plan retrieval and score raw Arrow IPC inputs through Rust without `ANDData`."""
 
     resolved_runtime_context = runtime_context or build_runtime_context("incremental_link_or_abstain_raw_arrow")
     n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
     top_k_resolved = int(artifact.metadata.retrieval_top_k if top_k is None else top_k)
-    provided_raw_candidate_plan = raw_candidate_plan is not None
-    if provided_raw_candidate_plan:
-        arrow_path_payload = normalize_arrow_paths(arrow_paths)
-    else:
-        arrow_path_payload = validate_arrow_prediction_artifacts(
-            arrow_paths,
-            require_specter=clusterer_uses_embedding_features(clusterer),
-            require_name_counts_index=clusterer_uses_name_count_features(clusterer),
-            require_cluster_seeds=True,
-            require_batch_indexes=True,
-            context="Raw Arrow scoring",
-            producer_hint=(
-                "include raw Arrow tables, raw-planner batch indexes, and cluster_seeds.arrow when planner "
-                "retrieval is requested; use a provided raw_candidate_plan plus matching rust_featurizer only "
-                "for bounded compatibility tests"
-            ),
-        )
+    arrow_path_payload = validate_arrow_prediction_artifacts(
+        arrow_paths,
+        require_specter=clusterer_uses_embedding_features(clusterer),
+        require_name_counts_index=clusterer_uses_name_count_features(clusterer),
+        require_cluster_seeds=True,
+        require_batch_indexes=True,
+        context="Raw Arrow scoring",
+        producer_hint=(
+            "include raw Arrow tables, raw-planner batch indexes, and cluster_seeds.arrow before raw Arrow scoring"
+        ),
+    )
     require_arrow_name_counts_index_for_clusterer(clusterer, arrow_path_payload, context="Raw Arrow scoring")
-    query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
+    require_arrow_artifacts(
+        arrow_path_payload,
+        required_keys=("query_signatures",),
+        context="Raw Arrow scoring",
+        producer_hint=(
+            "include query_signatures.arrow with raw Arrow tables, raw-planner batch indexes, "
+            "and cluster_seeds.arrow before raw Arrow scoring"
+        ),
+    )
+    query_request_rows = read_incremental_query_signatures_arrow(Path(arrow_path_payload["query_signatures"]))
+    query_signature_id_strings = tuple(row.signature_id for row in query_request_rows)
     resolved_orcid_enabled = (
         not bool(getattr(clusterer, "suppress_orcid", False)) if orcid_enabled is None else bool(orcid_enabled)
     )
-    raw_candidate_plan_mapping: Mapping[str, Any]
-    if raw_candidate_plan is None:
-        stage_start = time.perf_counter()
-        rust_module = feature_port._require_rust_runtime()  # noqa: SLF001
-        raw_planner_cls = getattr(rust_module, "RawBlockQueryCandidatePlanner", None)
-        if raw_planner_cls is None:
-            raise RuntimeError(
-                "raw Arrow scoring requires s2and_rust.RawBlockQueryCandidatePlanner; rebuild the Rust extension"
-            )
-        raw_planner = raw_planner_cls(
-            arrow_path_payload,
-            list(query_signature_id_strings),
-            top_k=top_k_resolved,
-            query_view=str(query_view),
-            orcid_enabled=resolved_orcid_enabled,
-            num_threads=n_jobs_resolved,
-            max_exemplars=int(max_exemplars),
+    stage_start = time.perf_counter()
+    rust_module = feature_port._require_rust_runtime()  # noqa: SLF001
+    _require_raw_arrow_query_signature_planner_capability(rust_module, context="raw Arrow scoring")
+    raw_planner_cls = getattr(rust_module, "RawBlockQueryCandidatePlanner", None)
+    if raw_planner_cls is None:
+        raise RuntimeError(
+            "raw Arrow scoring requires s2and_rust.RawBlockQueryCandidatePlanner; rebuild the Rust extension"
         )
-        raw_candidate_plan_mapping = raw_planner.plan(list(query_signature_id_strings))
-        if not isinstance(raw_candidate_plan_mapping, MutableMapping):
-            raise RuntimeError(
-                "RawBlockQueryCandidatePlanner.plan returned a non-mutable raw candidate plan; "
-                "rebuild the Rust extension"
-            )
-        build_telemetry = getattr(raw_planner, "build_telemetry", None)
-        if not callable(build_telemetry):
-            raise RuntimeError(
-                "raw Arrow scoring requires RawBlockQueryCandidatePlanner.build_telemetry; "
-                "rebuild the Rust extension"
-            )
-        _merge_raw_arrow_planner_build_telemetry(raw_candidate_plan_mapping, build_telemetry())
-        raw_arrow_retrieval_seconds = time.perf_counter() - stage_start
-    else:
-        source_plan = (
-            raw_candidate_plan.plan if isinstance(raw_candidate_plan, RawArrowPlanBundle) else raw_candidate_plan
+    from_query_signatures = getattr(raw_planner_cls, "from_query_signatures", None)
+    if not callable(from_query_signatures):
+        raise RuntimeError(
+            "raw Arrow scoring requires RawBlockQueryCandidatePlanner.from_query_signatures; rebuild the Rust extension"
         )
-        raw_candidate_plan_mapping = source_plan
-        raw_arrow_retrieval_seconds = 0.0
+    raw_planner = from_query_signatures(
+        arrow_path_payload,
+        top_k=top_k_resolved,
+        orcid_enabled=resolved_orcid_enabled,
+        num_threads=n_jobs_resolved,
+        max_exemplars=int(max_exemplars),
+    )
+    plan_query_signatures = getattr(raw_planner, "plan_query_signatures", None)
+    if not callable(plan_query_signatures):
+        raise RuntimeError(
+            "raw Arrow scoring requires RawBlockQueryCandidatePlanner.plan_query_signatures; "
+            "rebuild the Rust extension"
+        )
+    raw_candidate_plan_mapping = plan_query_signatures()
+    if not isinstance(raw_candidate_plan_mapping, MutableMapping):
+        raise RuntimeError(
+            "RawBlockQueryCandidatePlanner.plan_query_signatures returned a non-mutable raw candidate plan; "
+            "rebuild the Rust extension"
+        )
+    build_telemetry = getattr(raw_planner, "build_telemetry", None)
+    if not callable(build_telemetry):
+        raise RuntimeError(
+            "raw Arrow scoring requires RawBlockQueryCandidatePlanner.build_telemetry; rebuild the Rust extension"
+        )
+    _merge_raw_arrow_planner_build_telemetry(raw_candidate_plan_mapping, build_telemetry())
+    raw_arrow_retrieval_seconds = time.perf_counter() - stage_start
 
-    return predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+    return _predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
         clusterer,
         artifact,
-        arrow_paths=arrow_path_payload,
+        arrow_paths=_strip_raw_query_signature_sidecar(arrow_path_payload),
         query_signature_ids=query_signature_id_strings,
         raw_candidate_plan=raw_candidate_plan_mapping,
-        rust_featurizer=rust_featurizer,
-        allow_featurizer_build=not provided_raw_candidate_plan,
+        rust_featurizer=None,
+        allow_featurizer_build=True,
         raw_arrow_retrieval_seconds=raw_arrow_retrieval_seconds,
         partial_supervision=partial_supervision,
         runtime_context=resolved_runtime_context,
@@ -2033,15 +2054,15 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
     )
 
 
-def predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+def _predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
     clusterer: Any,
     artifact: IncrementalLinkingArtifact,
     *,
     arrow_paths: Mapping[str, Any],
     query_signature_ids: Sequence[Any],
-    raw_candidate_plan: Mapping[str, Any] | RawArrowPlanBundle,
+    raw_candidate_plan: Mapping[str, Any],
     rust_featurizer: Any | None,
-    allow_featurizer_build: bool = False,
+    allow_featurizer_build: bool,
     raw_arrow_retrieval_seconds: float = 0.0,
     partial_supervision: Mapping[tuple[Any, Any], int | float] | None = None,
     runtime_context: Any | None = None,
@@ -2052,32 +2073,27 @@ def predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
     name_tuples: set[tuple[str, str]] | str | None = "filtered",
     partial_supervision_seed_signature_to_component: Mapping[str, Any] | None = None,
 ) -> LinkOrAbstainProductionResult:
-    """Score a preplanned raw Arrow candidate plan without `ANDData`."""
+    """Shared raw Arrow scoring implementation."""
 
     resolved_runtime_context = runtime_context or build_runtime_context("incremental_link_or_abstain_raw_arrow")
     n_jobs_resolved = resolve_n_jobs(getattr(clusterer, "n_jobs", 1) if n_jobs is None else n_jobs)
     top_k_resolved = int(artifact.metadata.retrieval_top_k if top_k is None else top_k)
-    arrow_path_payload = normalize_arrow_paths(arrow_paths)
+    arrow_path_payload = _strip_raw_query_signature_sidecar(arrow_paths)
     require_arrow_name_counts_index_for_clusterer(clusterer, arrow_path_payload, context="raw Arrow scoring")
     query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
-    source_plan = raw_candidate_plan.plan if isinstance(raw_candidate_plan, RawArrowPlanBundle) else raw_candidate_plan
-    raw_plan_bundle = RawArrowPlanBundle.from_mapping(source_plan)
+    raw_plan_bundle = RawArrowPlanBundle.from_mapping(raw_candidate_plan)
     _validate_raw_plan_query_signature_ids(raw_plan_bundle.plan, query_signature_id_strings)
     _raw_plan_query_views(raw_plan_bundle.plan, len(query_signature_id_strings))
     if rust_featurizer is None and not allow_featurizer_build:
-        raise ValueError(
-            "raw Arrow scoring with a provided raw_candidate_plan requires rust_featurizer; "
-            "use the planner path or pass the featurizer built for the same candidate plan to avoid "
-            "unbounded Arrow scans"
-        )
+        raise ValueError("preplanned raw Arrow scoring requires rust_featurizer built for the same raw_candidate_plan")
     stage_start = time.perf_counter()
     signature_order = raw_plan_bundle.signature_order
-    resolved_load_name_counts = _resolve_load_name_counts_policy(
-        clusterer,
-        load_name_counts,
-        context="raw Arrow scoring",
-    )
     if rust_featurizer is None:
+        resolved_load_name_counts = _resolve_load_name_counts_policy(
+            clusterer,
+            load_name_counts,
+            context="raw Arrow scoring",
+        )
         featurizer = feature_port.build_rust_featurizer_from_arrow_paths(
             arrow_path_payload,
             signature_ids=signature_order.signature_ids,

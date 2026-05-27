@@ -160,7 +160,7 @@ def _run_single(args: argparse.Namespace) -> dict[str, Any]:
             bool(args.require_rust_release),
         )
 
-    # Rust inference defaults to JSON ingest; keep path inputs even on limited fixtures.
+    # Rust comparison keeps file-backed inputs for compatibility baselines, even on limited fixtures.
     force_path_inputs = args.backend == "rust"
     signatures_input, papers_input, _tmpdir = _load_dataset_inputs(
         args.dataset,

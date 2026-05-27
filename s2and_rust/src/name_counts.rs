@@ -8,6 +8,8 @@ use crate::{
     FNV_OFFSET,
 };
 
+const NAME_COUNTS_INDEX_SCHEMA_VERSION: &str = "name_counts_index_v1";
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct NameCountsData {
     pub(crate) first: f64,
@@ -334,6 +336,23 @@ fn read_name_counts_index_manifest(index_dir: &Path) -> PyResult<RawNameCountInd
             err
         ))
     })?;
+    let schema_version = manifest
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "name-count index manifest {} is missing schema_version",
+                manifest_path.display()
+            ))
+        })?;
+    if schema_version != NAME_COUNTS_INDEX_SCHEMA_VERSION {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "name-count index manifest {} has unsupported schema_version {:?}; expected {:?}",
+            manifest_path.display(),
+            schema_version,
+            NAME_COUNTS_INDEX_SCHEMA_VERSION
+        )));
+    }
     let files = manifest
         .get("files")
         .and_then(serde_json::Value::as_object)

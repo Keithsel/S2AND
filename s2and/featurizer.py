@@ -1692,24 +1692,17 @@ def many_pairs_featurize(
     rust_batch_rss_baseline_locked = False
     rust_batch_adaptive_halvings = 0
 
+    rust_module_available = False
     if _use_rust_featurizer(runtime_context):
-        if feature_port.s2and_rust is None:
-            if stage_uses_rust(runtime_context):
-                raise RuntimeError(
-                    "Rust backend requested for pair_featurization but s2and_rust extension is unavailable "
-                    f"(run_id={runtime_context.run_id})"
-                )
-        else:
-            try:
-                # Prewarm so from_dataset build doesn't land inside the RSS measurement window.
-                feature_port._get_rust_featurizer(
-                    dataset,
-                    runtime_context=runtime_context,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Rust featurizer init failed " f"(run_id={runtime_context.run_id} error={exc})"
-                ) from exc
+        try:
+            # Prewarm so from_dataset build doesn't land inside the RSS measurement window.
+            feature_port._get_rust_featurizer(
+                dataset,
+                runtime_context=runtime_context,
+            )
+            rust_module_available = True
+        except Exception as exc:
+            raise RuntimeError("Rust featurizer init failed " f"(run_id={runtime_context.run_id} error={exc})") from exc
         try:
             rust_batch_total_ram_for_stage, _ = memory_budget.resolve_total_ram_bytes(total_ram_bytes)
             rust_batch_rss_before_bytes, rust_batch_rss_source = memory_budget.current_rss_bytes_best_effort(
@@ -1832,7 +1825,6 @@ def many_pairs_featurize(
 
     if cache_changed:
         use_rust = _use_rust_featurizer(runtime_context)
-        rust_module_available = feature_port.s2and_rust is not None if use_rust else False
         if use_rust and not rust_module_available:
             raise RuntimeError(
                 "Rust backend requested for pair_featurization but s2and_rust extension is unavailable "

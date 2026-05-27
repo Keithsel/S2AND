@@ -62,3 +62,12 @@ def as_uint16_1d(name: str, values: Sequence[Any] | np.ndarray) -> np.ndarray:
             raise ValueError(f"{name}[{offset}]={integer_value} is outside uint16 range [0, {UINT16_MAX}]")
         checked[offset] = integer_value
     return checked
+
+
+def as_retrieval_rank_uint16_1d(name: str, values: Sequence[Any] | np.ndarray) -> np.ndarray:
+    """Return one-based retrieval ranks as contiguous uint16 values."""
+
+    ranks = as_uint16_1d(name, values)
+    if np.any(ranks == 0):
+        raise ValueError(f"{name} values must be in uint16 range [1, {UINT16_MAX}]")
+    return ranks

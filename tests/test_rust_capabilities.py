@@ -26,9 +26,6 @@ def _make_core_rust_featurizer(*, supports_from_dataset_paper_preprocess: bool =
         def signature_ids(self):
             return []
 
-        def get_constraint(self, *args, **kwargs):
-            return None
-
         def get_constraints_matrix_indexed(self, *args, **kwargs):
             return []
 
@@ -45,10 +42,16 @@ def _pair_plan_build_info(
     *,
     supported_kwargs: tuple[str, ...] = ("query_candidate_component_keys_by_signature_id",),
     row_signals: tuple[str, ...] = ("row_orcid_match",),
+    raw_planner_methods: tuple[str, ...] = (
+        "from_query_signatures",
+        "plan_query_signatures",
+        "build_telemetry",
+    ),
 ) -> dict[str, tuple[str, ...]]:
     return {
         "incremental_linking_pair_plan_supported_kwargs": supported_kwargs,
         "incremental_linking_pair_plan_row_signals": row_signals,
+        "raw_arrow_query_signature_planner_methods": raw_planner_methods,
     }
 
 
@@ -61,7 +64,7 @@ def test_load_s2and_rust_extension_prefers_versioned_candidate_on_tie(monkeypatc
     cast(Any, ShimModule).RustFeaturizer = RustFeaturizer
 
     class NativeModule:
-        __version__ = "0.50.0"
+        __version__ = "0.51.0"
 
     cast(Any, NativeModule).RustFeaturizer = RustFeaturizer
 
@@ -111,7 +114,7 @@ def test_load_s2and_rust_extension_reraises_nested_missing_dependency(monkeypatc
     RustFeaturizer = _make_core_rust_featurizer()
 
     class ShimModule:
-        __version__ = "0.50.0"
+        __version__ = "0.51.0"
 
     cast(Any, ShimModule).RustFeaturizer = RustFeaturizer
 
@@ -176,7 +179,7 @@ def test_detect_rust_runtime_capabilities_reads_from_dataset_paper_preprocess_ma
     RustFeaturizer = _make_core_rust_featurizer(supports_from_dataset_paper_preprocess=True)
 
     class Module:
-        __version__ = "0.50.0"
+        __version__ = "0.51.0"
 
     cast(Any, Module).RustFeaturizer = RustFeaturizer
 
@@ -194,9 +197,6 @@ def test_detect_rust_runtime_capabilities_does_not_require_json_ingest_markers()
         def signature_ids(self):
             return []
 
-        def get_constraint(self, *args, **kwargs):
-            return None
-
         def get_constraints_matrix_indexed(self, *args, **kwargs):
             return []
 
@@ -207,7 +207,7 @@ def test_detect_rust_runtime_capabilities_does_not_require_json_ingest_markers()
             return 0
 
     class Module:
-        __version__ = "0.50.0"
+        __version__ = "0.51.0"
         RustFeaturizer = RustFeaturizerWithoutJsonCompat
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
@@ -231,10 +231,16 @@ def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():
         def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):
             return None
 
+    class NamedRawBlockQueryCandidatePlanner:
+        @staticmethod
+        def from_query_signatures(*args, **kwargs):
+            return None
+
     class Module:
-        __version__ = "0.50.0"
+        __version__ = "0.51.0"
         RustFeaturizer = NamedRustFeaturizer
         RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
+        RawBlockQueryCandidatePlanner = NamedRawBlockQueryCandidatePlanner
 
         @staticmethod
         def get_build_info():
@@ -246,6 +252,28 @@ def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():
     assert "indexed_pair_array_featurization_v1" in capabilities.named_capabilities
     assert "incremental_linking_pair_plan_v1" in capabilities.named_capabilities
     assert "incremental_linking_constraint_arrays_v1" in capabilities.named_capabilities
+    assert "raw_arrow_query_signature_planner_v1" in capabilities.named_capabilities
+
+
+def test_detect_rust_runtime_capabilities_rejects_stale_raw_query_signature_planner_abi():
+    class NamedRawPlanner:
+        @staticmethod
+        def from_query_signatures(*args, **kwargs):
+            return None
+
+    class Module:
+        __version__ = "0.51.0"
+        RustFeaturizer = _make_core_rust_featurizer()
+        RawBlockQueryCandidatePlanner = NamedRawPlanner
+
+        @staticmethod
+        def get_build_info():
+            return _pair_plan_build_info(raw_planner_methods=("from_query_signatures",))
+
+    capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
+
+    assert capabilities.core_runtime_available is True
+    assert "raw_arrow_query_signature_planner_v1" not in capabilities.named_capabilities
 
 
 def test_detect_rust_runtime_capabilities_rejects_stale_incremental_pair_plan_abi():
@@ -258,7 +286,7 @@ def test_detect_rust_runtime_capabilities_rejects_stale_incremental_pair_plan_ab
             return None
 
     class Module:
-        __version__ = "0.50.0"
+        __version__ = "0.51.0"
         RustFeaturizer = NamedRustFeaturizer
         RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
 
@@ -283,7 +311,7 @@ def test_detect_rust_runtime_capabilities_requires_pair_plan_orcid_signal_marker
             return None
 
     class Module:
-        __version__ = "0.50.0"
+        __version__ = "0.51.0"
         RustFeaturizer = NamedRustFeaturizer
         RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
 
@@ -313,3 +341,9 @@ def test_rust_get_build_info_contract():
     assert "row_orcid_match" in row_signals
     supported_kwargs = tuple(info.get("incremental_linking_pair_plan_supported_kwargs", ()))
     assert "query_candidate_component_keys_by_signature_id" in supported_kwargs
+    if "raw_arrow_query_signature_planner_methods" not in info:
+        pytest.skip("installed local s2and_rust extension was built before raw-planner build-info markers")
+    raw_planner_methods = tuple(info.get("raw_arrow_query_signature_planner_methods", ()))
+    assert "from_query_signatures" in raw_planner_methods
+    assert "plan_query_signatures" in raw_planner_methods
+    assert "build_telemetry" in raw_planner_methods

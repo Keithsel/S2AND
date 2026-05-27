@@ -75,7 +75,6 @@ from s2and.model_pairwise import FastCluster, PairwiseModeler, VotingClassifier,
 from s2and.runtime import RequestedBackend, RuntimeContext, build_runtime_context, stage_uses_rust
 from s2and.rust_calls import (
     build_block_upper_triangle_feature_matrix_indexed_rust,
-    get_constraint_rust,
     get_constraints_block_upper_triangle_indexed_rust,
     get_constraints_matrix_indexed_rust,
     update_rust_cluster_seeds,
@@ -1749,62 +1748,6 @@ class _ConstraintPolicy:
     dont_merge_cluster_seeds: bool = True
     incremental_dont_use_cluster_seeds: bool = False
     suppress_orcid: bool = False
-
-
-def _get_constraint_value(
-    dataset: ANDData,
-    sig_id_1: str,
-    sig_id_2: str,
-    dont_merge_cluster_seeds: bool = True,
-    incremental_dont_use_cluster_seeds: bool = False,
-    rust_featurizer: object | None = None,
-    use_rust_constraints: bool | None = None,
-    runtime_context: RuntimeContext | None = None,
-    suppress_orcid: bool = False,
-):
-    policy = _ConstraintPolicy(
-        dont_merge_cluster_seeds=dont_merge_cluster_seeds,
-        incremental_dont_use_cluster_seeds=incremental_dont_use_cluster_seeds,
-        suppress_orcid=suppress_orcid,
-    )
-    if runtime_context is None:
-        runtime_context = build_runtime_context("constraints")
-    if use_rust_constraints is None:
-        use_rust_constraints = _use_rust_constraints(runtime_context)
-    if use_rust_constraints:
-        return _optional_rust_or_python_path(
-            fn=lambda: get_constraint_rust(
-                dataset,
-                sig_id_1,
-                sig_id_2,
-                dont_merge_cluster_seeds=policy.dont_merge_cluster_seeds,
-                incremental_dont_use_cluster_seeds=policy.incremental_dont_use_cluster_seeds,
-                featurizer=rust_featurizer,
-                runtime_context=runtime_context,
-                suppress_orcid=policy.suppress_orcid,
-            ),
-            python_fn=lambda: dataset.get_constraint(
-                sig_id_1,
-                sig_id_2,
-                dont_merge_cluster_seeds=policy.dont_merge_cluster_seeds,
-                incremental_dont_use_cluster_seeds=policy.incremental_dont_use_cluster_seeds,
-                suppress_orcid=policy.suppress_orcid,
-            ),
-            runtime_context=runtime_context,
-            label="constraint evaluation",
-            strict_message="Rust constraint evaluation failed in strict rust backend",
-            python_path_warning=(
-                "Optional Rust get_constraint failed while runtime backend is Python; using Python constraint path"
-            ),
-            context_fields=(f"pair=({sig_id_1}, {sig_id_2})",),
-        )
-    return dataset.get_constraint(
-        sig_id_1,
-        sig_id_2,
-        dont_merge_cluster_seeds=policy.dont_merge_cluster_seeds,
-        incremental_dont_use_cluster_seeds=policy.incremental_dont_use_cluster_seeds,
-        suppress_orcid=policy.suppress_orcid,
-    )
 
 
 def _sync_rust_cluster_seeds(

@@ -2,19 +2,20 @@
 
 Status date: 2026-03-02
 
-This doc explains what S2AND stage-wise memory predictors/telemetry measure, why they can be wrong, and what work remains to make them both **safe** (avoid under-allocation) and **tight** (avoid overly conservative chunking).
+This doc explains what S2AND stage-wise memory predictors and telemetry
+measure, why they can be wrong, and how to calibrate them.
 
 ## Terms (what we measure)
 
 Most telemetry compares:
-- `predicted_peak_delta_bytes`: model-based estimate for the stage’s peak RSS increase above `rss_before_bytes`
+- `predicted_peak_delta_bytes`: model-based estimate for the stage's peak RSS increase above `rss_before_bytes`
 - `rss_before_bytes`, `rss_peak_bytes`, `rss_after_bytes`: best-effort process RSS samples
 - `observed_peak_delta_bytes = rss_peak_bytes - rss_before_bytes`
 - `prediction_error_ratio = observed_peak_delta_bytes / predicted_peak_delta_bytes`
 
-## Measurement caveats (RSS is not “bytes allocated by the stage”)
+## Measurement caveats (RSS is not "bytes allocated by the stage")
 
-- Allocator/OS behavior can retain memory after frees (RSS deltas can look “wrong”).
+- Allocator/OS behavior can retain memory after frees (RSS deltas can look wrong).
 - Background activity can shift RSS during a stage window.
 - Sampling can miss short-lived peaks.
 - Fidelity differs by platform and RSS source (Windows vs Linux, psutil vs WinAPI vs `/proc`).
@@ -30,12 +31,14 @@ Recommended per-stage contract:
 
 Boundary rules:
 1. Decide whether the predictor models **delta above `rss_before`** (recommended) vs an **absolute** peak.
-2. Sample `rss_before` before the stage’s large allocations start.
+2. Sample `rss_before` before the stage's large allocations start.
 3. Ensure RSS sampling covers all allocations that can define the peak (including post-processing copies).
 
-## What remains (next work)
+## Status
 
-No additional work is planned right now. These predictors are treated as best-effort; we prioritize stable telemetry contracts and regression tests over further tightening.
+No dedicated memory-estimate backlog is active right now. These predictors are
+treated as best-effort; the active TODO plan is in
+[general_todo_plan.md](general_todo_plan.md).
 
 Regression coverage:
 - `tests/test_memory_budget.py`
@@ -63,4 +66,4 @@ Regression coverage:
    - peaks are not missed (probes/sampling covers the real peak window)
 3. Calibrate and check safety:
    - underprediction is eliminated (`underpredicted=false` where surfaced)
-   - ratios are stable enough to gate (don’t over-tighten on noisy RSS deltas)
+   - ratios are stable enough to gate (do not over-tighten on noisy RSS deltas)

@@ -814,7 +814,7 @@ def test_validate_arrow_dataset_manifest_rejects_incomplete_name_counts_index(tm
     name_counts_index = tmp_path / "name_counts_index"
     name_counts_index.mkdir()
     (name_counts_index / "manifest.json").write_text(
-        json.dumps({"files": {"first": {"path": "missing-first.bin"}}}),
+        json.dumps({"schema_version": "name_counts_index_v1", "files": {"first": {"path": "missing-first.bin"}}}),
         encoding="utf-8",
     )
     write_arrow_ipc_table(

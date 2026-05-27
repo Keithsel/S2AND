@@ -14,7 +14,6 @@ from s2and.feature_port import (
     _get_rust_featurizer,
     build_linker_pair_distance_accumulators_rust,
     get_constraint_labels_index_arrays_rust,
-    get_constraint_rust,
     get_constraints_matrix_indexed_rust,
 )
 from s2and.featurizer import _single_pair_featurize
@@ -46,6 +45,19 @@ def _featurize_pair_indexed_rust(dataset, sig_id_1: str, sig_id_2: str) -> np.nd
             np.nan,
         ),
         dtype=np.float64,
+    )[0]
+
+
+def _constraint_indexed_rust(dataset, sig_id_1: str, sig_id_2: str, **kwargs):
+    rust_featurizer = kwargs.pop("featurizer", None)
+    if rust_featurizer is None:
+        rust_featurizer = _get_rust_featurizer(dataset)
+    signature_id_to_index = {str(sig_id): index for index, sig_id in enumerate(rust_featurizer.signature_ids())}
+    return get_constraints_matrix_indexed_rust(
+        dataset,
+        [(signature_id_to_index[str(sig_id_1)], signature_id_to_index[str(sig_id_2)])],
+        featurizer=rust_featurizer,
+        **kwargs,
     )[0]
 
 
@@ -284,7 +296,7 @@ def test_rust_featurizer_supports_string_paper_ids():
     features = _featurize_pair_indexed_rust(ds, "s1", "s2")
     assert len(features) > 0
 
-    constraint = get_constraint_rust(ds, "s1", "s2")
+    constraint = _constraint_indexed_rust(ds, "s1", "s2")
     assert constraint is None or isinstance(constraint, int | float)
 
 
@@ -440,7 +452,7 @@ def test_many_pairs_end_to_end_parity_python_vs_rust(monkeypatch):
     _reset_featurizer_env_caches()
 
 
-def test_get_constraint_rust_ignores_reliable_language_mismatch():
+def test_indexed_constraint_rust_ignores_reliable_language_mismatch():
     data_dir = os.path.join(PROJECT_ROOT_PATH, "tests", "dummy")
     ds = _load_dataset_from_dir(data_dir, "dummy_language_constraint_removed")
 
@@ -453,7 +465,7 @@ def test_get_constraint_rust_ignores_reliable_language_mismatch():
     ds.papers[paper_id_2] = ds.papers[paper_id_2]._replace(predicted_language="fr", is_reliable=True)
 
     ref_val = ds.get_constraint(s1, s2)
-    got_val = get_constraint_rust(ds, s1, s2)
+    got_val = _constraint_indexed_rust(ds, s1, s2)
 
     assert ref_val is None
     assert got_val is None
@@ -471,7 +483,7 @@ def test_get_constraint_rust_ignores_reliable_language_mismatch():
     assert got_indexed == [None]
 
 
-def test_get_constraint_rust_uses_dataset_name_tuple_aliases():
+def test_indexed_constraint_rust_uses_dataset_name_tuple_aliases():
     signatures = {
         "s1": {
             "signature_id": "s1",
@@ -551,7 +563,7 @@ def test_get_constraint_rust_uses_dataset_name_tuple_aliases():
 
     assert ds.get_constraint("s1", "s2") is None
     rust_featurizer = _get_rust_featurizer(ds)
-    assert get_constraint_rust(ds, "s1", "s2", featurizer=rust_featurizer) is None
+    assert _constraint_indexed_rust(ds, "s1", "s2", featurizer=rust_featurizer) is None
     signature_ids = list(rust_featurizer.signature_ids())
     signature_index = {sig_id: idx for idx, sig_id in enumerate(signature_ids)}
     indexed_values = get_constraints_matrix_indexed_rust(

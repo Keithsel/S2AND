@@ -45,6 +45,7 @@ DECLARED_ARROW_SIDECAR_KEYS = (
 UNSUPPORTED_ARROW_NAME_ALIAS_KEYS = frozenset({"name_pairs", "name_tuples"})
 DIRECTORY_ARTIFACT_KEYS = frozenset({"name_counts_index"})
 NAME_COUNTS_INDEX_MANIFEST_FILES = ("first", "last", "first_last", "last_first_initial")
+NAME_COUNTS_INDEX_SCHEMA_VERSION = "name_counts_index_v1"
 
 
 def _name_counts_index_error(path: Path) -> str | None:
@@ -55,6 +56,12 @@ def _name_counts_index_error(path: Path) -> str | None:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return f"{manifest_path} (invalid manifest: {exc})"
+    schema_version = manifest.get("schema_version")
+    if schema_version != NAME_COUNTS_INDEX_SCHEMA_VERSION:
+        return (
+            f"{manifest_path} (unsupported schema_version {schema_version!r}; "
+            f"expected {NAME_COUNTS_INDEX_SCHEMA_VERSION!r})"
+        )
     files = manifest.get("files")
     if not isinstance(files, Mapping):
         return f"{manifest_path} (missing files mapping)"

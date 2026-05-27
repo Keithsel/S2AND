@@ -28,9 +28,6 @@ class ArrowOnlyRustFeaturizer:
     def signature_ids(self) -> list[str]:
         return []
 
-    def get_constraint(self, *_args: Any, **_kwargs: Any) -> None:
-        return None
-
     def get_constraints_matrix_indexed(self, *_args: Any, **_kwargs: Any) -> list[Any]:
         return []
 

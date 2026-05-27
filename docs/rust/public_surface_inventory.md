@@ -27,7 +27,6 @@ cleanup risk, not a user-facing API promise.
 | `update_cluster_seeds(...)` and `update_signature_name_counts(...)` | cache/seed update helpers in `feature_port.py` and tests | Compatibility/training lifecycle helpers. |
 | `signature_ids(...)` | pairwise matrix wrappers, promoted incremental runtime, parity scripts | Shared index-order contract; keep. |
 | `signature_rule_metadata(...)`, `signature_name_counts_present(...)`, `cluster_seeds_require(...)` | `predict_from_rust_featurizer(...)`, parity tests, and state restoration checks | Required metadata for direct Rust-featurizer prediction and parity. |
-| `get_constraint(...)` | `s2and/model.py`, `s2and/rust_calls.py`, tests | Single-pair `ANDData` Rust constraint helper used by compatibility/full-predict plumbing. |
 | `get_constraints_matrix_indexed(...)` | `model.py`, `rust_calls.py`, parity tests | Maintained indexed constraint API. |
 | `get_constraints_block_upper_triangle_indexed(...)` | `model.py`, Arrow parity script | Maintained blockwise constraint API. |
 | `linker_pair_index_arrays_constraint_labels(...)` | promoted linker training/materialization and runtime tests | Maintained promoted incremental constraint-label API. |
@@ -44,7 +43,7 @@ cleanup risk, not a user-facing API promise.
 | `RustHybridCentroidRetriever.__new__(...)` | raw Arrow planners, training query support, tests | Maintained constructor. |
 | `top_k_hybrid_centroid_pair_plan(...)` | `s2and/incremental_linking/retrieval.py`, raw Arrow planners | Canonical runtime retrieval output. |
 | `top_k_experimental_weighted_hybrid_centroid_subset(...)` | `s2and/incremental_linking_training/query_support.py`, tests | Training/query-support scoring surface. |
-| `RawBlockQueryCandidatePlanner.__new__(...)`, `build_telemetry(...)`, `plan(...)` | `s2and/incremental_linking/production.py`, `s2and/incremental_linking/runtime.py`; tests | Canonical reusable production raw Arrow planner. |
+| `RawBlockQueryCandidatePlanner.from_query_signatures(...)`, `plan_query_signatures(...)`, `build_telemetry(...)`, `plan(...)` | `s2and/incremental_linking/production.py`, `s2and/incremental_linking/runtime.py`; tests | Canonical reusable production raw Arrow planner. The public constructor is intentionally not exposed; callers enter through typed request-local `query_signatures.arrow`. |
 
 ## Python Wrapper Ownership
 
@@ -60,7 +59,9 @@ cleanup risk, not a user-facing API promise.
 ## Cleanup Notes
 
 - Keep `RawBlockQueryCandidatePlanner` as the canonical raw Arrow planning
-  API; it owns reusable seed state and strict indexed-read defaults.
+  API; it owns reusable seed state and strict indexed-read defaults. Callers
+  should use `from_query_signatures(...)` plus `plan_query_signatures()` or
+  subset `plan(...)`.
 - Do not delete `RustNameCompatibleSubblockSelector` internals; the pair-plan
   route still uses them for retrieval subblock filtering.
 - Status 2026-05-25: `RustHybridCentroidRetriever.summary_count(...)` was
@@ -118,3 +119,8 @@ cleanup risk, not a user-facing API promise.
 - Status 2026-05-25: Arrow graph subblocking uses raw-planner batch lookup
   indexes for filtered evidence reads and no longer exposes the unused Python
   full-table graph loader.
+- Status 2026-05-27: the single-pair Rust constraint API was removed from the
+  maintained surface. Constraint parity is owned by indexed matrix APIs.
+- Status 2026-05-27: raw query-signature planner support is capability-gated
+  by `raw_arrow_query_signature_planner_v1`; `query_signatures.arrow` is
+  request-local planner input, not a generic scoring artifact sidecar.

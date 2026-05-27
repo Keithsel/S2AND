@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -136,6 +137,18 @@ def test_validate_arrow_prediction_artifacts_requires_manifest_backed_name_count
         )["name_counts_index"]
         == valid_index_dir
     )
+
+    manifest_path = Path(valid_index_dir) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = "unexpected"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(MissingArrowArtifactError) as bad_schema_exc:
+        validate_arrow_prediction_artifacts(
+            {**paths, "name_counts_index": valid_index_dir},
+            require_specter=False,
+            require_name_counts_index=True,
+        )
+    assert "schema_version" in bad_schema_exc.value.missing_files["name_counts_index"]
 
 
 def test_validate_arrow_prediction_artifacts_ignores_unused_specter_path(tmp_path: Path) -> None:

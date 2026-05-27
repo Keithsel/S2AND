@@ -52,8 +52,8 @@ Python path remains available via explicit backend and stage overrides at any ti
 - Core runtime capability requires extension importability plus the current
   Rust markers used by production Arrow paths: direct Arrow ingest, indexed
   featurization, constraints, seed updates, and name-count index support.
-  Dataset and JSON ingest remain maintained compatibility, training, benchmark,
-  and parity markers; they are not production inference authorities.
+  `ANDData`/`from_dataset` remains the maintained compatibility, training,
+  benchmark, and parity surface; it is not the production inference authority.
 
 ### Stage defaults (resolved backend = `rust`)
 
@@ -173,20 +173,9 @@ Maintenance checklist:
    - `uv run pytest -q tests/test_rust_from_dataset_contract.py tests/test_preprocess_papers_parallel_defaults.py tests/test_rust_lifecycle.py tests/test_rust_capabilities.py`
 3. Optional: rerun transfer-mini compare and write the JSON under `scratch/baselines_YYYYMMDD/` (see `baselines.md`).
 
-### Open follow-up
-
-- If training needs `compute_reference_features=True`, either port reference-details preprocessing to Rust or keep the gate.
-
----
-
-## High-impact risk register
-
-### Accepted (monitored, low severity)
-
-| Risk | Notes |
-|---|---|
-| Featurizer cold-start serialization: global cache lock spans full build/load path | Lock scope is correct and necessary for atomicity. Contention under `n_jobs=4-8` not observed. |
-| Name-count precedence drift | Canonicalization shims (`_canonicalize_last_for_counts`, `_lasts_equivalent_for_constraint`) introduce implicit precedence assumptions. Shims will be removed after normalization migration phase 4. That migration is currently **blocked** -- see [`../normalization_migration_blocked.md`](../normalization_migration_blocked.md). |
+Current watchlist items for this area are tracked in
+[../general_todo_plan.md](../general_todo_plan.md), especially the
+reference-feature training gate and blocked normalization migration.
 
 ---
 

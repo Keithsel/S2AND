@@ -292,6 +292,11 @@ const INCREMENTAL_LINKING_PAIR_PLAN_SUPPORTED_KWARGS: [&str; 5] = [
     "query_candidate_component_keys_by_signature_id",
     "full_first_global_backfill_count",
 ];
+const RAW_ARROW_QUERY_SIGNATURE_PLANNER_METHODS: [&str; 3] = [
+    "from_query_signatures",
+    "plan_query_signatures",
+    "build_telemetry",
+];
 const RETRIEVAL_MIDDLE_INITIAL_CONFLICT_SCORE: f64 = -0.25;
 const RETRIEVAL_YEAR_SCORE_DECAY_YEARS: f64 = 15.0;
 const RETRIEVAL_YEAR_SCORE_RANGE_GAP: i64 = 10;
@@ -1230,13 +1235,22 @@ fn extract_id_string(obj: &Bound<'_, PyAny>) -> PyResult<String> {
     if let Ok(s) = obj.extract::<String>() {
         return Ok(s);
     }
+    let type_name = obj.get_type().name()?;
+    if type_name == "bool" {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "expected id value to be str, int, or uint-compatible int; got bool",
+        ));
+    }
     if let Ok(i) = obj.extract::<i64>() {
         return Ok(i.to_string());
     }
     if let Ok(u) = obj.extract::<u64>() {
         return Ok(u.to_string());
     }
-    Ok(obj.str()?.to_string())
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "expected id value to be str, int, or uint-compatible int; got {}",
+        type_name
+    )))
 }
 
 fn extract_set_id_string(obj: &Bound<'_, PyAny>) -> PyResult<HashSet<PaperId>> {
@@ -2338,6 +2352,72 @@ fn read_raw_arrow_cluster_seed_disallows(path: &str) -> PyResult<HashSet<(String
     Ok(out)
 }
 
+#[derive(Clone)]
+struct RawArrowQuerySignatureRequest {
+    signature_id: String,
+    query_view: String,
+    query_author: String,
+}
+
+fn validate_raw_arrow_query_view(value: &str) -> PyResult<()> {
+    if value == "auto" || value == "full" || value == "initial_only" {
+        Ok(())
+    } else {
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "query_signatures Arrow contains unknown query_view: {value:?}"
+        )))
+    }
+}
+
+fn read_raw_arrow_query_signatures(path: &str) -> PyResult<Vec<RawArrowQuerySignatureRequest>> {
+    let mut rows = Vec::<RawArrowQuerySignatureRequest>::new();
+    let mut seen_signature_ids = HashSet::<String>::new();
+    for batch in read_arrow_batches(path)? {
+        let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
+        let signature_id_values =
+            ArrowStringColumn::from_string_array(signature_id_col.as_ref(), "signature_id")?;
+        let query_view_col = batch.column(arrow_column_index(&batch, "query_view", path)?);
+        let query_view_values =
+            ArrowStringColumn::from_string_array(query_view_col.as_ref(), "query_view")?;
+        let query_author_col = batch.column(arrow_column_index(&batch, "query_author", path)?);
+        let query_author_values =
+            ArrowStringColumn::from_string_array(query_author_col.as_ref(), "query_author")?;
+        for row in 0..batch.num_rows() {
+            let signature_id = signature_id_values
+                .required_value(row, "signature_id")?
+                .into_owned();
+            let query_view = query_view_values
+                .required_value(row, "query_view")?
+                .into_owned();
+            let query_author = query_author_values
+                .required_value(row, "query_author")?
+                .into_owned();
+            if signature_id.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "query_signatures Arrow cannot contain empty signature_id values",
+                ));
+            }
+            if query_view.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "query_signatures Arrow cannot contain empty query_view values: {signature_id:?}"
+                )));
+            }
+            validate_raw_arrow_query_view(&query_view)?;
+            if !seen_signature_ids.insert(signature_id.clone()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "query_signatures Arrow contains duplicate signature_id: {signature_id:?}"
+                )));
+            }
+            rows.push(RawArrowQuerySignatureRequest {
+                signature_id,
+                query_view,
+                query_author,
+            });
+        }
+    }
+    Ok(rows)
+}
+
 fn read_raw_arrow_specter_from_batches(
     path: &str,
     batches: Vec<RecordBatch>,
@@ -2388,7 +2468,6 @@ fn read_raw_arrow_with_optional_index<T, F>(
     index_path: Option<&str>,
     key_column: &str,
     keep_ids: Option<&HashSet<String>>,
-    full_scan_without_index: bool,
     read_from_batches: F,
 ) -> PyResult<(T, IndexedArrowReadStats)>
 where
@@ -2398,11 +2477,10 @@ where
         let (batches, stats) = read_indexed_arrow_batches(path, index_path, key_column, keep_ids)?;
         return Ok((read_from_batches(path, batches, Some(keep_ids))?, stats));
     }
-    if keep_ids.is_some() && index_path.is_none() && !full_scan_without_index {
+    if keep_ids.is_some() && index_path.is_none() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Refusing filtered full scan of Arrow IPC file '{path}' without a batch lookup index for key column \
-             '{key_column}'. Provide the matching *_batch_index path or set full_scan_without_index=true for an \
-             explicit small/full-scan path."
+             '{key_column}'. Provide the matching *_batch_index path."
         )));
     }
     let batches = read_arrow_batches(path)?;
@@ -2418,14 +2496,12 @@ fn read_raw_arrow_signatures_with_optional_index(
     path: &str,
     index_path: Option<&str>,
     keep_signature_ids: Option<&HashSet<String>>,
-    full_scan_without_index: bool,
 ) -> PyResult<(HashMap<String, RawArrowSignature>, IndexedArrowReadStats)> {
     read_raw_arrow_with_optional_index(
         path,
         index_path,
         "signature_id",
         keep_signature_ids,
-        full_scan_without_index,
         read_raw_arrow_signatures_from_batches,
     )
 }
@@ -2434,14 +2510,12 @@ fn read_raw_arrow_papers_with_optional_index(
     path: &str,
     index_path: Option<&str>,
     keep_paper_ids: &HashSet<String>,
-    full_scan_without_index: bool,
 ) -> PyResult<(HashMap<String, RawArrowPaper>, IndexedArrowReadStats)> {
     read_raw_arrow_with_optional_index(
         path,
         index_path,
         "paper_id",
         Some(keep_paper_ids),
-        full_scan_without_index,
         read_raw_arrow_papers_from_batches,
     )
 }
@@ -2450,14 +2524,12 @@ fn read_raw_arrow_paper_authors_with_optional_index(
     path: &str,
     index_path: Option<&str>,
     keep_paper_ids: &HashSet<String>,
-    full_scan_without_index: bool,
 ) -> PyResult<(HashMap<String, Vec<(i64, String)>>, IndexedArrowReadStats)> {
     read_raw_arrow_with_optional_index(
         path,
         index_path,
         "paper_id",
         Some(keep_paper_ids),
-        full_scan_without_index,
         read_raw_arrow_paper_authors_from_batches,
     )
 }
@@ -2466,14 +2538,12 @@ fn read_raw_arrow_specter_with_optional_index(
     path: &str,
     index_path: Option<&str>,
     keep_paper_ids: &HashSet<String>,
-    full_scan_without_index: bool,
 ) -> PyResult<(HashMap<String, Vec<f32>>, IndexedArrowReadStats)> {
     read_raw_arrow_with_optional_index(
         path,
         index_path,
         "paper_id",
         Some(keep_paper_ids),
-        full_scan_without_index,
         read_raw_arrow_specter_from_batches,
     )
 }
@@ -4673,7 +4743,6 @@ fn read_subblocking_signature_rows_with_optional_index(
     path: &str,
     index_path: Option<&str>,
     keep_signature_ids: Option<&HashSet<String>>,
-    full_scan_without_index: bool,
 ) -> PyResult<(
     HashMap<String, SubblockingSignatureRow>,
     IndexedArrowReadStats,
@@ -4683,7 +4752,6 @@ fn read_subblocking_signature_rows_with_optional_index(
         index_path,
         "signature_id",
         keep_signature_ids,
-        full_scan_without_index,
         read_subblocking_signature_rows_from_batches,
     )
 }
@@ -6154,13 +6222,11 @@ fn build_native_graph_evidence_store(
         &graph_paths.paper_authors_path,
         Some(&graph_paths.paper_authors_batch_index_path),
         &paper_ids,
-        false,
     )?;
     let (specter_by_paper_id, specter_stats) = read_raw_arrow_specter_with_optional_index(
         &graph_paths.specter_path,
         Some(&graph_paths.specter_batch_index_path),
         &paper_ids,
-        false,
     )?;
     telemetry.load_metrics.paper_authors_record_batches_scanned = paper_author_stats.batches_read;
     telemetry.load_metrics.paper_authors_rows_scanned = paper_author_stats.rows_scanned;
@@ -7114,8 +7180,7 @@ fn make_subblocks_with_telemetry_from_rows_native_graph(
     first_k_letter_counts_sorted,
     graph_config = None,
     random_seed = 0,
-    use_orcid_subblocking = true,
-    full_scan_without_index = false
+    use_orcid_subblocking = true
 ))]
 fn make_subblocks_with_telemetry_arrow_native_graph(
     py: Python<'_>,
@@ -7126,7 +7191,6 @@ fn make_subblocks_with_telemetry_arrow_native_graph(
     graph_config: Option<&Bound<'_, PyAny>>,
     random_seed: u64,
     use_orcid_subblocking: bool,
-    full_scan_without_index: bool,
 ) -> PyResult<(HashMap<String, Vec<String>>, Py<PyDict>)> {
     let signatures_path = extract_path_mapping_string(paths, "signatures", true)?
         .expect("required signatures path exists");
@@ -7144,7 +7208,6 @@ fn make_subblocks_with_telemetry_arrow_native_graph(
         &signatures_path,
         signatures_index_path.as_deref(),
         Some(&keep_signature_ids),
-        full_scan_without_index,
     )?;
     let missing_signature_ids: Vec<String> = requested_signature_ids
         .iter()
@@ -8457,37 +8520,6 @@ impl RustFeaturizer {
         None
     }
 
-    fn get_constraint_value_for_pair(
-        &self,
-        sig_id1: &str,
-        sig_id2: &str,
-        low_value: f64,
-        high_value: f64,
-        dont_merge_cluster_seeds: bool,
-        incremental_dont_use_cluster_seeds: bool,
-        suppress_orcid: bool,
-    ) -> PyResult<Option<f64>> {
-        let s1 = self
-            .signatures
-            .get(sig_id1)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id1.to_string()))?;
-        let s2 = self
-            .signatures
-            .get(sig_id2)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id2.to_string()))?;
-        Ok(self.constraint_value_from_records(
-            sig_id1,
-            sig_id2,
-            s1,
-            s2,
-            low_value,
-            high_value,
-            dont_merge_cluster_seeds,
-            incremental_dont_use_cluster_seeds,
-            suppress_orcid,
-        ))
-    }
-
     fn signature_id_order(&self) -> &[String] {
         debug_assert_eq!(self.signature_ids.len(), self.signatures.len());
         self.signature_ids.as_slice()
@@ -8760,14 +8792,9 @@ impl RustFeaturizer {
         cluster_seed_disallow_value: f64,
         num_threads: Option<usize>,
     ) -> PyResult<Self> {
-        let compute_reference_features: bool = dataset
-            .getattr("compute_reference_features")
-            .and_then(|v| v.extract())
-            .unwrap_or(false);
-        let preprocess: bool = dataset
-            .getattr("preprocess")
-            .and_then(|v| v.extract())
-            .unwrap_or(true);
+        let compute_reference_features: bool =
+            dataset.getattr("compute_reference_features")?.extract()?;
+        let preprocess: bool = dataset.getattr("preprocess")?.extract()?;
 
         let text_module = py.import("s2and.text")?;
         let stop_words = extract_required_string_set(&text_module.getattr("STOPWORDS")?)?;
@@ -9454,8 +9481,7 @@ impl RustFeaturizer {
             preprocess = true,
             cluster_seed_require_value = 0.0,
             cluster_seed_disallow_value = 10000.0,
-            num_threads = None,
-            full_scan_without_index = false
+            num_threads = None
         )
     )]
     fn from_arrow_paths(
@@ -9467,7 +9493,6 @@ impl RustFeaturizer {
         cluster_seed_require_value: f64,
         cluster_seed_disallow_value: f64,
         num_threads: Option<usize>,
-        full_scan_without_index: bool,
     ) -> PyResult<Self> {
         let signatures_path =
             extract_path_mapping_string(paths, "signatures", true)?.ok_or_else(|| {
@@ -9510,7 +9535,6 @@ impl RustFeaturizer {
             &signatures_path,
             signatures_batch_index_path.as_deref(),
             keep_signature_ids.as_ref(),
-            full_scan_without_index,
         )?;
         let mut signature_ids = match requested_signature_ids {
             Some(ids) => ids,
@@ -9543,13 +9567,11 @@ impl RustFeaturizer {
             &papers_path,
             papers_batch_index_path.as_deref(),
             &needed_paper_ids,
-            full_scan_without_index,
         )?;
         let (mut raw_authors_by_paper, _) = read_raw_arrow_paper_authors_with_optional_index(
             &paper_authors_path,
             paper_authors_batch_index_path.as_deref(),
             &needed_paper_ids,
-            full_scan_without_index,
         )?;
         let specter_by_paper = match specter_path.as_ref() {
             Some(path) => {
@@ -9557,7 +9579,6 @@ impl RustFeaturizer {
                     path,
                     specter_batch_index_path.as_deref(),
                     &needed_paper_ids,
-                    full_scan_without_index,
                 )?
                 .0
             }
@@ -9773,38 +9794,6 @@ impl RustFeaturizer {
         self.cluster_seeds_disallow = extract_pair_set(cluster_seeds_disallow)?;
         self.cluster_seeds_disallow_index = OnceLock::new();
         Ok(())
-    }
-
-    #[pyo3(
-        signature = (
-            sig_id1,
-            sig_id2,
-            low_value = 0.0,
-            high_value = 10000.0,
-            dont_merge_cluster_seeds = true,
-            incremental_dont_use_cluster_seeds = false,
-            suppress_orcid = false
-        )
-    )]
-    fn get_constraint(
-        &self,
-        sig_id1: &str,
-        sig_id2: &str,
-        low_value: f64,
-        high_value: f64,
-        dont_merge_cluster_seeds: bool,
-        incremental_dont_use_cluster_seeds: bool,
-        suppress_orcid: bool,
-    ) -> PyResult<Option<f64>> {
-        self.get_constraint_value_for_pair(
-            sig_id1,
-            sig_id2,
-            low_value,
-            high_value,
-            dont_merge_cluster_seeds,
-            incremental_dont_use_cluster_seeds,
-            suppress_orcid,
-        )
     }
 
     #[pyo3(
@@ -11207,6 +11196,10 @@ fn get_build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
         "incremental_linking_pair_plan_supported_kwargs",
         INCREMENTAL_LINKING_PAIR_PLAN_SUPPORTED_KWARGS.to_vec(),
     )?;
+    build_info.set_item(
+        "raw_arrow_query_signature_planner_methods",
+        RAW_ARROW_QUERY_SIGNATURE_PLANNER_METHODS.to_vec(),
+    )?;
     Ok(build_info.unbind())
 }
 
@@ -11610,7 +11603,6 @@ fn read_reusable_raw_arrow_query_inputs(
     paths: &RawArrowPlannerPaths,
     query_signature_ids: &[String],
     num_threads: Option<usize>,
-    full_scan_without_index: bool,
 ) -> PyResult<RawArrowQueryInputReadResult> {
     let query_signature_id_set: HashSet<String> = query_signature_ids.iter().cloned().collect();
     let read_signatures_start = Instant::now();
@@ -11618,7 +11610,6 @@ fn read_reusable_raw_arrow_query_inputs(
         &paths.signatures_path,
         paths.signatures_batch_index_path.as_deref(),
         Some(&query_signature_id_set),
-        full_scan_without_index,
     )?;
     let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
     for signature_id in query_signature_ids.iter() {
@@ -11651,7 +11642,6 @@ fn read_reusable_raw_arrow_query_inputs(
                                     &paths.papers_path,
                                     paths.papers_batch_index_path.as_deref(),
                                     &needed_paper_ids,
-                                    full_scan_without_index,
                                 )?;
                                 Ok((loaded, stats, start.elapsed().as_secs_f64()))
                             },
@@ -11666,7 +11656,6 @@ fn read_reusable_raw_arrow_query_inputs(
                                         &paths.paper_authors_path,
                                         paths.paper_authors_batch_index_path.as_deref(),
                                         &needed_paper_ids,
-                                        full_scan_without_index,
                                     )?;
                                 Ok((loaded, stats, start.elapsed().as_secs_f64()))
                             },
@@ -11684,7 +11673,6 @@ fn read_reusable_raw_arrow_query_inputs(
                                     path,
                                     paths.specter_batch_index_path.as_deref(),
                                     &needed_paper_ids,
-                                    full_scan_without_index,
                                 )?;
                                 (loaded, stats)
                             }
@@ -11735,39 +11723,25 @@ fn read_reusable_raw_arrow_query_inputs(
 struct RawBlockQueryCandidatePlanner {
     paths: RawArrowPlannerPaths,
     state: ReusableRawArrowCandidatePlanState,
+    planner_query_signature_ids: Vec<String>,
     planner_query_signature_count: usize,
     planner_query_signature_id_set: HashSet<String>,
+    planner_query_requests_by_signature_id: HashMap<String, RawArrowQuerySignatureRequest>,
     top_k: usize,
-    query_view: String,
     orcid_enabled: bool,
     num_threads: Option<usize>,
     max_exemplars: usize,
-    full_scan_without_index: bool,
 }
 
-#[pymethods]
 impl RawBlockQueryCandidatePlanner {
-    #[new]
-    #[pyo3(signature = (
-        paths,
-        query_signature_ids,
-        top_k,
-        query_view = "auto",
-        orcid_enabled = true,
-        num_threads = None,
-        max_exemplars = 4,
-        full_scan_without_index = false
-    ))]
-    fn new(
+    fn build_from_query_signature_ids(
         py: Python<'_>,
         paths: &Bound<'_, PyDict>,
         query_signature_ids: Vec<String>,
         top_k: usize,
-        query_view: &str,
         orcid_enabled: bool,
         num_threads: Option<usize>,
         max_exemplars: usize,
-        full_scan_without_index: bool,
     ) -> PyResult<Self> {
         validate_retrieval_rank_top_k(top_k)?;
         validate_raw_arrow_query_signature_ids(&query_signature_ids)?;
@@ -11809,7 +11783,6 @@ impl RawBlockQueryCandidatePlanner {
                 &paths.signatures_path,
                 paths.signatures_batch_index_path.as_deref(),
                 Some(&seed_signature_id_set),
-                full_scan_without_index,
             )?
         };
         let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
@@ -11849,7 +11822,6 @@ impl RawBlockQueryCandidatePlanner {
                                         &paths.papers_path,
                                         paths.papers_batch_index_path.as_deref(),
                                         &needed_paper_ids,
-                                        full_scan_without_index,
                                     )?
                                 };
                                 Ok((loaded, stats, start.elapsed().as_secs_f64()))
@@ -11867,7 +11839,6 @@ impl RawBlockQueryCandidatePlanner {
                                         &paths.paper_authors_path,
                                         paths.paper_authors_batch_index_path.as_deref(),
                                         &needed_paper_ids,
-                                        full_scan_without_index,
                                     )?
                                 };
                                 Ok((loaded, stats, start.elapsed().as_secs_f64()))
@@ -11889,7 +11860,6 @@ impl RawBlockQueryCandidatePlanner {
                                                 path,
                                                 paths.specter_batch_index_path.as_deref(),
                                                 &needed_paper_ids,
-                                                full_scan_without_index,
                                             )?;
                                         (loaded, stats)
                                     }
@@ -12063,15 +12033,59 @@ impl RawBlockQueryCandidatePlanner {
                     indexed_arrow_candidate_plan,
                 },
             },
+            planner_query_signature_ids: query_signature_ids.clone(),
             planner_query_signature_count: query_signature_ids.len(),
             planner_query_signature_id_set,
+            planner_query_requests_by_signature_id: HashMap::new(),
             top_k,
-            query_view: query_view.to_string(),
             orcid_enabled,
             num_threads,
             max_exemplars,
-            full_scan_without_index,
         })
+    }
+}
+
+#[pymethods]
+impl RawBlockQueryCandidatePlanner {
+    #[staticmethod]
+    #[pyo3(signature = (
+        paths,
+        top_k,
+        orcid_enabled = true,
+        num_threads = None,
+        max_exemplars = 4
+    ))]
+    fn from_query_signatures(
+        py: Python<'_>,
+        paths: &Bound<'_, PyDict>,
+        top_k: usize,
+        orcid_enabled: bool,
+        num_threads: Option<usize>,
+        max_exemplars: usize,
+    ) -> PyResult<Self> {
+        let query_signatures_path = required_path_from_py_dict(paths, "query_signatures")?;
+        let query_requests = read_raw_arrow_query_signatures(&query_signatures_path)?;
+        let query_signature_ids = query_requests
+            .iter()
+            .map(|request| request.signature_id.clone())
+            .collect::<Vec<_>>();
+        validate_raw_arrow_query_signature_ids(&query_signature_ids)?;
+        let mut planner = Self::build_from_query_signature_ids(
+            py,
+            paths,
+            query_signature_ids.clone(),
+            top_k,
+            orcid_enabled,
+            num_threads,
+            max_exemplars,
+        )?;
+        planner.planner_query_signature_ids = query_signature_ids;
+        planner.planner_query_signature_count = query_requests.len();
+        planner.planner_query_requests_by_signature_id = query_requests
+            .into_iter()
+            .map(|request| (request.signature_id.clone(), request))
+            .collect();
+        Ok(planner)
     }
 
     fn build_telemetry(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -12146,6 +12160,10 @@ impl RawBlockQueryCandidatePlanner {
         Ok(payload.unbind())
     }
 
+    fn plan_query_signatures(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.plan(py, self.planner_query_signature_ids.clone())
+    }
+
     #[pyo3(signature = (query_signature_ids))]
     fn plan(&mut self, py: Python<'_>, query_signature_ids: Vec<String>) -> PyResult<Py<PyDict>> {
         validate_raw_arrow_query_signature_ids(&query_signature_ids)?;
@@ -12166,7 +12184,6 @@ impl RawBlockQueryCandidatePlanner {
             &self.paths,
             &query_signature_ids,
             self.num_threads,
-            self.full_scan_without_index,
         )?;
 
         let text_context_start = Instant::now();
@@ -12228,7 +12245,24 @@ impl RawBlockQueryCandidatePlanner {
         for signature_id in query_signature_ids.iter() {
             let base_feature = &query_features_by_signature_id[signature_id];
             let base = &base_feature.query;
-            let (masked, resolved_view) = mask_raw_arrow_query(base, &self.query_view)
+            let request = self
+                .planner_query_requests_by_signature_id
+                .get(signature_id)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "RawBlockQueryCandidatePlanner is missing query_signatures request row for \
+                         signature_id {signature_id:?}"
+                    ))
+                })?;
+            if !request.query_author.is_empty() && request.query_author != base_feature.query_author
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "query_signatures Arrow query_author for signature_id {:?} does not match \
+                     signatures-derived query_author: {:?} != {:?}",
+                    signature_id, request.query_author, base_feature.query_author
+                )));
+            }
+            let (masked, resolved_view) = mask_raw_arrow_query(base, request.query_view.as_str())
                 .map_err(pyo3::exceptions::PyValueError::new_err)?;
             queries.push(masked);
             query_views.push(resolved_view);
@@ -13090,8 +13124,7 @@ fn raw_arrow_counter_present(counter: &Option<CounterData>) -> bool {
     component_members,
     orcid_enabled = false,
     num_threads = None,
-    max_exemplars = 4,
-    full_scan_without_index = false
+    max_exemplars = 4
 ))]
 fn raw_arrow_labeled_candidate_plan<'py>(
     py: Python<'py>,
@@ -13105,7 +13138,6 @@ fn raw_arrow_labeled_candidate_plan<'py>(
     orcid_enabled: bool,
     num_threads: Option<usize>,
     max_exemplars: usize,
-    full_scan_without_index: bool,
 ) -> PyResult<Py<PyDict>> {
     let total_start = Instant::now();
     let row_count = row_component_keys.len();
@@ -13125,6 +13157,11 @@ fn raw_arrow_labeled_candidate_plan<'py>(
     }
     if row_count == 0 {
         return raw_arrow_labeled_empty_plan(py);
+    }
+    if stored_retrieval_ranks.iter().any(|rank| *rank == 0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "stored_retrieval_ranks values must be one-based uint16 ranks in [1, 65535]",
+        ));
     }
 
     let paths = raw_arrow_feature_paths_from_py_dict(paths)?;
@@ -13185,13 +13222,8 @@ fn raw_arrow_labeled_candidate_plan<'py>(
         }
     }
 
-    let query_inputs = read_reusable_raw_arrow_query_inputs(
-        py,
-        &paths,
-        &needed_signature_ids,
-        num_threads,
-        full_scan_without_index,
-    )?;
+    let query_inputs =
+        read_reusable_raw_arrow_query_inputs(py, &paths, &needed_signature_ids, num_threads)?;
     let raw_name_counts = match paths.name_counts_index_path.as_ref() {
         Some(path) => read_raw_name_counts_index(path)?,
         None => match paths.name_counts_arrow_path.as_ref() {
@@ -14102,6 +14134,20 @@ mod tests {
     }
 
     #[test]
+    fn extract_id_string_rejects_non_scalar_ids() {
+        prepare_python_for_test();
+        Python::with_gil(|py| {
+            let value = PyList::empty(py);
+            let result = extract_id_string(value.as_any());
+            assert!(result.is_err(), "non-scalar ids should raise");
+            let err = result
+                .err()
+                .unwrap_or_else(|| unreachable!("assert above guarantees error"));
+            assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        });
+    }
+
+    #[test]
     fn orcid_normalization_canonicalizes_common_forms() {
         assert_eq!(
             normalize_orcid_owned(" https://orcid.org/0000-0002-1825-0097 "),
@@ -14459,6 +14505,10 @@ fn _s2and_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS",
         INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS.to_vec(),
+    )?;
+    m.add(
+        "RAW_ARROW_QUERY_SIGNATURE_PLANNER_METHODS",
+        RAW_ARROW_QUERY_SIGNATURE_PLANNER_METHODS.to_vec(),
     )?;
     m.add_function(wrap_pyfunction!(get_build_info, m)?)?;
     m.add_function(wrap_pyfunction!(raw_arrow_labeled_candidate_plan, m)?)?;

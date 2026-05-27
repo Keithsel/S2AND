@@ -103,12 +103,13 @@ def _build_arrow_release_fixture(tmp_path: Path, dataset_name: str = "s2and_mini
     _touch_json(
         name_counts_index / "manifest.json",
         {
+            "schema_version": "name_counts_index_v1",
             "files": {
                 "first": {"path": "first.bin"},
                 "last": {"path": "last.bin"},
                 "first_last": {"path": "first_last.bin"},
                 "last_first_initial": {"path": "last_first_initial.bin"},
-            }
+            },
         },
     )
 

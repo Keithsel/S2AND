@@ -39,6 +39,24 @@ lookup, and avoids shipping a query engine or managing SQLite runtime state.
 Reconsider SQLite only if the requirement changes to ad hoc querying, partial
 updates, cross-process transactional writes, or richer offline inspection.
 
+## One Rust Production Route Per Job
+
+Each production job should have exactly one Rust entrypoint. Other Rust APIs may
+exist for parity, training/eval compatibility, or targeted diagnostics, but they
+are not alternate production paths.
+
+| Job | Production route | Not production |
+|---|---|---|
+| Full-block prediction | `Clusterer.predict_from_arrow_paths(...)` or Arrow-routed `Clusterer.predict(...)` -> `feature_port.build_rust_featurizer_from_arrow_paths(...)` -> `RustFeaturizer.from_arrow_paths(...)`. | `RustFeaturizer.from_dataset(...)`, JSON loaders, raw Python object scoring. |
+| Raw incremental candidate planning | `RawBlockQueryCandidatePlanner.from_query_signatures(paths_with_query_signatures_and_batch_indexes, ...)` -> `.plan_query_signatures()` or subset `.plan(...)` calls. | Unindexed filtered Arrow scans, Python mini object materialization, direct retriever wiring from callers. |
+| Pairwise feature and prediction inputs | `LinkerCandidateBatch` index arrays -> indexed Rust pairwise APIs. | String-pair feature APIs or ad hoc per-pair calls. |
+| Constraints | `get_constraints_matrix_indexed`, `get_constraints_block_upper_triangle_indexed`, or linker label-array APIs. | Single-pair Rust constraints. |
+| Arrow graph subblocking | `make_subblocks_with_telemetry_arrow_native_graph(...)` with `signatures_batch_index`. | Full scans or Python callback-based Rust subblocking. |
+| Training and materialization | Python owns cleaning, sampling, LightGBM training, calibration, and metrics. `raw_arrow_labeled_candidate_plan(...)` is allowed only as a training/materialization helper. | Treating training helpers as online production inference APIs. |
+
+CI should guard the removed production escape hatches: the unindexed
+filtered-read bypass and the single-pair Rust constraint API must not reappear.
+
 ## Compatibility And Python-Heavy Paths
 
 Production Rust inference uses `Clusterer.predict_from_arrow_paths(...)`,
@@ -50,7 +68,7 @@ surfaces rather than production inference APIs.
 Removed bridge surfaces: `RustFeaturizer.from_feature_block(...)` and raw
 payload scoring wrappers are no longer Rust inference APIs. They built or
 traversed Python `FeatureBlock` objects before scoring; production raw requests
-must materialize typed Arrow request rows before entering Rust.
+now use typed Arrow query-signature request sidecars for raw planner entry.
 
 | Path | Current Python dependency | Production status |
 |---|---|---|
@@ -60,29 +78,13 @@ must materialize typed Arrow request rows before entering Rust.
 | JSON Rust loaders | Avoid `ANDData`, but still read compatibility JSON and call Python text normalization helpers. | Fixture, legacy script, and benchmark surface only; Arrow IPC is the production table-shaped target. |
 | Training and release replay | Python owns data cleaning, feature table materialization, LightGBM training, calibration, and metrics. | Not a no-`ANDData` inference target; keep Python unless runtime profiling shows a training bottleneck worth porting. |
 
-Profiling on the `f_matsen` inference payload shows that the Arrow incremental
-path spent its material residual time in altered-profile seed pre-splitting:
-raw Arrow retrieval and scoring were small, while the altered pre-split called
-back through pairwise prediction for hundreds of seed signatures. Production
-request producers should still emit the canonical Arrow inputs, including
-`cluster_seed_disallows.arrow` when seed disallow constraints exist and
-`altered_cluster_signatures.arrow` when altered claimed profiles are present.
-The runtime pre-splits altered claimed profiles in process before promoted
-incremental linking; request producers do not provide any separate altered split
-artifact. This pre-split intentionally runs before retrieval/linking so the
-candidate components match the naturalized seed map used by the Python
-incremental path.
-
-For true incremental Arrow requests, `cluster_seeds.arrow` is the seed
-membership source when no Python seed map has been materialized, and optional
-`cluster_seed_disallows.arrow` is merged into partial supervision for altered
-pre-split and residual scoring. After altered-profile pre-split, the runtime
-writes a request-local temporary seed table for Rust retrieval. For
-bulk full-block prediction with subblocking, the single-letter synthetic
-incremental pass suppresses the original required seed memberships from
-`cluster_seeds.arrow` and the altered-profile list from
-`altered_cluster_signatures.arrow`, but preserves optional
-`cluster_seed_disallows.arrow` as pairwise negative supervision.
+Incremental seed and altered-profile behavior is part of the production
+runtime contract, but the implementation details live in the operational docs:
+[../production_inference.md](../production_inference.md) owns caller-visible
+telemetry and routing semantics, while [arrow_dataset_spec.md](arrow_dataset_spec.md)
+owns the Arrow table contracts. Active cleanup work is tracked in
+[../work_plan.md](../work_plan.md) and summarized in
+[../general_todo_plan.md](../general_todo_plan.md).
 
 ## Current Verification Focus
 

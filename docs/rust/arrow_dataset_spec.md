@@ -34,6 +34,7 @@ Required for full-block prediction:
 Required in addition for seeded prediction or incremental prediction promoted
 through Arrow:
 
+- request-local `query_signatures.arrow` for raw incremental candidate planning
 - `cluster_seeds.arrow`
 
 Optional for seeded prediction or incremental prediction promoted through Arrow:
@@ -74,6 +75,7 @@ Preferred on-disk layout:
     paper_authors.paper_authors_batch_index.bin
     specter.specter_batch_index.bin
     specter2.specter_batch_index.bin
+    query_signatures.arrow
     cluster_seeds.arrow
     cluster_seed_disallows.arrow
     altered_cluster_signatures.arrow
@@ -82,6 +84,10 @@ Preferred on-disk layout:
 
 Notes:
 
+- `query_signatures.arrow` is the request-local query table consumed by the
+  raw incremental planner. Runtime helpers may materialize it from existing
+  Python request arguments; producers that already have a typed request should
+  pass it under the `query_signatures` path key.
 - `cluster_seeds.arrow` is one accepted seed source for seeded/incremental
   datasets. It can be omitted for unseeded full prediction, offline eval, and
   incremental production requests that provide seed assignments through another
@@ -129,6 +135,7 @@ should use these keys:
 | `papers` | Path to `papers.arrow` |
 | `paper_authors` | Path to `paper_authors.arrow` |
 | `specter` | Path to the embedding table selected for the current model, even if the file is physically named `specter2.arrow` |
+| `query_signatures` | Request-local path to `query_signatures.arrow` for raw incremental candidate planning |
 | `cluster_seeds` | Optional path to `cluster_seeds.arrow` for incremental/seeded prediction; required only when this sidecar is the seed source |
 | `cluster_seed_disallows` | Optional path to `cluster_seed_disallows.arrow` for pairwise seed disallow constraints |
 | `altered_cluster_signatures` | Path to `altered_cluster_signatures.arrow` when altered claimed profiles are present |
@@ -164,6 +171,7 @@ The smaller request-scoped tables do not need a random-access physical layout:
 
 | Table | Layout guidance |
 |---|---|
+| `query_signatures.arrow` | Read fully by the raw planner; no bounded-batch requirement. |
 | `cluster_seeds.arrow` | Read fully by the raw planner; no bounded-batch requirement. |
 | `cluster_seed_disallows.arrow` | Read fully when present; no bounded-batch requirement. |
 | `altered_cluster_signatures.arrow` | Read as request metadata; bounded batches do not address altered-profile pre-splitting cost. |
@@ -353,6 +361,22 @@ uses `embedding_similarity`, every paper referenced by `signatures.arrow` should
 have an embedding row for the selected embedding version. Missing embeddings can
 change scores and should fail validation unless the target model explicitly
 permits them.
+
+### `query_signatures.arrow`
+
+Request-local query table for raw incremental candidate planning. The Rust
+planner reads this table before candidate retrieval and uses it as the planner
+query set and per-query view policy.
+
+| Column | Arrow type | Nulls | Meaning |
+|---|---:|---:|---|
+| `signature_id` | `string` | no | Query signature id |
+| `query_view` | `string` | no | Requested view: `auto`, `full`, or `initial_only` |
+| `query_author` | `string` | no | Caller-visible query author text; empty string is allowed |
+
+`signature_id` values must be unique and non-empty. `query_view` values must be
+valid. The planner derives scoring-time author evidence from `signatures.arrow`
+and validates a non-empty `query_author` against that derived query author.
 
 ### `cluster_seeds.arrow`
 
@@ -620,6 +644,9 @@ Required checks:
 - When embeddings are required, the selected SPECTER Arrow file exists and
   validates structurally. Require every referenced paper to have an embedding
   only for datasets whose source contract guarantees complete coverage.
+- `query_signatures.signature_id` is unique, is a subset of
+  `signatures.signature_id`, and every `query_view` is one of `auto`, `full`,
+  or `initial_only`.
 - `cluster_seeds.signature_id` is a subset of `signatures.signature_id`.
 - `cluster_seeds.signature_id` values are unique and every `cluster_id` is a
   non-empty string.

@@ -13,7 +13,7 @@ import numpy as np
 from s2and import feature_port, memory_budget, rust_calls
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
-from s2and.incremental_linking.array_validation import as_uint32_1d
+from s2and.incremental_linking.array_validation import as_retrieval_rank_uint16_1d, as_uint32_1d
 from s2and.thread_config import resolve_n_jobs
 
 PROD_PAIRWISE_FEATURE_GROUPS: tuple[str, ...] = (
@@ -213,12 +213,18 @@ class LinkerCandidateBatch:
             raise ValueError(
                 f"retrieval_scores must have length row_count: {len(self.retrieval_scores)} != {row_count}"
             )
-        if self.retrieval_ranks is not None and len(self.retrieval_ranks) != row_count:
-            raise ValueError(f"retrieval_ranks must have length row_count: {len(self.retrieval_ranks)} != {row_count}")
+        ranks = (
+            None
+            if self.retrieval_ranks is None
+            else as_retrieval_rank_uint16_1d("retrieval_ranks", self.retrieval_ranks)
+        )
+        if ranks is not None and len(ranks) != row_count:
+            raise ValueError(f"retrieval_ranks must have length row_count: {len(ranks)} != {row_count}")
         object.__setattr__(self, "row_count", row_count)
         object.__setattr__(self, "left_signature_indices", left)
         object.__setattr__(self, "right_signature_indices", right)
         object.__setattr__(self, "pair_row_indices", rows)
+        object.__setattr__(self, "retrieval_ranks", ranks)
         if self.row_query_signature_indices is not None:
             object.__setattr__(
                 self,
@@ -285,7 +291,9 @@ def build_candidate_batch_from_members(
         row_component_keys=None if row_component_keys is None else tuple(row_component_keys),
         labels=None if labels is None else np.asarray(labels),
         retrieval_scores=None if retrieval_scores is None else np.asarray(retrieval_scores, dtype=np.float32),
-        retrieval_ranks=None if retrieval_ranks is None else np.asarray(retrieval_ranks, dtype=np.uint16),
+        retrieval_ranks=None
+        if retrieval_ranks is None
+        else as_retrieval_rank_uint16_1d("retrieval_ranks", retrieval_ranks),
     )
 
 

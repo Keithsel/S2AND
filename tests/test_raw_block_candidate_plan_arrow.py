@@ -13,6 +13,7 @@ import pytest
 from s2and.incremental_linking.feature_block import (
     feature_block_signature_order_from_raw_candidate_plan,
     write_arrow_batch_lookup_index,
+    write_incremental_query_signatures_arrow,
     write_name_counts_index,
     write_raw_arrow_batch_lookup_indexes,
 )
@@ -245,7 +246,7 @@ def _name_count_record_path(index_root: str | Path, kind: str) -> Path:
     return record_path
 
 
-def _base_arrow_paths(tmp_path: Path) -> dict[str, str]:
+def _base_arrow_paths(tmp_path: Path, *, with_indexes: bool = True) -> dict[str, str]:
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s1", "s2"], type=pa.string()),
@@ -287,12 +288,16 @@ def _base_arrow_paths(tmp_path: Path) -> dict[str, str]:
             "cluster_id": pa.array(["c_match", "c_other"], type=pa.string()),
         }
     )
-    return {
+    paths = {
         "signatures": _write_ipc(tmp_path / "signatures.arrow", signatures),
         "papers": _write_ipc(tmp_path / "papers.arrow", papers),
         "paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors),
         "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
     }
+    if not with_indexes:
+        return paths
+    indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
+    return indexed_paths
 
 
 def _assert_retrieval_plan_equal(raw_plan: dict[str, Any], direct_plan: dict[str, Any]) -> None:
@@ -324,21 +329,44 @@ def _raw_candidate_plan_arrow(
     orcid_enabled: bool = True,
     num_threads: int | None = None,
     max_exemplars: int = 4,
-    full_scan_without_index: bool = True,
 ) -> dict[str, Any]:
-    planner = s2and_rust.RawBlockQueryCandidatePlanner(
+    planner = _raw_candidate_planner_from_query_signatures(
         paths,
-        list(query_signature_ids),
+        query_signature_ids,
         top_k=top_k,
         query_view=query_view,
         orcid_enabled=orcid_enabled,
         num_threads=num_threads,
         max_exemplars=max_exemplars,
-        full_scan_without_index=full_scan_without_index,
     )
-    plan = planner.plan(list(query_signature_ids))
+    plan = planner.plan_query_signatures()
     _merge_raw_arrow_planner_build_telemetry(plan, planner.build_telemetry())
     return plan
+
+
+def _raw_candidate_planner_from_query_signatures(
+    paths: dict[str, str],
+    query_signature_ids: list[str],
+    *,
+    top_k: int = 25,
+    query_view: str = "auto",
+    orcid_enabled: bool = True,
+    num_threads: int | None = None,
+    max_exemplars: int = 4,
+) -> Any:
+    query_signatures_path = Path(paths["signatures"]).parent / "incremental_query_signatures.arrow"
+    write_incremental_query_signatures_arrow(
+        query_signatures_path,
+        query_signature_ids,
+        query_views=[query_view] * len(query_signature_ids),
+    )
+    return s2and_rust.RawBlockQueryCandidatePlanner.from_query_signatures(
+        {**paths, "query_signatures": str(query_signatures_path)},
+        top_k=top_k,
+        orcid_enabled=orcid_enabled,
+        num_threads=num_threads,
+        max_exemplars=max_exemplars,
+    )
 
 
 def _raw_plan_for_base_paths(paths: dict[str, str]) -> dict[str, Any]:
@@ -427,16 +455,14 @@ def test_raw_arrow_candidate_planner_matches_one_shot_plan(tmp_path: Path) -> No
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
-    planner = s2and_rust.RawBlockQueryCandidatePlanner(
+    planner = _raw_candidate_planner_from_query_signatures(
         paths,
         ["q1"],
         top_k=2,
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
     planned = planner.plan(["q1"])
 
@@ -446,6 +472,62 @@ def test_raw_arrow_candidate_planner_matches_one_shot_plan(tmp_path: Path) -> No
     assert planned["telemetry"]["planner_seed_state_reused"] == 1
     assert planned["telemetry"]["timings"]["read_cluster_seeds_secs"] == 0.0
     assert planned["telemetry"]["timings"]["read_name_counts_secs"] == 0.0
+
+
+def test_raw_arrow_candidate_planner_ingests_query_signature_request_table(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path)
+    query_signatures_path = tmp_path / "incremental_query_signatures.arrow"
+    write_incremental_query_signatures_arrow(
+        query_signatures_path,
+        ["q1"],
+        query_views=["full"],
+        query_authors=["Alice Wang"],
+    )
+    request_paths = {**paths, "query_signatures": str(query_signatures_path)}
+
+    one_shot = _raw_candidate_plan_arrow(
+        paths,
+        ["q1"],
+        top_k=2,
+        query_view="full",
+        orcid_enabled=False,
+        num_threads=1,
+    )
+    planner = s2and_rust.RawBlockQueryCandidatePlanner.from_query_signatures(
+        request_paths,
+        top_k=2,
+        orcid_enabled=False,
+        num_threads=1,
+    )
+    planned = planner.plan_query_signatures()
+
+    _assert_raw_candidate_plans_equal(planned, one_shot)
+    assert planned["query_signature_ids"] == ["q1"]
+    assert planned["query_views"] == ["full"]
+    assert planner.build_telemetry()["query_signature_count"] == 1
+
+
+def test_raw_arrow_candidate_planner_rejects_duplicate_query_signature_request_rows(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path)
+    query_signatures_path = tmp_path / "duplicate_incremental_query_signatures.arrow"
+    _write_ipc(
+        query_signatures_path,
+        pa.table(
+            {
+                "signature_id": pa.array(["q1", "q1"], type=pa.string()),
+                "query_view": pa.array(["full", "full"], type=pa.string()),
+                "query_author": pa.array(["Alice Wang", "Alice Wang"], type=pa.string()),
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="duplicate signature_id"):
+        s2and_rust.RawBlockQueryCandidatePlanner.from_query_signatures(
+            {**paths, "query_signatures": str(query_signatures_path)},
+            top_k=2,
+            orcid_enabled=False,
+            num_threads=1,
+        )
 
 
 def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: Path) -> None:
@@ -467,16 +549,14 @@ def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: 
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
-    planner = s2and_rust.RawBlockQueryCandidatePlanner(
+    planner = _raw_candidate_planner_from_query_signatures(
         paths,
         ["q1"],
         top_k=2,
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
     planned = planner.plan(["q1"])
 
@@ -486,14 +566,13 @@ def test_raw_arrow_candidate_planner_filters_batch_query_seed_overlap(tmp_path: 
 
 def test_raw_arrow_candidate_planner_rejects_multi_query_seed_overlap(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
-    planner = s2and_rust.RawBlockQueryCandidatePlanner(
+    planner = _raw_candidate_planner_from_query_signatures(
         paths,
         ["q1", "s1"],
         top_k=2,
         query_view="full",
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
 
     with pytest.raises(ValueError, match="singleton query windows"):
@@ -504,11 +583,11 @@ def test_raw_arrow_candidate_planner_rejects_multi_query_seed_overlap(tmp_path: 
     assert planned["right_signature_ids"] == ["s1", "s2"]
 
 
-def test_raw_arrow_candidate_planner_requires_indexes_without_explicit_full_scan(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
+def test_raw_arrow_candidate_planner_requires_indexes(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path, with_indexes=False)
 
     with pytest.raises(ValueError, match="batch lookup index"):
-        s2and_rust.RawBlockQueryCandidatePlanner(
+        _raw_candidate_planner_from_query_signatures(
             paths,
             ["q1"],
             top_k=2,
@@ -583,6 +662,7 @@ def test_raw_arrow_candidate_plan_keeps_zero_specter_vectors(tmp_path: Path) -> 
             }
         ),
     )
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
     raw_plan = _raw_candidate_plan_arrow(
         paths,
@@ -600,7 +680,7 @@ def test_raw_arrow_candidate_plan_keeps_zero_specter_vectors(tmp_path: Path) -> 
 def test_raw_arrow_candidate_plan_rejects_hidden_query_view(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
 
-    with pytest.raises(ValueError, match="Unknown query view"):
+    with pytest.raises(ValueError, match="unknown query_view"):
         _raw_candidate_plan_arrow(
             paths,
             ["q1"],
@@ -614,7 +694,7 @@ def test_raw_arrow_candidate_plan_rejects_hidden_query_view(tmp_path: Path) -> N
 def test_raw_arrow_candidate_plan_rejects_duplicate_query_signature_ids(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
 
-    with pytest.raises(ValueError, match="query_signature_ids must be unique"):
+    with pytest.raises(ValueError, match="duplicate signature_id"):
         _raw_candidate_plan_arrow(
             paths,
             ["q1", "q1"],
@@ -625,7 +705,7 @@ def test_raw_arrow_candidate_plan_rejects_duplicate_query_signature_ids(tmp_path
         )
 
 
-def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(tmp_path: Path) -> None:
+def test_raw_arrow_candidate_plan_batch_indexes_bound_rows(tmp_path: Path) -> None:
     irrelevant_count = 24
     signature_ids = ["q1", "s1", "s2"] + [f"junk_sig_{index}" for index in range(irrelevant_count)]
     paper_ids = ["p_q", "p1", "p2"] + [f"junk_paper_{index}" for index in range(irrelevant_count)]
@@ -693,14 +773,6 @@ def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(t
     }
     indexed_paths, index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
-    full_scan_plan = _raw_candidate_plan_arrow(
-        paths,
-        ["q1"],
-        top_k=2,
-        query_view="full",
-        orcid_enabled=False,
-        num_threads=1,
-    )
     indexed_plan = _raw_candidate_plan_arrow(
         indexed_paths,
         ["q1"],
@@ -710,19 +782,8 @@ def test_raw_arrow_candidate_plan_batch_indexes_match_full_scan_and_bound_rows(t
         num_threads=1,
     )
 
-    _assert_raw_candidate_plans_equal(indexed_plan, full_scan_plan)
     telemetry = indexed_plan["telemetry"]
     assert telemetry["indexed_arrow_candidate_plan"] is True
-    assert full_scan_plan["telemetry"]["indexed_arrow_candidate_plan"] is False
-    assert full_scan_plan["telemetry"]["signature_count"] == 3
-    assert full_scan_plan["telemetry"]["paper_count"] == 3
-    assert full_scan_plan["telemetry"]["paper_author_paper_count"] == 3
-    assert full_scan_plan["telemetry"]["specter_count"] == 3
-    full_scan_rows = len(signature_ids) * 2
-    assert full_scan_plan["telemetry"]["signature_rows_scanned"] == full_scan_rows
-    assert full_scan_plan["telemetry"]["paper_rows_scanned"] == full_scan_rows
-    assert full_scan_plan["telemetry"]["paper_author_rows_scanned"] == full_scan_rows
-    assert full_scan_plan["telemetry"]["specter_rows_scanned"] == full_scan_rows
     assert telemetry["signature_count"] == 3
     assert telemetry["paper_count"] == 3
     assert telemetry["paper_author_paper_count"] == 3
@@ -935,11 +996,11 @@ def test_arrow_batch_lookup_index_rejects_same_size_same_mtime_sampled_source_ch
 
 
 def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
+    unindexed_paths = _base_arrow_paths(tmp_path, with_indexes=False)
 
     with pytest.raises(ValueError, match="filtered full scan"):
         s2and_rust.RustFeaturizer.from_arrow_paths(
-            paths,
+            unindexed_paths,
             ["q1", "s1"],
             set(),
             True,
@@ -948,6 +1009,7 @@ def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tm
             1,
         )
 
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(unindexed_paths, tmp_path)
     featurizer = s2and_rust.RustFeaturizer.from_arrow_paths(
         paths,
         ["q1", "s1", "q1", "s2", "s1"],
@@ -956,7 +1018,6 @@ def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tm
         0.0,
         10000.0,
         1,
-        True,
     )
 
     assert tuple(featurizer.signature_ids()) == ("q1", "s1", "s2")
@@ -973,6 +1034,7 @@ def test_rust_featurizer_from_arrow_paths_rejects_null_author_position(tmp_path:
         pa.array([None, 0, 0], type=pa.int64()),
     )
     paths["signatures"] = _write_ipc(tmp_path / "signatures_with_null_position.arrow", signatures)
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
     with pytest.raises(ValueError, match="author_position is null"):
         s2and_rust.RustFeaturizer.from_arrow_paths(
@@ -983,7 +1045,6 @@ def test_rust_featurizer_from_arrow_paths_rejects_null_author_position(tmp_path:
             0.0,
             10000.0,
             1,
-            True,
         )
 
 
@@ -999,6 +1060,7 @@ def test_rust_featurizer_from_arrow_paths_reuses_cached_language_without_fasttex
     papers = papers.append_column("predicted_language", pa.array(["en", "en", "en"], type=pa.string()))
     papers = papers.append_column("is_reliable", pa.array([True, True, True], type=pa.bool_()))
     paths["papers"] = _write_ipc(tmp_path / "papers_with_language.arrow", papers)
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
     monkeypatch.delenv("S2AND_SKIP_FASTTEXT", raising=False)
     monkeypatch.setattr(
         file_cache,
@@ -1014,26 +1076,15 @@ def test_rust_featurizer_from_arrow_paths_reuses_cached_language_without_fasttex
         0.0,
         10000.0,
         1,
-        True,
     )
 
     assert tuple(featurizer.signature_ids()) == ("q1", "s1")
 
 
 def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
+    paths = _base_arrow_paths(tmp_path, with_indexes=False)
     indexed_paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
-    full_scan = s2and_rust.RustFeaturizer.from_arrow_paths(
-        paths,
-        ["q1", "s1"],
-        set(),
-        True,
-        0.0,
-        10000.0,
-        1,
-        True,
-    )
     indexed = s2and_rust.RustFeaturizer.from_arrow_paths(
         indexed_paths,
         ["q1", "s1"],
@@ -1045,12 +1096,7 @@ def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> 
     )
 
     assert tuple(indexed.signature_ids()) == ("q1", "s1")
-    np.testing.assert_allclose(
-        _indexed_pair_matrix(indexed, [("q1", "s1")]),
-        _indexed_pair_matrix(full_scan, [("q1", "s1")]),
-        rtol=1e-6,
-        atol=1e-6,
-    )
+    assert _indexed_pair_matrix(indexed, [("q1", "s1")]).shape == (1, 39)
 
     with Path(paths["signatures"]).open("ab") as outfile:
         outfile.write(b"\0")
@@ -1117,6 +1163,7 @@ def test_raw_arrow_candidate_plan_orcid_override_returns_all_matches(tmp_path: P
         "paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors),
         "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
     }
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
     plan = _raw_candidate_plan_arrow(
         paths,
@@ -1184,6 +1231,7 @@ def test_raw_arrow_candidate_plan_orcid_override_is_exempt_from_seed_disallows(t
         "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
         "cluster_seed_disallows": _write_ipc(tmp_path / "cluster_seed_disallows.arrow", disallows),
     }
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
     plan = _raw_candidate_plan_arrow(
         paths,
@@ -1248,6 +1296,7 @@ def test_raw_arrow_candidate_plan_missing_query_position_has_no_coauthor_overlap
         "paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors),
         "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
     }
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
     plan = _raw_candidate_plan_arrow(
         paths,
@@ -1351,6 +1400,7 @@ def test_raw_arrow_candidate_plan_matches_multi_query_auto_views_and_specter(tmp
         "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
         "specter": _write_ipc(tmp_path / "specter.arrow", specter),
     }
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
     raw_plan = _raw_candidate_plan_arrow(
         paths,
@@ -1525,6 +1575,7 @@ def test_raw_arrow_candidate_plan_excludes_query_seed_and_handles_missing_metada
         "paper_authors": _write_ipc(tmp_path / "paper_authors.arrow", paper_authors),
         "cluster_seeds": _write_ipc(tmp_path / "cluster_seeds.arrow", cluster_seeds),
     }
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
     plan = _raw_candidate_plan_arrow(
         paths,
@@ -1570,6 +1621,7 @@ def test_raw_arrow_candidate_plan_accepts_missing_papers_year_column(tmp_path: P
         }
     )
     paths["papers"] = _write_ipc(tmp_path / "papers_without_year.arrow", papers)
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
     raw_plan = _raw_candidate_plan_arrow(
         paths,
@@ -1656,7 +1708,6 @@ def test_raw_arrow_labeled_candidate_plan_scores_frozen_rows_without_cluster_see
         {"c_match": ["s1"], "c_other": ["s2"]},
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
 
     assert raw_plan["schema_version"] == "raw_arrow_labeled_candidate_plan_v1"
@@ -1690,7 +1741,6 @@ def test_raw_arrow_labeled_candidate_plan_scores_use_all_components_for_global_d
         component_members,
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
     two_rows = s2and_rust.raw_arrow_labeled_candidate_plan(
         paths,
@@ -1702,7 +1752,6 @@ def test_raw_arrow_labeled_candidate_plan_scores_use_all_components_for_global_d
         component_members,
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
 
     assert one_row["telemetry"]["component_count"] == 2
@@ -1726,7 +1775,6 @@ def test_raw_arrow_labeled_candidate_plan_initial_view_keeps_full_first_token(tm
         {"c_match": ["s1"]},
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
 
     assert raw_plan["row_query_views"] == ["initial_only"]
@@ -1745,7 +1793,6 @@ def test_raw_arrow_candidate_plan_initial_view_keeps_full_first_token(tmp_path: 
         query_view="initial_only",
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
 
     assert raw_plan["query_views"] == ["initial_only"]
@@ -1772,6 +1819,7 @@ def test_raw_arrow_labeled_candidate_plan_applies_block_local_members(tmp_path: 
         }
     )
     paths["signatures"] = _write_ipc(tmp_path / "signatures_with_blocks.arrow", signatures)
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
 
     raw_plan = s2and_rust.raw_arrow_labeled_candidate_plan(
         paths,
@@ -1783,7 +1831,6 @@ def test_raw_arrow_labeled_candidate_plan_applies_block_local_members(tmp_path: 
         {"block-a::c": ["q1", "s1", "s2"]},
         orcid_enabled=False,
         num_threads=1,
-        full_scan_without_index=True,
     )
 
     assert raw_plan["left_signature_ids"] == ["q1"]
@@ -1868,14 +1915,14 @@ def test_rust_featurizer_from_arrow_paths_applies_cluster_seed_disallows(tmp_pat
         0.0,
         10000.0,
         1,
-        True,
     )
     pairs = [("q1", "s1"), ("q1", "s2")]
 
     assert tuple(direct.signature_ids()) == signature_order.signature_ids
     assert _indexed_pair_matrix(direct, pairs).shape == (2, 39)
-    assert direct.get_constraint("q1", "s1") is None
-    assert direct.get_constraint("q1", "s2") == 10000.0
+    signature_index = {str(signature_id): index for index, signature_id in enumerate(direct.signature_ids())}
+    assert direct.get_constraints_matrix_indexed([(signature_index["q1"], signature_index["s1"])]) == [None]
+    assert direct.get_constraints_matrix_indexed([(signature_index["q1"], signature_index["s2"])]) == [10000.0]
 
 
 def test_rust_featurizer_missing_name_counts_presence_is_consistent(
@@ -1893,7 +1940,6 @@ def test_rust_featurizer_missing_name_counts_presence_is_consistent(
         0.0,
         10000.0,
         1,
-        True,
     )
 
     assert from_arrow.signature_name_counts_present() == [("q1", False), ("s1", False), ("s2", False)]
@@ -1908,7 +1954,6 @@ def test_rust_featurizer_missing_name_counts_presence_is_consistent(
         0.0,
         10000.0,
         1,
-        True,
     )
     assert with_name_counts.signature_name_counts_present() == [("q1", True), ("s1", True), ("s2", True)]
 
@@ -1957,7 +2002,6 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
         0.0,
         10000.0,
         1,
-        True,
     )
     from_arrow = s2and_rust.RustFeaturizer.from_arrow_paths(
         arrow_paths,
@@ -1967,7 +2011,6 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
         0.0,
         10000.0,
         1,
-        True,
     )
 
     np.testing.assert_allclose(
@@ -1987,7 +2030,6 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
             0.0,
             10000.0,
             1,
-            True,
         )
 
     alias_only_paths = dict(arrow_paths)
@@ -2001,7 +2043,6 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
             0.0,
             10000.0,
             1,
-            True,
         )
 
 
@@ -2022,7 +2063,29 @@ def test_rust_featurizer_rejects_unsorted_name_counts_index(
             0.0,
             10000.0,
             1,
+        )
+
+
+def test_rust_featurizer_rejects_wrong_name_counts_index_schema_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _base_arrow_paths(tmp_path)
+    paths["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index_artifact", monkeypatch)
+    manifest_path = Path(paths["name_counts_index"]) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = "unexpected"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema_version"):
+        s2and_rust.RustFeaturizer.from_arrow_paths(
+            paths,
+            ["q1", "s1", "s2"],
+            set(),
             True,
+            0.0,
+            10000.0,
+            1,
         )
 
 
@@ -2043,5 +2106,4 @@ def test_rust_featurizer_rejects_out_of_bounds_name_counts_index_record(
             0.0,
             10000.0,
             1,
-            True,
         )

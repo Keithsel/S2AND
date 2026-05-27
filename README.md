@@ -366,7 +366,7 @@ git config core.hooksPath .githooks
 Workflow:
 ```bash
 # 1) edit VERSION
-echo 0.50.0 > VERSION
+echo 0.51.0 > VERSION
 
 # 2) sync manifests
 uv run python scripts/sync_version.py
@@ -383,8 +383,8 @@ Notes:
 ### Docs
 
 - Index (start here): `docs/README.md`
-- Next steps: `docs/work_plan.md`
-- Open work: `docs/work_plan.md`
+- Consolidated TODO plan: `docs/general_todo_plan.md`
+- Rust/Arrow execution backlog: `docs/work_plan.md`
 
 ---
 

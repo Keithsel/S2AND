@@ -505,7 +505,7 @@ def _run_single(
             }
         else:
             try:
-                from s2and.feature_port import _get_rust_featurizer, get_constraint_rust
+                from s2and.feature_port import _get_rust_featurizer, get_constraints_matrix_indexed_rust
             except Exception as exc:  # pragma: no cover - rust extension optional
                 raise RuntimeError(
                     "Constraint parity sampling requires the Rust extension. "
@@ -518,6 +518,9 @@ def _run_single(
             sample_pairs = min(int(constraint_sample), int(max_pairs))
 
             rust_featurizer = _get_rust_featurizer(anddata)
+            signature_index = {
+                str(signature_id): index for index, signature_id in enumerate(rust_featurizer.signature_ids())
+            }
 
             mismatch_count = 0
             mismatch_python_none = 0
@@ -538,14 +541,13 @@ def _run_single(
                     dont_merge_cluster_seeds=dont_merge,
                     incremental_dont_use_cluster_seeds=False,
                 )
-                rust_val = get_constraint_rust(
+                rust_val = get_constraints_matrix_indexed_rust(
                     anddata,
-                    sig_a,
-                    sig_b,
+                    [(signature_index[str(sig_a)], signature_index[str(sig_b)])],
                     dont_merge_cluster_seeds=dont_merge,
                     incremental_dont_use_cluster_seeds=False,
                     featurizer=rust_featurizer,
-                )
+                )[0]
 
                 if py_val is not None:
                     python_constraint_hits += 1

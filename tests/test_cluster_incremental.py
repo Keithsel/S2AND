@@ -14,6 +14,7 @@ from s2and.consts import LARGE_DISTANCE
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.feature_block import (
+    read_incremental_query_signatures_arrow,
     write_altered_cluster_signatures_arrow,
     write_cluster_seed_disallows_arrow,
     write_cluster_seeds_arrow,
@@ -89,9 +90,17 @@ def _patch_fake_raw_arrow_planner(
 
     class FakePlanner:
         def __init__(self, _paths: object, query_signature_ids: list[str], **_kwargs: object):
+            self._paths = cast(dict[str, str], _paths)
             self._query_signature_ids = tuple(query_signature_ids)
             if captured is not None:
                 captured.setdefault("planner_inits", []).append(self._query_signature_ids)
+                captured.setdefault("planner_query_signature_paths", []).append(self._paths.get("query_signatures"))
+
+        @classmethod
+        def from_query_signatures(cls, paths: object, **kwargs: object) -> "FakePlanner":
+            path_map = cast(dict[str, str], paths)
+            rows = read_incremental_query_signatures_arrow(Path(path_map["query_signatures"]))
+            return cls(path_map, [row.signature_id for row in rows], **kwargs)
 
         def build_telemetry(self):
             return {
@@ -541,7 +550,7 @@ def test_predict_incremental_arrow_promoted_linker_cleans_up_temp_seed_context_o
     monkeypatch.setattr(production_module, "clusterer_uses_name_count_features", lambda _clusterer: False)
     monkeypatch.setattr(
         production_module.runtime_module,
-        "predict_incremental_link_or_abstain_from_raw_arrow_paths",
+        "_predict_incremental_link_or_abstain_from_preplanned_raw_arrow",
         fail_raw_arrow_linker,
     )
     monkeypatch.setattr(
@@ -629,7 +638,7 @@ def test_predict_incremental_arrow_promoted_linker_uses_typed_request_sidecars(
     )
     monkeypatch.setattr(
         production_module.runtime_module,
-        "predict_incremental_link_or_abstain_from_raw_arrow_paths",
+        "_predict_incremental_link_or_abstain_from_preplanned_raw_arrow",
         fake_raw_arrow_linker,
     )
     _patch_fake_raw_arrow_planner(monkeypatch, captured=captured)
@@ -666,6 +675,7 @@ def test_predict_incremental_arrow_promoted_linker_uses_typed_request_sidecars(
     assert captured["altered_from_arrow"] == ["seed"]
     assert captured["finish_arrow_paths"]["cluster_seeds"] == str(cluster_seeds_path)
     assert captured["planner_inits"] == [("query",)]
+    assert captured["planner_query_signature_paths"][0] is not None
     assert captured["planner_plans"] == [("query",)]
     assert result["clusters"] == {"c_seed": ["seed", "query"]}
     telemetry = result["incremental_linker_telemetry"]
@@ -702,7 +712,7 @@ def test_predict_incremental_arrow_promoted_linker_fails_closed_when_single_quer
     )
     monkeypatch.setattr(
         production_module.runtime_module,
-        "predict_incremental_link_or_abstain_from_raw_arrow_paths",
+        "_predict_incremental_link_or_abstain_from_preplanned_raw_arrow",
         lambda *args, **kwargs: raw_calls.append((args, kwargs)),
     )
 
@@ -1097,7 +1107,7 @@ def test_predict_incremental_arrow_promoted_linker_rejects_none_arrow_path(
     )
     monkeypatch.setattr(
         production_module.runtime_module,
-        "predict_incremental_link_or_abstain_from_raw_arrow_paths",
+        "_predict_incremental_link_or_abstain_from_preplanned_raw_arrow",
         fail_raw_arrow_linker,
     )
 
@@ -1504,7 +1514,6 @@ def test_predict_incremental_batch_constraint_path_parity(clusterer_dataset_fact
         ]
 
     monkeypatch.setattr(model_module, "get_constraints_matrix_indexed_rust", _fake_get_constraints_matrix_indexed_rust)
-    monkeypatch.setattr(model_module, "get_constraint_rust", lambda *_args, **_kwargs: None)
 
     batch_output = _clusters(batch_clusterer.predict_incremental(block, batch_dataset, batching_threshold=None))
     assert _same_partition(

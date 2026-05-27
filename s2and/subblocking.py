@@ -1342,12 +1342,33 @@ def make_dataset_graph_subblocking_cluster_fn(
 
 
 def signature_name_parts_for_subblocking(signature) -> tuple[str, str]:
+    raw_first = signature.author_info_first
+    raw_middle = signature.author_info_middle
     first = signature.author_info_first_normalized_without_apostrophe
     middle = signature.author_info_middle_normalized_without_apostrophe
     if first is not None and middle is not None:
-        return first, middle
+        return _spill_non_ascii_dash_first_for_subblocking(raw_first, first, middle)
     # Rust preprocessing can defer normalized name fields; reconstruct with Python-equivalent logic.
-    return split_first_middle_hyphen_aware(signature.author_info_first, signature.author_info_middle)
+    first, middle = split_first_middle_hyphen_aware(raw_first, raw_middle)
+    return _spill_non_ascii_dash_first_for_subblocking(raw_first, first, middle)
+
+
+def _spill_non_ascii_dash_first_for_subblocking(
+    raw_first: str | None,
+    first: str,
+    middle: str,
+) -> tuple[str, str]:
+    """Spill non-ASCII dash compounds to match legacy subblocking keys."""
+
+    raw_first = raw_first or ""
+    non_ascii_dashes = "\u2010\u2011\u2012\u2013\u2014\u2212\ufe58\ufe63\uff0d"
+    if "-" in raw_first or not any(character in raw_first for character in non_ascii_dashes):
+        return first, middle
+    first_parts = first.split()
+    if len(first_parts) <= 1:
+        return first, middle
+    middle_parts = middle.split()
+    return first_parts[0], " ".join(first_parts[1:] + middle_parts)
 
 
 def _signature_coauthor_blocks_for_specter(signature, anddata, compute_block_fn=compute_block) -> list[str]:
@@ -1599,49 +1620,48 @@ def _sorted_subblock_merge_candidates(
     return sorted(candidates, key=lambda x: (x[1], x[0][0], x[0][1]), reverse=True)
 
 
-def _rust_arrow_subblocking_callable():
+def _rust_arrow_native_graph_subblocking_callable():
     from s2and.runtime import load_s2and_rust_extension
 
     rust_module = load_s2and_rust_extension()
-    return None if rust_module is None else getattr(rust_module, "make_subblocks_with_telemetry_arrow", None)
+    return (
+        None if rust_module is None else getattr(rust_module, "make_subblocks_with_telemetry_arrow_native_graph", None)
+    )
 
 
 def rust_arrow_subblocking_available() -> bool:
     """Return whether the loaded Rust extension can run Arrow-backed subblocking."""
 
-    return callable(_rust_arrow_subblocking_callable())
+    return callable(_rust_arrow_native_graph_subblocking_callable())
 
 
 def _make_subblocks_with_telemetry_arrow_rust(
     arrow_paths: Mapping[str, Any],
     signature_ids,
-    anddata,
     maximum_size=15000,
     first_k_letter_counts_sorted=FIRST_K_LETTER_COUNTS,
-    compute_block_fn=compute_block,
-    specter_cluster_fn=None,
+    graph_subblocking_config: GraphSubblockingConfig | None = None,
+    graph_subblocking_random_seed: int = 0,
     use_orcid_subblocking: bool = True,
     full_scan_without_index: bool = False,
 ):
-    """Run experimental Rust subblocking with signature rows loaded from Arrow."""
+    """Run native Rust graph subblocking with signature rows loaded from Arrow."""
 
-    rust_make_subblocks = _rust_arrow_subblocking_callable()
+    rust_make_subblocks = _rust_arrow_native_graph_subblocking_callable()
     if not callable(rust_make_subblocks):
         raise RuntimeError(
             "Rust Arrow subblocking requires an s2and_rust extension with "
-            "make_subblocks_with_telemetry_arrow; rebuild with "
+            "make_subblocks_with_telemetry_arrow_native_graph; rebuild with "
             "`uv run maturin develop -m s2and_rust/Cargo.toml`."
         )
 
-    fallback_cluster_fn = specter_cluster_fn or cluster_with_specter
     subblocks, telemetry = rust_make_subblocks(
         dict(arrow_paths),
         [str(signature_id) for signature_id in signature_ids],
         int(maximum_size),
         first_k_letter_counts_sorted,
-        fallback_cluster_fn,
-        anddata,
-        compute_block_fn,
+        graph_subblocking_config,
+        int(graph_subblocking_random_seed),
         bool(use_orcid_subblocking),
         bool(full_scan_without_index),
     )
@@ -1651,11 +1671,10 @@ def _make_subblocks_with_telemetry_arrow_rust(
 def make_subblocks_arrow_rust(
     arrow_paths: Mapping[str, Any],
     signature_ids,
-    anddata,
     maximum_size=15000,
     first_k_letter_counts_sorted=FIRST_K_LETTER_COUNTS,
-    compute_block_fn=compute_block,
-    specter_cluster_fn=None,
+    graph_subblocking_config: GraphSubblockingConfig | None = None,
+    graph_subblocking_random_seed: int = 0,
     use_orcid_subblocking: bool = True,
     full_scan_without_index: bool = False,
 ):
@@ -1664,11 +1683,10 @@ def make_subblocks_arrow_rust(
     output, _ = _make_subblocks_with_telemetry_arrow_rust(
         arrow_paths,
         signature_ids,
-        anddata,
         maximum_size=maximum_size,
         first_k_letter_counts_sorted=first_k_letter_counts_sorted,
-        compute_block_fn=compute_block_fn,
-        specter_cluster_fn=specter_cluster_fn,
+        graph_subblocking_config=graph_subblocking_config,
+        graph_subblocking_random_seed=graph_subblocking_random_seed,
         use_orcid_subblocking=use_orcid_subblocking,
         full_scan_without_index=full_scan_without_index,
     )
@@ -1983,7 +2001,14 @@ def make_subblocks_with_telemetry(
                         maximum_size,
                     )
                     continue
-                subblock_id_to_move_to = feasible_subblock_ids[0]
+                subblock_id_to_move_to = sorted(
+                    feasible_subblock_ids,
+                    key=lambda subblock_id: (
+                        -current_subblock_counts[subblock_id],
+                        subblock_id.count("specter") * 10 + subblock_id.count("|"),
+                        subblock_id,
+                    ),
+                )[0]
                 sig_ids_to_move = []
                 moved_sig_ids_by_source = defaultdict(set)
                 for sig_id in orcid_sig_ids:

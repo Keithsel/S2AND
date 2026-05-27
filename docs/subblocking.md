@@ -7,21 +7,19 @@ subblock dictionary.
 For `Clusterer.predict(..., batching_threshold=N)`, `N` becomes the maximum subblock size. Every emitted subblock is
 expected to have at most `N` signatures.
 
-## Current default
+## Current Default
 
-The current default is graph-first subblocking fallback:
+Subblocking uses graph fallback for oversized groups that cannot be split by names:
 
 - Prefix and middle-name splitting still define the main subblock structure.
 - Oversized groups that cannot be split by names call the graph fallback instead of the old SPECTER fallback.
 - For Python/`ANDData` graph fallback, graph preparation or fallback-call IO failures run the old Python
   `cluster_with_specter(...)` path for that fallback group. Arrow-backed Rust production graph failures raise instead
   of falling back to `ANDData`.
-- Set `clusterer.subblocking_fallback_mode = "legacy"` to bypass graph fallback and use the old behavior directly.
 
-The default is configured on `Clusterer`:
+The graph configuration is available on `Clusterer`:
 
 ```python
-clusterer.subblocking_fallback_mode = "graph"
 clusterer.subblocking_graph_config = GraphSubblockingConfig()
 ```
 
@@ -87,8 +85,8 @@ Subblocking has two supported routes:
 - **Arrow-native Rust.** `Clusterer.predict(...)` can route oversized blocks to Rust when
   the call's resolved backend is Rust and indexed Arrow signature rows are available.
 
-For `Clusterer.predict(...)` with Arrow paths and a Rust-resolved backend, Rust Arrow subblocking is strict. It is
-used only when all of these are true:
+For `Clusterer.predict(...)` with Arrow paths and a Rust-resolved backend, Rust Arrow subblocking is strict and always
+uses the native graph fallback. It is used only when all of these are true:
 
 - `Clusterer.predict(..., backend="rust")` is used, or its `runtime_context` resolves to Rust.
 - `arrow_paths["signatures"]` is present.
@@ -99,8 +97,8 @@ Arrow. If an Arrow-backed Rust production prediction is missing either artifact,
 missing-artifact error instead of silently using `ANDData` partitioning. Python subblocking orchestration remains
 available through explicit Python/compatibility routes and direct `make_subblocks(...)` calls.
 
-In both Rust and Python orchestration, oversized fallback groups still call the configured fallback callable, so graph
-fallback remains the default unless `subblocking_fallback_mode="legacy"`.
+In Python orchestration, oversized fallback groups call the Python graph fallback callable. In Arrow-native Rust
+orchestration, oversized fallback groups are handled inside Rust; Rust does not call back into Python.
 
 ## Telemetry
 

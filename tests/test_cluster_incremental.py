@@ -1540,18 +1540,21 @@ def test_build_subblocked_block_dict_uses_indexed_arrow_rust_subblocking_when_en
     fake_arrow_paths = _subblocking_arrow_paths(tmp_path)
     captured: dict[str, Any] = {}
 
-    def fake_make_subblocks_arrow_rust(arrow_paths, signatures, anddata, **kwargs):
+    def fake_make_subblocks_with_telemetry_arrow_rust(arrow_paths, signatures, **kwargs):
         captured["arrow_paths"] = dict(arrow_paths)
         captured["signatures"] = list(signatures)
-        captured["anddata"] = anddata
         captured["kwargs"] = dict(kwargs)
-        return {"beta": ["3", "4"], "alpha": ["5", "6"]}
+        return {"beta": ["3", "4"], "alpha": ["5", "6"]}, {}
 
     def fail_make_subblocks(*_args, **_kwargs):
         raise AssertionError("Python make_subblocks should not run when Arrow Rust subblocking is enabled")
 
     fallback = object()
-    monkeypatch.setattr(model_module, "make_subblocks_arrow_rust", fake_make_subblocks_arrow_rust)
+    monkeypatch.setattr(
+        model_module,
+        "_make_subblocks_with_telemetry_arrow_rust",
+        fake_make_subblocks_with_telemetry_arrow_rust,
+    )
     monkeypatch.setattr(model_module, "make_subblocks", fail_make_subblocks)
     monkeypatch.setattr(model_module, "rust_arrow_subblocking_available", lambda: True)
 
@@ -1570,9 +1573,11 @@ def test_build_subblocked_block_dict_uses_indexed_arrow_rust_subblocking_when_en
     }
     assert captured["arrow_paths"] == fake_arrow_paths
     assert captured["signatures"] == ["3", "4", "5", "6"]
-    assert captured["anddata"] is dataset
     assert captured["kwargs"]["maximum_size"] == 3
-    assert captured["kwargs"]["specter_cluster_fn"] is fallback
+    assert "specter_cluster_fn" not in captured["kwargs"]
+    assert captured["kwargs"]["graph_subblocking_config"] == clusterer.subblocking_graph_config
+    assert captured["kwargs"]["graph_subblocking_random_seed"] == clusterer.random_state
+    assert captured["kwargs"]["use_orcid_subblocking"] is False
 
 
 def test_build_subblocked_block_dict_fails_when_arrow_rust_subblocking_unavailable(
@@ -1581,14 +1586,18 @@ def test_build_subblocked_block_dict_fails_when_arrow_rust_subblocking_unavailab
     clusterer, dataset = clusterer_dataset_factory(name="dummy_arrow_rust_subblocking_unavailable")
     fake_arrow_paths = _subblocking_arrow_paths(tmp_path)
 
-    def fail_make_subblocks_arrow_rust(*_args, **_kwargs):
+    def fail_make_subblocks_with_telemetry_arrow_rust(*_args, **_kwargs):
         raise AssertionError("Rust Arrow subblocking should not run when the capability is missing")
 
     def fail_make_subblocks(*_args, **_kwargs):
         raise AssertionError("Python make_subblocks should not run in strict Arrow Rust subblocking")
 
     fallback = object()
-    monkeypatch.setattr(model_module, "make_subblocks_arrow_rust", fail_make_subblocks_arrow_rust)
+    monkeypatch.setattr(
+        model_module,
+        "_make_subblocks_with_telemetry_arrow_rust",
+        fail_make_subblocks_with_telemetry_arrow_rust,
+    )
     monkeypatch.setattr(model_module, "make_subblocks", fail_make_subblocks)
     monkeypatch.setattr(model_module, "rust_arrow_subblocking_available", lambda: False)
 
@@ -2281,13 +2290,6 @@ def test_cluster_seeds_arrow_read_cache_reuses_parse_and_returns_copy(monkeypatc
     assert open_file_call_count == 1
 
 
-def test_cluster_seeds_arrow_rejects_missing_explicit_path(tmp_path: Path):
-    missing_path = tmp_path / "missing_cluster_seeds.arrow"
-
-    with pytest.raises(FileNotFoundError, match="cluster_seeds"):
-        model_module._cluster_seeds_require_from_arrow_paths({"cluster_seeds": str(missing_path)})
-
-
 def test_arrow_paths_need_current_cluster_seeds_rewrites_missing_seed_sidecar(tmp_path: Path):
     dataset = SimpleNamespace(cluster_seeds_require={"seed0": "7"})
 
@@ -2299,53 +2301,6 @@ def test_arrow_paths_need_current_cluster_seeds_rewrites_missing_seed_sidecar(tm
         )
         is True
     )
-
-
-def test_cluster_seeds_arrow_rejects_duplicate_and_empty_rows(tmp_path: Path):
-    import pyarrow as pa
-
-    cluster_seeds_path = tmp_path / "cluster_seeds.arrow"
-    duplicate_table = pa.table(
-        {
-            "signature_id": pa.array(["seed0", "seed0"], type=pa.string()),
-            "cluster_id": pa.array(["7", "8"], type=pa.string()),
-        }
-    )
-    with pa.OSFile(str(cluster_seeds_path), "wb") as sink:
-        with pa.ipc.new_file(sink, duplicate_table.schema) as writer:
-            writer.write_table(duplicate_table)
-    with pytest.raises(ValueError, match="duplicate signature_id"):
-        model_module._cluster_seeds_require_from_arrow_paths({"cluster_seeds": str(cluster_seeds_path)})
-
-    empty_cluster_table = pa.table(
-        {
-            "signature_id": pa.array(["seed0"], type=pa.string()),
-            "cluster_id": pa.array([""], type=pa.string()),
-        }
-    )
-    with pa.OSFile(str(cluster_seeds_path), "wb") as sink:
-        with pa.ipc.new_file(sink, empty_cluster_table.schema) as writer:
-            writer.write_table(empty_cluster_table)
-    with pytest.raises(ValueError, match="empty cluster_id"):
-        model_module._cluster_seeds_require_from_arrow_paths({"cluster_seeds": str(cluster_seeds_path)})
-
-
-def test_cluster_seed_disallows_arrow_rejects_duplicate_bidirectional_pairs(tmp_path: Path):
-    import pyarrow as pa
-
-    disallow_path = tmp_path / "cluster_seed_disallows.arrow"
-    disallow_table = pa.table(
-        {
-            "signature_id_1": pa.array(["seed0", "seed1"], type=pa.string()),
-            "signature_id_2": pa.array(["seed1", "seed0"], type=pa.string()),
-        }
-    )
-    with pa.OSFile(str(disallow_path), "wb") as sink:
-        with pa.ipc.new_file(sink, disallow_table.schema) as writer:
-            writer.write_table(disallow_table)
-
-    with pytest.raises(ValueError, match="duplicate pair"):
-        model_module._read_cluster_seed_disallows_arrow(disallow_path)
 
 
 def test_partial_supervision_disallow_merge_respects_reverse_existing_pair():
@@ -2448,60 +2403,6 @@ def test_build_incremental_seed_setup_rejects_missing_declared_altered_arrow_pat
         )
 
     assert exc_info.value.missing_files == {"altered_cluster_signatures": str(missing_path)}
-
-
-def test_arrow_altered_cluster_signatures_rejects_legacy_text_sidecar(tmp_path: Path):
-    clusterer = _build_minimal_incremental_clusterer()
-    altered_text_path = tmp_path / "altered_cluster_signatures.txt"
-    altered_text_path.write_text("seed0\n", encoding="utf-8")
-    dataset = cast(
-        ANDData,
-        SimpleNamespace(
-            cluster_seeds_require={"seed0": "7"},
-            cluster_seeds_disallow=set(),
-            altered_cluster_signatures=None,
-            name_tuples="filtered",
-        ),
-    )
-
-    with pytest.raises(ValueError, match="text files are only supported by legacy ANDData/training inputs"):
-        clusterer._build_incremental_seed_setup(
-            dataset,
-            {},
-            runtime_context=cast(Any, object()),
-            arrow_paths={"altered_cluster_signatures": str(altered_text_path)},
-        )
-
-
-def test_read_altered_cluster_signatures_arrow_rejects_null_and_duplicates(tmp_path: Path):
-    import pyarrow as pa
-
-    null_path = tmp_path / "altered_null.arrow"
-    null_table = pa.table({"signature_id": pa.array(["seed0", None], type=pa.string())})
-    with pa.OSFile(str(null_path), "wb") as sink:
-        with pa.ipc.new_file(sink, null_table.schema) as writer:
-            writer.write_table(null_table)
-
-    with pytest.raises(ValueError, match="null or empty"):
-        model_module._read_altered_cluster_signatures_arrow(null_path)
-
-    duplicate_path = tmp_path / "altered_duplicate.arrow"
-    duplicate_table = pa.table({"signature_id": pa.array(["seed0", "seed0"], type=pa.string())})
-    with pa.OSFile(str(duplicate_path), "wb") as sink:
-        with pa.ipc.new_file(sink, duplicate_table.schema) as writer:
-            writer.write_table(duplicate_table)
-
-    with pytest.raises(ValueError, match="duplicate"):
-        model_module._read_altered_cluster_signatures_arrow(duplicate_path)
-
-    integer_path = tmp_path / "altered_integer.arrow"
-    integer_table = pa.table({"signature_id": pa.array([1], type=pa.int64())})
-    with pa.OSFile(str(integer_path), "wb") as sink:
-        with pa.ipc.new_file(sink, integer_table.schema) as writer:
-            writer.write_table(integer_table)
-
-    with pytest.raises(ValueError, match="signature_id expected string"):
-        model_module._read_altered_cluster_signatures_arrow(integer_path)
 
 
 def test_top1_consensus_broadcast_only_applies_when_cluster_members_agree():

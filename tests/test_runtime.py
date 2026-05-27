@@ -207,16 +207,9 @@ def test_rust_backend_pair_featurization_fails_fast_on_rust_error(monkeypatch):
 
     class FailingRustFeaturizer:
         def signature_ids(self):
-            return []
+            return sorted(dataset.signatures.keys())
 
         def featurize_pairs_matrix_indexed(self, _pairs, _indices, _threads, _nan):
-            raise RuntimeError("synthetic rust batch failure")
-
-        def featurize_pairs_matrix(self, *_args, **_kwargs):
-            raise RuntimeError("synthetic rust batch failure")
-
-        def featurize_pairs(self, _pairs, num_threads=None):
-            del num_threads
             raise RuntimeError("synthetic rust batch failure")
 
     monkeypatch.setattr(feature_port, "s2and_rust", object())

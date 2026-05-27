@@ -1,6 +1,6 @@
 # Rust Public Surface Inventory
 
-Status date: 2026-05-25
+Status date: 2026-05-26
 
 This inventory records the current Python-visible `s2and_rust` surface before
 module splitting or API deletion. It is intentionally about ownership and
@@ -12,11 +12,10 @@ cleanup risk, not a user-facing API promise.
 |---|---|---|
 | `RustFeaturizer` | `s2and/feature_port.py`, `s2and/rust_calls.py`, production Arrow paths, parity tests | Core class. Production Rust inference should enter through `from_arrow_paths`; non-Arrow constructors are compatibility/training/parity. |
 | `RustHybridCentroidRetriever` | `s2and/incremental_linking/retrieval.py`, raw Arrow planners, training query-support code | Core retrieval class. Production runtime should prefer `top_k_hybrid_centroid_pair_plan(...)`. |
-| `RustNameCompatibleSubblockSelector` | Internal helper used by `RustHybridCentroidRetriever.top_k_hybrid_centroid_pair_plan(...)`; direct Python use is test-only | Keep until pair-plan subblock filtering no longer needs it. |
 | `RawBlockQueryCandidatePlanner` | `s2and/incremental_linking/production.py`, `s2and/incremental_linking/runtime.py` | Canonical production raw Arrow planner. |
 | `raw_arrow_labeled_candidate_plan(...)` | `scripts/production/model/linker_train_calibrate_eval.py` | Training/materialization replay surface, not request-time inference. |
 | `promoted_linker_non_pairwise_features(...)` | `s2and/incremental_linking/row_features.py` | Production promoted-linker row feature builder. |
-| `make_subblocks_with_telemetry_arrow(...)` | `s2and/subblocking.py` | Arrow subblocking helper used by large-block prediction. |
+| `make_subblocks_with_telemetry_arrow_native_graph(...)` | `s2and/subblocking.py` | Arrow-native graph subblocking helper used by large-block prediction. |
 | `signature_ngrams_batch(...)` | `s2and/feature_port.py` and `s2and/data.py` preprocessing | Training/eval preprocessing accelerator, not Arrow production inference. |
 | `get_build_info(...)` | `scripts/_rust_suite/common.py`, capability tests | Diagnostics and ABI metadata. |
 
@@ -25,9 +24,7 @@ cleanup risk, not a user-facing API promise.
 | Method | Owner / caller | Status |
 |---|---|---|
 | `from_arrow_paths(...)` | `feature_port.build_rust_featurizer_from_arrow_paths(...)`; full predict, subblocked predict, raw Arrow scoring | Production Arrow constructor. Filtered reads require batch indexes by default; explicit full-scan opt-in is compatibility/testing only. |
-| `from_dataset(...)` | `feature_port.build_rust_featurizer(...)`, `_get_rust_featurizer(...)`; training/eval, parity, compatibility | Keep callable but do not present as production inference. |
-| `from_json_paths(...)` | `feature_port.build_rust_featurizer(...)`; JSON compatibility scripts/tests | Compatibility and benchmark surface. |
-| `json_ingest_telemetry(...)` | JSON ingest validation and service-JSON tests | Compatibility telemetry. |
+| `from_dataset(...)` | `feature_port.build_rust_featurizer(...)`, `_get_rust_featurizer(...)`; training/eval, parity, classic `ANDData` callers | Keep callable for `ANDData` paths; do not present as the production inference boundary. |
 | `update_cluster_seeds(...)` and `update_signature_name_counts(...)` | cache/seed update helpers in `feature_port.py` and tests | Compatibility/training lifecycle helpers. |
 | `signature_ids(...)` | pairwise matrix wrappers, promoted incremental runtime, parity scripts | Shared index-order contract; keep. |
 | `signature_rule_metadata(...)`, `signature_name_counts_present(...)`, `cluster_seeds_require(...)` | parity/debug tests and state restoration checks | Debug/parity metadata; not production routing. |
@@ -36,14 +33,10 @@ cleanup risk, not a user-facing API promise.
 | `get_constraints_block_upper_triangle_indexed(...)` | `model.py`, Arrow parity script | Maintained blockwise constraint API. |
 | `linker_pair_index_arrays_constraint_labels(...)` | promoted linker training/materialization and runtime tests | Maintained promoted incremental constraint-label API. |
 | `linker_pair_distance_accumulators(...)` | promoted incremental runtime and tests | Maintained promoted incremental aggregate API. |
-| `featurize_pair(...)` | parity/debug tests and compatibility wrappers | Keep as debug/parity helper only. |
-| `featurize_pairs(...)` | legacy row-by-row fallback in `s2and/featurizer.py` | Keep until Python featurizer no longer needs row-by-row fallback. |
-| `featurize_pairs_matrix(...)` | pairwise compatibility, parity, and Arrow parity script | Matrix API retained while callers still pass string pairs. |
-| `featurize_pairs_matrix_indexed(...)` | `s2and/featurizer.py`, capability probes | Preferred pairwise matrix API for indexed callers. |
+| `featurize_pairs_matrix_indexed(...)` | `s2and/featurizer.py`, capability probes | Canonical pairwise matrix API for Python Rust batching. |
 | `linker_pair_index_arrays_and_aggregate_stats(...)` | `s2and/incremental_linking/linker_pairwise.py` | Canonical promoted linker pair-feature plus aggregate API. |
 | `linker_pair_index_arrays_and_aggregate_stats(..., emit_matrix=False)` | `s2and/incremental_linking/linker_pairwise.py`, capability probes | Canonical aggregate-only mode; preserves the no-matrix fast path without a second PyO3 method. |
 | `featurize_block_upper_triangle_matrix_indexed(...)` | blockwise full predict | Maintained blockwise feature API. |
-| `save(...)` / `load(...)` | lifecycle/debug persistence; `load(...)` is used by counter-data measurement scripts | Compatibility/debug persistence. |
 
 ## Retrieval Classes
 
@@ -52,7 +45,6 @@ cleanup risk, not a user-facing API promise.
 | `RustHybridCentroidRetriever.__new__(...)` | raw Arrow planners, training query support, tests | Maintained constructor. |
 | `top_k_hybrid_centroid_pair_plan(...)` | `s2and/incremental_linking/retrieval.py`, raw Arrow planners | Canonical runtime retrieval output. |
 | `top_k_experimental_weighted_hybrid_centroid_subset(...)` | `s2and/incremental_linking_training/query_support.py`, tests | Training/query-support scoring surface. |
-| `RustNameCompatibleSubblockSelector.select(...)` | tests only; internal Rust helper trio used by pair-plan | Keep while pair-plan subblock filtering depends on the selector internals. |
 | `RawBlockQueryCandidatePlanner.__new__(...)`, `build_telemetry(...)`, `plan(...)` | `s2and/incremental_linking/production.py`, `s2and/incremental_linking/runtime.py`; tests | Canonical reusable production raw Arrow planner. |
 
 ## Python Wrapper Ownership
@@ -60,7 +52,7 @@ cleanup risk, not a user-facing API promise.
 | Wrapper | Owner / caller | Status |
 |---|---|---|
 | `feature_port.build_rust_featurizer_from_arrow_paths(...)` | strict full predict, subblocked predict, raw Arrow scoring | Production constructor wrapper. |
-| `feature_port.build_rust_featurizer(...)`, `_get_rust_featurizer(...)`, `warm_rust_featurizer(...)` | `ANDData` training/eval, compatibility, parity, legacy scripts | Compatibility/training dispatcher. |
+| `feature_port.build_rust_featurizer(...)`, `_get_rust_featurizer(...)`, `warm_rust_featurizer(...)` | `ANDData` training/eval, parity, classic scripts | `ANDData` dispatcher; file-backed production inference should use Arrow wrappers. |
 | `rust_calls.get_constraints_matrix_indexed_rust(...)` and `get_constraints_block_upper_triangle_indexed_rust(...)` | full predict and parity | Maintained constraint wrappers. |
 | `rust_calls.build_linker_pair_features_and_aggregate_stats_arrays_rust(...)` | promoted incremental pairwise scoring | Maintained canonical array wrapper. |
 | `rust_calls.build_linker_pair_aggregate_stats_arrays_rust(...)` | promoted incremental aggregate-only path | Thin Python wrapper over `linker_pair_index_arrays_and_aggregate_stats(..., emit_matrix=False)`. |
@@ -88,6 +80,24 @@ cleanup risk, not a user-facing API promise.
   `top_k_hybrid_centroid(...)` and `chooser_feature_rows_subset(...)` were
   removed after capability probes and tests moved to the canonical pair-plan
   route.
+- Status 2026-05-26: Python wrappers
+  `feature_port.featurize_pair_rust(...)` and
+  `feature_port.build_pair_feature_matrix_rust(...)` were removed. Rust pair
+  feature batching from Python now requires
+  `featurize_pairs_matrix_indexed(...)`.
+- Status 2026-05-26: Rust PyO3 debug methods
+  `RustFeaturizer.featurize_pair(...)`, `featurize_pairs(...)`, and
+  `featurize_pairs_matrix(...)` were removed after repo-local tests and scripts
+  moved to `featurize_pairs_matrix_indexed(...)`.
+- Status 2026-05-26: `RustFeaturizer.from_json_paths(...)` and the Python
+  JSON-ingest lifecycle were removed. Scripts now use either Arrow
+  `from_arrow_paths(...)` or classic `ANDData`/`from_dataset(...)`.
+- Status 2026-05-26: direct Rust tuple handling for SPECTER pickle payloads
+  was removed from `RustFeaturizer.from_dataset(...)`. Python `ANDData` remains
+  responsible for loading/normalizing pickle payloads before delegating to Rust.
+- Status 2026-05-26: `RustFeaturizer.save(...)` and
+  `RustFeaturizer.load(...)` were removed. Counter-data measurement now uses
+  build-time RSS deltas rather than Rust featurizer serialization.
 - Status 2026-05-25: the one-shot
   `raw_block_query_candidate_plan_arrow(...)` PyO3 wrapper was removed after
   runtime callers moved to `RawBlockQueryCandidatePlanner`.

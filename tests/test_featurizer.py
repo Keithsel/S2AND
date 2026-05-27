@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -10,7 +10,7 @@ import s2and.feature_port as feature_port
 import s2and.memory_budget as memory_budget
 from s2and.consts import LARGE_INTEGER
 from s2and.data import ANDData
-from s2and.featurizer import FeaturizationInfo, _signature_id_to_index_or_raise, many_pairs_featurize
+from s2and.featurizer import NUM_FEATURES, FeaturizationInfo, _signature_id_to_index_or_raise, many_pairs_featurize
 from s2and.runtime import RuntimeContext
 from tests.helpers import tiny_name_counts
 
@@ -92,9 +92,23 @@ def test_rust_prewarm_happens_before_rss_sampling(monkeypatch: pytest.MonkeyPatc
 
     state = {"prewarm_called": False, "rss_called": False}
 
+    class FakeRustFeaturizer:
+        def signature_ids(self) -> list[str]:
+            return ["a", "b"]
+
+        def featurize_pairs_matrix_indexed(
+            self,
+            pairs: object,
+            selected_indices: object,
+            num_threads: object,
+            nan_value: object,
+        ) -> np.ndarray:
+            del selected_indices, num_threads, nan_value
+            return np.zeros((len(cast(Any, pairs)), NUM_FEATURES), dtype=np.float64)
+
     def fake_get_rust_featurizer(*_args: object, **_kwargs: object) -> object:
         state["prewarm_called"] = True
-        return object()
+        return FakeRustFeaturizer()
 
     def fake_resolve_total_ram_bytes(_total_ram_bytes: object) -> tuple[int, str]:
         return 1024, "test"
@@ -239,7 +253,7 @@ def test_bound_dataset_is_available_in_workers() -> None:
             nan_value=-1,
         )
     except (AttributeError, NameError) as exc:
-        pytest.fail(f"Dataset not available in worker processes: {exc}")
+        raise AssertionError(f"Dataset not available in worker processes: {exc}") from exc
 
     assert features.shape[0] == len(test_pairs)
 

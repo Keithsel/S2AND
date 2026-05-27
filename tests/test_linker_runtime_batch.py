@@ -20,16 +20,8 @@ s2and_rust = pytest.importorskip("s2and_rust", reason="s2and_rust is unavailable
 
 def test_rust_retrieval_public_exports_are_available() -> None:
     assert s2and_rust.DEFAULT_HYBRID_EXEMPLAR_4_WEIGHTS == [0.40, 0.23, 0.12, 0.05, 0.07]
-
-    selector = s2and_rust.RustNameCompatibleSubblockSelector(
-        {
-            "signature_to_subblock": {"q": "a"},
-            "subblock_to_components": {"a": ["c1"], "b": ["c2"]},
-            "subblock_tokens_by_subblock": {"a": ["alice"], "b": ["bob"]},
-        }
-    )
-
-    assert selector.select("q", "alice", ["c2", "c1"]) == ["c1"]
+    assert hasattr(s2and_rust, "RustHybridCentroidRetriever")
+    assert not hasattr(s2and_rust, "RustNameCompatibleSubblockSelector")
 
 
 def test_pair_plan_rejects_values_above_uint16_rank_limit() -> None:

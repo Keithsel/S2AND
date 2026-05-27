@@ -160,7 +160,6 @@ def _maybe_calibrate_rust_batch_fixed_overhead_bytes(
     *,
     rust_featurizer: Any,
     pieces_of_work: list[tuple[tuple[str, str], int]],
-    use_indexed_pairs: bool,
     signature_id_to_index: dict[Any, int],
     rust_selected_indices: list[int] | None,
     selected_feature_count: int,
@@ -222,38 +221,22 @@ def _maybe_calibrate_rust_batch_fixed_overhead_bytes(
             rss_now_bytes, _ = memory_budget.current_rss_bytes_best_effort(total_ram_for_stage)
             rss_peak_bytes = max(rss_peak_bytes, int(rss_now_bytes))
 
-            if use_indexed_pairs:
-                probe_pairs_indexed = [
-                    (
-                        _signature_id_to_index_or_raise(signature_id_to_index, pair[0]),
-                        _signature_id_to_index_or_raise(signature_id_to_index, pair[1]),
-                    )
-                    for pair in probe_pairs
-                ]
-                probe_chunk = np.asarray(
-                    rust_featurizer.featurize_pairs_matrix_indexed(
-                        probe_pairs_indexed,
-                        rust_selected_indices,
-                        int(num_threads),
-                        np.nan,
-                    ),
-                    dtype=np.float64,
+            probe_pairs_indexed = [
+                (
+                    _signature_id_to_index_or_raise(signature_id_to_index, pair[0]),
+                    _signature_id_to_index_or_raise(signature_id_to_index, pair[1]),
                 )
-            elif hasattr(rust_featurizer, "featurize_pairs_matrix"):
-                probe_chunk = np.asarray(
-                    rust_featurizer.featurize_pairs_matrix(
-                        probe_pairs,
-                        rust_selected_indices,
-                        int(num_threads),
-                        np.nan,
-                    ),
-                    dtype=np.float64,
-                )
-            else:
-                probe_chunk = np.asarray(
-                    rust_featurizer.featurize_pairs(probe_pairs, num_threads=int(num_threads)),
-                    dtype=np.float64,
-                )
+                for pair in probe_pairs
+            ]
+            probe_chunk = np.asarray(
+                rust_featurizer.featurize_pairs_matrix_indexed(
+                    probe_pairs_indexed,
+                    rust_selected_indices,
+                    int(num_threads),
+                    np.nan,
+                ),
+                dtype=np.float64,
+            )
 
             rss_after_call_bytes, _ = memory_budget.current_rss_bytes_best_effort(total_ram_for_stage)
             rss_peak_bytes = max(rss_peak_bytes, int(rss_after_call_bytes))
@@ -1058,24 +1041,6 @@ def _single_pair_featurize(
         raise RuntimeError("global_dataset is not initialized; call many_pairs_featurize first")
 
     features = []
-    if runtime_context is None:
-        runtime_context = global_runtime_context
-    if runtime_context is None:
-        runtime_context = build_runtime_context("pair_featurization", emit_startup_warning=False)
-    use_rust = _use_rust_featurizer(runtime_context)
-    if use_rust and feature_port.s2and_rust is not None:
-        try:
-            features = feature_port.featurize_pair_rust(
-                dataset,
-                work_input[0],
-                work_input[1],
-                runtime_context=runtime_context,
-            )
-            return features, index
-        except Exception as exc:
-            raise RuntimeError(
-                "Rust pair featurization failed " f"(run_id={runtime_context.run_id} pair={work_input} error={exc})"
-            ) from exc
 
     signature_1 = dataset.signatures[work_input[0]]
     signature_2 = dataset.signatures[work_input[1]]
@@ -1432,20 +1397,20 @@ def _execute_rust_batch_featurization_phase(
         dataset,
         runtime_context=runtime_context,
     )
-    use_indexed_pairs = bool(
-        hasattr(rust_featurizer, "featurize_pairs_matrix_indexed") and hasattr(rust_featurizer, "signature_ids")
-    )
-    supports_matrix_api = bool(use_indexed_pairs or hasattr(rust_featurizer, "featurize_pairs_matrix"))
+    if not hasattr(rust_featurizer, "featurize_pairs_matrix_indexed") or not hasattr(rust_featurizer, "signature_ids"):
+        raise RuntimeError(
+            "Rust batch pair featurization requires featurize_pairs_matrix_indexed and signature_ids; "
+            "rebuild/install a supported s2and-rust extension."
+        )
     rust_selected_indices: list[int] | None = None
-    if supports_matrix_api and not cache_policy.requires_full_feature_rows and len(indices_needed_for_compute) > 0:
+    if not cache_policy.requires_full_feature_rows and len(indices_needed_for_compute) > 0:
         rust_selected_indices = indices_needed_for_compute
     signature_id_to_index: dict[Any, int] = {}
-    if use_indexed_pairs:
-        rust_signature_ids = rust_featurizer.signature_ids()
-        for idx, sig_id in enumerate(rust_signature_ids):
-            signature_id_to_index[sig_id] = int(idx)
-            signature_id_to_index[str(sig_id)] = int(idx)
-        logger.info("Rust indexed pair API enabled (signature_count=%d)", len(signature_id_to_index))
+    rust_signature_ids = rust_featurizer.signature_ids()
+    for idx, sig_id in enumerate(rust_signature_ids):
+        signature_id_to_index[sig_id] = int(idx)
+        signature_id_to_index[str(sig_id)] = int(idx)
+    logger.info("Rust indexed pair API enabled (signature_count=%d)", len(signature_id_to_index))
     rust_feature_count = NUM_FEATURES if rust_selected_indices is None else len(rust_selected_indices)
     rust_prediction_params = memory_budget.resolve_rust_batch_prediction_params()
     configured_fixed_overhead_bytes = int(rust_prediction_params["fixed_overhead_bytes"])
@@ -1454,7 +1419,6 @@ def _execute_rust_batch_featurization_phase(
         calibrated_fixed_overhead_bytes = _maybe_calibrate_rust_batch_fixed_overhead_bytes(
             rust_featurizer=rust_featurizer,
             pieces_of_work=pieces_of_work,
-            use_indexed_pairs=use_indexed_pairs,
             signature_id_to_index=signature_id_to_index,
             rust_selected_indices=rust_selected_indices,
             selected_feature_count=len(indices_to_use),
@@ -1553,44 +1517,22 @@ def _execute_rust_batch_featurization_phase(
             while start_index < len(pieces_of_work):
                 chunk_work = pieces_of_work[start_index : start_index + target_chunk_size]
                 rust_pairs_chunk = [pair for pair, _ in chunk_work]
-                if use_indexed_pairs:
-                    rust_pairs_chunk_indexed = [
-                        (
-                            _signature_id_to_index_or_raise(signature_id_to_index, pair[0]),
-                            _signature_id_to_index_or_raise(signature_id_to_index, pair[1]),
-                        )
-                        for pair in rust_pairs_chunk
-                    ]
-                    rust_features_chunk = np.asarray(
-                        rust_featurizer.featurize_pairs_matrix_indexed(
-                            rust_pairs_chunk_indexed,
-                            rust_selected_indices,
-                            num_threads,
-                            np.nan,
-                        ),
-                        dtype=np.float64,
+                rust_pairs_chunk_indexed = [
+                    (
+                        _signature_id_to_index_or_raise(signature_id_to_index, pair[0]),
+                        _signature_id_to_index_or_raise(signature_id_to_index, pair[1]),
                     )
-                elif hasattr(rust_featurizer, "featurize_pairs_matrix"):
-                    rust_features_chunk = np.asarray(
-                        rust_featurizer.featurize_pairs_matrix(
-                            rust_pairs_chunk,
-                            rust_selected_indices,
-                            num_threads,
-                            np.nan,
-                        ),
-                        dtype=np.float64,
-                    )
-                else:
-                    if rust_selected_indices is not None:
-                        raise RuntimeError(
-                            "Rust batch selected-indices requested but "
-                            "featurize_pairs_matrix APIs are unavailable "
-                            f"(run_id={runtime_context.run_id})"
-                        )
-                    rust_features_chunk = np.asarray(
-                        rust_featurizer.featurize_pairs(rust_pairs_chunk, num_threads=num_threads),
-                        dtype=np.float64,
-                    )
+                    for pair in rust_pairs_chunk
+                ]
+                rust_features_chunk = np.asarray(
+                    rust_featurizer.featurize_pairs_matrix_indexed(
+                        rust_pairs_chunk_indexed,
+                        rust_selected_indices,
+                        num_threads,
+                        np.nan,
+                    ),
+                    dtype=np.float64,
+                )
 
                 if rust_features_chunk.shape[0] != len(chunk_work):
                     raise RuntimeError(

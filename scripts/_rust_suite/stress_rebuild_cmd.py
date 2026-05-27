@@ -24,7 +24,7 @@ from _rust_suite.common import (  # type: ignore  # noqa: E402
     compute_rss_growth_fraction,
 )
 
-BUILD_PATH_CHOICES = ("from_arrow_paths", "from_json_paths", "from_dataset")
+BUILD_PATH_CHOICES = ("from_arrow_paths", "from_dataset")
 DEFAULT_ARROW_DATA_ROOT = os.path.join("s2and", "data")
 DEFAULT_ARROW_SPECTER_SUFFIX = "_specter2.pkl"
 
@@ -167,30 +167,6 @@ def _build_from_arrow_paths(
     )
 
 
-def _build_from_json_paths(
-    *,
-    s2and_rust_module: Any,
-    paths: dict[str, str | None],
-    compute_reference_features: bool,
-    preprocess: bool,
-    num_threads: int,
-    use_specter: bool,
-) -> Any:
-    return s2and_rust_module.RustFeaturizer.from_json_paths(
-        paths["signatures"],
-        paths["papers"],
-        paths["cluster_seeds"],
-        paths["specter"] if use_specter else None,
-        None,  # name_tuples_path
-        None,  # name_counts_path
-        bool(preprocess),
-        bool(compute_reference_features),
-        0.0,
-        10000.0,
-        max(1, int(num_threads)),
-    )
-
-
 def _build_from_dataset(
     *,
     s2and_rust_module: Any,
@@ -287,15 +263,6 @@ def run_rebuild_stress(
                         preprocess=preprocess,
                         num_threads=num_threads,
                     )
-                elif build_path == "from_json_paths":
-                    featurizer = _build_from_json_paths(
-                        s2and_rust_module=s2and_rust_module,
-                        paths=cast(dict[str, str | None], paths),
-                        compute_reference_features=compute_reference_features,
-                        preprocess=preprocess,
-                        num_threads=num_threads,
-                        use_specter=use_specter,
-                    )
                 else:
                     featurizer, dataset_obj = _build_from_dataset(
                         s2and_rust_module=s2and_rust_module,
@@ -389,7 +356,7 @@ def _rss_growth_fraction(rss_peak_gb_by_iteration: list[float]) -> float | None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Repeatedly build/drop RustFeaturizer using from_arrow_paths, from_json_paths, or from_dataset "
+            "Repeatedly build/drop RustFeaturizer using from_arrow_paths or from_dataset "
             "to stress lifecycle robustness."
         )
     )
@@ -425,7 +392,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-specter",
         action="store_true",
-        help="Load and pass specter embeddings for explicit legacy JSON/dataset build paths.",
+        help="Load and pass specter embeddings for the dataset build path.",
     )
     parser.add_argument(
         "--rss-sample-ms",

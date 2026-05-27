@@ -1,6 +1,6 @@
 # Arrow Dataset Specification
 
-Status date: 2026-05-21
+Status date: 2026-05-26
 
 This document defines the Arrow artifact contract for engineers assembling
 datasets for the direct Rust S2AND inference path. These artifacts are used by
@@ -8,7 +8,10 @@ datasets for the direct Rust S2AND inference path. These artifacts are used by
 promoted phase of `Clusterer.predict_incremental(...)`.
 
 The goal is parity with the current `ANDData(preprocess=True)` representation
-without requiring production inference to materialize full `ANDData`.
+without requiring production inference to materialize full `ANDData`. Arrow
+paper text columns are runtime preprocessing inputs, not authoritative
+precomputed feature values: Rust normalizes titles, venues, journals, and paper
+author names while building the scoring view.
 
 ---
 
@@ -291,13 +294,19 @@ One row per paper referenced by `signatures.arrow`. Required columns:
 | Column | Arrow type | Nulls | Meaning |
 |---|---:|---:|---|
 | `paper_id` | `string` | no | Stable paper id |
-| `title` | `string` | yes | Preprocessed title |
+| `title` | `string` | yes | Paper title text used as runtime preprocessing input. Prefer source/raw title, especially when `predicted_language` is null. |
 | `abstract` | `string` | yes | Abstract-presence signal: `"Has Abstract"` or `""` |
-| `venue` | `string` | yes | Preprocessed venue |
-| `journal_name` | `string` | yes | Preprocessed journal name |
+| `venue` | `string` | yes | Venue text used as runtime preprocessing input |
+| `journal_name` | `string` | yes | Journal text used as runtime preprocessing input |
 | `year` | `int64` | yes | Publication year |
 | `predicted_language` | `string` | yes | Predicted language if available |
 | `is_reliable` | `bool` | yes | S2AND reliability flag if available |
+
+`papers.arrow` may be generated from an `ANDData` object whose Python paper
+preprocessing already ran, or from a Rust-deferred conversion where the text is
+still source/raw text. Consumers must not assume the text fields are already
+normalized. If `predicted_language` is null, Rust detects language from
+`title`, so producers should keep raw/source title text in that case.
 
 ### `paper_authors.arrow`
 

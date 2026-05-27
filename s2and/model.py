@@ -78,11 +78,11 @@ from s2and.rust_calls import (
 )
 from s2and.subblocking import (
     GraphSubblockingConfig,
+    _make_subblocks_with_telemetry_arrow_rust,
     cluster_with_specter,
     make_arrow_graph_subblocking_cluster_fn,
     make_dataset_graph_subblocking_cluster_fn,
     make_subblocks,
-    make_subblocks_arrow_rust,
     rust_arrow_subblocking_available,
 )
 from s2and.text import first_names_name_compatible, normalize_orcid_compact
@@ -2362,7 +2362,6 @@ class Clusterer:
         self.production_model_bundle_dir: Path | None = None
         self.production_model_bundle_version: str | None = None
         self.production_model_bundle_status: str | None = None
-        self.subblocking_fallback_mode: Literal["legacy", "graph"] = "graph"
         self.subblocking_graph_config = GraphSubblockingConfig()
 
     @property
@@ -3873,13 +3872,17 @@ class Clusterer:
         use_rust_subblocking: bool = False,
     ) -> dict[str, list[str]]:
         block_dict_subblocked: dict[str, list[str]] = {}
+        rust_native_graph_telemetry_records: list[dict[str, Any]] = []
+        use_rust_arrow_subblocking = subblocking_arrow_paths is not None and use_rust_subblocking
         for block_key in sorted(block_dict):
             block_signatures = block_dict[block_key]
             if len(block_signatures) > batching_threshold:
                 kwargs: dict[str, Any] = {"maximum_size": batching_threshold}
-                if specter_cluster_fn is not None:
+                if specter_cluster_fn is not None and not use_rust_arrow_subblocking:
                     kwargs["specter_cluster_fn"] = specter_cluster_fn
-                if subblocking_arrow_paths is not None and use_rust_subblocking:
+                if use_rust_arrow_subblocking:
+                    if subblocking_arrow_paths is None:
+                        raise RuntimeError("Rust Arrow subblocking requires Arrow subblocking artifacts")
                     arrow_subblocking_paths = require_arrow_artifacts(
                         subblocking_arrow_paths,
                         required_keys=("signatures", "signatures_batch_index"),
@@ -3893,14 +3896,17 @@ class Clusterer:
                     if not rust_arrow_subblocking_available():
                         raise RuntimeError(
                             "Rust Arrow subblocking requires an s2and_rust extension with "
-                            "make_subblocks_with_telemetry_arrow"
+                            "make_subblocks_with_telemetry_arrow_native_graph"
                         )
-                    subblocks = make_subblocks_arrow_rust(
+                    kwargs["graph_subblocking_config"] = self._subblocking_graph_config()
+                    kwargs["graph_subblocking_random_seed"] = int(getattr(self, "random_state", 0) or 0)
+                    kwargs["use_orcid_subblocking"] = False
+                    subblocks, telemetry = _make_subblocks_with_telemetry_arrow_rust(
                         arrow_subblocking_paths,
                         block_signatures,
-                        dataset,
                         **kwargs,
                     )
+                    rust_native_graph_telemetry_records.append(dict(telemetry))
                 else:
                     subblocks = make_subblocks(block_signatures, dataset, **kwargs)
                 for subblock_key in sorted(subblocks):
@@ -3909,6 +3915,43 @@ class Clusterer:
                     assert len(subblock_signatures) <= batching_threshold, "Subblock is too big for some reason!"
             else:
                 block_dict_subblocked[block_key] = block_signatures
+        if rust_native_graph_telemetry_records:
+            fallback_stats = [
+                dict(stat)
+                for record in rust_native_graph_telemetry_records
+                for stat in record.get("graph_fallback_stats", []) or []
+            ]
+            load_metrics: dict[str, int] = {}
+            for record in rust_native_graph_telemetry_records:
+                for key, value in dict(record.get("graph_fallback_load_metrics", {}) or {}).items():
+                    load_metrics[str(key)] = int(load_metrics.get(str(key), 0)) + int(value)
+            self._last_rust_arrow_graph_subblocking_telemetry = {
+                "enabled": 1,
+                "mode": "graph",
+                "source": "arrow",
+                "native_rust": 1,
+                "candidate_signature_count": int(
+                    sum(
+                        int(record.get("input_signature_count", 0) or 0)
+                        for record in rust_native_graph_telemetry_records
+                    )
+                ),
+                "arrow_load_seconds": float(
+                    sum(
+                        float(record.get("graph_fallback_load_seconds", 0.0) or 0.0)
+                        for record in rust_native_graph_telemetry_records
+                    )
+                ),
+                "arrow_load_metrics": load_metrics,
+                "fallback_invocation_count": int(len(fallback_stats)),
+                "fallback_stats": fallback_stats,
+                "legacy_fallback_invocation_count": 0,
+                "graph_prepare_failed": 0,
+                "graph_prepare_error": None,
+                "graph_fallback_errors": [],
+            }
+        else:
+            self._last_rust_arrow_graph_subblocking_telemetry = None
         return block_dict_subblocked
 
     def _subblocking_graph_config(self) -> GraphSubblockingConfig:
@@ -3929,27 +3972,7 @@ class Clusterer:
         arrow_paths: Mapping[str, Any] | None,
         signature_ids: Sequence[str],
     ) -> Callable[..., dict[str, list[str]]] | None:
-        mode = str(getattr(self, "subblocking_fallback_mode", "graph"))
         candidate_signature_count = int(len(tuple(dict.fromkeys(str(value) for value in signature_ids))))
-        if mode == "legacy":
-            self._last_graph_subblocking_telemetry = {
-                "enabled": 0,
-                "mode": mode,
-                "source": "legacy",
-                "candidate_signature_count": candidate_signature_count,
-                "arrow_load_seconds": 0.0,
-                "arrow_load_metrics": {},
-                "fallback_invocation_count": 0,
-                "fallback_stats": [],
-                "legacy_fallback_invocation_count": 0,
-                "graph_prepare_failed": 0,
-                "graph_prepare_error": None,
-                "graph_fallback_errors": [],
-            }
-            self._last_arrow_graph_subblocking_telemetry = self._last_graph_subblocking_telemetry
-            return None
-        if mode != "graph":
-            raise ValueError("subblocking_fallback_mode must be 'legacy' or 'graph'; " f"got {mode!r}")
         if arrow_paths is not None:
             fallback = make_arrow_graph_subblocking_cluster_fn(
                 arrow_paths,
@@ -3963,7 +3986,7 @@ class Clusterer:
             source = "anddata"
         self._last_graph_subblocking_telemetry = {
             "enabled": 1,
-            "mode": mode,
+            "mode": "graph",
             "source": source,
             "candidate_signature_count": candidate_signature_count,
             "legacy_fallback_invocation_count": 0,
@@ -4317,7 +4340,25 @@ class Clusterer:
                     subblocking_arrow_paths=arrow_paths_for_predict,
                     use_rust_subblocking=stage_uses_rust(runtime_context),
                 )
-                if specter_cluster_fn is not None:
+                rust_native_graph_telemetry = getattr(self, "_last_rust_arrow_graph_subblocking_telemetry", None)
+                if rust_native_graph_telemetry is not None:
+                    self._last_arrow_graph_subblocking_telemetry = dict(rust_native_graph_telemetry)
+                    self._last_graph_subblocking_telemetry = self._last_arrow_graph_subblocking_telemetry
+                    graph_subblocking_source = str(self._last_graph_subblocking_telemetry["source"])
+                    graph_subblocking_load_seconds = float(
+                        cast(Any, self._last_graph_subblocking_telemetry.get("arrow_load_seconds", 0.0)) or 0.0
+                    )
+                    graph_subblocking_fallback_invocations = int(
+                        cast(Any, self._last_graph_subblocking_telemetry.get("fallback_invocation_count", 0)) or 0
+                    )
+                    logger.info(
+                        "Telemetry stage: stage=graph_subblocking_fallback "
+                        "source=%s native_rust=1 load_seconds=%.3f fallback_invocations=%d",
+                        graph_subblocking_source,
+                        graph_subblocking_load_seconds,
+                        graph_subblocking_fallback_invocations,
+                    )
+                elif specter_cluster_fn is not None:
                     fallback_stats = list(getattr(specter_cluster_fn, "stats", []) or [])
                     fallback_load_seconds = float(getattr(specter_cluster_fn, "load_seconds", 0.0) or 0.0)
                     fallback_load_metrics = dict(getattr(specter_cluster_fn, "load_metrics", {}) or {})

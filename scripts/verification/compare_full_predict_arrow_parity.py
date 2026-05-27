@@ -144,11 +144,11 @@ def _numeric_report(left: np.ndarray, right: np.ndarray, *, treat_nan_as_mismatc
     }
 
 
-def _upper_triangle_pairs(signature_ids: Sequence[str]) -> list[tuple[str, str]]:
+def _upper_triangle_index_pairs(signature_indices: Sequence[int]) -> list[tuple[int, int]]:
     return [
-        (str(signature_ids[left]), str(signature_ids[right]))
-        for left in range(len(signature_ids))
-        for right in range(left + 1, len(signature_ids))
+        (int(signature_indices[left]), int(signature_indices[right]))
+        for left in range(len(signature_indices))
+        for right in range(left + 1, len(signature_indices))
     ]
 
 
@@ -239,17 +239,18 @@ def _feature_constraint_report(
     *,
     n_jobs: int,
 ) -> dict[str, Any]:
-    pairs = _upper_triangle_pairs(signature_ids)
+    incumbent_pairs = _upper_triangle_index_pairs(_block_signature_indices(incumbent_featurizer, signature_ids))
+    arrow_pairs = _upper_triangle_index_pairs(_block_signature_indices(arrow_featurizer, signature_ids))
     incumbent_features = np.asarray(
-        incumbent_featurizer.featurize_pairs_matrix(pairs, None, n_jobs, np.nan),
+        incumbent_featurizer.featurize_pairs_matrix_indexed(incumbent_pairs, None, n_jobs, np.nan),
         dtype=np.float64,
     )
     arrow_features = np.asarray(
-        arrow_featurizer.featurize_pairs_matrix(pairs, None, n_jobs, np.nan),
+        arrow_featurizer.featurize_pairs_matrix_indexed(arrow_pairs, None, n_jobs, np.nan),
         dtype=np.float64,
     )
     return {
-        "pair_count": int(len(pairs)),
+        "pair_count": int(len(incumbent_pairs)),
         "feature_matrix": _numeric_report(incumbent_features, arrow_features, treat_nan_as_mismatch=True),
         "constraints": _constraint_report(
             incumbent_featurizer,

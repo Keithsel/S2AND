@@ -450,11 +450,9 @@ fn promoted_linker_non_pairwise_features<'py>(
         .zip(component_keys.iter())
         .filter(|(family, component)| !family.is_empty() && *family != *component)
         .count();
-    let text_module = py.import("s2and.text")?;
-    let unidecode = text_module.getattr("unidecode")?;
     let mut linker_unidecode_char_map = HashMap::<char, String>::new();
     for value in query_first_token.iter().chain(dominant_first_name.iter()) {
-        ensure_unidecode_for_text(&unidecode, value, &mut linker_unidecode_char_map)?;
+        ensure_unidecode_for_text(value, &mut linker_unidecode_char_map)?;
     }
     let query_first_alpha =
         linker_normalized_alpha_vec(&query_first_token, &linker_unidecode_char_map);

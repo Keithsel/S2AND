@@ -102,6 +102,12 @@ def _specter_dataset(name: str, specter_embeddings: Any) -> ANDData:
     )
 
 
+def _indexed_pair_matrix(featurizer: Any, pairs: list[tuple[str, str]]) -> np.ndarray:
+    signature_id_to_index = {str(signature_id): index for index, signature_id in enumerate(featurizer.signature_ids())}
+    indexed_pairs = [(signature_id_to_index[left], signature_id_to_index[right]) for left, right in pairs]
+    return np.asarray(featurizer.featurize_pairs_matrix_indexed(indexed_pairs, None, 1, np.nan))
+
+
 def _dummy_clusterer(
     *,
     cluster_model: object | None,
@@ -145,9 +151,9 @@ def _partial_supervision_for_upper_triangle(signatures: list[str]) -> tuple[dict
     return partial_supervision, np.asarray(values, dtype=np.float64)
 
 
-def test_rust_from_dataset_supports_tuple_specter_payloads():
-    tuple_dataset = _specter_dataset(
-        "tuple_specter_rust_dataset",
+def test_rust_from_dataset_expects_python_normalized_specter_dict():
+    tuple_input_dataset = _specter_dataset(
+        "tuple_specter_python_normalized_dataset",
         (np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32), ["p1", "p2"]),
     )
     dict_dataset = _specter_dataset(
@@ -159,16 +165,23 @@ def test_rust_from_dataset_supports_tuple_specter_payloads():
     )
     no_specter_dataset = _specter_dataset("no_specter_rust_dataset", None)
 
-    tuple_featurizer = s2and_rust.RustFeaturizer.from_dataset(tuple_dataset, 0.0, 10000.0, 1)
+    tuple_featurizer = s2and_rust.RustFeaturizer.from_dataset(tuple_input_dataset, 0.0, 10000.0, 1)
     dict_featurizer = s2and_rust.RustFeaturizer.from_dataset(dict_dataset, 0.0, 10000.0, 1)
     no_specter_featurizer = s2and_rust.RustFeaturizer.from_dataset(no_specter_dataset, 0.0, 10000.0, 1)
     pairs = [("s1", "s2")]
-    tuple_features = np.asarray(tuple_featurizer.featurize_pairs_matrix(pairs, None, 1, np.nan))
-    dict_features = np.asarray(dict_featurizer.featurize_pairs_matrix(pairs, None, 1, np.nan))
-    no_specter_features = np.asarray(no_specter_featurizer.featurize_pairs_matrix(pairs, None, 1, np.nan))
+    tuple_features = _indexed_pair_matrix(tuple_featurizer, pairs)
+    dict_features = _indexed_pair_matrix(dict_featurizer, pairs)
+    no_specter_features = _indexed_pair_matrix(no_specter_featurizer, pairs)
 
     np.testing.assert_allclose(tuple_features, dict_features, equal_nan=True)
     assert not np.allclose(tuple_features, no_specter_features, equal_nan=True)
+
+    dict_dataset.specter_embeddings = (
+        np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+        ["p1", "p2"],
+    )
+    with pytest.raises(TypeError, match="specter_embeddings to be a dict"):
+        s2and_rust.RustFeaturizer.from_dataset(dict_dataset, 0.0, 10000.0, 1)
 
 
 def test_make_distance_matrices_rust_blockwise_fastcluster(monkeypatch):

@@ -1,6 +1,6 @@
 # Work Plan
 
-Status date: 2026-05-26
+Status date: 2026-05-27
 
 This is the active Rust/Arrow platform backlog. Stable architecture and artifact
 contracts live in:
@@ -120,6 +120,11 @@ Current state:
 - `refresh-root-manifest` refreshes those checksums/audits/validation commands
   in a local S3-synced checkout while preserving the logical S3 `output_root`
   and nested replay-bundle metadata.
+- `scripts/verification/validate_local_arrow_release.py` provides the
+  non-network local release-root smoke: root helper files, root-manifest
+  checksum fields, dataset manifest references, required Arrow artifact paths,
+  raw-planner batch-index sidecars, replay-bundle manifests, and
+  `name_counts_index/manifest.json` targets.
 - The local tiny-fixture release-layout regression covers root manifest
   checksums, dataset manifest references, readable Arrow IPC files, a
   batch-index sidecar, production model manifest, and
@@ -150,6 +155,9 @@ Already landed:
   seed source before entering promoted incremental scoring.
 - Arrow graph subblocking requires batch indexes and no longer falls back after
   Arrow read/prepare/call failures on the Rust production path.
+- Rust Arrow subblocking is native-graph only. The legacy
+  `subblocking_fallback_mode` knob and the Rust `fallback_cluster_fn` callback
+  path were removed, so Rust no longer calls Python during Arrow subblocking.
 - Raw payload / Python `FeatureBlock` Rust scoring bridges were removed.
 - Bounded script-level smoke tests cover
   `scripts/convert_to_arrow.py service-json`, the Arrow production tutorial,
@@ -164,6 +172,13 @@ Already landed:
 - The same Arrow eval smoke now runs against the S3-synced public release root
   in `s2and/data`: `pubmed`, `qian`, and `zbmath` with SPECTER2 produced B3
   F1 0.943, 0.971, and 0.959 respectively.
+- Existing-release feature parity was spot-checked on 2026-05-26 with
+  `scripts/verification/compare_existing_arrow_anddata_feature_parity.py`
+  against `s2and/data-backup` raw JSON/pickle and `s2and/data` Arrow bundles
+  for `pubmed`, `qian`, and `zbmath`. The bounded SPECTER2 run used 64
+  signatures and 128 sampled pairs per dataset, and all three had 39 feature
+  columns, zero NaN mismatches, and max absolute drift `0.0` at tolerance
+  `1e-5`.
 
 Remaining:
 
@@ -185,6 +200,9 @@ Remaining:
   `predict(...)` for production inference.
 - Prefer `RawBlockQueryCandidatePlanner.plan(...)` plus typed Arrow request
   tables for single-query/seeded incremental requests.
+- Use `scripts/verification/compare_graph_subblocking_arrow_quality.py` for
+  Python graph vs Rust graph subblocking checks. It no longer compares against
+  the old SPECTER fallback or any Rust-calls-Python callback path.
 - Split the broad raw-Arrow incremental runtime entrypoint into narrow
   planner-owned execution and preplanned scoring surfaces. Use a typed
   `RawArrowPlanBundle` or equivalent only after typed Arrow request-table
@@ -215,8 +233,20 @@ Already landed:
   the legacy list-of-tuples linker aggregate API,
   the aggregate-only pair stats PyO3 method,
   the string-pair constraint API, and direct retriever debug APIs.
-- Demoted `RustFeaturizer.from_json_paths(...)` from core runtime capability
-  checks.
+- Removed `RustFeaturizer.from_json_paths(...)` and the Python JSON-ingest
+  lifecycle from active constructors.
+- Removed direct Rust handling of tuple-shaped SPECTER pickle payloads from
+  `RustFeaturizer.from_dataset(...)`; Python `ANDData` owns pickle loading and
+  normalization before Rust feature generation.
+- Production pairwise training now defaults `S2AND_BACKEND=rust` before
+  importing `s2and`, so `ANDData` loading/preprocessing can delegate feature
+  generation to `RustFeaturizer.from_dataset(...)`.
+- Removed `RustFeaturizer.save(...)` and `RustFeaturizer.load(...)`; the
+  counter-data measurement helper now reports build-time RSS deltas instead of
+  depending on Rust featurizer serialization.
+- Removed the legacy `make_subblocks_with_telemetry_arrow(...)` PyO3 export and
+  its Python fallback callback. The Python wrapper now probes only
+  `make_subblocks_with_telemetry_arrow_native_graph(...)`.
 - Removed the `s2and.rust_capabilities` compatibility shim.
 - Extracted the promoted non-pairwise linker feature kernel into
   `s2and_rust/src/promoted_linker.rs` with its focused Rust unit test and PyO3
@@ -233,9 +263,10 @@ Remaining:
 
 - Remove or isolate JSON ingest helpers once their remaining parity and
   benchmark uses are explicitly labeled compatibility-only.
-- Keep canonical pairwise feature APIs matrix/indexed. Leave
-  `featurize_pair(...)` and `featurize_pairs(...)` as parity/debug/fallback
-  helpers until Python callers no longer need them.
+- Keep the indexed pairwise feature API as the Python Rust batching boundary.
+  The Python `featurize_pair_rust(...)` and string-pair matrix wrappers have
+  been removed; direct Rust `featurize_pair(...)`, `featurize_pairs(...)`, and
+  `featurize_pairs_matrix(...)` PyO3 debug methods have also been removed.
 - Split `s2and_rust/src/lib.rs` mechanically, one low-coupling module at a
   time. Completed extractions: `promoted_linker`, `name_counts`,
   `text_compat`. Candidate next modules: `arrow_io`, `ingest_arrow`,
@@ -270,6 +301,10 @@ Done when:
 - Equivalent ingest semantics share staging helpers.
 - Source-specific behavior remains explicit.
 - Rust library tests and focused Python/Rust integration tests pass.
+- Bounded real-dataset Arrow-vs-`ANDData` feature parity is recorded for
+  datasets that have both original JSON inputs and generated Arrow bundles,
+  with feature matrix drift no larger than `1e-5` except for documented,
+  intentional source-policy differences.
 
 ### 7. Incremental Helper Shim
 
@@ -297,13 +332,16 @@ Current evidence:
   clusters and 25 query signatures because the canonical replay bundle has no
   `clusters` artifact.
 - Result summary:
-  p50 predict wall time 19.65s, min 17.07s, max 21.41s, max RSS 2.90 GB,
-  625 candidate rows, 5 query batches, p50 final predicted peak delta
-  17,164,216 bytes.
+  p50 predict wall time 11.15s, min 11.12s, max 11.63s, max RSS 3.72 GB,
+  625 candidate rows, 1 query batch, p50 final predicted peak delta
+  18,712,216 bytes.
 - The largest measured contributors in the Arrow telemetry were reusable
   window featurizer work and manifest-backed name-count reads during window
   planning. Treat these as the next optimization candidates only if a focused
   before/after profile shows at least a 10% wall-time or allocation impact.
+- Evidence: [rust/profiling/2026-05-27-promoted-incremental-arrow.md](rust/profiling/2026-05-27-promoted-incremental-arrow.md).
+  This was a dirty-worktree/debug-assertions run, so it is operational
+  prioritization evidence rather than a release-grade performance claim.
 
 Next profiling target:
 

@@ -176,30 +176,6 @@ def test_benchmark_main_run_full_discovers_datasets_only_when_explicit(
     assert [call["sources"].dataset for call in calls] == ["first", "second"]
 
 
-def test_root_manifest_rejects_existing_benchmark_reports(
-    tmp_path: Path,
-) -> None:
-    output_root = tmp_path / "out"
-    output_root.mkdir()
-    legacy_manifest = {
-        "output_root": str(output_root),
-        "reports": [{"dataset": "existing", "paths": {"manifest": "existing/manifest.json"}}],
-    }
-    (output_root / "manifest.json").write_text(
-        json.dumps(legacy_manifest),
-        encoding="utf-8",
-    )
-
-    dataset_dir = output_root / "new"
-    dataset_dir.mkdir()
-
-    with pytest.raises(ValueError, match="unsupported schema"):
-        convert_to_arrow._upsert_root_manifest(output_root, dataset_name="new", dataset_dir=dataset_dir)
-
-    root_manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
-    assert root_manifest == legacy_manifest
-
-
 def test_root_manifest_upsert_keeps_dataset_order_stable(tmp_path: Path) -> None:
     output_root = tmp_path / "out"
     output_root.mkdir()

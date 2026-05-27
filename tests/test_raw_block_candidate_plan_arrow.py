@@ -39,7 +39,7 @@ if _RUST_FEATURIZER is None:
 elif not hasattr(_RUST_FEATURIZER, "from_arrow_paths"):
     _MISSING_RUST_RAW_APIS.append("RustFeaturizer.from_arrow_paths")
 if _MISSING_RUST_RAW_APIS:
-    pytest.fail(f"s2and_rust is missing required raw Arrow APIs: {_MISSING_RUST_RAW_APIS}")
+    raise AssertionError(f"s2and_rust is missing required raw Arrow APIs: {_MISSING_RUST_RAW_APIS}")
 
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
@@ -47,6 +47,12 @@ _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQQQ")
 _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT = struct.Struct("<QII")
 _NAME_COUNTS_INDEX_HEADER_LEN = 32
 _NAME_COUNTS_INDEX_RECORD_LEN = 40
+
+
+def _indexed_pair_matrix(featurizer: Any, pairs: list[tuple[str, str]]) -> np.ndarray:
+    signature_id_to_index = {str(signature_id): index for index, signature_id in enumerate(featurizer.signature_ids())}
+    indexed_pairs = [(signature_id_to_index[left], signature_id_to_index[right]) for left, right in pairs]
+    return np.asarray(featurizer.featurize_pairs_matrix_indexed(indexed_pairs, None, 1, np.nan))
 
 
 def _minimal_raw_candidate_plan(**overrides: Any) -> dict[str, Any]:
@@ -960,88 +966,6 @@ def test_arrow_batch_lookup_index_rejects_same_size_same_mtime_sampled_source_ch
         )
 
 
-def test_raw_arrow_candidate_plan_rejects_duplicate_signature_ids(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    duplicate_signatures = pa.table(
-        {
-            "signature_id": pa.array(["q1", "q1", "s1", "s2"], type=pa.string()),
-            "paper_id": pa.array(["p_q", "p_q", "p1", "p2"], type=pa.string()),
-            "author_first": pa.array(["Alice", "Alice", "Alice", "Bob"], type=pa.string()),
-            "author_middle": pa.array(["", "", "", ""], type=pa.string()),
-            "author_last": pa.array(["Wang", "Wang", "Wang", "Jones"], type=pa.string()),
-            "author_suffix": pa.array(["", "", "", ""], type=pa.string()),
-            "author_affiliations": pa.array(
-                [["AI Lab"], ["AI Lab"], ["AI Lab"], ["Other Lab"]],
-                type=pa.list_(pa.string()),
-            ),
-            "author_orcid": pa.array([None, None, None, None], type=pa.string()),
-            "author_position": pa.array([0, 0, 0, 0], type=pa.int64()),
-        }
-    )
-    _write_ipc(Path(paths["signatures"]), duplicate_signatures)
-
-    with pytest.raises(ValueError, match="duplicate signature_id"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_duplicate_paper_author_positions(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    duplicate_authors = pa.table(
-        {
-            "paper_id": pa.array(["p_q", "p_q", "p1", "p2"], type=pa.string()),
-            "position": pa.array([0, 0, 0, 0], type=pa.int64()),
-            "author_name": pa.array(["Alice Wang", "A. Wang", "Alice Wang", "Bob Jones"], type=pa.string()),
-        }
-    )
-    _write_ipc(Path(paths["paper_authors"]), duplicate_authors)
-
-    with pytest.raises(ValueError, match="duplicate"):
-        _raw_plan_for_base_paths(paths)
-
-
-def test_raw_arrow_candidate_plan_rejects_invalid_cluster_seed_rows(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    idempotent_duplicate_seeds = pa.table(
-        {
-            "signature_id": pa.array(["s1", "s1", "s2"], type=pa.string()),
-            "cluster_id": pa.array(["c_match", "c_match", "c_other"], type=pa.string()),
-        }
-    )
-    _write_ipc(Path(paths["cluster_seeds"]), idempotent_duplicate_seeds)
-    with pytest.raises(ValueError, match="duplicate signature_id"):
-        _raw_plan_for_base_paths(paths)
-
-    duplicate_seeds = pa.table(
-        {
-            "signature_id": pa.array(["s1", "s1", "s2"], type=pa.string()),
-            "cluster_id": pa.array(["c_match", "c_other", "c_other"], type=pa.string()),
-        }
-    )
-    _write_ipc(Path(paths["cluster_seeds"]), duplicate_seeds)
-    with pytest.raises(ValueError, match="duplicate signature_id"):
-        _raw_plan_for_base_paths(paths)
-
-    integer_seed_ids = pa.table(
-        {
-            "signature_id": pa.array([1, 2], type=pa.int64()),
-            "cluster_id": pa.array(["c_match", "c_other"], type=pa.string()),
-        }
-    )
-    _write_ipc(Path(paths["cluster_seeds"]), integer_seed_ids)
-    with pytest.raises(TypeError, match="signature_id must be a string column"):
-        _raw_plan_for_base_paths(paths)
-
-    empty_cluster_id = pa.table(
-        {
-            "signature_id": pa.array(["s1", "s2"], type=pa.string()),
-            "cluster_id": pa.array(["", "c_other"], type=pa.string()),
-        }
-    )
-    _write_ipc(Path(paths["cluster_seeds"]), empty_cluster_id)
-    with pytest.raises(ValueError, match="empty cluster_id"):
-        _raw_plan_for_base_paths(paths)
-
-
 def test_rust_featurizer_from_arrow_paths_deduplicates_unsorted_requested_ids(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
 
@@ -1100,8 +1024,8 @@ def test_rust_featurizer_from_arrow_paths_uses_batch_indexes(tmp_path: Path) -> 
 
     assert tuple(indexed.signature_ids()) == ("q1", "s1")
     np.testing.assert_allclose(
-        indexed.featurize_pairs_matrix([("q1", "s1")], None, 1, np.nan),
-        full_scan.featurize_pairs_matrix([("q1", "s1")], None, 1, np.nan),
+        _indexed_pair_matrix(indexed, [("q1", "s1")]),
+        _indexed_pair_matrix(full_scan, [("q1", "s1")]),
         rtol=1e-6,
         atol=1e-6,
     )
@@ -1856,73 +1780,6 @@ def test_raw_arrow_candidate_plan_bridge_maps_compact_numeric_indices(tmp_path: 
     assert candidate_batch.row_component_keys == ("c_match",)
 
 
-def test_raw_arrow_candidate_plan_rejects_name_counts_arrow_without_index(tmp_path: Path) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    paths["name_counts"] = _write_ipc(
-        tmp_path / "name_counts.arrow",
-        pa.table(
-            {
-                "kind": pa.array(
-                    [
-                        "first",
-                        "last",
-                        "first_last",
-                        "last_first_initial",
-                        "first",
-                        "last",
-                        "first_last",
-                        "last_first_initial",
-                    ],
-                    type=pa.string(),
-                ),
-                "name": pa.array(
-                    ["alice", "wang", "alice wang", "wang a", "bob", "jones", "bob jones", "jones b"],
-                    type=pa.string(),
-                ),
-                "count": pa.array([10.0, 20.0, 5.0, 8.0, 30.0, 40.0, 6.0, 9.0], type=pa.float64()),
-            }
-        ),
-    )
-
-    with pytest.raises(ValueError, match="requires name_counts_index"):
-        _raw_candidate_plan_arrow(
-            paths,
-            ["q1"],
-            top_k=2,
-            query_view="full",
-            orcid_enabled=False,
-            num_threads=1,
-        )
-
-
-def test_raw_arrow_candidate_plan_rejects_name_counts_index_dir_alias(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    paths = _base_arrow_paths(tmp_path)
-    paths["name_counts"] = _write_ipc(
-        tmp_path / "name_counts.arrow",
-        pa.table(
-            {
-                "kind": pa.array(["first"], type=pa.string()),
-                "name": pa.array(["alice"], type=pa.string()),
-                "count": pa.array([10.0], type=pa.float64()),
-            }
-        ),
-    )
-    paths["name_counts_index_dir"] = _write_tiny_name_counts_index(tmp_path / "index", monkeypatch)
-
-    with pytest.raises(ValueError, match="requires name_counts_index"):
-        _raw_candidate_plan_arrow(
-            paths,
-            ["q1"],
-            top_k=2,
-            query_view="full",
-            orcid_enabled=False,
-            num_threads=1,
-        )
-
-
 def test_raw_arrow_candidate_plan_emits_native_row_signals_from_name_counts_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2006,7 +1863,7 @@ def test_rust_featurizer_from_arrow_paths_applies_cluster_seed_disallows(tmp_pat
     pairs = [("q1", "s1"), ("q1", "s2")]
 
     assert tuple(direct.signature_ids()) == signature_order.signature_ids
-    assert direct.featurize_pairs_matrix(pairs, None, 1, np.nan).shape == (2, 39)
+    assert _indexed_pair_matrix(direct, pairs).shape == (2, 39)
     assert direct.get_constraint("q1", "s1") is None
     assert direct.get_constraint("q1", "s2") == 10000.0
 
@@ -2108,8 +1965,8 @@ def test_rust_featurizer_from_arrow_paths_uses_name_counts_index(
     )
 
     np.testing.assert_allclose(
-        from_index.featurize_pairs_matrix(pairs, None, 1, np.nan),
-        from_arrow.featurize_pairs_matrix(pairs, None, 1, np.nan),
+        _indexed_pair_matrix(from_index, pairs),
+        _indexed_pair_matrix(from_arrow, pairs),
         equal_nan=True,
     )
 

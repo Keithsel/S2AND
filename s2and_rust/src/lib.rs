@@ -9,7 +9,7 @@ use cld2::{detect_language_ext as cld2_detect_language_ext, Format as Cld2Format
 use fasttext::FastText;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, ToPyArray};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyIterator, PyModule, PyTuple};
+use pyo3::types::{PyAny, PyDict, PyIterator, PyList, PyModule, PyTuple};
 use pyo3::Bound;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read};
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -26,11 +26,13 @@ use std::time::Instant;
 mod name_counts;
 mod promoted_linker;
 mod text_compat;
+mod text_unidecode_data;
 
 use name_counts::{NameCountsData, RawNameCountIndex, RawNameCountKind, RawNameCountMaps};
 use text_compat::{
-    compute_block_compat, contains_name_dash, ensure_unidecode_for_text,
-    first_normalized_token_python_compat, normalize_text_compat_from_map,
+    compute_block_compat, contains_name_dash, contains_non_ascii_name_dash,
+    ensure_unidecode_for_text, first_normalized_token_python_compat,
+    normalize_text_compat_from_map, normalize_text_compat_native,
     split_first_middle_hyphen_aware_compat,
 };
 
@@ -219,8 +221,6 @@ struct RustFeaturizer {
     cluster_seed_require_value: f64,
     cluster_seed_disallow_value: f64,
     #[serde(skip)]
-    json_ingest_telemetry: Option<JsonIngestTelemetry>,
-    #[serde(skip)]
     cached_signature_id_order: OnceLock<Vec<String>>,
     #[serde(skip)]
     cluster_seeds_disallow_index: OnceLock<HashMap<String, HashSet<String>>>,
@@ -390,7 +390,6 @@ struct RustHybridCentroidRetriever {
     affiliation_cluster_df: HashMap<u64, usize>,
 }
 
-#[pyclass]
 struct RustNameCompatibleSubblockSelector {
     signature_to_subblock: HashMap<String, String>,
     subblock_to_components: HashMap<String, Vec<String>>,
@@ -1004,23 +1003,6 @@ impl RustHybridCentroidRetriever {
     }
 }
 
-#[derive(Clone, Default)]
-struct JsonIngestTelemetry {
-    json_parse_seconds: f64,
-    paper_preprocess_seconds: f64,
-    reference_counter_seconds: f64,
-    signature_preprocess_seconds: f64,
-    cluster_seed_seconds: f64,
-    missing_specter_paper_count: usize,
-    defaulted_name_count_signature_count: usize,
-    defaulted_name_count_first_count: usize,
-    defaulted_name_count_first_last_count: usize,
-    defaulted_name_count_last_count: usize,
-    defaulted_name_count_last_first_initial_count: usize,
-    defaulted_signature_author_position_count: usize,
-    defaulted_paper_author_position_count: usize,
-}
-
 const RAYON_POOL_CACHE_MAX_ENTRIES: usize = 8;
 
 static RAYON_POOL_CACHE: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
@@ -1120,65 +1102,6 @@ fn upper_triangle_pairs_for_range(
     Ok(pairs)
 }
 
-fn json_ingest_telemetry_to_py(
-    py: Python<'_>,
-    telemetry: &JsonIngestTelemetry,
-) -> PyResult<Py<PyDict>> {
-    let stage_seconds = PyDict::new(py);
-    stage_seconds.set_item("json_parse_seconds", telemetry.json_parse_seconds)?;
-    stage_seconds.set_item(
-        "paper_preprocess_seconds",
-        telemetry.paper_preprocess_seconds,
-    )?;
-    stage_seconds.set_item(
-        "reference_counter_seconds",
-        telemetry.reference_counter_seconds,
-    )?;
-    stage_seconds.set_item(
-        "signature_preprocess_seconds",
-        telemetry.signature_preprocess_seconds,
-    )?;
-    stage_seconds.set_item("cluster_seed_seconds", telemetry.cluster_seed_seconds)?;
-
-    let telemetry_dict = PyDict::new(py);
-    telemetry_dict.set_item("stage_seconds", stage_seconds)?;
-    let counts = PyDict::new(py);
-    counts.set_item(
-        "missing_specter_paper_count",
-        telemetry.missing_specter_paper_count,
-    )?;
-    counts.set_item(
-        "defaulted_name_count_signature_count",
-        telemetry.defaulted_name_count_signature_count,
-    )?;
-    counts.set_item(
-        "defaulted_name_count_first_count",
-        telemetry.defaulted_name_count_first_count,
-    )?;
-    counts.set_item(
-        "defaulted_name_count_first_last_count",
-        telemetry.defaulted_name_count_first_last_count,
-    )?;
-    counts.set_item(
-        "defaulted_name_count_last_count",
-        telemetry.defaulted_name_count_last_count,
-    )?;
-    counts.set_item(
-        "defaulted_name_count_last_first_initial_count",
-        telemetry.defaulted_name_count_last_first_initial_count,
-    )?;
-    counts.set_item(
-        "defaulted_signature_author_position_count",
-        telemetry.defaulted_signature_author_position_count,
-    )?;
-    counts.set_item(
-        "defaulted_paper_author_position_count",
-        telemetry.defaulted_paper_author_position_count,
-    )?;
-    telemetry_dict.set_item("counts", counts)?;
-    Ok(telemetry_dict.unbind())
-}
-
 fn extract_counter(obj: &Bound<'_, PyAny>) -> PyResult<Option<CounterData>> {
     if obj.is_none() {
         return Ok(None);
@@ -1248,11 +1171,6 @@ fn canonical_signature_pair_owned(a: String, b: String) -> (String, String) {
     } else {
         (b, a)
     }
-}
-
-fn canonical_signature_pair_cloned(a: &str, b: &str) -> (String, String) {
-    let (left, right) = canonical_signature_pair_ref(a, b);
-    (left.to_string(), right.to_string())
 }
 
 fn extract_pair_set(obj: &Bound<'_, PyAny>) -> PyResult<HashSet<(String, String)>> {
@@ -2849,57 +2767,52 @@ struct PaperTextFields<'a> {
 }
 
 fn ensure_unidecode_for_signature_texts<'a>(
-    unidecode_fn: &Bound<'_, PyAny>,
     signatures: impl IntoIterator<Item = SignatureTextFields<'a>>,
     unidecode_char_map: &mut HashMap<char, String>,
 ) -> PyResult<()> {
     for signature in signatures {
-        ensure_unidecode_for_text(unidecode_fn, signature.author_first, unidecode_char_map)?;
-        ensure_unidecode_for_text(unidecode_fn, signature.author_middle, unidecode_char_map)?;
-        ensure_unidecode_for_text(unidecode_fn, signature.author_last, unidecode_char_map)?;
-        ensure_unidecode_for_text(unidecode_fn, signature.author_suffix, unidecode_char_map)?;
+        ensure_unidecode_for_text(signature.author_first, unidecode_char_map)?;
+        ensure_unidecode_for_text(signature.author_middle, unidecode_char_map)?;
+        ensure_unidecode_for_text(signature.author_last, unidecode_char_map)?;
+        ensure_unidecode_for_text(signature.author_suffix, unidecode_char_map)?;
         for affiliation in signature.affiliations.iter() {
-            ensure_unidecode_for_text(unidecode_fn, affiliation, unidecode_char_map)?;
+            ensure_unidecode_for_text(affiliation, unidecode_char_map)?;
         }
     }
     Ok(())
 }
 
 fn ensure_unidecode_for_paper_texts<'a>(
-    unidecode_fn: &Bound<'_, PyAny>,
     papers: impl IntoIterator<Item = PaperTextFields<'a>>,
     unidecode_char_map: &mut HashMap<char, String>,
 ) -> PyResult<()> {
     for paper in papers {
-        ensure_unidecode_for_text(unidecode_fn, paper.title, unidecode_char_map)?;
-        ensure_unidecode_for_text(unidecode_fn, paper.venue, unidecode_char_map)?;
-        ensure_unidecode_for_text(unidecode_fn, paper.journal_name, unidecode_char_map)?;
+        ensure_unidecode_for_text(paper.title, unidecode_char_map)?;
+        ensure_unidecode_for_text(paper.venue, unidecode_char_map)?;
+        ensure_unidecode_for_text(paper.journal_name, unidecode_char_map)?;
     }
     Ok(())
 }
 
 fn ensure_unidecode_for_paper_author_texts<'a>(
-    unidecode_fn: &Bound<'_, PyAny>,
     paper_authors: impl IntoIterator<Item = &'a [(i64, String)]>,
     unidecode_char_map: &mut HashMap<char, String>,
 ) -> PyResult<()> {
     for authors in paper_authors {
         for (_position, author_name) in authors.iter() {
-            ensure_unidecode_for_text(unidecode_fn, author_name, unidecode_char_map)?;
+            ensure_unidecode_for_text(author_name, unidecode_char_map)?;
         }
     }
     Ok(())
 }
 
 fn ensure_unidecode_for_raw_arrow_inputs(
-    unidecode_fn: &Bound<'_, PyAny>,
     signatures: &HashMap<String, RawArrowSignature>,
     papers: &HashMap<String, RawArrowPaper>,
     paper_authors: &HashMap<String, Vec<(i64, String)>>,
     unidecode_char_map: &mut HashMap<char, String>,
 ) -> PyResult<()> {
     ensure_unidecode_for_signature_texts(
-        unidecode_fn,
         signatures.values().map(|signature| SignatureTextFields {
             author_first: &signature.author_first,
             author_middle: &signature.author_middle,
@@ -2910,7 +2823,6 @@ fn ensure_unidecode_for_raw_arrow_inputs(
         unidecode_char_map,
     )?;
     ensure_unidecode_for_paper_texts(
-        unidecode_fn,
         papers.values().map(|paper| PaperTextFields {
             title: &paper.title,
             venue: &paper.venue,
@@ -2919,7 +2831,6 @@ fn ensure_unidecode_for_raw_arrow_inputs(
         unidecode_char_map,
     )?;
     ensure_unidecode_for_paper_author_texts(
-        unidecode_fn,
         paper_authors.values().map(Vec::as_slice),
         unidecode_char_map,
     )?;
@@ -3109,8 +3020,7 @@ fn preprocess_stage_signatures(
                 &first_without_apostrophe,
                 &entry.raw_last,
                 &last_normalized,
-            )
-            .data;
+            );
             (
                 entry.sig_id.clone(),
                 SignatureData {
@@ -3159,8 +3069,7 @@ fn build_raw_arrow_feature(
         &first,
         &signature.author_last,
         &last_normalized,
-    )
-    .data;
+    );
     let middle_initials: HashSet<String> = middle
         .split_whitespace()
         .filter_map(|token| token.chars().next().map(|ch| ch.to_string()))
@@ -4745,248 +4654,6 @@ fn update_cluster_df_from_counter(
     Ok(())
 }
 
-fn specter_payload_to_dict<'py>(
-    py: Python<'py>,
-    payload: &Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyDict>> {
-    if let Ok(dict) = payload.downcast::<PyDict>() {
-        return Ok(dict.clone());
-    }
-
-    if let Ok(tuple_payload) = payload.downcast::<PyTuple>() {
-        if tuple_payload.len() != 2 {
-            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                "Unsupported specter pickle tuple payload; expected (X, keys), got tuple length {}",
-                tuple_payload.len()
-            )));
-        }
-        let matrix = tuple_payload.get_item(0)?;
-        let keys = tuple_payload.get_item(1)?;
-        let out = PyDict::new(py);
-        for (idx, key_item) in PyIterator::from_object(&keys)?.enumerate() {
-            let key = key_item?;
-            let row = matrix.get_item(idx)?;
-            out.set_item(key, row)?;
-        }
-        return Ok(out);
-    }
-
-    Err(pyo3::exceptions::PyTypeError::new_err(
-        "Unsupported specter pickle payload; expected dict or (X, keys) tuple",
-    ))
-}
-
-fn load_pickle_dict<'py>(py: Python<'py>, path: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
-    let builtins = py.import("builtins")?;
-    let pickle = py.import("pickle")?;
-    let file_obj = builtins.call_method1("open", (path, "rb"))?;
-    let loaded = pickle.call_method1("load", (&file_obj,));
-    let _ = file_obj.call_method0("close");
-    match loaded {
-        Ok(value) => {
-            if value.is_none() {
-                Ok(None)
-            } else {
-                Ok(Some(specter_payload_to_dict(py, &value)?))
-            }
-        }
-        Err(err) => Err(err),
-    }
-}
-
-type JsonValue = serde_json::Value;
-type JsonObject = serde_json::Map<String, JsonValue>;
-
-fn load_json_value(path: &str) -> PyResult<JsonValue> {
-    let file = File::open(path).map_err(|err| {
-        pyo3::exceptions::PyIOError::new_err(format!("failed to open JSON path {}: {}", path, err))
-    })?;
-    let reader = BufReader::new(file);
-    serde_json::from_reader::<_, JsonValue>(reader).map_err(|err| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "failed to parse JSON path {}: {}",
-            path, err
-        ))
-    })
-}
-
-fn json_as_object<'a>(value: &'a JsonValue, context: &str) -> PyResult<&'a JsonObject> {
-    value.as_object().ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err(format!("{} must be a JSON object", context))
-    })
-}
-
-fn json_value_to_string(value: &JsonValue) -> Option<String> {
-    match value {
-        JsonValue::String(v) => Some(v.clone()),
-        JsonValue::Number(v) => Some(v.to_string()),
-        JsonValue::Bool(v) => Some(v.to_string()),
-        _ => None,
-    }
-}
-
-fn json_value_to_id(value: &JsonValue) -> Option<String> {
-    match value {
-        JsonValue::String(v) => Some(v.clone()),
-        JsonValue::Number(v) => Some(v.to_string()),
-        _ => None,
-    }
-}
-
-fn json_value_to_i64(value: &JsonValue, context: &str) -> PyResult<Option<i64>> {
-    match value {
-        JsonValue::Number(v) => {
-            if let Some(i) = v.as_i64() {
-                Ok(Some(i))
-            } else if let Some(u) = v.as_u64() {
-                i64::try_from(u).map(Some).map_err(|_| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "{context} is outside i64 range: {u}"
-                    ))
-                })
-            } else {
-                Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "{context} must be an integer, got floating-point value {v}"
-                )))
-            }
-        }
-        JsonValue::Null => Ok(None),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "{context} must be an integer or null"
-        ))),
-    }
-}
-
-fn json_get_required<'a>(obj: &'a JsonObject, key: &str, context: &str) -> PyResult<&'a JsonValue> {
-    obj.get(key).ok_or_else(|| {
-        pyo3::exceptions::PyKeyError::new_err(format!(
-            "missing required key '{}' in {}",
-            key, context
-        ))
-    })
-}
-
-fn json_get_string(obj: &JsonObject, key: &str, default: &str) -> String {
-    match obj.get(key) {
-        None | Some(JsonValue::Null) => default.to_string(),
-        Some(value) => json_value_to_string(value).unwrap_or_else(|| default.to_string()),
-    }
-}
-
-fn json_get_optional_string(obj: &JsonObject, key: &str) -> Option<String> {
-    obj.get(key).and_then(|value| match value {
-        JsonValue::Null => None,
-        _ => json_value_to_string(value),
-    })
-}
-
-fn json_get_i64_optional(obj: &JsonObject, key: &str, context: &str) -> PyResult<Option<i64>> {
-    let field_context = format!("{context}.{key}");
-    match obj.get(key) {
-        Some(value) => json_value_to_i64(value, &field_context),
-        None => Ok(None),
-    }
-}
-
-fn json_get_string_list(value: Option<&JsonValue>) -> Vec<String> {
-    let Some(array) = value.and_then(JsonValue::as_array) else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(array.len());
-    for item in array {
-        if let Some(text) = json_value_to_string(item) {
-            out.push(text);
-        }
-    }
-    out
-}
-
-fn json_get_id_set(value: Option<&JsonValue>) -> HashSet<PaperId> {
-    let Some(array) = value.and_then(JsonValue::as_array) else {
-        return HashSet::new();
-    };
-    let mut out = HashSet::with_capacity(array.len());
-    for item in array {
-        if let Some(id) = json_value_to_id(item) {
-            out.insert(id);
-        }
-    }
-    out
-}
-
-fn json_extract_string_f64_map(value: Option<&JsonValue>) -> HashMap<String, f64> {
-    let Some(object) = value.and_then(JsonValue::as_object) else {
-        return HashMap::new();
-    };
-    let mut out = HashMap::with_capacity(object.len());
-    for (key, val) in object {
-        if let Some(f) = val.as_f64() {
-            out.insert(key.clone(), f);
-        } else if let Some(i) = val.as_i64() {
-            out.insert(key.clone(), i as f64);
-        } else if let Some(u) = val.as_u64() {
-            out.insert(key.clone(), u as f64);
-        }
-    }
-    out
-}
-
-fn load_raw_name_counts_from_json_path(
-    path: Option<&str>,
-    expected_normalization_version: Option<&str>,
-    allow_normalization_version_mismatch: bool,
-) -> PyResult<RawNameCountMaps> {
-    let Some(path_value) = path else {
-        return Ok(RawNameCountMaps::default());
-    };
-    let counts_json = load_json_value(path_value)?;
-    let counts_obj = json_as_object(&counts_json, "name counts payload")?;
-
-    // Validate normalization_version if an expected version was provided.
-    if let Some(expected) = expected_normalization_version {
-        match counts_obj.get("normalization_version") {
-            None => {
-                let msg = format!(
-                    "Missing normalization_version in name counts artifact; fail-fast by default. \
-                     path={} expected={} set allow_normalization_version_mismatch=true explicitly to override",
-                    path_value, expected,
-                );
-                if !allow_normalization_version_mismatch {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(msg));
-                }
-                eprintln!("WARNING: {}", msg);
-            }
-            Some(artifact_val) => {
-                let artifact_version = artifact_val.as_str().unwrap_or("");
-                if artifact_version != expected {
-                    let msg = format!(
-                        "Normalization version mismatch between runtime and name-count artifact; \
-                         fail-fast by default. path={} expected={} artifact={} \
-                         set allow_normalization_version_mismatch=true explicitly to override",
-                        path_value, expected, artifact_version,
-                    );
-                    if !allow_normalization_version_mismatch {
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(msg));
-                    }
-                    eprintln!("WARNING: {}", msg);
-                }
-            }
-        }
-    }
-
-    let first = json_extract_string_f64_map(counts_obj.get("first_dict"));
-    let last = json_extract_string_f64_map(counts_obj.get("last_dict"));
-    let first_last = json_extract_string_f64_map(counts_obj.get("first_last_dict"));
-    let last_first_initial = json_extract_string_f64_map(counts_obj.get("last_first_initial_dict"));
-    Ok(RawNameCountMaps {
-        first,
-        last,
-        first_last,
-        last_first_initial,
-        index: None,
-    })
-}
-
 fn default_name_tuples_path(py: Python<'_>) -> PyResult<String> {
     let consts = py.import("s2and.consts")?;
     let package_data_dir: String = consts.getattr("_PACKAGE_DATA_DIR")?.extract()?;
@@ -5040,25 +4707,6 @@ fn canonical_last_for_counts(raw_last: &str, normalized_last: &str) -> String {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct NameCountsDefaultTelemetry {
-    first: bool,
-    first_last: bool,
-    last: bool,
-    last_first_initial: bool,
-}
-
-impl NameCountsDefaultTelemetry {
-    fn any(self) -> bool {
-        self.first || self.first_last || self.last || self.last_first_initial
-    }
-}
-
-struct NameCountsBuildResult {
-    data: Option<NameCountsData>,
-    telemetry: NameCountsDefaultTelemetry,
-}
-
 fn build_name_counts_data_from_artifact(
     raw_name_counts: &RawNameCountMaps,
     raw_first: &str,
@@ -5066,15 +4714,11 @@ fn build_name_counts_data_from_artifact(
     first_without_apostrophe: &str,
     raw_last: &str,
     last_normalized: &str,
-) -> NameCountsBuildResult {
+) -> Option<NameCountsData> {
     if !has_name_counts_artifact(raw_name_counts) {
-        return NameCountsBuildResult {
-            data: None,
-            telemetry: NameCountsDefaultTelemetry::default(),
-        };
+        return None;
     }
 
-    let mut telemetry = NameCountsDefaultTelemetry::default();
     let mut first_for_counts = first_without_apostrophe
         .split(' ')
         .next()
@@ -5103,10 +4747,7 @@ fn build_name_counts_data_from_artifact(
     let first = if py_len(&first_for_counts) > 1 {
         match raw_name_counts.get(RawNameCountKind::First, &first_for_counts) {
             Some(value) => value,
-            None => {
-                telemetry.first = true;
-                1.0
-            }
+            None => 1.0,
         }
     } else {
         f64::NAN
@@ -5114,39 +4755,27 @@ fn build_name_counts_data_from_artifact(
     let first_last = if py_len(&first_for_counts) > 1 {
         match raw_name_counts.get(RawNameCountKind::FirstLast, &first_last_key) {
             Some(value) => value,
-            None => {
-                telemetry.first_last = true;
-                1.0
-            }
+            None => 1.0,
         }
     } else {
         f64::NAN
     };
     let last = match raw_name_counts.get(RawNameCountKind::Last, &last_for_counts) {
         Some(value) => value,
-        None => {
-            telemetry.last = true;
-            1.0
-        }
+        None => 1.0,
     };
     let last_first_initial =
         match raw_name_counts.get(RawNameCountKind::LastFirstInitial, &last_first_initial_key) {
             Some(value) => value,
-            None => {
-                telemetry.last_first_initial = true;
-                1.0
-            }
+            None => 1.0,
         };
 
-    NameCountsBuildResult {
-        data: Some(NameCountsData {
-            first,
-            first_last,
-            last,
-            last_first_initial,
-        }),
-        telemetry,
-    }
+    Some(NameCountsData {
+        first,
+        first_last,
+        last,
+        last_first_initial,
+    })
 }
 
 fn count_initials(s: &str) -> HashMap<char, usize> {
@@ -5232,9 +4861,29 @@ fn subblock_tokens_from_key(subblock_key: &str) -> Vec<String> {
 #[derive(Clone)]
 struct SubblockingSignatureRow {
     signature_id: String,
+    paper_id: String,
     first: String,
     middle: String,
+    affiliations: Vec<String>,
     orcid: Option<String>,
+    position: Option<i64>,
+}
+
+fn spill_non_ascii_dash_first_for_subblocking(
+    raw_first: &str,
+    first: &str,
+    middle: &str,
+) -> (String, String) {
+    if raw_first.contains('-') || !contains_non_ascii_name_dash(raw_first) {
+        return (first.to_string(), middle.to_string());
+    }
+    let first_parts: Vec<&str> = first.split_whitespace().collect();
+    if first_parts.len() <= 1 {
+        return (first.to_string(), middle.to_string());
+    }
+    let mut middle_parts: Vec<&str> = first_parts[1..].to_vec();
+    middle_parts.extend(middle.split_whitespace());
+    (first_parts[0].to_string(), middle_parts.join(" "))
 }
 
 fn normalize_subblocking_signature_rows(
@@ -5243,12 +4892,15 @@ fn normalize_subblocking_signature_rows(
     unidecode_char_map: &HashMap<char, String>,
 ) {
     for row in rows.iter_mut() {
+        let raw_first = row.first.clone();
         let (first, middle) = split_first_middle_hyphen_aware_compat(
             &row.first,
             &row.middle,
             name_prefixes,
             unidecode_char_map,
         );
+        let (first, middle) =
+            spill_non_ascii_dash_first_for_subblocking(&raw_first, &first, &middle);
         row.first = first;
         row.middle = middle;
     }
@@ -5264,15 +4916,23 @@ fn read_subblocking_signature_rows_from_batches(
         let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
         let signature_id_values =
             ArrowStringColumn::from_string_array(signature_id_col.as_ref(), "signature_id")?;
+        let paper_id_col = batch.column(arrow_column_index(&batch, "paper_id", path)?);
+        let paper_id_values =
+            ArrowStringColumn::from_string_array(paper_id_col.as_ref(), "paper_id")?;
         let first_col = batch.column(arrow_column_index(&batch, "author_first", path)?);
         let first_values =
             ArrowStringColumn::from_string_array(first_col.as_ref(), "author_first")?;
         let middle_col = batch.column(arrow_column_index(&batch, "author_middle", path)?);
         let middle_values =
             ArrowStringColumn::from_string_array(middle_col.as_ref(), "author_middle")?;
+        let affiliations_col =
+            batch.column(arrow_column_index(&batch, "author_affiliations", path)?);
         let orcid_col = batch.column(arrow_column_index(&batch, "author_orcid", path)?);
         let orcid_values =
             ArrowStringColumn::from_string_array(orcid_col.as_ref(), "author_orcid")?;
+        let position_col = batch.column(arrow_column_index(&batch, "author_position", path)?);
+        let position_values =
+            ArrowI64Column::from_i64_array(position_col.as_ref(), "author_position")?;
         for row in 0..batch.num_rows() {
             let signature_id_value = signature_id_values.required_value(row, "signature_id")?;
             if keep_signature_ids.map_or(false, |keep| !keep.contains(signature_id_value.as_ref()))
@@ -5295,11 +4955,20 @@ fn read_subblocking_signature_rows_from_batches(
                 Entry::Vacant(entry) => {
                     entry.insert(SubblockingSignatureRow {
                         signature_id,
+                        paper_id: paper_id_values
+                            .required_value(row, "paper_id")?
+                            .into_owned(),
                         first: first_values.optional_owned(row).unwrap_or_default(),
                         middle: middle_values.optional_owned(row).unwrap_or_default(),
+                        affiliations: arrow_optional_string_list(
+                            affiliations_col.as_ref(),
+                            row,
+                            "author_affiliations",
+                        )?,
                         orcid: orcid_values
                             .optional_owned(row)
                             .and_then(|value| normalize_orcid_owned(&value)),
+                        position: position_values.optional_value(row, "author_position")?,
                     });
                 }
             }
@@ -5325,6 +4994,1554 @@ fn read_subblocking_signature_rows_with_optional_index(
         full_scan_without_index,
         read_subblocking_signature_rows_from_batches,
     )
+}
+
+#[derive(Clone)]
+struct NativeGraphSubblockingConfig {
+    neighbor_mode: String,
+    neighbors: usize,
+    min_edge_score: f64,
+    specter_weight: f64,
+    coauthor_weight: f64,
+    affiliation_weight: f64,
+    max_exact_knn_group_size: usize,
+    projection_count: usize,
+    projection_window: usize,
+    max_candidate_edges: usize,
+    pack_components: bool,
+    component_pack_strategy: String,
+    sparse_evidence_edges: bool,
+    sparse_evidence_max_posting_size: usize,
+    sparse_evidence_neighbors: usize,
+    sparse_evidence_min_weight: f64,
+    sparse_evidence_include_coauthors: bool,
+    sparse_evidence_include_affiliations: bool,
+    component_pack_top_k: usize,
+    local_move_passes: usize,
+    adaptive_projection: bool,
+    adaptive_projection_max_group_size: usize,
+    adaptive_projection_count: usize,
+    adaptive_projection_window: usize,
+}
+
+impl Default for NativeGraphSubblockingConfig {
+    fn default() -> Self {
+        Self {
+            neighbor_mode: "projection".to_string(),
+            neighbors: 16,
+            min_edge_score: 0.30,
+            specter_weight: 1.0,
+            coauthor_weight: 0.35,
+            affiliation_weight: 0.20,
+            max_exact_knn_group_size: 25_000,
+            projection_count: 12,
+            projection_window: 12,
+            max_candidate_edges: 5_000_000,
+            pack_components: true,
+            component_pack_strategy: "edge-greedy".to_string(),
+            sparse_evidence_edges: false,
+            sparse_evidence_max_posting_size: 64,
+            sparse_evidence_neighbors: 4,
+            sparse_evidence_min_weight: 0.20,
+            sparse_evidence_include_coauthors: true,
+            sparse_evidence_include_affiliations: true,
+            component_pack_top_k: 8,
+            local_move_passes: 0,
+            adaptive_projection: false,
+            adaptive_projection_max_group_size: 5_000,
+            adaptive_projection_count: 24,
+            adaptive_projection_window: 24,
+        }
+    }
+}
+
+fn graph_config_get_value<'py>(
+    config_obj: Option<&Bound<'py, PyAny>>,
+    key: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some(config) = config_obj else {
+        return Ok(None);
+    };
+    if config.is_none() {
+        return Ok(None);
+    }
+    if let Ok(dict) = config.downcast::<PyDict>() {
+        return dict.get_item(key);
+    }
+    match config.getattr(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn graph_config_get_string(
+    config_obj: Option<&Bound<'_, PyAny>>,
+    key: &str,
+    default_value: &str,
+) -> PyResult<String> {
+    Ok(match graph_config_get_value(config_obj, key)? {
+        Some(value) => value.extract()?,
+        None => default_value.to_string(),
+    })
+}
+
+fn graph_config_get_usize(
+    config_obj: Option<&Bound<'_, PyAny>>,
+    key: &str,
+    default_value: usize,
+) -> PyResult<usize> {
+    Ok(match graph_config_get_value(config_obj, key)? {
+        Some(value) => value.extract()?,
+        None => default_value,
+    })
+}
+
+fn graph_config_get_f64(
+    config_obj: Option<&Bound<'_, PyAny>>,
+    key: &str,
+    default_value: f64,
+) -> PyResult<f64> {
+    Ok(match graph_config_get_value(config_obj, key)? {
+        Some(value) => value.extract()?,
+        None => default_value,
+    })
+}
+
+fn graph_config_get_bool(
+    config_obj: Option<&Bound<'_, PyAny>>,
+    key: &str,
+    default_value: bool,
+) -> PyResult<bool> {
+    Ok(match graph_config_get_value(config_obj, key)? {
+        Some(value) => value.extract()?,
+        None => default_value,
+    })
+}
+
+impl NativeGraphSubblockingConfig {
+    fn from_py(config_obj: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let default = Self::default();
+        let config = Self {
+            neighbor_mode: graph_config_get_string(
+                config_obj,
+                "neighbor_mode",
+                &default.neighbor_mode,
+            )?,
+            neighbors: graph_config_get_usize(config_obj, "neighbors", default.neighbors)?,
+            min_edge_score: graph_config_get_f64(
+                config_obj,
+                "min_edge_score",
+                default.min_edge_score,
+            )?,
+            specter_weight: graph_config_get_f64(
+                config_obj,
+                "specter_weight",
+                default.specter_weight,
+            )?,
+            coauthor_weight: graph_config_get_f64(
+                config_obj,
+                "coauthor_weight",
+                default.coauthor_weight,
+            )?,
+            affiliation_weight: graph_config_get_f64(
+                config_obj,
+                "affiliation_weight",
+                default.affiliation_weight,
+            )?,
+            max_exact_knn_group_size: graph_config_get_usize(
+                config_obj,
+                "max_exact_knn_group_size",
+                default.max_exact_knn_group_size,
+            )?,
+            projection_count: graph_config_get_usize(
+                config_obj,
+                "projection_count",
+                default.projection_count,
+            )?,
+            projection_window: graph_config_get_usize(
+                config_obj,
+                "projection_window",
+                default.projection_window,
+            )?,
+            max_candidate_edges: graph_config_get_usize(
+                config_obj,
+                "max_candidate_edges",
+                default.max_candidate_edges,
+            )?,
+            pack_components: graph_config_get_bool(
+                config_obj,
+                "pack_components",
+                default.pack_components,
+            )?,
+            component_pack_strategy: graph_config_get_string(
+                config_obj,
+                "component_pack_strategy",
+                &default.component_pack_strategy,
+            )?,
+            sparse_evidence_edges: graph_config_get_bool(
+                config_obj,
+                "sparse_evidence_edges",
+                default.sparse_evidence_edges,
+            )?,
+            sparse_evidence_max_posting_size: graph_config_get_usize(
+                config_obj,
+                "sparse_evidence_max_posting_size",
+                default.sparse_evidence_max_posting_size,
+            )?,
+            sparse_evidence_neighbors: graph_config_get_usize(
+                config_obj,
+                "sparse_evidence_neighbors",
+                default.sparse_evidence_neighbors,
+            )?,
+            sparse_evidence_min_weight: graph_config_get_f64(
+                config_obj,
+                "sparse_evidence_min_weight",
+                default.sparse_evidence_min_weight,
+            )?,
+            sparse_evidence_include_coauthors: graph_config_get_bool(
+                config_obj,
+                "sparse_evidence_include_coauthors",
+                default.sparse_evidence_include_coauthors,
+            )?,
+            sparse_evidence_include_affiliations: graph_config_get_bool(
+                config_obj,
+                "sparse_evidence_include_affiliations",
+                default.sparse_evidence_include_affiliations,
+            )?,
+            component_pack_top_k: graph_config_get_usize(
+                config_obj,
+                "component_pack_top_k",
+                default.component_pack_top_k,
+            )?,
+            local_move_passes: graph_config_get_usize(
+                config_obj,
+                "local_move_passes",
+                default.local_move_passes,
+            )?,
+            adaptive_projection: graph_config_get_bool(
+                config_obj,
+                "adaptive_projection",
+                default.adaptive_projection,
+            )?,
+            adaptive_projection_max_group_size: graph_config_get_usize(
+                config_obj,
+                "adaptive_projection_max_group_size",
+                default.adaptive_projection_max_group_size,
+            )?,
+            adaptive_projection_count: graph_config_get_usize(
+                config_obj,
+                "adaptive_projection_count",
+                default.adaptive_projection_count,
+            )?,
+            adaptive_projection_window: graph_config_get_usize(
+                config_obj,
+                "adaptive_projection_window",
+                default.adaptive_projection_window,
+            )?,
+        };
+        if config.neighbor_mode != "projection" && config.neighbor_mode != "exact" {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Graph subblocking neighbor_mode must be 'projection' or 'exact'",
+            ));
+        }
+        if !matches!(
+            config.component_pack_strategy.as_str(),
+            "edge-greedy" | "aggregate-greedy" | "size"
+        ) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Graph subblocking component_pack_strategy must be 'edge-greedy', 'aggregate-greedy', or 'size'",
+            ));
+        }
+        if config.projection_count == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Graph subblocking projection_count must be positive",
+            ));
+        }
+        if config.projection_window == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Graph subblocking projection_window must be positive",
+            ));
+        }
+        if config.sparse_evidence_edges && config.sparse_evidence_max_posting_size <= 1 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Graph subblocking sparse_evidence_max_posting_size must be greater than 1",
+            ));
+        }
+        Ok(config)
+    }
+
+    fn effective_for_group(&self, group_size: usize) -> Self {
+        if !self.adaptive_projection
+            || self.neighbor_mode != "projection"
+            || group_size > self.adaptive_projection_max_group_size
+        {
+            return self.clone();
+        }
+        let mut out = self.clone();
+        out.projection_count = out.projection_count.max(out.adaptive_projection_count);
+        out.projection_window = out.projection_window.max(out.adaptive_projection_window);
+        out
+    }
+}
+
+struct NativeGraphArrowPaths {
+    paper_authors_path: String,
+    paper_authors_batch_index_path: String,
+    specter_path: String,
+    specter_batch_index_path: String,
+}
+
+impl NativeGraphArrowPaths {
+    fn from_py(paths: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let paper_authors_path = extract_path_mapping_string(paths, "paper_authors", true)?
+            .expect("required paper_authors path exists");
+        let paper_authors_batch_index_path =
+            extract_path_mapping_string(paths, "paper_authors_batch_index", true)?
+                .expect("required paper_authors_batch_index path exists");
+        let (specter_path, specter_batch_index_path) =
+            if let Some(path) = extract_path_mapping_string(paths, "specter", false)? {
+                let index_path = extract_path_mapping_string(paths, "specter_batch_index", true)?
+                    .expect("required specter_batch_index path exists");
+                (path, index_path)
+            } else if let Some(path) = extract_path_mapping_string(paths, "specter2", false)? {
+                let index_path =
+                    match extract_path_mapping_string(paths, "specter2_batch_index", false)? {
+                        Some(value) => value,
+                        None => extract_path_mapping_string(paths, "specter_batch_index", true)?
+                            .expect("required specter_batch_index path exists"),
+                    };
+                (path, index_path)
+            } else {
+                return Err(pyo3::exceptions::PyKeyError::new_err(
+                    "Arrow path bundle is missing required key: specter or specter2",
+                ));
+            };
+        Ok(Self {
+            paper_authors_path,
+            paper_authors_batch_index_path,
+            specter_path,
+            specter_batch_index_path,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct NativeGraphSignatureEvidence {
+    embedding: Vec<f32>,
+    coauthor_blocks: HashSet<String>,
+    affiliation_keys: HashSet<String>,
+}
+
+struct NativeGraphEvidenceStore {
+    signatures: HashMap<String, NativeGraphSignatureEvidence>,
+    dimension: usize,
+}
+
+#[derive(Default)]
+struct NativeGraphLoadMetrics {
+    signatures_record_batches_scanned: usize,
+    signatures_rows_scanned: usize,
+    signatures_rows_loaded: usize,
+    paper_authors_record_batches_scanned: usize,
+    paper_authors_rows_scanned: usize,
+    paper_authors_rows_loaded: usize,
+    specter_record_batches_scanned: usize,
+    specter_rows_scanned: usize,
+    specter_rows_loaded: usize,
+}
+
+#[derive(Default)]
+struct SparseEvidenceStats {
+    sparse_evidence_feature_count: usize,
+    sparse_evidence_skipped_feature_count: usize,
+    sparse_evidence_added_edge_count: usize,
+    sparse_evidence_neighbors: usize,
+}
+
+struct NativeGraphFallbackStats {
+    input_signature_count: usize,
+    neighbor_mode: String,
+    projection_count: usize,
+    projection_window: usize,
+    candidate_edge_count: usize,
+    sparse_evidence_stats: SparseEvidenceStats,
+    raw_component_count: usize,
+    raw_max_component_size: usize,
+    raw_median_component_size: f64,
+    packed_component_count: usize,
+    max_component_size: usize,
+    median_component_size: f64,
+    pack_components: bool,
+    component_pack_strategy: String,
+    component_pack_top_k: usize,
+    local_move_passes: usize,
+    edge_build_seconds: f64,
+    total_seconds: f64,
+}
+
+#[derive(Default)]
+struct NativeGraphTelemetry {
+    load_seconds: f64,
+    load_metrics: NativeGraphLoadMetrics,
+    stats: Vec<NativeGraphFallbackStats>,
+}
+
+fn native_graph_load_metrics_to_dict(
+    py: Python<'_>,
+    metrics: &NativeGraphLoadMetrics,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item(
+        "signatures_record_batches_scanned",
+        metrics.signatures_record_batches_scanned,
+    )?;
+    out.set_item("signatures_rows_scanned", metrics.signatures_rows_scanned)?;
+    out.set_item("signatures_rows_loaded", metrics.signatures_rows_loaded)?;
+    out.set_item(
+        "paper_authors_record_batches_scanned",
+        metrics.paper_authors_record_batches_scanned,
+    )?;
+    out.set_item(
+        "paper_authors_rows_scanned",
+        metrics.paper_authors_rows_scanned,
+    )?;
+    out.set_item(
+        "paper_authors_rows_loaded",
+        metrics.paper_authors_rows_loaded,
+    )?;
+    out.set_item(
+        "specter_record_batches_scanned",
+        metrics.specter_record_batches_scanned,
+    )?;
+    out.set_item("specter_rows_scanned", metrics.specter_rows_scanned)?;
+    out.set_item("specter_rows_loaded", metrics.specter_rows_loaded)?;
+    Ok(out.unbind())
+}
+
+fn native_graph_stats_to_pylist(
+    py: Python<'_>,
+    stats: &[NativeGraphFallbackStats],
+) -> PyResult<Py<PyList>> {
+    let out = PyList::empty(py);
+    for stat in stats {
+        let item = PyDict::new(py);
+        item.set_item("input_signature_count", stat.input_signature_count)?;
+        item.set_item("neighbor_mode", &stat.neighbor_mode)?;
+        item.set_item("projection_count", stat.projection_count)?;
+        item.set_item("projection_window", stat.projection_window)?;
+        item.set_item("candidate_edge_count", stat.candidate_edge_count)?;
+        item.set_item(
+            "sparse_evidence_feature_count",
+            stat.sparse_evidence_stats.sparse_evidence_feature_count,
+        )?;
+        item.set_item(
+            "sparse_evidence_skipped_feature_count",
+            stat.sparse_evidence_stats
+                .sparse_evidence_skipped_feature_count,
+        )?;
+        item.set_item(
+            "sparse_evidence_added_edge_count",
+            stat.sparse_evidence_stats.sparse_evidence_added_edge_count,
+        )?;
+        item.set_item(
+            "sparse_evidence_neighbors",
+            stat.sparse_evidence_stats.sparse_evidence_neighbors,
+        )?;
+        item.set_item("raw_component_count", stat.raw_component_count)?;
+        item.set_item("raw_max_component_size", stat.raw_max_component_size)?;
+        item.set_item("raw_median_component_size", stat.raw_median_component_size)?;
+        item.set_item("packed_component_count", stat.packed_component_count)?;
+        item.set_item("max_component_size", stat.max_component_size)?;
+        item.set_item("median_component_size", stat.median_component_size)?;
+        item.set_item("pack_components", stat.pack_components)?;
+        item.set_item("component_pack_strategy", &stat.component_pack_strategy)?;
+        item.set_item("component_pack_top_k", stat.component_pack_top_k)?;
+        item.set_item("local_move_passes", stat.local_move_passes)?;
+        item.set_item("edge_build_seconds", stat.edge_build_seconds)?;
+        item.set_item("total_seconds", stat.total_seconds)?;
+        out.append(item)?;
+    }
+    Ok(out.unbind())
+}
+
+fn insert_native_graph_telemetry(
+    py: Python<'_>,
+    telemetry: &Bound<'_, PyDict>,
+    graph_telemetry: &NativeGraphTelemetry,
+) -> PyResult<()> {
+    telemetry.set_item("graph_fallback_native", true)?;
+    telemetry.set_item("graph_fallback_load_seconds", graph_telemetry.load_seconds)?;
+    telemetry.set_item(
+        "graph_fallback_load_metrics",
+        native_graph_load_metrics_to_dict(py, &graph_telemetry.load_metrics)?,
+    )?;
+    telemetry.set_item(
+        "graph_fallback_invocation_count",
+        graph_telemetry.stats.len(),
+    )?;
+    telemetry.set_item(
+        "graph_fallback_stats",
+        native_graph_stats_to_pylist(py, &graph_telemetry.stats)?,
+    )?;
+    Ok(())
+}
+
+fn median_usize(values: &[usize]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid] as f64
+    } else {
+        (sorted[mid - 1] as f64 + sorted[mid] as f64) / 2.0
+    }
+}
+
+fn normalize_f32_vector(mut vector: Vec<f32>, dimension: usize) -> Vec<f32> {
+    if vector.len() != dimension {
+        vector.resize(dimension, 0.0);
+    }
+    let norm = vector
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in vector.iter_mut() {
+            *value = (f64::from(*value) / norm) as f32;
+        }
+    }
+    vector
+}
+
+fn dot_f32(left: &[f32], right: &[f32]) -> f64 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(left_value, right_value)| f64::from(*left_value) * f64::from(*right_value))
+        .sum()
+}
+
+fn jaccard(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let intersection = left.intersection(right).count();
+    let union = left.len() + right.len() - intersection;
+    intersection as f64 / union as f64
+}
+
+fn native_graph_weighted_edge_score(
+    cosine_similarity: f64,
+    left: &NativeGraphSignatureEvidence,
+    right: &NativeGraphSignatureEvidence,
+    config: &NativeGraphSubblockingConfig,
+) -> f64 {
+    config.specter_weight * cosine_similarity
+        + config.coauthor_weight * jaccard(&left.coauthor_blocks, &right.coauthor_blocks)
+        + config.affiliation_weight * jaccard(&left.affiliation_keys, &right.affiliation_keys)
+}
+
+fn score_native_graph_candidate_edge(
+    edge_scores: &mut HashMap<(usize, usize), f64>,
+    left_index: usize,
+    right_index: usize,
+    evidences: &[NativeGraphSignatureEvidence],
+    config: &NativeGraphSubblockingConfig,
+) {
+    if left_index == right_index {
+        return;
+    }
+    let left = left_index.min(right_index);
+    let right = left_index.max(right_index);
+    let cosine_similarity =
+        dot_f32(&evidences[left].embedding, &evidences[right].embedding).max(0.0);
+    let score = native_graph_weighted_edge_score(
+        cosine_similarity,
+        &evidences[left],
+        &evidences[right],
+        config,
+    );
+    if score < config.min_edge_score {
+        return;
+    }
+    match edge_scores.entry((left, right)) {
+        Entry::Occupied(mut entry) => {
+            if score > *entry.get() {
+                entry.insert(score);
+            }
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(score);
+        }
+    }
+}
+
+fn score_native_graph_candidate_edge_from_cosine(
+    edge_scores: &mut HashMap<(usize, usize), f64>,
+    left_index: usize,
+    right_index: usize,
+    cosine_similarity: f64,
+    evidences: &[NativeGraphSignatureEvidence],
+    config: &NativeGraphSubblockingConfig,
+) {
+    let score = native_graph_weighted_edge_score(
+        cosine_similarity.max(0.0),
+        &evidences[left_index],
+        &evidences[right_index],
+        config,
+    );
+    if score < config.min_edge_score {
+        return;
+    }
+    match edge_scores.entry((left_index, right_index)) {
+        Entry::Occupied(mut entry) => {
+            if score > *entry.get() {
+                entry.insert(score);
+            }
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(score);
+        }
+    }
+}
+
+fn prune_native_graph_edge_scores(
+    edge_scores: &mut HashMap<(usize, usize), f64>,
+    max_candidate_edges: usize,
+) {
+    if max_candidate_edges == 0 || edge_scores.len() <= max_candidate_edges {
+        return;
+    }
+    let mut strongest: Vec<((usize, usize), f64)> = edge_scores
+        .iter()
+        .map(|(key, value)| (*key, *value))
+        .collect();
+    strongest.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0 .0.cmp(&right.0 .0).reverse())
+            .then_with(|| left.0 .1.cmp(&right.0 .1).reverse())
+    });
+    strongest.truncate(max_candidate_edges);
+    edge_scores.clear();
+    edge_scores.extend(strongest);
+}
+
+fn exact_native_graph_edge_scores(
+    evidences: &[NativeGraphSignatureEvidence],
+    config: &NativeGraphSubblockingConfig,
+) -> HashMap<(usize, usize), f64> {
+    let neighbor_count = evidences.len().min((config.neighbors + 1).max(2));
+    let mut edge_scores = HashMap::<(usize, usize), f64>::new();
+    for left_index in 0..evidences.len() {
+        let mut neighbors: Vec<(usize, f64)> = (0..evidences.len())
+            .map(|right_index| {
+                (
+                    right_index,
+                    dot_f32(
+                        &evidences[left_index].embedding,
+                        &evidences[right_index].embedding,
+                    ),
+                )
+            })
+            .collect();
+        neighbors.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        for (right_index, cosine_similarity) in neighbors.into_iter().take(neighbor_count) {
+            if right_index == left_index {
+                continue;
+            }
+            let left = left_index.min(right_index);
+            let right = left_index.max(right_index);
+            score_native_graph_candidate_edge_from_cosine(
+                &mut edge_scores,
+                left,
+                right,
+                cosine_similarity,
+                evidences,
+                config,
+            );
+        }
+    }
+    edge_scores
+}
+
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+fn splitmix_unit_f64(state: &mut u64) -> f64 {
+    let raw = splitmix64_next(state) >> 11;
+    (raw as f64) * (1.0 / ((1u64 << 53) as f64))
+}
+
+fn splitmix_normal_pair(state: &mut u64) -> (f64, f64) {
+    let u1 = splitmix_unit_f64(state).max(f64::MIN_POSITIVE);
+    let u2 = splitmix_unit_f64(state);
+    let radius = (-2.0 * u1.ln()).sqrt();
+    let theta = std::f64::consts::TAU * u2;
+    (radius * theta.cos(), radius * theta.sin())
+}
+
+fn projection_seed(signature_ids: &[String], random_seed: u64) -> u64 {
+    let mut state = FNV_OFFSET ^ random_seed;
+    let mut sorted = signature_ids.to_vec();
+    sorted.sort_unstable();
+    for signature_id in sorted {
+        state = fnv64_update(state, signature_id.as_bytes());
+        state = fnv64_update(state, b"\0");
+    }
+    state
+}
+
+fn projection_native_graph_edge_scores(
+    signature_ids: &[String],
+    evidences: &[NativeGraphSignatureEvidence],
+    config: &NativeGraphSubblockingConfig,
+    random_seed: u64,
+    dimension: usize,
+) -> HashMap<(usize, usize), f64> {
+    let mut edge_scores = HashMap::<(usize, usize), f64>::new();
+    let mut state = projection_seed(signature_ids, random_seed);
+    for _projection_index in 0..config.projection_count {
+        let mut projection = vec![0.0_f32; dimension];
+        let mut offset = 0usize;
+        while offset < dimension {
+            let (left, right) = splitmix_normal_pair(&mut state);
+            projection[offset] = left as f32;
+            if offset + 1 < dimension {
+                projection[offset + 1] = right as f32;
+            }
+            offset += 2;
+        }
+        let projection_norm = projection
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
+        if projection_norm > 0.0 {
+            for value in projection.iter_mut() {
+                *value = (f64::from(*value) / projection_norm) as f32;
+            }
+        }
+        let mut order: Vec<(usize, f64)> = evidences
+            .iter()
+            .enumerate()
+            .map(|(index, evidence)| (index, dot_f32(&evidence.embedding, &projection)))
+            .collect();
+        order.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        for position in 0..order.len() {
+            let left_index = order[position].0;
+            let stop = order.len().min(position + config.projection_window + 1);
+            for &right_index in order[position + 1..stop]
+                .iter()
+                .map(|(index, _score)| index)
+            {
+                let left = left_index.min(right_index);
+                let right = left_index.max(right_index);
+                if edge_scores.contains_key(&(left, right)) {
+                    continue;
+                }
+                score_native_graph_candidate_edge(&mut edge_scores, left, right, evidences, config);
+            }
+        }
+        prune_native_graph_edge_scores(&mut edge_scores, config.max_candidate_edges);
+    }
+    edge_scores
+}
+
+fn add_sparse_native_graph_edge_scores(
+    edge_scores: &mut HashMap<(usize, usize), f64>,
+    evidences: &[NativeGraphSignatureEvidence],
+    config: &NativeGraphSubblockingConfig,
+) -> SparseEvidenceStats {
+    let mut stats = SparseEvidenceStats {
+        sparse_evidence_neighbors: config.sparse_evidence_neighbors,
+        ..SparseEvidenceStats::default()
+    };
+    let mut postings: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, evidence) in evidences.iter().enumerate() {
+        if config.sparse_evidence_include_coauthors {
+            for value in evidence.coauthor_blocks.iter() {
+                if !value.is_empty() {
+                    postings
+                        .entry(format!("coauthor:{value}"))
+                        .or_default()
+                        .push(index);
+                }
+            }
+        }
+        if config.sparse_evidence_include_affiliations {
+            for value in evidence.affiliation_keys.iter() {
+                if !value.is_empty() {
+                    postings
+                        .entry(format!("affiliation:{value}"))
+                        .or_default()
+                        .push(index);
+                }
+            }
+        }
+    }
+    let edge_count_before = edge_scores.len();
+    for indices in postings.values_mut() {
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.len() <= 1 {
+            continue;
+        }
+        if indices.len() > config.sparse_evidence_max_posting_size {
+            stats.sparse_evidence_skipped_feature_count += 1;
+            continue;
+        }
+        stats.sparse_evidence_feature_count += 1;
+        for left_offset in 0..indices.len() {
+            let left_index = indices[left_offset];
+            let right_stop = if config.sparse_evidence_neighbors == 0 {
+                indices.len()
+            } else {
+                indices
+                    .len()
+                    .min(left_offset + config.sparse_evidence_neighbors + 1)
+            };
+            for &right_index in indices[left_offset + 1..right_stop].iter() {
+                let cosine_similarity = dot_f32(
+                    &evidences[left_index].embedding,
+                    &evidences[right_index].embedding,
+                )
+                .max(0.0);
+                let score = native_graph_weighted_edge_score(
+                    cosine_similarity,
+                    &evidences[left_index],
+                    &evidences[right_index],
+                    config,
+                );
+                if score < config.sparse_evidence_min_weight {
+                    continue;
+                }
+                let left = left_index.min(right_index);
+                let right = left_index.max(right_index);
+                match edge_scores.entry((left, right)) {
+                    Entry::Occupied(mut entry) => {
+                        if score > *entry.get() {
+                            entry.insert(score);
+                        }
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(score);
+                    }
+                }
+            }
+        }
+        if config.max_candidate_edges > 0 && edge_scores.len() > config.max_candidate_edges * 2 {
+            prune_native_graph_edge_scores(edge_scores, config.max_candidate_edges);
+        }
+    }
+    prune_native_graph_edge_scores(edge_scores, config.max_candidate_edges);
+    stats.sparse_evidence_added_edge_count = edge_scores.len().saturating_sub(edge_count_before);
+    stats
+}
+
+struct NativeGraphUnionFind {
+    parent: Vec<usize>,
+    component_size: Vec<usize>,
+}
+
+impl NativeGraphUnionFind {
+    fn new(size: usize) -> Self {
+        Self {
+            parent: (0..size).collect(),
+            component_size: vec![1; size],
+        }
+    }
+
+    fn find(&mut self, item: usize) -> usize {
+        let parent = self.parent[item];
+        if parent != item {
+            let root = self.find(parent);
+            self.parent[item] = root;
+        }
+        self.parent[item]
+    }
+
+    fn union_if_capacity(&mut self, left: usize, right: usize, maximum_size: usize) -> bool {
+        let mut left_root = self.find(left);
+        let mut right_root = self.find(right);
+        if left_root == right_root {
+            return false;
+        }
+        let merged_size = self.component_size[left_root] + self.component_size[right_root];
+        if merged_size > maximum_size {
+            return false;
+        }
+        if self.component_size[left_root] < self.component_size[right_root] {
+            std::mem::swap(&mut left_root, &mut right_root);
+        }
+        self.parent[right_root] = left_root;
+        self.component_size[left_root] = merged_size;
+        true
+    }
+}
+
+fn ordered_native_graph_components(
+    signature_ids: &[String],
+    uf: &mut NativeGraphUnionFind,
+) -> (Vec<Vec<String>>, Vec<usize>, HashMap<usize, usize>) {
+    let mut root_by_index = Vec::with_capacity(signature_ids.len());
+    let mut components_by_root: HashMap<usize, Vec<String>> = HashMap::new();
+    for (index, signature_id) in signature_ids.iter().enumerate() {
+        let root = uf.find(index);
+        root_by_index.push(root);
+        components_by_root
+            .entry(root)
+            .or_default()
+            .push(signature_id.clone());
+    }
+    let mut roots: Vec<usize> = components_by_root.keys().copied().collect();
+    roots.sort_by(|left, right| {
+        let left_values = components_by_root.get(left).expect("left root exists");
+        let right_values = components_by_root.get(right).expect("right root exists");
+        right_values.len().cmp(&left_values.len()).then_with(|| {
+            let left_first = left_values.iter().min().expect("left component nonempty");
+            let right_first = right_values.iter().min().expect("right component nonempty");
+            left_first.cmp(right_first)
+        })
+    });
+    let component_id_by_root: HashMap<usize, usize> = roots
+        .iter()
+        .enumerate()
+        .map(|(component_id, root)| (*root, component_id))
+        .collect();
+    let mut components = Vec::<Vec<String>>::with_capacity(roots.len());
+    for root in roots {
+        let mut values = components_by_root
+            .remove(&root)
+            .expect("component root exists");
+        values.sort_unstable();
+        components.push(values);
+    }
+    (components, root_by_index, component_id_by_root)
+}
+
+fn native_component_adjacency(
+    edge_scores: &HashMap<(usize, usize), f64>,
+    root_by_index: &[usize],
+    component_id_by_root: &HashMap<usize, usize>,
+    aggregate: bool,
+) -> HashMap<usize, HashMap<usize, f64>> {
+    let mut adjacency: HashMap<usize, HashMap<usize, f64>> = HashMap::new();
+    for ((left_index, right_index), score) in edge_scores {
+        let left_component = component_id_by_root[&root_by_index[*left_index]];
+        let right_component = component_id_by_root[&root_by_index[*right_index]];
+        if left_component == right_component {
+            continue;
+        }
+        if aggregate {
+            *adjacency
+                .entry(left_component)
+                .or_default()
+                .entry(right_component)
+                .or_insert(0.0) += *score;
+            *adjacency
+                .entry(right_component)
+                .or_default()
+                .entry(left_component)
+                .or_insert(0.0) += *score;
+        } else {
+            let left_neighbors = adjacency.entry(left_component).or_default();
+            if left_neighbors
+                .get(&right_component)
+                .map_or(true, |current| *score > *current)
+            {
+                left_neighbors.insert(right_component, *score);
+                adjacency
+                    .entry(right_component)
+                    .or_default()
+                    .insert(left_component, *score);
+            }
+        }
+    }
+    adjacency
+}
+
+fn component_affinities_to_bins(
+    component_id: usize,
+    component_to_bin: &HashMap<usize, usize>,
+    adjacency: &HashMap<usize, HashMap<usize, f64>>,
+    top_k: usize,
+) -> HashMap<usize, f64> {
+    let mut scores_by_bin: HashMap<usize, Vec<f64>> = HashMap::new();
+    if let Some(neighbors) = adjacency.get(&component_id) {
+        for (neighbor_component_id, score) in neighbors {
+            if let Some(bin_index) = component_to_bin.get(neighbor_component_id) {
+                scores_by_bin.entry(*bin_index).or_default().push(*score);
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for (bin_index, mut scores) in scores_by_bin {
+        if top_k > 0 && scores.len() > top_k {
+            scores.sort_by(|left, right| right.total_cmp(left));
+            scores.truncate(top_k);
+        }
+        out.insert(bin_index, scores.iter().sum());
+    }
+    out
+}
+
+fn pack_native_components_by_size(
+    components: &[Vec<String>],
+    target_subblock_size: usize,
+) -> PyResult<Vec<Vec<String>>> {
+    let mut bins: Vec<Vec<String>> = Vec::new();
+    let mut bin_sizes: Vec<usize> = Vec::new();
+    for component in components {
+        let component_size = component.len();
+        if component_size > target_subblock_size {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Graph component size {component_size} exceeds target_subblock_size={target_subblock_size}"
+            )));
+        }
+        let mut best_bin = None;
+        let mut best_remaining = None;
+        for (bin_index, bin_size) in bin_sizes.iter().enumerate() {
+            let remaining = target_subblock_size - *bin_size;
+            if component_size <= remaining
+                && best_remaining.map_or(true, |current| remaining < current)
+            {
+                best_bin = Some(bin_index);
+                best_remaining = Some(remaining);
+            }
+        }
+        if let Some(bin_index) = best_bin {
+            bins[bin_index].extend(component.iter().cloned());
+            bin_sizes[bin_index] += component_size;
+        } else {
+            bins.push(component.clone());
+            bin_sizes.push(component_size);
+        }
+    }
+    for values in bins.iter_mut() {
+        values.sort_unstable();
+    }
+    Ok(bins)
+}
+
+fn pack_native_component_ids_greedy(
+    components: &[Vec<String>],
+    edge_scores: &HashMap<(usize, usize), f64>,
+    root_by_index: &[usize],
+    component_id_by_root: &HashMap<usize, usize>,
+    target_subblock_size: usize,
+    config: &NativeGraphSubblockingConfig,
+) -> PyResult<Vec<Vec<usize>>> {
+    let use_aggregate = config.component_pack_strategy == "aggregate-greedy";
+    let adjacency = native_component_adjacency(
+        edge_scores,
+        root_by_index,
+        component_id_by_root,
+        use_aggregate,
+    );
+    let mut component_order: Vec<usize> = (0..components.len()).collect();
+    component_order.sort_by(|left, right| {
+        components[*right]
+            .len()
+            .cmp(&components[*left].len())
+            .then_with(|| components[*left][0].cmp(&components[*right][0]))
+    });
+    let mut bins: Vec<Vec<usize>> = Vec::new();
+    let mut bin_sizes: Vec<usize> = Vec::new();
+    let mut component_to_bin: HashMap<usize, usize> = HashMap::new();
+    for component_id in component_order {
+        let component_size = components[component_id].len();
+        if component_size > target_subblock_size {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Graph component size {component_size} exceeds target_subblock_size={target_subblock_size}"
+            )));
+        }
+        let mut candidate_bins: HashMap<usize, f64> = HashMap::new();
+        if use_aggregate {
+            for (bin_index, affinity) in component_affinities_to_bins(
+                component_id,
+                &component_to_bin,
+                &adjacency,
+                config.component_pack_top_k,
+            ) {
+                if bin_index < bins.len()
+                    && bin_sizes[bin_index] + component_size <= target_subblock_size
+                    && affinity > 0.0
+                {
+                    candidate_bins.insert(bin_index, affinity);
+                }
+            }
+        } else if let Some(neighbors) = adjacency.get(&component_id) {
+            for (neighbor_component, score) in neighbors {
+                if let Some(bin_index) = component_to_bin.get(neighbor_component) {
+                    if bin_sizes[*bin_index] + component_size > target_subblock_size {
+                        continue;
+                    }
+                    if candidate_bins
+                        .get(bin_index)
+                        .map_or(true, |current| *score > *current)
+                    {
+                        candidate_bins.insert(*bin_index, *score);
+                    }
+                }
+            }
+        }
+        let selected_bin = if candidate_bins.is_empty() {
+            let mut best_bin = None;
+            let mut best_remaining = None;
+            for (bin_index, bin_size) in bin_sizes.iter().enumerate() {
+                let remaining = target_subblock_size - *bin_size;
+                if component_size <= remaining
+                    && best_remaining.map_or(true, |current| remaining < current)
+                {
+                    best_bin = Some(bin_index);
+                    best_remaining = Some(remaining);
+                }
+            }
+            best_bin
+        } else {
+            candidate_bins.keys().copied().min_by(|left, right| {
+                let left_affinity = candidate_bins[left];
+                let right_affinity = candidate_bins[right];
+                right_affinity
+                    .total_cmp(&left_affinity)
+                    .then_with(|| {
+                        let left_remaining =
+                            target_subblock_size - (bin_sizes[*left] + component_size);
+                        let right_remaining =
+                            target_subblock_size - (bin_sizes[*right] + component_size);
+                        left_remaining.cmp(&right_remaining)
+                    })
+                    .then_with(|| left.cmp(right))
+            })
+        };
+        let bin_index = match selected_bin {
+            Some(value) => value,
+            None => {
+                bins.push(Vec::new());
+                bin_sizes.push(0);
+                bins.len() - 1
+            }
+        };
+        bins[bin_index].push(component_id);
+        bin_sizes[bin_index] += component_size;
+        component_to_bin.insert(component_id, bin_index);
+    }
+    if config.local_move_passes == 0 {
+        return Ok(bins);
+    }
+    Ok(local_move_native_component_bins(
+        components,
+        &bins,
+        &adjacency,
+        target_subblock_size,
+        config.local_move_passes,
+        config.component_pack_top_k,
+    ))
+}
+
+fn local_move_native_component_bins(
+    components: &[Vec<String>],
+    bins: &[Vec<usize>],
+    adjacency: &HashMap<usize, HashMap<usize, f64>>,
+    target_subblock_size: usize,
+    passes: usize,
+    top_k: usize,
+) -> Vec<Vec<usize>> {
+    let mut working_bins = bins.to_vec();
+    let mut bin_sizes: Vec<usize> = working_bins
+        .iter()
+        .map(|component_ids| {
+            component_ids
+                .iter()
+                .map(|component_id| components[*component_id].len())
+                .sum()
+        })
+        .collect();
+    for _pass_index in 0..passes {
+        let mut moved = false;
+        let mut component_to_bin: HashMap<usize, usize> = HashMap::new();
+        for (bin_index, component_ids) in working_bins.iter().enumerate() {
+            for component_id in component_ids {
+                component_to_bin.insert(*component_id, bin_index);
+            }
+        }
+        let mut component_order: Vec<usize> = component_to_bin.keys().copied().collect();
+        component_order.sort_by(|left, right| {
+            components[*left]
+                .len()
+                .cmp(&components[*right].len())
+                .then_with(|| components[*left][0].cmp(&components[*right][0]))
+        });
+        for component_id in component_order {
+            let Some(source_bin) = component_to_bin.get(&component_id).copied() else {
+                continue;
+            };
+            let component_size = components[component_id].len();
+            let affinities =
+                component_affinities_to_bins(component_id, &component_to_bin, adjacency, top_k);
+            let current_affinity = affinities.get(&source_bin).copied().unwrap_or(0.0);
+            let mut best_bin = None;
+            let mut best_gain = 0.0;
+            for (target_bin, candidate_affinity) in affinities {
+                if target_bin >= working_bins.len() || target_bin == source_bin {
+                    continue;
+                }
+                if bin_sizes[target_bin] + component_size > target_subblock_size {
+                    continue;
+                }
+                let gain = candidate_affinity - current_affinity;
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_bin = Some(target_bin);
+                }
+            }
+            let Some(target_bin) = best_bin else {
+                continue;
+            };
+            if let Some(position) = working_bins[source_bin]
+                .iter()
+                .position(|candidate| *candidate == component_id)
+            {
+                working_bins[source_bin].remove(position);
+                working_bins[target_bin].push(component_id);
+                bin_sizes[source_bin] -= component_size;
+                bin_sizes[target_bin] += component_size;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+        let mut nonempty_bins = Vec::new();
+        let mut nonempty_sizes = Vec::new();
+        for (component_ids, bin_size) in working_bins.into_iter().zip(bin_sizes.into_iter()) {
+            if !component_ids.is_empty() {
+                nonempty_bins.push(component_ids);
+                nonempty_sizes.push(bin_size);
+            }
+        }
+        working_bins = nonempty_bins;
+        bin_sizes = nonempty_sizes;
+    }
+    working_bins
+}
+
+fn component_ids_to_native_subblocks(
+    components: &[Vec<String>],
+    bins: &[Vec<usize>],
+) -> Vec<Vec<String>> {
+    let mut packed = Vec::new();
+    for component_ids in bins {
+        let mut ordered_component_ids = component_ids.clone();
+        ordered_component_ids
+            .sort_by(|left, right| components[*left][0].cmp(&components[*right][0]));
+        let mut values = Vec::new();
+        for component_id in ordered_component_ids {
+            values.extend(components[component_id].iter().cloned());
+        }
+        values.sort_unstable();
+        packed.push(values);
+    }
+    packed
+}
+
+fn pack_native_graph_components(
+    components: &[Vec<String>],
+    edge_scores: &HashMap<(usize, usize), f64>,
+    root_by_index: &[usize],
+    component_id_by_root: &HashMap<usize, usize>,
+    target_subblock_size: usize,
+    config: &NativeGraphSubblockingConfig,
+) -> PyResult<Vec<Vec<String>>> {
+    if !config.pack_components {
+        return Ok(components.to_vec());
+    }
+    if config.component_pack_strategy == "size" {
+        return pack_native_components_by_size(components, target_subblock_size);
+    }
+    let bins = pack_native_component_ids_greedy(
+        components,
+        edge_scores,
+        root_by_index,
+        component_id_by_root,
+        target_subblock_size,
+        config,
+    )?;
+    Ok(component_ids_to_native_subblocks(components, &bins))
+}
+
+fn native_graph_cluster(
+    signature_ids: Vec<String>,
+    store: &NativeGraphEvidenceStore,
+    target_subblock_size: usize,
+    config: &NativeGraphSubblockingConfig,
+    random_seed: u64,
+    telemetry: &mut NativeGraphTelemetry,
+) -> PyResult<HashMap<String, Vec<String>>> {
+    let fallback_start = Instant::now();
+    if signature_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if signature_ids.len() <= target_subblock_size {
+        return Ok(HashMap::from([("0".to_string(), signature_ids)]));
+    }
+    let config = config.effective_for_group(signature_ids.len());
+    if config.neighbor_mode == "exact" && signature_ids.len() > config.max_exact_knn_group_size {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Exact graph subblocking fallback group exceeds max_exact_knn_group_size: group_size={} max_exact_knn_group_size={}",
+            signature_ids.len(),
+            config.max_exact_knn_group_size
+        )));
+    }
+    let mut evidences = Vec::with_capacity(signature_ids.len());
+    for signature_id in signature_ids.iter() {
+        let evidence = store.signatures.get(signature_id).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Arrow graph subblocking evidence is missing required signature: {signature_id:?}"
+            ))
+        })?;
+        evidences.push(evidence.clone());
+    }
+    let edge_start = Instant::now();
+    let mut edge_scores = if config.neighbor_mode == "exact" {
+        exact_native_graph_edge_scores(&evidences, &config)
+    } else {
+        projection_native_graph_edge_scores(
+            &signature_ids,
+            &evidences,
+            &config,
+            random_seed,
+            store.dimension,
+        )
+    };
+    let sparse_evidence_stats = if config.sparse_evidence_edges {
+        add_sparse_native_graph_edge_scores(&mut edge_scores, &evidences, &config)
+    } else {
+        SparseEvidenceStats {
+            sparse_evidence_neighbors: config.sparse_evidence_neighbors,
+            ..SparseEvidenceStats::default()
+        }
+    };
+    let edge_seconds = edge_start.elapsed().as_secs_f64();
+    let mut uf = NativeGraphUnionFind::new(signature_ids.len());
+    let mut sorted_edges: Vec<(f64, usize, usize)> = edge_scores
+        .iter()
+        .map(|((left, right), score)| (*score, *left, *right))
+        .collect();
+    sorted_edges.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| signature_ids[left.1].cmp(&signature_ids[right.1]))
+            .then_with(|| signature_ids[left.2].cmp(&signature_ids[right.2]))
+    });
+    for (_score, left, right) in sorted_edges {
+        uf.union_if_capacity(left, right, target_subblock_size);
+    }
+    let (raw_components, root_by_index, component_id_by_root) =
+        ordered_native_graph_components(&signature_ids, &mut uf);
+    let mut ordered_components = pack_native_graph_components(
+        &raw_components,
+        &edge_scores,
+        &root_by_index,
+        &component_id_by_root,
+        target_subblock_size,
+        &config,
+    )?;
+    ordered_components.sort_by(|left, right| {
+        right
+            .len()
+            .cmp(&left.len())
+            .then_with(|| left[0].cmp(&right[0]))
+    });
+    let raw_sizes: Vec<usize> = raw_components.iter().map(Vec::len).collect();
+    let sizes: Vec<usize> = ordered_components.iter().map(Vec::len).collect();
+    telemetry.stats.push(NativeGraphFallbackStats {
+        input_signature_count: signature_ids.len(),
+        neighbor_mode: config.neighbor_mode.clone(),
+        projection_count: config.projection_count,
+        projection_window: config.projection_window,
+        candidate_edge_count: edge_scores.len(),
+        sparse_evidence_stats,
+        raw_component_count: raw_components.len(),
+        raw_max_component_size: raw_sizes.iter().copied().max().unwrap_or(0),
+        raw_median_component_size: median_usize(&raw_sizes),
+        packed_component_count: ordered_components.len(),
+        max_component_size: sizes.iter().copied().max().unwrap_or(0),
+        median_component_size: median_usize(&sizes),
+        pack_components: config.pack_components,
+        component_pack_strategy: config.component_pack_strategy.clone(),
+        component_pack_top_k: config.component_pack_top_k,
+        local_move_passes: config.local_move_passes,
+        edge_build_seconds: edge_seconds,
+        total_seconds: fallback_start.elapsed().as_secs_f64(),
+    });
+    Ok(ordered_components
+        .into_iter()
+        .enumerate()
+        .map(|(index, values)| (index.to_string(), values))
+        .collect())
+}
+
+fn collect_native_graph_signature_groups(signature_groups: &[Vec<String>]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for group in signature_groups {
+        for signature_id in group {
+            if seen.insert(signature_id.clone()) {
+                out.push(signature_id.clone());
+            }
+        }
+    }
+    out
+}
+
+fn build_native_graph_evidence_store(
+    py: Python<'_>,
+    paths: &Bound<'_, PyAny>,
+    row_by_signature_id: &HashMap<String, SubblockingSignatureRow>,
+    fallback_signature_groups: &[Vec<String>],
+    telemetry: &mut NativeGraphTelemetry,
+) -> PyResult<NativeGraphEvidenceStore> {
+    let load_start = Instant::now();
+    let graph_paths = NativeGraphArrowPaths::from_py(paths)?;
+    let fallback_signature_ids = collect_native_graph_signature_groups(fallback_signature_groups);
+    telemetry.load_metrics.signatures_record_batches_scanned = 0;
+    telemetry.load_metrics.signatures_rows_scanned = fallback_signature_ids.len();
+    telemetry.load_metrics.signatures_rows_loaded = fallback_signature_ids.len();
+    let mut paper_ids = HashSet::<String>::new();
+    for signature_id in fallback_signature_ids.iter() {
+        let row = row_by_signature_id.get(signature_id).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "signatures Arrow is missing graph-subblocking signature ids: {signature_id:?}"
+            ))
+        })?;
+        if row.paper_id.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "signatures Arrow cannot contain empty paper_id values",
+            ));
+        }
+        paper_ids.insert(row.paper_id.clone());
+    }
+    let (paper_authors, paper_author_stats) = read_raw_arrow_paper_authors_with_optional_index(
+        &graph_paths.paper_authors_path,
+        Some(&graph_paths.paper_authors_batch_index_path),
+        &paper_ids,
+        false,
+    )?;
+    let (specter_by_paper_id, specter_stats) = read_raw_arrow_specter_with_optional_index(
+        &graph_paths.specter_path,
+        Some(&graph_paths.specter_batch_index_path),
+        &paper_ids,
+        false,
+    )?;
+    telemetry.load_metrics.paper_authors_record_batches_scanned = paper_author_stats.batches_read;
+    telemetry.load_metrics.paper_authors_rows_scanned = paper_author_stats.rows_scanned;
+    telemetry.load_metrics.paper_authors_rows_loaded =
+        paper_authors.values().map(Vec::len).sum::<usize>();
+    telemetry.load_metrics.specter_record_batches_scanned = specter_stats.batches_read;
+    telemetry.load_metrics.specter_rows_scanned = specter_stats.rows_scanned;
+    telemetry.load_metrics.specter_rows_loaded = specter_by_paper_id.len();
+
+    let affiliation_stopwords = extract_affiliation_stopwords(py)?;
+    let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
+    for signature_id in fallback_signature_ids.iter() {
+        let row = row_by_signature_id
+            .get(signature_id)
+            .expect("fallback signature row exists after validation");
+        for affiliation in row.affiliations.iter() {
+            ensure_unidecode_for_text(affiliation, &mut unidecode_char_map)?;
+        }
+    }
+    for authors in paper_authors.values() {
+        for (_position, author_name) in authors {
+            ensure_unidecode_for_text(author_name, &mut unidecode_char_map)?;
+        }
+    }
+
+    let dimension = specter_by_paper_id.values().next().map_or(0usize, Vec::len);
+    let mut signatures = HashMap::with_capacity(fallback_signature_ids.len());
+    for signature_id in fallback_signature_ids {
+        let row = row_by_signature_id
+            .get(&signature_id)
+            .expect("fallback signature row exists after validation");
+        let embedding = specter_by_paper_id
+            .get(&row.paper_id)
+            .cloned()
+            .unwrap_or_else(|| vec![0.0; dimension]);
+        let mut coauthor_blocks = HashSet::new();
+        if let Some(position) = row.position {
+            if let Some(authors) = paper_authors.get(&row.paper_id) {
+                for (author_position, author_name) in authors {
+                    if *author_position == position {
+                        continue;
+                    }
+                    let trimmed = author_name.trim();
+                    if trimmed.is_empty() {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "paper_authors Arrow cannot contain empty author_name values",
+                        ));
+                    }
+                    let normalized =
+                        normalize_text_compat_from_map(trimmed, false, &unidecode_char_map);
+                    let block = compute_block_compat(&normalized);
+                    if !block.is_empty() {
+                        coauthor_blocks.insert(block);
+                    }
+                }
+            }
+        }
+        let normalized_affiliations: Vec<String> = row
+            .affiliations
+            .iter()
+            .filter_map(|affiliation| {
+                let normalized =
+                    normalize_text_compat_from_map(affiliation, false, &unidecode_char_map);
+                if normalized.is_empty() {
+                    None
+                } else {
+                    Some(normalized)
+                }
+            })
+            .collect();
+        let affiliation_text = normalized_affiliations.join(" ");
+        let affiliation_keys: HashSet<String> =
+            word_ngrams_counter_python_compat(&affiliation_text, &affiliation_stopwords)
+                .into_keys()
+                .collect();
+        signatures.insert(
+            signature_id,
+            NativeGraphSignatureEvidence {
+                embedding: normalize_f32_vector(embedding, dimension),
+                coauthor_blocks,
+                affiliation_keys,
+            },
+        );
+    }
+    telemetry.load_seconds = load_start.elapsed().as_secs_f64();
+    Ok(NativeGraphEvidenceStore {
+        signatures,
+        dimension,
+    })
 }
 
 #[derive(Default)]
@@ -5908,7 +7125,21 @@ fn apply_orcid_subblocking(
             continue;
         }
 
-        let subblock_id_to_move_to = feasible_subblock_ids[0].clone();
+        let subblock_id_to_move_to = feasible_subblock_ids
+            .iter()
+            .min_by(|left, right| {
+                let left_count = current_subblock_counts.get(*left).copied().unwrap_or(0);
+                let right_count = current_subblock_counts.get(*right).copied().unwrap_or(0);
+                let left_score = left.matches("specter").count() * 10 + left.matches('|').count();
+                let right_score =
+                    right.matches("specter").count() * 10 + right.matches('|').count();
+                right_count
+                    .cmp(&left_count)
+                    .then_with(|| left_score.cmp(&right_score))
+                    .then_with(|| left.cmp(right))
+            })
+            .expect("feasible_subblock_ids is not empty")
+            .clone();
         let mut sig_ids_to_move = Vec::<String>::new();
         let mut moved_sig_ids_by_source: HashMap<String, HashSet<String>> = HashMap::new();
         for sig_id in orcid_sig_ids {
@@ -5951,14 +7182,14 @@ fn extract_string_vec_entries(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(String, V
     Ok(out)
 }
 
-fn make_subblocks_with_telemetry_from_rows(
+fn make_subblocks_with_telemetry_from_rows_native_graph(
     py: Python<'_>,
+    paths: &Bound<'_, PyAny>,
     rows: Vec<SubblockingSignatureRow>,
     maximum_size: usize,
     first_k_letter_counts_sorted: HashMap<String, HashMap<String, f64>>,
-    fallback_cluster_fn: &Bound<'_, PyAny>,
-    anddata: &Bound<'_, PyAny>,
-    compute_block_fn: Option<&Bound<'_, PyAny>>,
+    graph_config: NativeGraphSubblockingConfig,
+    random_seed: u64,
     use_orcid_subblocking: bool,
 ) -> PyResult<(HashMap<String, Vec<String>>, Py<PyDict>)> {
     if maximum_size == 0 {
@@ -6061,13 +7292,18 @@ fn make_subblocks_with_telemetry_from_rows(
             }
         })
         .collect();
-    if !fallback_signature_groups.is_empty() {
-        if let Ok(prepare_fallback) = fallback_cluster_fn.getattr("prepare") {
-            if prepare_fallback.is_callable() {
-                prepare_fallback.call1((fallback_signature_groups.clone(),))?;
-            }
-        }
-    }
+    let mut graph_telemetry = NativeGraphTelemetry::default();
+    let graph_store = if fallback_signature_groups.is_empty() {
+        None
+    } else {
+        Some(build_native_graph_evidence_store(
+            py,
+            paths,
+            &row_by_signature_id,
+            &fallback_signature_groups,
+            &mut graph_telemetry,
+        )?)
+    };
 
     for (key, sig_ids_loop) in output_for_specter.entries {
         if sig_ids_loop.len() <= maximum_size {
@@ -6077,14 +7313,25 @@ fn make_subblocks_with_telemetry_from_rows(
         } else {
             telemetry.specter_invocation_count += 1;
             telemetry.specter_input_signature_count += sig_ids_loop.len();
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("target_subblock_size", maximum_size)?;
-            if let Some(compute_block_fn_value) = compute_block_fn {
-                kwargs.set_item("compute_block_fn", compute_block_fn_value)?;
-            }
-            let specter_clustering =
-                fallback_cluster_fn.call((sig_ids_loop, anddata), Some(&kwargs))?;
-            for (key_loop, values) in extract_string_vec_entries(&specter_clustering)? {
+            let store = graph_store.as_ref().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "Native graph fallback evidence store was not loaded for an oversized group",
+                )
+            })?;
+            let mut specter_clustering = native_graph_cluster(
+                sig_ids_loop,
+                store,
+                maximum_size,
+                &graph_config,
+                random_seed,
+                &mut graph_telemetry,
+            )?;
+            let mut keys: Vec<String> = specter_clustering.keys().cloned().collect();
+            keys.sort_unstable();
+            for key_loop in keys {
+                let values = specter_clustering
+                    .remove(&key_loop)
+                    .expect("native graph subblock key exists");
                 output.insert(format!("{key}|specter={key_loop}"), values);
             }
         }
@@ -6123,7 +7370,18 @@ fn make_subblocks_with_telemetry_from_rows(
     telemetry.final_subblock_count = output.len();
     telemetry.final_specter_labeled_subblock_count = final_specter_subblock_count;
     telemetry.final_specter_labeled_signature_count = final_specter_signature_count;
-    Ok((output.to_hashmap(), telemetry.to_dict(py)?))
+    let telemetry_dict = telemetry.to_dict(py)?;
+    insert_native_graph_telemetry(py, telemetry_dict.bind(py), &graph_telemetry)?;
+    Ok((output.to_hashmap(), telemetry_dict))
+}
+
+#[pyfunction]
+#[pyo3(signature = (text, special_case_apostrophes = false))]
+fn normalize_text_compat(text: Option<String>, special_case_apostrophes: bool) -> String {
+    match text {
+        Some(value) => normalize_text_compat_native(&value, special_case_apostrophes),
+        None => String::new(),
+    }
 }
 
 #[pyfunction]
@@ -6132,21 +7390,19 @@ fn make_subblocks_with_telemetry_from_rows(
     signature_ids,
     maximum_size,
     first_k_letter_counts_sorted,
-    fallback_cluster_fn,
-    anddata,
-    compute_block_fn = None,
+    graph_config = None,
+    random_seed = 0,
     use_orcid_subblocking = true,
     full_scan_without_index = false
 ))]
-fn make_subblocks_with_telemetry_arrow(
+fn make_subblocks_with_telemetry_arrow_native_graph(
     py: Python<'_>,
     paths: &Bound<'_, PyAny>,
     signature_ids: Vec<String>,
     maximum_size: usize,
     first_k_letter_counts_sorted: HashMap<String, HashMap<String, f64>>,
-    fallback_cluster_fn: &Bound<'_, PyAny>,
-    anddata: &Bound<'_, PyAny>,
-    compute_block_fn: Option<&Bound<'_, PyAny>>,
+    graph_config: Option<&Bound<'_, PyAny>>,
+    random_seed: u64,
     use_orcid_subblocking: bool,
     full_scan_without_index: bool,
 ) -> PyResult<(HashMap<String, Vec<String>>, Py<PyDict>)> {
@@ -6190,23 +7446,22 @@ fn make_subblocks_with_telemetry_arrow(
         })
         .collect();
     let text_module = py.import("s2and.text")?;
-    let unidecode = text_module.getattr("unidecode")?;
     let name_prefixes = extract_required_string_set(&text_module.getattr("NAME_PREFIXES")?)?;
     let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
     for row in signature_rows.iter() {
-        ensure_unidecode_for_text(&unidecode, &row.first, &mut unidecode_char_map)?;
-        ensure_unidecode_for_text(&unidecode, &row.middle, &mut unidecode_char_map)?;
+        ensure_unidecode_for_text(&row.first, &mut unidecode_char_map)?;
+        ensure_unidecode_for_text(&row.middle, &mut unidecode_char_map)?;
     }
     normalize_subblocking_signature_rows(&mut signature_rows, &name_prefixes, &unidecode_char_map);
 
-    make_subblocks_with_telemetry_from_rows(
+    make_subblocks_with_telemetry_from_rows_native_graph(
         py,
+        paths,
         signature_rows,
         maximum_size,
         first_k_letter_counts_sorted,
-        fallback_cluster_fn,
-        anddata,
-        compute_block_fn,
+        NativeGraphSubblockingConfig::from_py(graph_config)?,
+        random_seed,
         use_orcid_subblocking,
     )
 }
@@ -7827,13 +9082,6 @@ impl RustFeaturizer {
     #[classattr]
     const SUPPORTS_FROM_DATASET_PAPER_PREPROCESS: bool = true;
 
-    fn json_ingest_telemetry(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
-        self.json_ingest_telemetry
-            .as_ref()
-            .map(|telemetry| json_ingest_telemetry_to_py(py, telemetry))
-            .transpose()
-    }
-
     #[staticmethod]
     #[pyo3(signature = (dataset, cluster_seed_require_value = 0.0, cluster_seed_disallow_value = 10000.0, num_threads = None))]
     fn from_dataset(
@@ -7853,7 +9101,6 @@ impl RustFeaturizer {
             .unwrap_or(true);
 
         let text_module = py.import("s2and.text")?;
-        let unidecode = text_module.getattr("unidecode")?;
         let stop_words = extract_required_string_set(&text_module.getattr("STOPWORDS")?)?;
         let venue_stop_words =
             extract_required_string_set(&text_module.getattr("VENUE_STOP_WORDS")?)?;
@@ -7895,7 +9142,17 @@ impl RustFeaturizer {
         )?;
         let specter_obj = dataset.getattr("specter_embeddings").ok();
         let specter_dict = match specter_obj.as_ref() {
-            Some(value) if !value.is_none() => Some(specter_payload_to_dict(py, value)?),
+            Some(value) if !value.is_none() => Some(
+                value
+                    .downcast::<PyDict>()
+                    .map_err(|_| {
+                        pyo3::exceptions::PyTypeError::new_err(concat!(
+                            "RustFeaturizer.from_dataset requires dataset.specter_embeddings to be a dict; ",
+                            "load or normalize pickle tuple payloads in Python before calling Rust"
+                        ))
+                    })?
+                    .clone(),
+            ),
             _ => None,
         };
 
@@ -8054,17 +9311,13 @@ impl RustFeaturizer {
                 || need_journal_ngrams
                 || need_language;
             if need_author_normalization {
-                ensure_unidecode_for_text(&unidecode, &raw_title, &mut unidecode_char_map)?;
+                ensure_unidecode_for_text(&raw_title, &mut unidecode_char_map)?;
                 if preprocess {
-                    ensure_unidecode_for_text(&unidecode, &raw_venue, &mut unidecode_char_map)?;
-                    ensure_unidecode_for_text(
-                        &unidecode,
-                        &raw_journal_name,
-                        &mut unidecode_char_map,
-                    )?;
+                    ensure_unidecode_for_text(&raw_venue, &mut unidecode_char_map)?;
+                    ensure_unidecode_for_text(&raw_journal_name, &mut unidecode_char_map)?;
                 }
                 for (_, author_name) in paper_authors.iter() {
-                    ensure_unidecode_for_text(&unidecode, author_name, &mut unidecode_char_map)?;
+                    ensure_unidecode_for_text(author_name, &mut unidecode_char_map)?;
                 }
                 paper_inputs.push(PaperInput {
                     paper_id: paper_id.clone(),
@@ -8297,9 +9550,9 @@ impl RustFeaturizer {
                 "author_info_last_normalized",
             )?)?;
             if first.is_none() || middle.is_none() || last_normalized.is_none() {
-                ensure_unidecode_for_text(&unidecode, &raw_first, &mut unidecode_char_map)?;
-                ensure_unidecode_for_text(&unidecode, &raw_middle, &mut unidecode_char_map)?;
-                ensure_unidecode_for_text(&unidecode, &raw_last, &mut unidecode_char_map)?;
+                ensure_unidecode_for_text(&raw_first, &mut unidecode_char_map)?;
+                ensure_unidecode_for_text(&raw_middle, &mut unidecode_char_map)?;
+                ensure_unidecode_for_text(&raw_last, &mut unidecode_char_map)?;
 
                 let (first_without_apostrophe, middle_without_apostrophe) =
                     split_first_middle_hyphen_aware_compat(
@@ -8423,7 +9676,7 @@ impl RustFeaturizer {
                 let mut normalized_affiliation_list: Vec<String> =
                     Vec::with_capacity(affiliation_list.len());
                 for affiliation in affiliation_list.iter() {
-                    ensure_unidecode_for_text(&unidecode, affiliation, &mut unidecode_char_map)?;
+                    ensure_unidecode_for_text(affiliation, &mut unidecode_char_map)?;
                     normalized_affiliation_list.push(normalize_text_compat_from_map(
                         affiliation,
                         false,
@@ -8519,7 +9772,6 @@ impl RustFeaturizer {
             compute_reference_features,
             cluster_seed_require_value,
             cluster_seed_disallow_value,
-            json_ingest_telemetry: None,
             cached_signature_id_order: OnceLock::new(),
             cluster_seeds_disallow_index: OnceLock::new(),
         })
@@ -8599,7 +9851,6 @@ impl RustFeaturizer {
             .as_ref()
             .map(|ids| ids.iter().cloned().collect());
 
-        let parse_start = Instant::now();
         let (raw_signatures, _) = read_raw_arrow_signatures_with_optional_index(
             &signatures_path,
             signatures_batch_index_path.as_deref(),
@@ -8679,10 +9930,7 @@ impl RustFeaturizer {
                 }
             }
         }
-        let parse_seconds = parse_start.elapsed().as_secs_f64();
-
         let text_module = py.import("s2and.text")?;
-        let unidecode = text_module.getattr("unidecode")?;
         let stop_words = extract_required_string_set(&text_module.getattr("STOPWORDS")?)?;
         let venue_stop_words =
             extract_required_string_set(&text_module.getattr("VENUE_STOP_WORDS")?)?;
@@ -8703,13 +9951,11 @@ impl RustFeaturizer {
 
         let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
         ensure_unidecode_for_raw_arrow_inputs(
-            &unidecode,
             &raw_signatures,
             &raw_papers,
             &raw_authors_by_paper,
             &mut unidecode_char_map,
         )?;
-        let mut defaulted_signature_author_position_count = 0usize;
         let mut signature_inputs = Vec::<StageSignatureInput>::with_capacity(signature_ids.len());
         for signature_id in signature_ids.iter() {
             let raw_signature = raw_signatures.get(signature_id).ok_or_else(|| {
@@ -8717,10 +9963,7 @@ impl RustFeaturizer {
                     "Arrow signatures input is missing signature_id '{signature_id}'"
                 ))
             })?;
-            let position = raw_signature.position.unwrap_or_else(|| {
-                defaulted_signature_author_position_count += 1;
-                0
-            });
+            let position = raw_signature.position.unwrap_or(0);
             signature_inputs.push(StageSignatureInput {
                 sig_id: signature_id.clone(),
                 paper_id: raw_signature.paper_id.clone(),
@@ -8767,7 +10010,6 @@ impl RustFeaturizer {
             });
         }
 
-        let paper_preprocess_start = Instant::now();
         let computed_papers = py.allow_threads(|| {
             let compute = || {
                 preprocess_stage_papers(
@@ -8785,9 +10027,6 @@ impl RustFeaturizer {
         for (paper_id, preprocessed) in computed_papers {
             preprocessed_papers.insert(paper_id, preprocessed);
         }
-        let paper_preprocess_seconds = paper_preprocess_start.elapsed().as_secs_f64();
-
-        let signature_preprocess_start = Instant::now();
         let computed_signatures = py.allow_threads(|| {
             let compute = || {
                 preprocess_stage_signatures(
@@ -8807,17 +10046,10 @@ impl RustFeaturizer {
         for (sig_id, signature) in computed_signatures {
             signatures.insert(sig_id, signature);
         }
-        let signature_preprocess_seconds = signature_preprocess_start.elapsed().as_secs_f64();
-
-        let reference_counter_start = Instant::now();
-        let mut missing_specter_paper_count = 0usize;
         let mut papers: HashMap<PaperId, PaperData> =
             HashMap::with_capacity(preprocessed_papers.len());
         for (paper_id, paper) in preprocessed_papers.into_iter() {
             let specter = specter_by_paper.get(&paper_id).cloned();
-            if specter.is_none() {
-                missing_specter_paper_count += 1;
-            }
             let specter_norm = specter.as_ref().map(|values| {
                 values
                     .iter()
@@ -8850,27 +10082,10 @@ impl RustFeaturizer {
                 },
             );
         }
-        let reference_counter_seconds = reference_counter_start.elapsed().as_secs_f64();
-
         let name_tuples = match name_tuples_arrow_path.as_ref() {
             Some(path) => read_raw_arrow_name_tuples(path)?,
             None => extract_name_tuples_argument(py, name_tuples)?,
         };
-        let json_ingest_telemetry = JsonIngestTelemetry {
-            json_parse_seconds: parse_seconds,
-            paper_preprocess_seconds,
-            reference_counter_seconds,
-            signature_preprocess_seconds,
-            cluster_seed_seconds: 0.0,
-            missing_specter_paper_count,
-            defaulted_name_count_signature_count: 0,
-            defaulted_name_count_first_count: 0,
-            defaulted_name_count_first_last_count: 0,
-            defaulted_name_count_last_count: 0,
-            defaulted_name_count_last_first_initial_count: 0,
-            defaulted_signature_author_position_count,
-            defaulted_paper_author_position_count: 0,
-        };
 
         Ok(RustFeaturizer {
             signatures,
@@ -8882,827 +10097,6 @@ impl RustFeaturizer {
             compute_reference_features,
             cluster_seed_require_value,
             cluster_seed_disallow_value,
-            json_ingest_telemetry: Some(json_ingest_telemetry),
-            cached_signature_id_order: OnceLock::new(),
-            cluster_seeds_disallow_index: OnceLock::new(),
-        })
-    }
-
-    #[staticmethod]
-    #[pyo3(
-        signature = (
-            signatures_path,
-            papers_path,
-            cluster_seeds_path = None,
-            specter_embeddings = None,
-            name_tuples_path = None,
-            name_counts_path = None,
-            preprocess = true,
-            compute_reference_features = false,
-            cluster_seed_require_value = 0.0,
-            cluster_seed_disallow_value = 10000.0,
-            num_threads = None,
-            expected_normalization_version = None,
-            allow_normalization_version_mismatch = false
-        )
-    )]
-    fn from_json_paths(
-        py: Python<'_>,
-        signatures_path: &str,
-        papers_path: &str,
-        cluster_seeds_path: Option<&str>,
-        specter_embeddings: Option<&Bound<'_, PyAny>>,
-        name_tuples_path: Option<&str>,
-        name_counts_path: Option<&str>,
-        preprocess: bool,
-        compute_reference_features: bool,
-        cluster_seed_require_value: f64,
-        cluster_seed_disallow_value: f64,
-        num_threads: Option<usize>,
-        expected_normalization_version: Option<&str>,
-        allow_normalization_version_mismatch: bool,
-    ) -> PyResult<Self> {
-        let text_module = py.import("s2and.text")?;
-        let unidecode = text_module.getattr("unidecode")?;
-        let stop_words_obj = text_module.getattr("STOPWORDS")?;
-        let venue_stop_words_obj = text_module.getattr("VENUE_STOP_WORDS")?;
-        let name_prefixes_obj = text_module.getattr("NAME_PREFIXES")?;
-
-        let stop_words = extract_required_string_set(&stop_words_obj)?;
-        let venue_stop_words = extract_required_string_set(&venue_stop_words_obj)?;
-        let name_prefixes = extract_required_string_set(&name_prefixes_obj)?;
-
-        let language_detector = Some(LanguageDetectorCompat::new(py));
-
-        let json_parse_start = Instant::now();
-        let signatures_json = load_json_value(signatures_path)?;
-        let signatures_obj = json_as_object(&signatures_json, "signatures payload")?;
-        let raw_name_counts = load_raw_name_counts_from_json_path(
-            name_counts_path,
-            expected_normalization_version,
-            allow_normalization_version_mismatch,
-        )?;
-        let name_tuples = load_name_tuples_from_text_path(py, name_tuples_path)?;
-        let affiliation_stopwords = extract_affiliation_stopwords(py)?;
-
-        #[derive(Clone)]
-        struct SignatureInput {
-            sig_id: String,
-            paper_id: PaperId,
-            raw_first: String,
-            raw_middle: String,
-            raw_last: String,
-            email: Option<String>,
-            position: i64,
-            affiliation_values: Vec<String>,
-            source_id_source: Option<String>,
-            source_ids: Vec<String>,
-        }
-
-        #[derive(Clone)]
-        struct PaperInput {
-            paper_id: PaperId,
-            raw_title: String,
-            raw_venue: String,
-            raw_journal: String,
-            raw_authors: Vec<(i64, String)>,
-            references: HashSet<PaperId>,
-            year: Option<i64>,
-            has_abstract: bool,
-            predicted_language: Option<String>,
-            is_reliable: bool,
-        }
-
-        let paper_preprocess_start = Instant::now();
-        let mut needed_paper_ids: HashSet<PaperId> = HashSet::new();
-        let mut signature_inputs: Vec<SignatureInput> = Vec::with_capacity(signatures_obj.len());
-        let mut paper_inputs: Vec<PaperInput> = Vec::new();
-        let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
-        let mut defaulted_signature_author_position_count = 0usize;
-        for (sig_id, sig_value) in signatures_obj.iter() {
-            let sig_dict = json_as_object(sig_value, "signature entry")?;
-            let paper_id_value = json_get_required(sig_dict, "paper_id", "signature entry")?;
-            let paper_id = json_value_to_id(paper_id_value).ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("signature paper_id must be string/int")
-            })?;
-            needed_paper_ids.insert(paper_id.clone());
-
-            let author_info_value = json_get_required(sig_dict, "author_info", "signature entry")?;
-            let author_info = json_as_object(author_info_value, "signature author_info")?;
-            let raw_first = json_get_string(author_info, "first", "");
-            let raw_middle = json_get_string(author_info, "middle", "");
-            let raw_last = json_get_string(author_info, "last", "");
-            let email = json_get_optional_string(author_info, "email");
-            let position =
-                match json_get_i64_optional(author_info, "position", "signature author_info")? {
-                    Some(value) => value,
-                    None => {
-                        defaulted_signature_author_position_count += 1;
-                        0
-                    }
-                };
-            let affiliation_values = json_get_string_list(author_info.get("affiliations"));
-            let source_id_source = json_get_optional_string(author_info, "source_id_source");
-            let source_ids = if source_id_source.as_deref() == Some("ORCID") {
-                json_get_string_list(author_info.get("source_ids"))
-            } else {
-                Vec::new()
-            };
-
-            ensure_unidecode_for_text(&unidecode, &raw_first, &mut unidecode_char_map)?;
-            ensure_unidecode_for_text(&unidecode, &raw_middle, &mut unidecode_char_map)?;
-            ensure_unidecode_for_text(&unidecode, &raw_last, &mut unidecode_char_map)?;
-            for affiliation in affiliation_values.iter() {
-                ensure_unidecode_for_text(&unidecode, affiliation, &mut unidecode_char_map)?;
-            }
-
-            signature_inputs.push(SignatureInput {
-                sig_id: sig_id.clone(),
-                paper_id,
-                raw_first,
-                raw_middle,
-                raw_last,
-                email,
-                position,
-                affiliation_values,
-                source_id_source,
-                source_ids,
-            });
-        }
-        drop(signatures_json);
-
-        #[derive(Clone)]
-        struct PaperPreprocessed {
-            title: String,
-            venue: String,
-            journal_name: String,
-            authors: Vec<(i64, String)>,
-            references: HashSet<PaperId>,
-            year: Option<i64>,
-            has_abstract: bool,
-            predicted_language: Option<String>,
-            is_reliable: bool,
-            title_words: Option<CounterData>,
-            title_chars: Option<CounterData>,
-            venue_ngrams: Option<CounterData>,
-            journal_ngrams: Option<CounterData>,
-        }
-
-        let papers_json = load_json_value(papers_path)?;
-        let papers_obj = json_as_object(&papers_json, "papers payload")?;
-        let mut defaulted_paper_author_position_count = 0usize;
-        for (_paper_key, paper_value) in papers_obj.iter() {
-            let paper_dict = json_as_object(paper_value, "paper entry")?;
-            let paper_id_value = json_get_required(paper_dict, "paper_id", "paper entry")?;
-            let paper_id = json_value_to_id(paper_id_value).ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("paper paper_id must be string/int")
-            })?;
-            if !needed_paper_ids.contains(&paper_id) {
-                continue;
-            }
-
-            let raw_title = json_get_string(paper_dict, "title", "");
-            let raw_venue = json_get_string(paper_dict, "venue", "");
-            let raw_journal = json_get_string(paper_dict, "journal_name", "");
-
-            ensure_unidecode_for_text(&unidecode, &raw_title, &mut unidecode_char_map)?;
-            ensure_unidecode_for_text(&unidecode, &raw_venue, &mut unidecode_char_map)?;
-            ensure_unidecode_for_text(&unidecode, &raw_journal, &mut unidecode_char_map)?;
-
-            let mut raw_authors: Vec<(i64, String)> = Vec::new();
-            if let Some(author_values) = paper_dict.get("authors").and_then(JsonValue::as_array) {
-                for author_value in author_values {
-                    let Some(author_dict) = author_value.as_object() else {
-                        continue;
-                    };
-                    let position =
-                        match json_get_i64_optional(author_dict, "position", "paper author entry")?
-                        {
-                            Some(value) => value,
-                            None => {
-                                defaulted_paper_author_position_count += 1;
-                                0
-                            }
-                        };
-                    let raw_author_name = json_get_string(author_dict, "author_name", "");
-                    ensure_unidecode_for_text(
-                        &unidecode,
-                        &raw_author_name,
-                        &mut unidecode_char_map,
-                    )?;
-                    raw_authors.push((position, raw_author_name));
-                }
-            }
-
-            let references = json_get_id_set(paper_dict.get("references"));
-
-            let year = match json_get_i64_optional(paper_dict, "year", "paper entry")? {
-                Some(v) if v > 0 => Some(v),
-                _ => None,
-            };
-
-            let has_abstract = match paper_dict.get("abstract") {
-                None | Some(JsonValue::Null) => false,
-                Some(JsonValue::String(s)) => !s.is_empty(),
-                Some(_) => true,
-            };
-
-            let detector = language_detector.as_ref().ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("missing language detector")
-            })?;
-            let (is_reliable, _is_english, language) = detector.detect(&raw_title);
-            let predicted_language = Some(language);
-
-            paper_inputs.push(PaperInput {
-                paper_id,
-                raw_title,
-                raw_venue,
-                raw_journal,
-                raw_authors,
-                references,
-                year,
-                has_abstract,
-                predicted_language,
-                is_reliable,
-            });
-        }
-        drop(needed_paper_ids);
-        drop(papers_json);
-        let json_parse_seconds = json_parse_start.elapsed().as_secs_f64();
-
-        let computed_papers = py.allow_threads(|| {
-            let compute = || {
-                paper_inputs
-                    .par_iter()
-                    .map(|paper_input| {
-                        let title = normalize_text_compat_from_map(
-                            &paper_input.raw_title,
-                            false,
-                            &unidecode_char_map,
-                        );
-                        let venue = if preprocess {
-                            normalize_text_compat_from_map(
-                                &paper_input.raw_venue,
-                                false,
-                                &unidecode_char_map,
-                            )
-                        } else {
-                            paper_input.raw_venue.clone()
-                        };
-                        let journal_name = if preprocess {
-                            normalize_text_compat_from_map(
-                                &paper_input.raw_journal,
-                                false,
-                                &unidecode_char_map,
-                            )
-                        } else {
-                            paper_input.raw_journal.clone()
-                        };
-                        let authors = paper_input
-                            .raw_authors
-                            .iter()
-                            .map(|(position, raw_name)| {
-                                (
-                                    *position,
-                                    normalize_text_compat_from_map(
-                                        raw_name,
-                                        false,
-                                        &unidecode_char_map,
-                                    ),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-
-                        let title_words = counter_data_from_usize_map(
-                            word_ngrams_counter_python_compat(&title, &stop_words),
-                        );
-
-                        let title_chars = if preprocess {
-                            counter_data_from_usize_map(char_ngrams_counter_python_compat(
-                                &title,
-                                false,
-                                true,
-                                Some(&stop_words),
-                            ))
-                        } else {
-                            None
-                        };
-
-                        let venue_ngrams = if preprocess {
-                            counter_data_from_usize_map(char_ngrams_counter_python_compat(
-                                &venue,
-                                false,
-                                true,
-                                Some(&venue_stop_words),
-                            ))
-                        } else {
-                            None
-                        };
-
-                        let journal_ngrams = if preprocess {
-                            counter_data_from_usize_map(char_ngrams_counter_python_compat(
-                                &journal_name,
-                                false,
-                                true,
-                                Some(&venue_stop_words),
-                            ))
-                        } else {
-                            None
-                        };
-
-                        (
-                            paper_input.paper_id.clone(),
-                            PaperPreprocessed {
-                                title,
-                                venue,
-                                journal_name,
-                                authors,
-                                references: paper_input.references.clone(),
-                                year: paper_input.year,
-                                has_abstract: paper_input.has_abstract,
-                                predicted_language: paper_input.predicted_language.clone(),
-                                is_reliable: paper_input.is_reliable,
-                                title_words,
-                                title_chars,
-                                venue_ngrams,
-                                journal_ngrams,
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            };
-            install_with_optional_rayon_pool(num_threads, compute)
-        });
-        drop(paper_inputs);
-
-        let mut preprocessed_papers: HashMap<PaperId, PaperPreprocessed> =
-            HashMap::with_capacity(computed_papers.len());
-        for (paper_id, preprocessed) in computed_papers {
-            preprocessed_papers.insert(paper_id, preprocessed);
-        }
-        let paper_preprocess_seconds = paper_preprocess_start.elapsed().as_secs_f64();
-
-        let signature_preprocess_start = Instant::now();
-        let missing_paper_ids: Vec<String> = signature_inputs
-            .iter()
-            .filter(|entry| !preprocessed_papers.contains_key(&entry.paper_id))
-            .map(|entry| entry.paper_id.to_string())
-            .collect();
-        if !missing_paper_ids.is_empty() {
-            let examples = missing_paper_ids
-                .iter()
-                .take(5)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "signatures reference {} missing papers; examples: {}",
-                missing_paper_ids.len(),
-                examples
-            )));
-        }
-        let computed_signatures = py.allow_threads(|| {
-            let compute = || {
-                signature_inputs
-                    .par_iter()
-                    .map(|entry| {
-                        let middle_normalized = normalize_text_compat_from_map(
-                            &entry.raw_middle,
-                            false,
-                            &unidecode_char_map,
-                        );
-                        let first_normalized = normalize_text_compat_from_map(
-                            &entry.raw_first,
-                            false,
-                            &unidecode_char_map,
-                        );
-                        let first_normalized_token = first_normalized_token_python_compat(
-                            &first_normalized,
-                            &middle_normalized,
-                            &name_prefixes,
-                        );
-                        let (first_without_apostrophe, middle_without_apostrophe) =
-                            split_first_middle_hyphen_aware_compat(
-                                &entry.raw_first,
-                                &entry.raw_middle,
-                                &name_prefixes,
-                                &unidecode_char_map,
-                            );
-                        let last_normalized = normalize_text_compat_from_map(
-                            &entry.raw_last,
-                            false,
-                            &unidecode_char_map,
-                        );
-
-                        let mut coauthor_list: Vec<String> = Vec::new();
-                        if let Some(preprocessed_paper) = preprocessed_papers.get(&entry.paper_id) {
-                            for (author_position, author_name) in preprocessed_paper.authors.iter()
-                            {
-                                if *author_position != entry.position {
-                                    coauthor_list.push(author_name.clone());
-                                }
-                            }
-                        }
-                        let coauthors = if coauthor_list.is_empty() {
-                            None
-                        } else {
-                            Some(coauthor_list.iter().cloned().collect::<HashSet<String>>())
-                        };
-
-                        let mut coauthor_blocks_set: HashSet<String> = HashSet::new();
-                        for coauthor in coauthor_list.iter() {
-                            coauthor_blocks_set.insert(compute_block_compat(coauthor));
-                        }
-                        let coauthor_blocks = if coauthor_blocks_set.is_empty() {
-                            None
-                        } else {
-                            Some(coauthor_blocks_set)
-                        };
-
-                        let normalized_affiliations: Vec<String> = if preprocess {
-                            entry
-                                .affiliation_values
-                                .iter()
-                                .filter_map(|affiliation| {
-                                    let normalized = normalize_text_compat_from_map(
-                                        affiliation,
-                                        false,
-                                        &unidecode_char_map,
-                                    );
-                                    if normalized.is_empty() {
-                                        None
-                                    } else {
-                                        Some(normalized)
-                                    }
-                                })
-                                .collect()
-                        } else {
-                            entry.affiliation_values.clone()
-                        };
-
-                        let affiliation_text = if preprocess {
-                            prefilter_affiliation_text(
-                                &normalized_affiliations,
-                                &affiliation_stopwords,
-                            )
-                        } else {
-                            String::new()
-                        };
-                        let coauthor_text = if preprocess {
-                            coauthor_list.join(" ")
-                        } else {
-                            String::new()
-                        };
-
-                        let affiliations = if preprocess && !affiliation_text.is_empty() {
-                            counter_data_from_usize_map(word_ngrams_counter(&affiliation_text))
-                        } else {
-                            None
-                        };
-                        let coauthor_ngrams = if preprocess && !coauthor_text.is_empty() {
-                            counter_data_from_usize_map(char_ngrams_counter(&coauthor_text))
-                        } else {
-                            None
-                        };
-
-                        let normalized_orcid = if entry.source_id_source.as_deref() == Some("ORCID")
-                        {
-                            entry
-                                .source_ids
-                                .first()
-                                .and_then(|source_id| normalize_orcid_compact_owned(source_id))
-                        } else {
-                            None
-                        };
-
-                        let name_counts_result = build_name_counts_data_from_artifact(
-                            &raw_name_counts,
-                            &entry.raw_first,
-                            &first_normalized_token,
-                            &first_without_apostrophe,
-                            &entry.raw_last,
-                            &last_normalized,
-                        );
-
-                        (
-                            entry.sig_id.clone(),
-                            SignatureData {
-                                first: Some(first_without_apostrophe.clone()),
-                                middle: Some(middle_without_apostrophe),
-                                last_normalized: Some(last_normalized),
-                                orcid: normalized_orcid,
-                                email: entry.email.clone(),
-                                affiliations,
-                                coauthor_blocks,
-                                coauthor_ngrams,
-                                coauthors,
-                                position: entry.position,
-                                paper_id: entry.paper_id.clone(),
-                                name_counts: name_counts_result.data,
-                                adv_name: Some(first_without_apostrophe),
-                            },
-                            name_counts_result.telemetry,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            };
-            install_with_optional_rayon_pool(num_threads, compute)
-        });
-        let mut signatures: HashMap<String, SignatureData> =
-            HashMap::with_capacity(computed_signatures.len());
-        let mut defaulted_name_count_signature_count = 0usize;
-        let mut defaulted_name_count_first_count = 0usize;
-        let mut defaulted_name_count_first_last_count = 0usize;
-        let mut defaulted_name_count_last_count = 0usize;
-        let mut defaulted_name_count_last_first_initial_count = 0usize;
-        for (sig_id, signature, name_count_telemetry) in computed_signatures {
-            if name_count_telemetry.any() {
-                defaulted_name_count_signature_count += 1;
-            }
-            if name_count_telemetry.first {
-                defaulted_name_count_first_count += 1;
-            }
-            if name_count_telemetry.first_last {
-                defaulted_name_count_first_last_count += 1;
-            }
-            if name_count_telemetry.last {
-                defaulted_name_count_last_count += 1;
-            }
-            if name_count_telemetry.last_first_initial {
-                defaulted_name_count_last_first_initial_count += 1;
-            }
-            signatures.insert(sig_id, signature);
-        }
-        drop(signature_inputs);
-        drop(unidecode_char_map);
-        let mut signature_ids: Vec<String> = signatures.keys().cloned().collect();
-        signature_ids.sort_unstable();
-        let signature_preprocess_seconds = signature_preprocess_start.elapsed().as_secs_f64();
-
-        let specter_dict = match specter_embeddings {
-            Some(obj) => {
-                if let Ok(path) = obj.extract::<&str>() {
-                    load_pickle_dict(py, path)?
-                } else if let Ok(dict) = obj.downcast::<PyDict>() {
-                    Some(dict.clone())
-                } else if obj.is_none() {
-                    None
-                } else {
-                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                        "specter_embeddings must be str, dict, or None; got {}",
-                        obj.get_type().name()?
-                    )));
-                }
-            }
-            None => None,
-        };
-
-        let reference_counter_start = Instant::now();
-        let mut missing_specter_paper_count = 0usize;
-        let mut papers: HashMap<PaperId, PaperData> =
-            HashMap::with_capacity(preprocessed_papers.len());
-        if compute_reference_features {
-            for (paper_id, paper) in preprocessed_papers.iter() {
-                let mut ref_authors = None;
-                let mut ref_titles = None;
-                let mut ref_venues = None;
-                let mut ref_blocks = None;
-                let ref_details_present = true;
-
-                let mut titles: Vec<String> = Vec::new();
-                let mut venues: Vec<String> = Vec::new();
-                let mut journals: Vec<String> = Vec::new();
-                let mut authors: Vec<String> = Vec::new();
-                let mut blocks: Vec<String> = Vec::new();
-
-                for reference_id in paper.references.iter() {
-                    if let Some(reference_paper) = preprocessed_papers.get(reference_id) {
-                        if !reference_paper.title.is_empty() {
-                            titles.push(reference_paper.title.clone());
-                        }
-                        if !reference_paper.venue.is_empty() {
-                            venues.push(reference_paper.venue.clone());
-                        }
-                        if !reference_paper.journal_name.is_empty() {
-                            journals.push(reference_paper.journal_name.clone());
-                        }
-                        for (_, author_name) in reference_paper.authors.iter() {
-                            if author_name.is_empty() {
-                                continue;
-                            }
-                            authors.push(author_name.clone());
-                            let block = compute_block_compat(author_name);
-                            blocks.push(block);
-                        }
-                    }
-                }
-
-                let author_names = authors.join(" ");
-                let reference_titles = titles.join(" ");
-                let venues_joined = venues.join(" ");
-                let journals_joined = journals.join(" ");
-                let reference_venues = if venues_joined == journals_joined {
-                    venues_joined
-                } else {
-                    format!("{} {}", venues_joined, journals_joined)
-                        .trim()
-                        .to_string()
-                };
-
-                if !author_names.is_empty() {
-                    ref_authors = counter_data_from_usize_map(char_ngrams_counter_python_compat(
-                        &author_names,
-                        false,
-                        true,
-                        None,
-                    ));
-                }
-
-                if !reference_titles.is_empty() {
-                    ref_titles = counter_data_from_usize_map(char_ngrams_counter_python_compat(
-                        &reference_titles,
-                        false,
-                        true,
-                        Some(&stop_words),
-                    ));
-                }
-
-                if !reference_venues.is_empty() {
-                    ref_venues = counter_data_from_usize_map(char_ngrams_counter_python_compat(
-                        &reference_venues,
-                        false,
-                        true,
-                        Some(&venue_stop_words),
-                    ));
-                }
-
-                if !blocks.is_empty() {
-                    let mut block_counter: HashMap<String, usize> = HashMap::new();
-                    for block in blocks {
-                        *block_counter.entry(block).or_insert(0) += 1;
-                    }
-                    ref_blocks = counter_data_from_usize_map(block_counter);
-                }
-                let specter = if let Some(spec_dict) = &specter_dict {
-                    extract_specter_for_paper_id(spec_dict, paper_id)?
-                } else {
-                    None
-                };
-                if specter.is_none() {
-                    missing_specter_paper_count += 1;
-                }
-                let specter_norm = specter.as_ref().map(|values| {
-                    values
-                        .iter()
-                        .map(|value| {
-                            let value_f64 = *value as f64;
-                            value_f64 * value_f64
-                        })
-                        .sum::<f64>()
-                        .sqrt()
-                });
-
-                papers.insert(
-                    paper_id.clone(),
-                    PaperData {
-                        venue_ngrams: paper.venue_ngrams.clone(),
-                        title_words: paper.title_words.clone(),
-                        title_chars: paper.title_chars.clone(),
-                        ref_authors,
-                        ref_titles,
-                        ref_venues,
-                        ref_blocks,
-                        ref_details_present,
-                        references: paper.references.clone(),
-                        year: paper.year,
-                        has_abstract: paper.has_abstract,
-                        predicted_language: paper.predicted_language.clone(),
-                        is_reliable: paper.is_reliable,
-                        journal_ngrams: paper.journal_ngrams.clone(),
-                        specter,
-                        specter_norm,
-                    },
-                );
-            }
-        } else {
-            for (paper_id, paper) in preprocessed_papers.into_iter() {
-                let specter = if let Some(spec_dict) = &specter_dict {
-                    extract_specter_for_paper_id(spec_dict, &paper_id)?
-                } else {
-                    None
-                };
-                if specter.is_none() {
-                    missing_specter_paper_count += 1;
-                }
-                let specter_norm = specter.as_ref().map(|values| {
-                    values
-                        .iter()
-                        .map(|value| {
-                            let value_f64 = *value as f64;
-                            value_f64 * value_f64
-                        })
-                        .sum::<f64>()
-                        .sqrt()
-                });
-                papers.insert(
-                    paper_id,
-                    PaperData {
-                        venue_ngrams: paper.venue_ngrams,
-                        title_words: paper.title_words,
-                        title_chars: paper.title_chars,
-                        ref_authors: None,
-                        ref_titles: None,
-                        ref_venues: None,
-                        ref_blocks: None,
-                        ref_details_present: false,
-                        references: paper.references,
-                        year: paper.year,
-                        has_abstract: paper.has_abstract,
-                        predicted_language: paper.predicted_language,
-                        is_reliable: paper.is_reliable,
-                        journal_ngrams: paper.journal_ngrams,
-                        specter,
-                        specter_norm,
-                    },
-                );
-            }
-        }
-        let reference_counter_seconds = reference_counter_start.elapsed().as_secs_f64();
-
-        let cluster_seed_start = Instant::now();
-        let mut cluster_seeds_disallow: HashSet<(String, String)> = HashSet::new();
-        let mut cluster_seeds_require: HashMap<String, ClusterId> = HashMap::new();
-        if let Some(path) = cluster_seeds_path {
-            let cluster_seeds_json = load_json_value(path)?;
-            let cluster_seeds_obj = json_as_object(&cluster_seeds_json, "cluster_seeds payload")?;
-            let mut cluster_num = 0_i64;
-            for (signature_id_a, values_value) in cluster_seeds_obj.iter() {
-                let values_obj = json_as_object(values_value, "cluster seed entry")?;
-                let mut root_added = false;
-                for (signature_id_b, constraint_value) in values_obj.iter() {
-                    let constraint = match constraint_value {
-                        JsonValue::String(value) => value.as_str(),
-                        _ => {
-                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                                "cluster seed constraint for ({signature_id_a:?}, {signature_id_b:?}) must be a string"
-                            )));
-                        }
-                    };
-                    match constraint {
-                        "disallow" => {
-                            cluster_seeds_disallow.insert(canonical_signature_pair_cloned(
-                                signature_id_a,
-                                signature_id_b,
-                            ));
-                        }
-                        "require" => {
-                            if !root_added {
-                                cluster_seeds_require
-                                    .insert(signature_id_a.clone(), ClusterId::Int(cluster_num));
-                                root_added = true;
-                            }
-                            cluster_seeds_require
-                                .insert(signature_id_b.clone(), ClusterId::Int(cluster_num));
-                        }
-                        _ => {
-                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                                "unknown cluster seed constraint {constraint:?} for ({signature_id_a:?}, {signature_id_b:?}); expected 'require' or 'disallow'"
-                            )));
-                        }
-                    }
-                }
-                cluster_num += 1;
-            }
-        }
-        let cluster_seed_seconds = cluster_seed_start.elapsed().as_secs_f64();
-
-        let json_ingest_telemetry = JsonIngestTelemetry {
-            json_parse_seconds,
-            paper_preprocess_seconds,
-            reference_counter_seconds,
-            signature_preprocess_seconds,
-            cluster_seed_seconds,
-            missing_specter_paper_count,
-            defaulted_name_count_signature_count,
-            defaulted_name_count_first_count,
-            defaulted_name_count_first_last_count,
-            defaulted_name_count_last_count,
-            defaulted_name_count_last_first_initial_count,
-            defaulted_signature_author_position_count,
-            defaulted_paper_author_position_count,
-        };
-
-        Ok(RustFeaturizer {
-            signatures,
-            signature_ids,
-            papers,
-            name_tuples,
-            cluster_seeds_disallow,
-            cluster_seeds_require,
-            compute_reference_features,
-            cluster_seed_require_value,
-            cluster_seed_disallow_value,
-            json_ingest_telemetry: Some(json_ingest_telemetry),
             cached_signature_id_order: OnceLock::new(),
             cluster_seeds_disallow_index: OnceLock::new(),
         })
@@ -10136,79 +10530,6 @@ impl RustFeaturizer {
         Ok((left_indices, right_indices, values))
     }
 
-    fn featurize_pair(&self, sig_id1: &str, sig_id2: &str) -> PyResult<Vec<f64>> {
-        let s1 = self
-            .signatures
-            .get(sig_id1)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id1.to_string()))?;
-        let s2 = self
-            .signatures
-            .get(sig_id2)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id2.to_string()))?;
-        let p1 = self
-            .papers
-            .get(&s1.paper_id)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(s1.paper_id.to_string()))?;
-        let p2 = self
-            .papers
-            .get(&s2.paper_id)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(s2.paper_id.to_string()))?;
-        Ok(self.featurize_pair_data(s1, s2, p1, p2).to_vec())
-    }
-
-    #[pyo3(signature = (pairs, num_threads = None))]
-    fn featurize_pairs(
-        &self,
-        py: Python<'_>,
-        pairs: Vec<(String, String)>,
-        num_threads: Option<usize>,
-    ) -> PyResult<Vec<Vec<f64>>> {
-        for (sig_id1, sig_id2) in pairs.iter() {
-            let s1 = self
-                .signatures
-                .get(sig_id1)
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id1.to_string()))?;
-            let s2 = self
-                .signatures
-                .get(sig_id2)
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id2.to_string()))?;
-            if self.papers.get(&s1.paper_id).is_none() {
-                return Err(pyo3::exceptions::PyKeyError::new_err(
-                    s1.paper_id.to_string(),
-                ));
-            }
-            if self.papers.get(&s2.paper_id).is_none() {
-                return Err(pyo3::exceptions::PyKeyError::new_err(
-                    s2.paper_id.to_string(),
-                ));
-            }
-        }
-        let feats = py.allow_threads(|| {
-            let compute = || {
-                pairs
-                    .par_iter()
-                    .map(|(sig_id1, sig_id2)| -> PyResult<Vec<f64>> {
-                        let s1 = self.signatures.get(sig_id1).ok_or_else(|| {
-                            pyo3::exceptions::PyKeyError::new_err(sig_id1.to_string())
-                        })?;
-                        let s2 = self.signatures.get(sig_id2).ok_or_else(|| {
-                            pyo3::exceptions::PyKeyError::new_err(sig_id2.to_string())
-                        })?;
-                        let p1 = self.papers.get(&s1.paper_id).ok_or_else(|| {
-                            pyo3::exceptions::PyKeyError::new_err(s1.paper_id.to_string())
-                        })?;
-                        let p2 = self.papers.get(&s2.paper_id).ok_or_else(|| {
-                            pyo3::exceptions::PyKeyError::new_err(s2.paper_id.to_string())
-                        })?;
-                        Ok(self.featurize_pair_data(s1, s2, p1, p2).to_vec())
-                    })
-                    .collect::<PyResult<Vec<_>>>()
-            };
-            install_with_optional_rayon_pool(num_threads, compute)
-        });
-        feats
-    }
-
     fn signature_ids(&self) -> Vec<String> {
         self.signature_id_order().to_vec()
     }
@@ -10267,114 +10588,6 @@ impl RustFeaturizer {
             }
         }
         Ok(updated)
-    }
-
-    #[pyo3(signature = (pairs, selected_indices = None, num_threads = None, nan_value = f64::NAN))]
-    fn featurize_pairs_matrix<'py>(
-        &self,
-        py: Python<'py>,
-        pairs: Vec<(String, String)>,
-        selected_indices: Option<Vec<usize>>,
-        num_threads: Option<usize>,
-        nan_value: f64,
-    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-        let row_count = pairs.len();
-        if row_count == 0 {
-            let empty = numpy::ndarray::Array2::<f64>::zeros((0, 0));
-            return Ok(empty.to_pyarray(py));
-        }
-
-        for (sig_id1, sig_id2) in pairs.iter() {
-            let s1 = self
-                .signatures
-                .get(sig_id1)
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id1.to_string()))?;
-            let s2 = self
-                .signatures
-                .get(sig_id2)
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id2.to_string()))?;
-            if self.papers.get(&s1.paper_id).is_none() {
-                return Err(pyo3::exceptions::PyKeyError::new_err(
-                    s1.paper_id.to_string(),
-                ));
-            }
-            if self.papers.get(&s2.paper_id).is_none() {
-                return Err(pyo3::exceptions::PyKeyError::new_err(
-                    s2.paper_id.to_string(),
-                ));
-            }
-        }
-
-        let mut id_to_lookup_idx: HashMap<&str, usize> =
-            HashMap::with_capacity(row_count.saturating_mul(2));
-        let mut lookup: Vec<(&SignatureData, &PaperData)> = Vec::new();
-        for (sig_id1, sig_id2) in pairs.iter() {
-            for sig_id in [sig_id1.as_str(), sig_id2.as_str()] {
-                if id_to_lookup_idx.contains_key(sig_id) {
-                    continue;
-                }
-                let signature = self
-                    .signatures
-                    .get(sig_id)
-                    .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id.to_string()))?;
-                let paper = self.papers.get(&signature.paper_id).ok_or_else(|| {
-                    pyo3::exceptions::PyKeyError::new_err(signature.paper_id.to_string())
-                })?;
-                let lookup_idx = lookup.len();
-                lookup.push((signature, paper));
-                id_to_lookup_idx.insert(sig_id, lookup_idx);
-            }
-        }
-
-        let mut indexed_pairs: Vec<(usize, usize)> = Vec::with_capacity(row_count);
-        for (sig_id1, sig_id2) in pairs.iter() {
-            let left_idx = *id_to_lookup_idx
-                .get(sig_id1.as_str())
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id1.clone()))?;
-            let right_idx = *id_to_lookup_idx
-                .get(sig_id2.as_str())
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(sig_id2.clone()))?;
-            indexed_pairs.push((left_idx, right_idx));
-        }
-
-        let full_cols = self.full_feature_count();
-        let indices = resolve_feature_indices("selected_indices", selected_indices, full_cols)?;
-        let out_cols = indices.len();
-        if out_cols == 0 {
-            let empty_cols = numpy::ndarray::Array2::<f64>::zeros((row_count, 0));
-            return Ok(empty_cols.to_pyarray(py));
-        }
-        let out = py.allow_threads(|| {
-            let compute = || {
-                let mut buffer = vec![0.0_f64; row_count * out_cols];
-                buffer
-                    .par_chunks_mut(out_cols)
-                    .zip(indexed_pairs.par_iter())
-                    .for_each(|(out_row, (left_idx, right_idx))| {
-                        let (s1, p1) = lookup[*left_idx];
-                        let (s2, p2) = lookup[*right_idx];
-                        let row = self.featurize_pair_data(s1, s2, p1, p2);
-                        for (dest, idx) in out_row.iter_mut().zip(indices.iter()) {
-                            let mut value = row[*idx];
-                            if value.is_nan() && !nan_value.is_nan() {
-                                value = nan_value;
-                            }
-                            *dest = value;
-                        }
-                    });
-                buffer
-            };
-            install_with_optional_rayon_pool(num_threads, compute)
-        });
-
-        let array =
-            numpy::ndarray::Array2::from_shape_vec((row_count, out_cols), out).map_err(|err| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to build output matrix: {}",
-                    err
-                ))
-            })?;
-        Ok(array.to_pyarray(py))
     }
 
     #[pyo3(signature = (pairs, selected_indices = None, num_threads = None, nan_value = f64::NAN))]
@@ -10799,25 +11012,6 @@ impl RustFeaturizer {
             })?;
         Ok(array.to_pyarray(py))
     }
-
-    fn save(&self, path: &str) -> PyResult<()> {
-        let file =
-            File::create(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let writer = BufWriter::new(file);
-        bincode::serialize_into(writer, self)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        Ok(())
-    }
-
-    #[staticmethod]
-    fn load(path: &str) -> PyResult<Self> {
-        let file =
-            File::open(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let reader = BufReader::new(file);
-        let featurizer: RustFeaturizer = bincode::deserialize_from(reader)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        Ok(featurizer)
-    }
 }
 
 impl RustNameCompatibleSubblockSelector {
@@ -10871,38 +11065,6 @@ impl RustNameCompatibleSubblockSelector {
         Some(allowed_components)
     }
 
-    fn select_ordered_component_keys(
-        &self,
-        query_signature_id: &str,
-        query_first: &str,
-        ordered_component_keys: Vec<String>,
-        global_backfill_count: usize,
-    ) -> Option<Vec<String>> {
-        let allowed_components = self.allowed_component_keys(query_signature_id, query_first)?;
-        let mut selected: Vec<String> = ordered_component_keys
-            .iter()
-            .filter(|component_key| allowed_components.contains(*component_key))
-            .cloned()
-            .collect();
-        if selected.is_empty() {
-            return None;
-        }
-        if global_backfill_count > 0 {
-            let mut selected_set: HashSet<String> = selected.iter().cloned().collect();
-            let mut remaining = global_backfill_count;
-            for component_key in ordered_component_keys {
-                if remaining == 0 {
-                    break;
-                }
-                if selected_set.insert(component_key.clone()) {
-                    selected.push(component_key);
-                    remaining -= 1;
-                }
-            }
-        }
-        Some(selected)
-    }
-
     fn select_candidate_indices_for_summaries(
         &self,
         query_signature_id: &str,
@@ -10939,38 +11101,6 @@ impl RustNameCompatibleSubblockSelector {
             }
         }
         Some(selected)
-    }
-}
-
-#[pymethods]
-impl RustNameCompatibleSubblockSelector {
-    #[new]
-    #[pyo3(signature = (retrieval_subblock_index, name_tuples_path = None))]
-    fn new(
-        py: Python<'_>,
-        retrieval_subblock_index: &Bound<'_, PyAny>,
-        name_tuples_path: Option<String>,
-    ) -> PyResult<Self> {
-        Self::from_py(py, retrieval_subblock_index, name_tuples_path)
-    }
-
-    #[pyo3(signature = (query_signature_id, query_first, component_keys, global_backfill_count = 0))]
-    fn select(
-        &self,
-        query_signature_id: &str,
-        query_first: &str,
-        component_keys: &Bound<'_, PyAny>,
-        global_backfill_count: usize,
-    ) -> PyResult<Option<Vec<String>>> {
-        let ordered_component_keys: Vec<String> = PyIterator::from_object(component_keys)?
-            .map(|item| item.and_then(|value| value.extract()))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(self.select_ordered_component_keys(
-            query_signature_id,
-            query_first,
-            ordered_component_keys,
-            global_backfill_count,
-        ))
     }
 }
 
@@ -12161,12 +12291,10 @@ impl RawBlockQueryCandidatePlanner {
 
         let text_context_start = Instant::now();
         let text_module = py.import("s2and.text")?;
-        let unidecode = text_module.getattr("unidecode")?;
         let name_prefixes = extract_required_string_set(&text_module.getattr("NAME_PREFIXES")?)?;
         let affiliation_stopwords = extract_affiliation_stopwords(py)?;
         let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
         ensure_unidecode_for_raw_arrow_inputs(
-            &unidecode,
             &signatures,
             &papers,
             &paper_authors,
@@ -12436,10 +12564,7 @@ impl RawBlockQueryCandidatePlanner {
         )?;
 
         let text_context_start = Instant::now();
-        let text_module = py.import("s2and.text")?;
-        let unidecode = text_module.getattr("unidecode")?;
         ensure_unidecode_for_raw_arrow_inputs(
-            &unidecode,
             &query_inputs.signatures,
             &query_inputs.papers,
             &query_inputs.paper_authors,
@@ -13566,12 +13691,10 @@ fn raw_arrow_labeled_candidate_plan<'py>(
 
     let text_context_start = Instant::now();
     let text_module = py.import("s2and.text")?;
-    let unidecode = text_module.getattr("unidecode")?;
     let name_prefixes = extract_required_string_set(&text_module.getattr("NAME_PREFIXES")?)?;
     let affiliation_stopwords = extract_affiliation_stopwords(py)?;
     let mut unidecode_char_map: HashMap<char, String> = HashMap::new();
     ensure_unidecode_for_raw_arrow_inputs(
-        &unidecode,
         &query_inputs.signatures,
         &query_inputs.papers,
         &query_inputs.paper_authors,
@@ -14251,19 +14374,6 @@ mod tests {
     }
 
     #[test]
-    fn json_value_to_i64_rejects_lossy_numbers() {
-        let float_value = serde_json::json!(1.5);
-        let float_error =
-            json_value_to_i64(&float_value, "signature author_info.position").unwrap_err();
-        assert!(py_err_message(float_error).contains("must be an integer"));
-
-        let overflow_value = serde_json::json!(u64::MAX);
-        let overflow_error =
-            json_value_to_i64(&overflow_value, "signature author_info.position").unwrap_err();
-        assert!(py_err_message(overflow_error).contains("outside i64 range"));
-    }
-
-    #[test]
     fn validate_retrieval_top_k_rejects_uint16_rank_overflow() {
         let error = validate_retrieval_rank_top_k((u16::MAX as usize) + 1).unwrap_err();
         assert!(py_err_message(error).contains("retrieval_ranks are stored as uint16"));
@@ -14444,27 +14554,39 @@ mod tests {
         let mut rows = vec![
             SubblockingSignatureRow {
                 signature_id: "s1".to_string(),
+                paper_id: "p1".to_string(),
                 first: "Alice".to_string(),
                 middle: String::new(),
+                affiliations: Vec::new(),
                 orcid: None,
+                position: None,
             },
             SubblockingSignatureRow {
                 signature_id: "s2".to_string(),
+                paper_id: "p2".to_string(),
                 first: "alice".to_string(),
                 middle: String::new(),
+                affiliations: Vec::new(),
                 orcid: None,
+                position: None,
             },
             SubblockingSignatureRow {
                 signature_id: "s3".to_string(),
+                paper_id: "p3".to_string(),
                 first: "Qi-Xin".to_string(),
                 middle: "A.".to_string(),
+                affiliations: Vec::new(),
                 orcid: None,
+                position: None,
             },
             SubblockingSignatureRow {
                 signature_id: "s4".to_string(),
+                paper_id: "p4".to_string(),
                 first: "Arif\u{2010}ullah".to_string(),
                 middle: String::new(),
+                affiliations: Vec::new(),
                 orcid: None,
+                position: None,
             },
         ];
         let prefixes = HashSet::new();
@@ -14476,8 +14598,8 @@ mod tests {
         assert_eq!(rows[1].first, "alice");
         assert_eq!(rows[2].first, "qi xin");
         assert_eq!(rows[2].middle, "a");
-        assert_eq!(rows[3].first, "arif ullah");
-        assert_eq!(rows[3].middle, "");
+        assert_eq!(rows[3].first, "arif");
+        assert_eq!(rows[3].middle, "ullah");
     }
 
     #[test]
@@ -14499,8 +14621,21 @@ mod tests {
         let unidecode_char_map = HashMap::new();
         assert_eq!(
             normalize_text_compat_from_map("\u{00C9}lodie", false, &unidecode_char_map),
-            "lodie",
+            "elodie",
         );
+    }
+
+    #[test]
+    fn normalize_text_compat_uses_native_text_unidecode_data() {
+        assert_eq!(
+            normalize_text_compat_native("te'\u{6F22}\u{5B57}xt", false),
+            "te han zi xt",
+        );
+        assert_eq!(
+            normalize_text_compat_native("O\u{2019}Neil", false),
+            "o neil",
+        );
+        assert_eq!(normalize_text_compat_native("O\u{2019}Neil", true), "oneil",);
     }
 
     #[test]
@@ -14618,13 +14753,16 @@ fn _s2and_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS.to_vec(),
     )?;
     m.add_function(wrap_pyfunction!(get_build_info, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize_text_compat, m)?)?;
     m.add_function(wrap_pyfunction!(raw_arrow_labeled_candidate_plan, m)?)?;
     promoted_linker::add_to_module(m)?;
     m.add_function(wrap_pyfunction!(signature_ngrams_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(make_subblocks_with_telemetry_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        make_subblocks_with_telemetry_arrow_native_graph,
+        m
+    )?)?;
     m.add_class::<RustFeaturizer>()?;
     m.add_class::<RustHybridCentroidRetriever>()?;
-    m.add_class::<RustNameCompatibleSubblockSelector>()?;
     m.add_class::<RawBlockQueryCandidatePlanner>()?;
     Ok(())
 }

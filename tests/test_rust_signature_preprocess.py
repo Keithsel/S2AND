@@ -3,6 +3,7 @@ import random
 from contextlib import contextmanager
 from itertools import combinations
 
+import numpy as np
 import pytest
 
 from s2and import feature_port
@@ -131,10 +132,22 @@ def test_signature_preprocess_pair_features_and_constraints_parity_with_deferred
     signature_ids = list(dataset_python.signatures.keys())
     pairs = _sample_pairs(signature_ids, limit=8)
     assert len(pairs) > 0
+    rust_featurizer = feature_port._get_rust_featurizer(dataset_rust)  # noqa: SLF001
+    rust_signature_id_to_index = {
+        str(signature_id): index for index, signature_id in enumerate(rust_featurizer.signature_ids())
+    }
 
     for s1, s2 in pairs:
         python_features, _ = _single_pair_featurize((s1, s2), dataset=dataset_python)
-        rust_features = feature_port.featurize_pair_rust(dataset_rust, s1, s2)
+        rust_features = np.asarray(
+            rust_featurizer.featurize_pairs_matrix_indexed(
+                [(rust_signature_id_to_index[str(s1)], rust_signature_id_to_index[str(s2)])],
+                None,
+                getattr(dataset_rust, "n_jobs", 1),
+                np.nan,
+            ),
+            dtype=np.float64,
+        )[0]
         assert len(python_features) == len(rust_features)
         for idx, (python_value, rust_value) in enumerate(zip(python_features, rust_features, strict=True)):
             assert equalish(python_value, rust_value), (
@@ -188,7 +201,7 @@ def test_subblocking_membership_parity_python_vs_rust():
     assert clusters_python == clusters_rust
 
 
-def test_rust_json_ingest_uses_minimal_python_paper_preprocess():
+def test_rust_inference_from_dataset_runs_python_paper_preprocess():
     with _temporary_env("S2AND_BACKEND", "rust"):
         dataset_train = build_dummy_dataset(
             "dummy_signature_preprocess_full_papers",
@@ -203,6 +216,6 @@ def test_rust_json_ingest_uses_minimal_python_paper_preprocess():
     inference_paper = dataset_inference.papers[paper_id]
 
     assert train_paper.title_ngrams_chars is not None
-    assert inference_paper.title_ngrams_chars is None
+    assert inference_paper.title_ngrams_chars is not None
     assert train_paper.title_ngrams_words is not None
-    assert inference_paper.title_ngrams_words is None
+    assert inference_paper.title_ngrams_words is not None

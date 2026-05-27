@@ -259,37 +259,6 @@ def get_constraints_block_upper_triangle_indexed_rust(
     )
 
 
-def featurize_pair_rust(
-    dataset: ANDData,
-    sig_id_1: str,
-    sig_id_2: str,
-    runtime_context: Any | None = None,
-):
-    featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
-    return featurizer.featurize_pair(sig_id_1, sig_id_2)
-
-
-def build_pair_feature_matrix_rust(
-    dataset: ANDData,
-    pairs: list[tuple[str, str]],
-    selected_indices: list[int] | None = None,
-    num_threads: int | None = None,
-    nan_value: float = np.nan,
-    runtime_context: Any | None = None,
-) -> np.ndarray:
-    featurizer = _get_rust_featurizer(dataset, runtime_context=runtime_context)
-    if not hasattr(featurizer, "featurize_pairs_matrix"):
-        raise RuntimeError("RustFeaturizer.featurize_pairs_matrix is unavailable in the loaded extension")
-    resolved_num_threads = None if num_threads is None else resolve_n_jobs(num_threads)
-    matrix = featurizer.featurize_pairs_matrix(
-        pairs,
-        selected_indices,
-        resolved_num_threads,
-        nan_value,
-    )
-    return np.asarray(matrix, dtype=np.float64)
-
-
 def build_linker_pair_features_and_aggregate_stats_arrays_rust(
     dataset: ANDData | None,
     left_signature_indices: np.ndarray,

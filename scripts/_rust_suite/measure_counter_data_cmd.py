@@ -5,20 +5,19 @@ featurizer for a given dataset, without modifying any production code.
 
 Method:
   1. Build ANDData for the dataset (same way as profile_transfer_mini).
-  2. Build RustFeaturizer from original ANDData -> save to temp file -> record size.
+  2. Build RustFeaturizer from original ANDData -> record RSS delta.
   3. Zero out all 4 CounterData fields on every paper -> build RustFeaturizer again ->
-     save to temp file -> record size.
-  4. Load each from disk and record RSS delta.
-  5. Report CounterData disk and in-memory contribution.
+     record RSS delta.
+  4. Report CounterData build-time RSS contribution.
 
 Usage:
   uv run python scripts/rust_suite.py measure-counter-data --dataset kisti
 """
 
 import argparse
+import gc
 import os
 import sys
-import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -94,11 +93,6 @@ def _build_featurizer(anddata) -> Any:
     return s2and_rust.RustFeaturizer.from_dataset(anddata)
 
 
-def _load_featurizer(path: str) -> Any:
-    s2and_rust = _import_rust_module()
-    return s2and_rust.RustFeaturizer.load(path)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default="kisti")
@@ -127,88 +121,58 @@ def main():
         avg = sum(sizes) / len(sizes) if sizes else 0
         print(f"  {f}: avg_entries={avg:.1f}  papers_with_data={nonzero}/{len(sizes)}")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path_full = os.path.join(tmpdir, "full.bin")
-        path_stripped = os.path.join(tmpdir, "stripped.bin")
+    # ---- Build FULL featurizer ----
+    print("\nBuilding full featurizer (with CounterData)...")
+    rss_before_full = _rss_gb()
+    t0 = time.perf_counter()
+    feat_full = _build_featurizer(anddata)
+    rss_after_build_full = _rss_gb()
+    build_time_full = time.perf_counter() - t0
+    build_delta_full = rss_after_build_full - rss_before_full
+    print(f"  Build time: {build_time_full:.1f}s")
+    print("  RSS: " f"{rss_before_full:.3f} -> {rss_after_build_full:.3f} GB  " f"(delta={build_delta_full:+.3f} GB)")
+    del feat_full
+    gc.collect()
+    rss_after_del_full = _rss_gb()
+    print(f"  RSS after del/gc: {rss_after_del_full:.3f} GB")
 
-        # ---- Build FULL featurizer ----
-        print("\nBuilding full featurizer (with CounterData)...")
-        rss_before_full = _rss_gb()
-        t0 = time.perf_counter()
-        feat_full = _build_featurizer(anddata)
-        rss_after_build_full = _rss_gb()
-        feat_full.save(path_full)
-        size_full = os.path.getsize(path_full)
-        del feat_full
-        rss_after_del_full = _rss_gb()
-        print(f"  Build time: {time.perf_counter()-t0:.1f}s")
-        print(
-            "  RSS: "
-            f"{rss_before_full:.3f} -> {rss_after_build_full:.3f} GB  "
-            f"(delta={rss_after_build_full - rss_before_full:+.3f} GB)"
-        )
-        print(f"  Disk size: {size_full/1e6:.1f} MB")
-        print(f"  RSS after del: {rss_after_del_full:.3f} GB")
+    # ---- Build STRIPPED featurizer ----
+    print("\nBuilding stripped featurizer (CounterData zeroed)...")
+    orig_papers = anddata.papers
+    anddata.papers = _strip_counter_data(anddata)
+    rss_before_stripped = _rss_gb()
+    t0 = time.perf_counter()
+    feat_stripped = _build_featurizer(anddata)
+    rss_after_build_stripped = _rss_gb()
+    build_time_stripped = time.perf_counter() - t0
+    build_delta_stripped = rss_after_build_stripped - rss_before_stripped
+    del feat_stripped
+    anddata.papers = orig_papers
+    gc.collect()
+    rss_after_del_stripped = _rss_gb()
+    print(f"  Build time: {build_time_stripped:.1f}s")
+    print(
+        "  RSS: "
+        f"{rss_before_stripped:.3f} -> {rss_after_build_stripped:.3f} GB  "
+        f"(delta={build_delta_stripped:+.3f} GB)"
+    )
+    print(f"  RSS after del/gc: {rss_after_del_stripped:.3f} GB")
 
-        # ---- Build STRIPPED featurizer ----
-        print("\nBuilding stripped featurizer (CounterData zeroed)...")
-        orig_papers = anddata.papers
-        anddata.papers = _strip_counter_data(anddata)
-        rss_before_stripped = _rss_gb()
-        t0 = time.perf_counter()
-        feat_stripped = _build_featurizer(anddata)
-        rss_after_build_stripped = _rss_gb()
-        feat_stripped.save(path_stripped)
-        size_stripped = os.path.getsize(path_stripped)
-        del feat_stripped
-        anddata.papers = orig_papers
-        rss_after_del_stripped = _rss_gb()
-        print(f"  Build time: {time.perf_counter()-t0:.1f}s")
-        print(
-            "  RSS: "
-            f"{rss_before_stripped:.3f} -> {rss_after_build_stripped:.3f} GB  "
-            f"(delta={rss_after_build_stripped - rss_before_stripped:+.3f} GB)"
-        )
-        print(f"  Disk size: {size_stripped/1e6:.1f} MB")
-        print(f"  RSS after del: {rss_after_del_stripped:.3f} GB")
-
-        # ---- Load from disk and compare RSS ----
-        print("\nLoading full featurizer from disk...")
-        rss_before_load_full = _rss_gb()
-        feat_full_loaded = _load_featurizer(path_full)
-        rss_after_load_full = _rss_gb()
-        del feat_full_loaded
-        load_delta_full = rss_after_load_full - rss_before_load_full
-
-        print("\nLoading stripped featurizer from disk...")
-        rss_before_load_stripped = _rss_gb()
-        feat_stripped_loaded = _load_featurizer(path_stripped)
-        rss_after_load_stripped = _rss_gb()
-        del feat_stripped_loaded
-        load_delta_stripped = rss_after_load_stripped - rss_before_load_stripped
-
-        # ---- Summary ----
-        disk_counter_data_mb = (size_full - size_stripped) / 1e6
-        mem_counter_data_gb = load_delta_full - load_delta_stripped
-        expansion = load_delta_full / (size_full / 1e9) if size_full > 0 else 0
-        print("\n" + "=" * 60)
-        print("SUMMARY")
-        print("=" * 60)
-        print(f"Disk size full:        {size_full/1e6:.1f} MB")
-        print(f"Disk size stripped:    {size_stripped/1e6:.1f} MB")
-        print(f"CounterData on disk:   {disk_counter_data_mb:.1f} MB")
-        print("")
-        print(f"Load RSS delta full:   {load_delta_full*1024:.0f} MB")
-        print(f"Load RSS delta stripped: {load_delta_stripped*1024:.0f} MB")
-        print(f"CounterData in memory: {mem_counter_data_gb*1024:.0f} MB")
-        print(f"Disk->memory expansion (full): {expansion:.2f}x")
-        print("")
-        print("HYPOTHESIS: ~200-300 MB in-memory savings from compact CounterData")
-        actual = mem_counter_data_gb * 1024
-        if actual >= 150:
-            print(f"RESULT: hypothesis SUPPORTED  (measured {actual:.0f} MB, >= 150 MB threshold)")
-        else:
-            print(f"RESULT: hypothesis NOT SUPPORTED  (measured {actual:.0f} MB, < 150 MB threshold)")
+    # ---- Summary ----
+    mem_counter_data_gb = build_delta_full - build_delta_stripped
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"Build RSS delta full:     {build_delta_full*1024:.0f} MB")
+    print(f"Build RSS delta stripped: {build_delta_stripped*1024:.0f} MB")
+    print(f"CounterData RSS delta:    {mem_counter_data_gb*1024:.0f} MB")
+    print("")
+    print("HYPOTHESIS: ~200-300 MB in-memory savings from compact CounterData")
+    actual = mem_counter_data_gb * 1024
+    if actual >= 150:
+        print(f"RESULT: hypothesis SUPPORTED  (measured {actual:.0f} MB, >= 150 MB threshold)")
+    else:
+        print(f"RESULT: hypothesis NOT SUPPORTED  (measured {actual:.0f} MB, < 150 MB threshold)")
 
 
 if __name__ == "__main__":

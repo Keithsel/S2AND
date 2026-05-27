@@ -1,6 +1,6 @@
 # Normalization Unification Migration Plan
 
-Execution status (last reconfirmed 2026-05-24; originally entered blocked state 2026-03-02)
+Execution status (last reconfirmed 2026-05-26; originally entered blocked state 2026-03-02)
 - Blocked: normalization work is on hold until the required data/artifacts are ready.
 - Keep this plan separate from the active execution plan in `docs/work_plan.md`.
 
@@ -8,6 +8,9 @@ Status
 - Draft updated from issue notes through August 31, 2025.
 - Rust compatibility-alignment notes added on February 20, 2026; helper porting is no longer tracked here as a separate blocking work item.
 - Reviewed on February 24, 2026 alongside big-block execution planning; no normalization-policy changes in that workstream.
+- Rechecked on May 26, 2026 during Rust Arrow graph-subblocking work. The current production-quality subblocking
+  behavior depends on a localized legacy-compatibility repair for dash-like given names; that repair is documented
+  below as current compatibility behavior, not as the canonical target state.
 
 Scope
 - Unify name normalization for first/middle/last across data preparation, modeling, subblocking, and auxiliary datasets (name counts, name tuples, ORCID prefix counts).
@@ -16,6 +19,9 @@ Scope
 Decided (from issue history)
 - Apostrophes: canonical fields should remove apostrophes globally (no dual stream).
 - Chinese given names: Sinonym-aware handling is part of canonicalization; hyphenated given names should stay together.
+- Dash semantics: canonical behavior should not assign different semantic meaning to ASCII hyphen versus Unicode
+  dash-like characters. Any current ASCII/non-ASCII split must be treated as a measured legacy-compatibility repair,
+  not as the desired canonical policy.
 - First-name compatibility checks should use multi-token prefix logic (`same_prefix_tokens`), not single-token-only rules.
 - Canonical surname storage:
   - Persist canonical last names as normalized, space-separated tokens (e.g., `ou yang`, `de la cruz`).
@@ -57,6 +63,10 @@ Rust Alignment Decisions (effective February 20, 2026; refreshed 2026-05-23)
 Current State (post-Sinonym hyphen pass)
 - Given-name canonicalization currently preserves hyphenated Chinese given names:
   - `s2and.text.split_first_middle_hyphen_aware`.
+- Generic text normalization treats all punctuation/dash-like characters as separators after transliteration; this is
+  shared by generic name/text features, affiliation/coauthor evidence, titles, venues, and Rust compatibility helpers.
+- ORCID normalization accepts ASCII and Unicode dash-like separators and emits canonical ASCII-hyphenated ORCIDs; compact
+  ORCID keys remove those hyphens afterward.
 - Backward-compat shims exist for artifacts built with legacy normalization:
   - Name counts (first): when raw first had a hyphen, join spaces in canonical first for count keys (e.g., `qi xin` -> `qixin`).
   - Name counts (last): join spaces in canonical last for compound/hyphenated surnames (e.g., `ou yang` -> `ouyang`).
@@ -68,6 +78,22 @@ Current State (post-Sinonym hyphen pass)
     `first_names_name_compatible(...)` probes exact, joined, and first-token forms for compatibility with legacy tuples.
   - Sinonym overwrite block recomputation preserves spaced compound surnames for blocking (`q ou yang`) when overwriting
     blocks.
+- Subblocking first/middle keys have an additional measured legacy-compatibility repair:
+  - Canonical first/middle fields keep dash-like given names together.
+  - Current subblocking quality is recovered by keeping ASCII-hyphen compounds together while spilling non-ASCII dash
+    compounds into first + middle for subblocking keys only.
+  - This is not semantically desirable, but it matches current legacy artifacts and restored measured quality:
+    - `s_lee`, `maximum_size=2500`: keep-all-dash recall `0.978647821860`; current repair recall
+      `0.983113309912` versus historical graph `0.983118072979`.
+    - `s_park`, `maximum_size=2500`: keep-all-dash recall `0.973201405109`; current repair recall
+      `0.979665201080`, matching the historical graph value.
+    - `h_wang`, `maximum_size=5000`: current repair recall `0.911857828379`, above the historical graph floor
+      `0.911296989543`.
+  - Uniform single-key alternatives were tested and were worse on the active artifacts:
+    - Keep all dashed compounds together regressed `s_lee` and `s_park`.
+    - Spill all dashed compounds increased single-letter first-name signatures, fallback work, and regressed
+      `s_lee`/`h_wang`.
+  - The clean replacement should be alias-aware or canonical-artifact-based, not another single-key dash heuristic.
 
 Fix during the blocked canonical migration (real-data findings)
 - These are intentionally deferred from `legacy_compat` unless called out elsewhere as a compatibility repair. Fix them
@@ -82,7 +108,7 @@ Fix during the blocked canonical migration (real-data findings)
       `s2and/incremental_linking/query_adapter.py::_normalize_term_set`.
     - Any training/reference feature code that consumes normalized titles or title n-grams.
   - Rust locations to audit/change in the same release:
-    - Generic compatibility normalizer: `s2and_rust/src/lib.rs::normalize_text_compat_from_map`.
+    - Generic compatibility normalizer: `s2and_rust/src/text_compat.rs::normalize_text_compat_from_map`.
     - Paper preprocessing and raw Arrow/JSON feature extraction paths that normalize titles, venues, journals,
       paper authors, or reference details before hashing/feature construction.
   - Do not change global `normalize_text(...)` in legacy mode. Introduce field-specific canonical title/venue
@@ -97,13 +123,22 @@ Fix during the blocked canonical migration (real-data findings)
     - Pairwise/incremental consumers of `author_info_first_normalized`,
       `author_info_first_normalized_without_apostrophe`, and middle/last normalized fields.
   - Rust locations:
-    - `s2and_rust/src/lib.rs::split_first_middle_hyphen_aware_compat`.
+    - `s2and_rust/src/text_compat.rs::split_first_middle_hyphen_aware_compat`.
     - `s2and_rust/src/lib.rs::build_name_counts_data_from_artifact`.
     - `s2and_rust/src/lib.rs::canonical_last_for_counts`.
     - Rust constraint/name-tuple helpers and pairwise/incremental feature extraction paths that consume normalized
       first/middle/last values.
   - Compatibility repairs inside `legacy_compat` may keep current behavior correct, but canonical-only semantics must
     wait for regenerated name counts, name tuples, and ORCID prefix counts.
+- Subblocking dash handling should not permanently encode ASCII/non-ASCII semantics:
+  - Current repair is acceptable only as a localized `legacy_compat` quality repair.
+  - A cleaner near-term experiment can be done before full canonical cutover if it keeps canonical dash semantics uniform
+    while emitting compatibility aliases for subblocking merge/graph evidence.
+  - Candidate design: one canonical key for all dash-like compounds, plus split aliases used only for merge candidates,
+    prefix-count lookup, and graph/co-location evidence when capacity constraints are satisfied.
+  - Required evidence before replacing the current repair: full `s_lee`, `s_park`, and `h_wang` subblocking metrics must
+    meet or beat the current repair; telemetry must not materially increase fallback invocations/signatures or final
+    subblock fragmentation.
 - `preprocess=False` is semantically misleading:
   - Today Python `s2and/data.py::preprocess_paper_1(..., preprocess=False)` still normalizes titles and authors,
     builds title word n-grams, and computes language for signature papers, while leaving venue/journal and some
@@ -120,7 +155,7 @@ Fix during the blocked canonical migration (real-data findings)
   - `normalize_text(None)`, empty strings, digit-only strings, and punctuation-only strings can all become `""`.
   - During canonical migration, distinguish true missingness from normalized-empty nonmissing values where that matters
     for paper titles, venues, journals, and affiliation evidence. Any schema/cache change must be versioned.
-  - Source identifiers are not text:
+- Source identifiers are not text:
   - `source_author_ids`, MAG IDs, DBLP suffixes, ACM IDs, and ORCIDs must never use `normalize_text(...)`.
   - Python locations carrying source IDs: `s2and/incremental_linking/feature_block_contract.py`,
     `scripts/arrow_conversion_helpers.py`, and
@@ -143,8 +178,11 @@ Migration Plan (phased, verifiable)
    - Freeze a canonical example table covering:
      - `Jo Ann`, `Jo-Ann`, `JoAnn`.
      - `Yu Zhong`, `Yu-Zhong`, `YuZhong`, `Y. Z.`.
+     - ASCII and Unicode dash-equivalent forms: `Sang-Min`, `Sang<U+2010>Min`, `Sang Min`;
+       `Qi-Xin`, `Qi<U+2010>Xin`, `Qi Xin`.
      - Apostrophe-like forms (`O'Brien`, ``O`Brien``, curly apostrophes).
      - Multi-initial cases (`H. G.`-style).
+     - Surname dash/space variants (`Ou-Yang`, `Ou Yang`, `Ouyang`) and particle surnames.
    - Output: explicit normalization invariants used by tests and artifact builders.
 
 2) Implement unified canonicalization
@@ -168,7 +206,8 @@ Migration Plan (phased, verifiable)
 
 5) Validate, benchmark, and roll out
    - Pairwise and clustering evaluation on representative datasets; compare to pinned baseline.
-   - Subblocking checks: size distribution, merge behavior, and ORCID co-location sanity checks.
+   - Subblocking checks: size distribution, merge behavior, ORCID co-location sanity checks, and dash-variant alias
+     behavior on `s_lee`, `s_park`, and `h_wang`.
    - Performance checks: runtime and memory for preprocessing/subblocking/featurization.
    - Cache/version bump as needed (featurizer cache and artifact versioning).
 
@@ -206,6 +245,10 @@ Compatibility/Rollback Notes
 
 References in code (as of this migration doc)
 - Given-name canonicalization: `s2and.text.split_first_middle_hyphen_aware`.
+- Rust compatibility implementation: `s2and_rust/src/text_compat.rs::split_first_middle_hyphen_aware_compat`.
+- Subblocking legacy-compat first/middle key materialization:
+  `s2and/subblocking.py::signature_name_parts_for_subblocking` and
+  `s2and_rust/src/lib.rs::normalize_subblocking_signature_rows`.
 - Surname count shim: `_canonicalize_last_for_counts` in `s2and/data.py`.
 - Last-name constraint shim: `_lasts_equivalent_for_constraint` in `s2and/data.py`.
 - Constraint and incremental new-name tuple fallback logic (exact/joined/first-token forms):

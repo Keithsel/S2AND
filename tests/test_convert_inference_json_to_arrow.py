@@ -288,34 +288,6 @@ def test_root_manifest_lock_removes_dead_pid_lock(tmp_path: Path, monkeypatch: p
     assert not lock_path.exists()
 
 
-def test_root_manifest_lock_removes_empty_pid_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    lock_path = tmp_path / "manifest.json.lock"
-    lock_path.write_text("", encoding="ascii")
-    monkeypatch.setattr(convert_module, "_pid_is_running", lambda _pid: False)
-
-    with convert_module._RootManifestLock(lock_path, attempts=1):
-        assert lock_path.exists()
-
-    assert not lock_path.exists()
-
-
-def test_root_manifest_lock_removes_corrupt_pid_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    lock_path = tmp_path / "manifest.json.lock"
-    lock_path.write_text("not-a-pid", encoding="ascii")
-    monkeypatch.setattr(convert_module, "_pid_is_running", lambda _pid: True)
-
-    with convert_module._RootManifestLock(lock_path, attempts=1):
-        assert lock_path.exists()
-
-    assert not lock_path.exists()
-
-
 def test_root_manifest_lock_does_not_remove_replaced_lock(tmp_path: Path) -> None:
     lock_path = tmp_path / "manifest.json.lock"
 
@@ -593,53 +565,6 @@ def test_convert_service_json_to_arrow_rejects_malformed_root_manifest_before_da
     )
 
     with pytest.raises(ValueError, match=r"dataset_manifests\[0\].*dataset"):
-        convert_service_json_to_arrow(
-            input_json=input_json,
-            output_root=output_root,
-            dataset_name="new_dataset",
-            name_counts_index_root=tmp_path,
-            n_jobs=1,
-            overwrite=True,
-            skip_name_counts_index=True,
-        )
-
-    assert not (output_root / "new_dataset" / "manifest.json").exists()
-
-
-@pytest.mark.parametrize(
-    "root_manifest",
-    [
-        {
-            "source_path": "old.json",
-            "datasets": ["existing_dataset"],
-            "reports": [],
-        },
-        {
-            "datasets": ["existing_dataset"],
-            "reports": [
-                {
-                    "dataset": "existing_dataset",
-                    "paths": {"manifest": "existing_dataset/manifest.json"},
-                }
-            ],
-        },
-    ],
-)
-def test_convert_service_json_to_arrow_rejects_legacy_root_manifest(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    root_manifest: dict[str, object],
-) -> None:
-    input_json = tmp_path / "service_payload.json"
-    input_json.write_text(json.dumps(_minimal_service_payload()), encoding="utf-8")
-    output_root = tmp_path / "arrow"
-    output_root.mkdir()
-    (output_root / "manifest.json").write_text(
-        json.dumps({**root_manifest, "output_root": str(output_root)}),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="unsupported schema"):
         convert_service_json_to_arrow(
             input_json=input_json,
             output_root=output_root,

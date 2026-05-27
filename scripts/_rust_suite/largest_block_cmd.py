@@ -1,25 +1,28 @@
 #!/usr/bin/env python
-"""Profile Python vs Rust on the single largest block across all datasets.
+"""Profile large-block prediction routes.
 
 This script:
 1. Scans all datasets to find the single largest block (by signature count)
 2. Loads the full dataset containing that block
-3. Runs predict() on just that one block, for both Python and Rust backends
+3. Runs predict() on just that one block
 4. Measures: ANDData build time, prediction time (featurize + cluster), peak RSS
 5. Captures cProfile hotspot analysis
 6. Outputs JSON results and cProfile text files
 
+Production-style profiling is ``--mode single --backend rust --input-format arrow``.
+Compare mode uses legacy JSON/ANDData paths for reference parity only.
+
 Usage:
-    # Auto-detect largest block across all datasets, compare Python vs Rust:
+    # Legacy JSON/ANDData reference compare:
     uv run python scripts/rust_suite.py largest-block --mode compare
 
     # Specify dataset and block manually:
     uv run python scripts/rust_suite.py largest-block --mode compare \
         --dataset aminer --block "j wang"
 
-    # Single backend run:
+    # Production-style Arrow/Rust single backend run:
     uv run python scripts/rust_suite.py largest-block --mode single \
-        --backend rust --dataset aminer --block "j wang"
+        --backend rust --input-format arrow --dataset aminer --block "j wang"
 
     # Limit block size (use first N signatures from the block):
     uv run python scripts/rust_suite.py largest-block --mode compare \
@@ -1129,7 +1132,7 @@ def main() -> None:
         "--mode",
         choices=["compare", "single"],
         default="compare",
-        help="'compare' runs both backends in subprocesses; 'single' runs one backend in-process.",
+        help="'compare' runs legacy JSON/ANDData reference subprocesses; 'single' runs one route in-process.",
     )
     parser.add_argument(
         "--backend",
@@ -1157,7 +1160,7 @@ def main() -> None:
     parser.add_argument(
         "--model-path",
         default=DEFAULT_MODEL_PATH,
-        help="Path to production model pickle.",
+        help="Path to production model artifact.",
     )
     parser.add_argument(
         "--data-root",
@@ -1168,7 +1171,10 @@ def main() -> None:
         "--input-format",
         choices=["json", "arrow"],
         default="json",
-        help="Input route for --mode single. Compare mode requires json.",
+        help=(
+            "Input route for --mode single; production-style Rust profiling should use arrow. "
+            "Compare mode requires json."
+        ),
     )
     parser.add_argument(
         "--arrow-data-root",

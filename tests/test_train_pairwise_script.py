@@ -20,6 +20,7 @@ def _import_train_pairwise(env: dict[str, str], repo_root: Path) -> dict[str, st
                 "'cache_root': str(CACHE_ROOT),"
                 "'default_feature_cache_root': str(train_pairwise.DEFAULT_FEATURE_CACHE_ROOT),"
                 "'env': os.environ.get('S2AND_CACHE'),"
+                "'backend': os.environ.get('S2AND_BACKEND'),"
                 "}))"
             ),
         ],
@@ -38,6 +39,7 @@ def test_train_pairwise_sets_default_cache_before_importing_s2and() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
     env.pop("S2AND_CACHE", None)
+    env.pop("S2AND_BACKEND", None)
 
     payload = _import_train_pairwise(env, repo_root)
 
@@ -45,15 +47,18 @@ def test_train_pairwise_sets_default_cache_before_importing_s2and() -> None:
     assert Path(payload["env"]).resolve() == expected_cache_root.resolve()
     assert Path(payload["cache_root"]).resolve() == expected_cache_root.resolve()
     assert Path(payload["default_feature_cache_root"]).resolve() == expected_cache_root.resolve()
+    assert payload["backend"] == "rust"
 
 
-def test_train_pairwise_respects_existing_cache_override(tmp_path: Path) -> None:
+def test_train_pairwise_respects_existing_cache_and_backend_overrides(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     override_cache_root = tmp_path / "custom_cache"
     env = os.environ.copy()
     env["S2AND_CACHE"] = str(override_cache_root)
+    env["S2AND_BACKEND"] = "python"
 
     payload = _import_train_pairwise(env, repo_root)
 
     assert Path(payload["env"]).resolve() == override_cache_root.resolve()
     assert Path(payload["cache_root"]).resolve() == override_cache_root.resolve()
+    assert payload["backend"] == "python"

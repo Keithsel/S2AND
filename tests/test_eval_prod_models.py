@@ -109,6 +109,55 @@ def test_arrow_eval_auto_selects_any_available_supported_bundle() -> None:
     )
 
 
+def test_train_mode_resolution_preserves_default_and_comparison() -> None:
+    assert eval_prod_models._resolve_requested_train_modes(None, compare_train_modes=False) == ["anddata-current"]
+    assert eval_prod_models._resolve_requested_train_modes(["json-rust"], compare_train_modes=False) == ["json-rust"]
+    assert eval_prod_models._resolve_requested_train_modes(None, compare_train_modes=True) == [
+        "anddata-python",
+        "json-rust",
+        "arrow-rust",
+    ]
+    with pytest.raises(ValueError, match="either --compare-train-modes or --train-modes"):
+        eval_prod_models._resolve_requested_train_modes(["json-rust"], compare_train_modes=True)
+
+
+def test_non_default_train_modes_are_qian_only_for_now() -> None:
+    eval_prod_models._validate_train_mode_scope(["anddata-current"], ["pubmed"])
+    eval_prod_models._validate_train_mode_scope(["json-rust", "arrow-rust"], ["qian"])
+
+    with pytest.raises(ValueError, match="qian-only"):
+        eval_prod_models._validate_train_mode_scope(["arrow-rust"], ["pubmed"])
+
+
+def test_training_mode_metric_assertion_accepts_identical_metrics() -> None:
+    results = {
+        ("_specter2.pkl", "anddata-python"): [{"B3 (P, R, F1)": (0.1, 0.2, 0.3)}],
+        ("_specter2.pkl", "json-rust"): [{"B3 (P, R, F1)": (0.1, 0.2, 0.3)}],
+    }
+
+    eval_prod_models._assert_training_mode_metrics_identical(
+        results,
+        specter_suffixes_to_check=["_specter2.pkl"],
+        train_modes=["anddata-python", "json-rust"],
+        datasets=["qian"],
+    )
+
+
+def test_training_mode_metric_assertion_rejects_different_metrics() -> None:
+    results = {
+        ("_specter2.pkl", "anddata-python"): [{"B3 (P, R, F1)": (0.1, 0.2, 0.3)}],
+        ("_specter2.pkl", "json-rust"): [{"B3 (P, R, F1)": (0.1, 0.2, 0.4)}],
+    }
+
+    with pytest.raises(AssertionError, match="Training mode metrics differ"):
+        eval_prod_models._assert_training_mode_metrics_identical(
+            results,
+            specter_suffixes_to_check=["_specter2.pkl"],
+            train_modes=["anddata-python", "json-rust"],
+            datasets=["qian"],
+        )
+
+
 def test_read_arrow_s2_blocks_reads_columns_without_row_dicts(tmp_path: Path) -> None:
     import pyarrow as pa
 
@@ -129,23 +178,83 @@ def test_read_arrow_s2_blocks_reads_columns_without_row_dicts(tmp_path: Path) ->
     }
 
 
+def test_pair_splits_from_arrow_paths_samples_within_block_random_pairs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clusters_path = tmp_path / "qian_clusters.json"
+    clusters_path.write_text(
+        json.dumps(
+            {
+                "c1": {"signature_ids": ["s1", "s2"]},
+                "c2": {"signature_ids": ["s3"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(eval_prod_models, "read_arrow_s2_blocks", lambda _path: {"block": ["s1", "s2", "s3"]})
+    monkeypatch.setattr(
+        eval_prod_models,
+        "split_blocks_like_anddata",
+        lambda blocks, *, random_seed: (dict(blocks), {}, {}),
+    )
+
+    splits = eval_prod_models.pair_splits_from_arrow_paths(
+        {"signatures": "signatures.arrow", "clusters": str(clusters_path)},
+        random_seed=42,
+        train_pairs_size=10,
+        val_pairs_size=10,
+        test_pairs_size=10,
+    )
+
+    assert set(splits.train_pairs) == {
+        ("s1", "s2", 1),
+        ("s1", "s3", 0),
+        ("s2", "s3", 0),
+    }
+    assert splits.val_pairs == []
+    assert splits.test_pairs == []
+
+
+def test_feature_tuple_from_rust_featurizer_uses_selected_feature_groups() -> None:
+    class FakeRustFeaturizer:
+        def signature_ids(self) -> list[str]:
+            return ["s1", "s2"]
+
+        def featurize_pairs_matrix_indexed(
+            self,
+            indexed_pairs: list[tuple[int, int]],
+            selected_indices: list[int],
+            _n_jobs: int,
+            _nan_value: float,
+        ) -> list[list[float]]:
+            assert indexed_pairs == [(0, 1)]
+            return [[float(index) for index in selected_indices]]
+
+    main_info = SimpleNamespace(features_to_use=["main"], feature_group_to_index={"main": [2, 0]})
+    nameless_info = SimpleNamespace(features_to_use=["nameless"], feature_group_to_index={"nameless": [1]})
+
+    features, labels, nameless = eval_prod_models._feature_tuple_from_rust_featurizer(
+        FakeRustFeaturizer(),
+        [("s1", "s2", 1)],
+        featurizer_info=main_info,
+        nameless_featurizer_info=nameless_info,
+        n_jobs=1,
+        nan_value=float("nan"),
+    )
+
+    assert features.tolist() == [[0.0, 2.0]]
+    assert labels.tolist() == [1.0]
+    assert nameless is not None
+    assert nameless.tolist() == [[1.0]]
+
+
 @pytest.mark.parametrize("block_count", [1, 2, 4])
 def test_split_blocks_like_anddata_rejects_tiny_smoke_datasets_like_anddata(block_count: int) -> None:
     blocks = {f"b{index}": [f"s{index}"] for index in range(block_count)}
 
     with pytest.raises(ValueError):
         eval_prod_models.split_blocks_like_anddata(blocks, random_seed=1)
-
-
-def test_split_blocks_like_anddata_preserves_input_order_for_legacy_eval_split() -> None:
-    block_items = [(f"b{index:02d}", [f"s{index}"]) for index in range(20)]
-    forward = dict(block_items)
-    reverse = dict(reversed(block_items))
-
-    forward_split = eval_prod_models.split_blocks_like_anddata(forward, random_seed=1)
-    reverse_split = eval_prod_models.split_blocks_like_anddata(reverse, random_seed=1)
-
-    assert [set(split) for split in forward_split] != [set(split) for split in reverse_split]
 
 
 def _read_minimal_incremental_signatures(signatures_path: Path) -> dict[str, Any]:

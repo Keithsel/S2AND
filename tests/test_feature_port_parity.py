@@ -13,7 +13,6 @@ from s2and.data import ANDData
 from s2and.feature_port import (
     _get_rust_featurizer,
     build_linker_pair_distance_accumulators_rust,
-    featurize_pair_rust,
     get_constraint_labels_index_arrays_rust,
     get_constraint_rust,
     get_constraints_matrix_indexed_rust,
@@ -34,6 +33,20 @@ if not HAS_RUST:
 def _paper_for_sig(dataset, sig_id):
     sig = dataset.signatures[sig_id]
     return dataset.papers[str(sig.paper_id)]
+
+
+def _featurize_pair_indexed_rust(dataset, sig_id_1: str, sig_id_2: str) -> np.ndarray:
+    rust_featurizer = _get_rust_featurizer(dataset)
+    signature_id_to_index = {str(sig_id): index for index, sig_id in enumerate(rust_featurizer.signature_ids())}
+    return np.asarray(
+        rust_featurizer.featurize_pairs_matrix_indexed(
+            [(signature_id_to_index[str(sig_id_1)], signature_id_to_index[str(sig_id_2)])],
+            None,
+            getattr(dataset, "n_jobs", 1),
+            np.nan,
+        ),
+        dtype=np.float64,
+    )[0]
 
 
 def _load_dataset_from_dir(data_dir, name, *, compute_reference_features=False):
@@ -268,7 +281,7 @@ def test_rust_featurizer_supports_string_paper_ids():
         compute_reference_features=False,
     )
 
-    features = featurize_pair_rust(ds, "s1", "s2")
+    features = _featurize_pair_indexed_rust(ds, "s1", "s2")
     assert len(features) > 0
 
     constraint = get_constraint_rust(ds, "s1", "s2")
@@ -357,7 +370,7 @@ def test_single_initial_name_text_features_match_rust(monkeypatch: pytest.Monkey
         compute_reference_features=False,
     )
     ref_features, _ = _single_pair_featurize(("s1", "s2"), dataset=ds)
-    rust_features = featurize_pair_rust(ds, "s1", "s2")
+    rust_features = _featurize_pair_indexed_rust(ds, "s1", "s2")
     feature_names = featurizer_mod.FeaturizationInfo().get_feature_names()
 
     assert ds.get_constraint("s1", "s2") is None
@@ -367,10 +380,10 @@ def test_single_initial_name_text_features_match_rust(monkeypatch: pytest.Monkey
         assert equalish(ref_features[idx], rust_features[idx])
 
 
-def test_featurize_pair_rust_parity(dataset, sample_pairs):
+def test_indexed_pair_matrix_rust_parity(dataset, sample_pairs):
     for s1, s2 in sample_pairs:
         ref_features, _ = _single_pair_featurize((s1, s2), dataset=dataset)
-        rust_features = featurize_pair_rust(dataset, s1, s2)
+        rust_features = _featurize_pair_indexed_rust(dataset, s1, s2)
         assert len(ref_features) == len(rust_features)
         for idx, (ref_val, got_val) in enumerate(zip(ref_features, rust_features, strict=True)):
             assert equalish(ref_val, got_val), (

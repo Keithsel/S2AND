@@ -65,8 +65,7 @@ Python path remains available via explicit backend and stage overrides at any ti
 
 - Direct Arrow inputs are the production inference boundary. Rust production
   prediction fails fast when required Arrow paths are incomplete.
-- JSON ingest (`from_json_paths`) remains a compatibility and benchmark surface.
-- Train/eval and non-path compatibility payloads use `from_dataset`.
+- Train/eval and classic `ANDData` payloads use `from_dataset`.
 - `S2AND_BACKEND` controls all stages uniformly.
 
 ### Failure semantics
@@ -104,8 +103,8 @@ These gates must pass before promoting any Rust defaults further.
 **Intentionally divergent** (by design):
 1. Direct Arrow inference uses typed runtime files that train/eval does not
    require.
-2. JSON ingest (`from_json_paths`) remains a compatibility path for file-shaped
-   inputs.
+2. Classic train/eval still starts from `ANDData`; production file-backed
+   inference starts from Arrow artifacts.
 
 ---
 
@@ -147,8 +146,7 @@ In training/eval mode, S2AND can skip Python paper preprocessing (`preprocess_pa
 `RustFeaturizer.from_dataset` compute missing paper-derived fields from raw strings. This targets the GIL-bound
 `preprocess_paper_1` bottleneck on Windows and reduces wall time when the Rust backend is enabled.
 
-Note: in Rust inference with JSON ingest (`from_json_paths`), Python paper preprocessing is also skipped. This section
-describes the training/eval `from_dataset` bypass.
+This section describes the training/eval `from_dataset` bypass.
 
 ### Gating (when Python paper preprocessing is skipped)
 

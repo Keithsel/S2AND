@@ -66,14 +66,26 @@ from s2and.production_model import load_production_model
 clusterer = load_production_model("s2and/data/production_model_v1.3")
 ```
 
+## Arrow Release Validation
+
+For local release-root smoke checks that do not touch S3 or scan large Arrow
+tables, run:
+
+```powershell
+uv run python scripts/verification/validate_local_arrow_release.py `
+  --release-root s2and/data
+```
+
+This verifies manifest checksums, required local files, raw-planner batch-index
+paths, replay-bundle manifest references, and `name_counts_index/manifest.json`
+targets. Use `scripts/convert_to_arrow.py validate --dataset-dir ...` for
+deeper per-dataset Arrow schema/table validation.
+
 ## Count Artifacts
 
-The `counts/` scripts document or export production count artifacts:
+The `counts/` scripts document production count artifacts:
 
 - `counts/generate_name_counts.py`: documents the internal query used to build
   `name_counts.pickle`.
 - `counts/generate_orcid_name_prefix_counts.py`: documents the internal query
   used to build `first_k_letter_counts_from_orcid.json`.
-- `counts/export_name_counts_for_rust.py`: converts the current Python
-  `name_counts.pickle` into the Rust JSON ingest shape until a shared native
-  count format replaces both.

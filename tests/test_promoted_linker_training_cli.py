@@ -55,7 +55,6 @@ def test_promoted_training_defaults_to_arrow_rust_source() -> None:
     assert parser_defaults["hyperopt"] is False
     assert parser_defaults["hyperopt_evals"] is None
     assert parser_defaults["hyperopt_metric"] == "weighted_average_error"
-    assert parser_defaults["allow_normalization_version_mismatch"] is False
 
 
 def test_finalized_arrow_materialization_bundle_creates_corrected_feature_asset_group(tmp_path: Path) -> None:
@@ -184,9 +183,6 @@ def test_materialization_selects_source_tables_from_featureless_assets(
         max_exemplars=1,
         max_top_k=1,
         reuse_existing_features=False,
-        rust_build_path=None,
-        name_counts_path=None,
-        allow_normalization_version_mismatch=False,
         pairwise_model_nan_value=float("nan"),
         pairwise_aggregate_nan_value=0.0,
         row_nan_policy="finite",

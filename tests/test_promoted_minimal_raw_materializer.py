@@ -665,7 +665,7 @@ def test_arrow_paths_use_manifest_name_counts_index_unless_explicit_override(
     assert paths["name_counts_index"] == str(Path(manifest_index).resolve())
 
     override_index, _metrics = write_name_counts_index(tmp_path / "override")
-    paths = _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=override_index)
+    paths = _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=Path(override_index))
     assert paths["name_counts_index"] == str(Path(override_index).resolve())
 
     manifest_path.write_text(
@@ -682,7 +682,7 @@ def test_arrow_paths_use_manifest_name_counts_index_unless_explicit_override(
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="signatures_batch_index"):
-        _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=override_index)
+        _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=Path(override_index))
 
     manifest_path.write_text(
         json.dumps(
@@ -703,7 +703,7 @@ def test_arrow_paths_use_manifest_name_counts_index_unless_explicit_override(
     )
     with pytest.raises(ValueError, match="name_counts_index"):
         _arrow_paths_for_dataset(bundle, "toy")
-    paths = _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=override_index)
+    paths = _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=Path(override_index))
     assert paths["name_counts_index"] == str(Path(override_index).resolve())
 
 

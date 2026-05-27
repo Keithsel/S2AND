@@ -12,8 +12,8 @@
 | `rust_suite.py featurizer-reuse` | Repeated production-model predictions through Arrow by default; `--input-format json` keeps the legacy same-object vs re-instantiated `ANDData` cache check | Per-iteration timing, RSS, Arrow telemetry or legacy featurizer cache counts |
 | `rust_suite.py largest-block` | Profile one large block; `--mode single --backend rust --input-format arrow` uses Arrow `predict_from_arrow_paths`, while compare/constraint parity remain JSON reference workflows | Partition diff (digest + per-signature), latency, RSS; optional `--quality-check` + JSON-only `--constraint-sample` |
 | `rust_suite.py promoted-incremental-arrow-profile` | Arrow-only promoted Rust `predict_incremental` profiling against the canonical `s2and_and_big_blocks_linker_dataset_20260525` bundle | Per-run wall time, p50 latency, peak RSS, promoted incremental telemetry, Arrow planner/summary timings |
-| `rust_suite.py stress-rebuild` | Repeat Rust featurizer construction (`from_arrow_paths` by default; legacy `from_json_paths` / `from_dataset` explicit) to stress lifecycle stability | Per-iteration elapsed + RSS peaks, RSS growth fraction, failure payloads |
-| `rust_suite.py measure-counter-data` | Measure CounterData memory contribution to Rust featurizer | Disk and in-memory size with vs without CounterData fields |
+| `rust_suite.py stress-rebuild` | Repeat Rust featurizer construction (`from_arrow_paths` by default; `from_dataset` explicit for classic `ANDData`) to stress lifecycle stability | Per-iteration elapsed + RSS peaks, RSS growth fraction, failure payloads |
+| `rust_suite.py measure-counter-data` | Measure CounterData memory contribution to Rust featurizer | Build-time RSS delta with vs without CounterData fields |
 | `rust_suite.py calibrate-phase-a` | Calibrate memory estimates for phase-A accumulator from memory telemetry JSONL | Per-entry byte overhead percentiles |
 | `rust_suite.py calibrate-rust-batch` | Calibrate memory estimates for Rust batch persistent overhead from memory telemetry JSONL | Per-row byte overhead percentiles |
 
@@ -26,7 +26,6 @@
 | `production/model/linker_train_calibrate_eval.py` | Low-level promoted linker replay implementation used by the finalization wrapper |
 | `production/counts/generate_name_counts.py` | Documentation for how production name-count metadata was collected (internal data) |
 | `production/counts/generate_orcid_name_prefix_counts.py` | Documentation for how ORCID prefix counts were collected (internal data) |
-| `production/counts/export_name_counts_for_rust.py` | Convert Python name-count pickle to Rust JSON artifact with normalization metadata (defaults to a local ignored output path) |
 
 ### Paper experiments & tutorials
 
@@ -53,7 +52,9 @@
 | Script | What it does |
 |---|---|
 | `eval_prod_models.py` | Evaluate production models (SPECTER1 vs SPECTER2) on full, inventors_s2and, or mini datasets; non-training evals use Arrow automatically when complete Arrow artifacts exist |
+| `verification/validate_local_arrow_release.py` | Non-network local Arrow release-root smoke; checks manifests, checksum fields, required files, batch-index paths, replay bundle manifests, and `name_counts_index` targets without scanning large Arrow tables |
 | `verification/compare_full_predict_arrow_parity.py` | Build a bounded Arrow parity artifact, including current raw-planner batch-index sidecars, and compare incumbent full predict against direct Arrow/Rust full predict |
+| `verification/compare_existing_arrow_anddata_feature_parity.py` | Compare Rust feature matrices from existing raw `ANDData` JSON/pickle inputs against existing Arrow release bundles |
 
 ### CI & release
 

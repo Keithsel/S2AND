@@ -1371,6 +1371,10 @@ def test_compact_constraint_require_forces_link() -> None:
     assert result.decisions[0].action == "link"
     assert result.decisions[0].component_key == "require_low_score"
     assert result.decisions[0].score == pytest.approx(0.10)
+    # Runner-up margin is reported against the full query group (the non-required
+    # candidate at 0.95), not just within the constraint-required subset.
+    assert result.decisions[0].runner_up_score == pytest.approx(0.95)
+    assert result.decisions[0].score_margin == pytest.approx(-0.85)
 
 
 def test_compact_constraint_require_rejects_conflicting_candidate_components() -> None:
@@ -1535,8 +1539,10 @@ def test_compact_orcid_match_forces_link_and_beats_non_orcid_rows() -> None:
     assert result.decisions[0].action == "link"
     assert result.decisions[0].component_key == "orcid_low_score"
     assert result.decisions[0].score == pytest.approx(0.10)
-    assert result.decisions[0].runner_up_score is None
-    assert result.decisions[0].score_margin is None
+    # Runner-up margin is reported against the full query group (the non-ORCID
+    # candidate at 0.95), not just within the ORCID-forced subset.
+    assert result.decisions[0].runner_up_score == pytest.approx(0.95)
+    assert result.decisions[0].score_margin == pytest.approx(-0.85)
 
 
 def test_private_retrieved_candidate_slice_scores_matrix_and_records_telemetry(

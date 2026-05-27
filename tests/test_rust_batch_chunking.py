@@ -74,6 +74,23 @@ def _build_pairs(count: int) -> list[tuple[str, str, float]]:
     return pairs
 
 
+class FakeIndexedRustFeaturizer:
+    def __init__(self, signature_ids: list[str], *, call_sizes: list[int] | None = None) -> None:
+        self._signature_ids = list(signature_ids)
+        self.call_sizes = call_sizes
+
+    def signature_ids(self) -> list[str]:
+        return list(self._signature_ids)
+
+    def featurize_pairs_matrix_indexed(self, pairs, selected_indices, num_threads, nan_value):
+        del num_threads, nan_value
+        if self.call_sizes is not None:
+            self.call_sizes.append(len(pairs))
+        if selected_indices is None:
+            return np.zeros((len(pairs), featurizer_mod.NUM_FEATURES), dtype=np.float64)
+        return np.zeros((len(pairs), len(selected_indices)), dtype=np.float64)
+
+
 def test_rust_batch_probe_row_counts_uses_three_probes():
     assert featurizer_mod._rust_batch_probe_row_counts(120_000, probe_count=3, min_total_pairs=30_000) == [
         10_000,
@@ -100,18 +117,14 @@ def test_rust_batch_plan_never_decreases_fixed_overhead(monkeypatch):
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
     pairs = _build_pairs(5)
     captured_fixed: list[int] = []
-
-    class FakeRustFeaturizer:
-        def featurize_pairs(self, pairs, num_threads=None):
-            del num_threads
-            return [[0.0] * featurizer_mod.NUM_FEATURES for _ in pairs]
+    fake_rust_featurizer = FakeIndexedRustFeaturizer(sorted(dataset.signatures.keys()))
 
     monkeypatch.setattr(featurizer_mod, "_use_rust_featurizer", lambda _rc=None: True)
     monkeypatch.setattr(feature_port, "s2and_rust", object())
     monkeypatch.setattr(
         feature_port,
         "_get_rust_featurizer",
-        lambda _dataset, **_kw: FakeRustFeaturizer(),
+        lambda _dataset, **_kw: fake_rust_featurizer,
     )
     monkeypatch.setattr(
         featurizer_mod,
@@ -156,14 +169,7 @@ def test_rust_batch_calls_are_chunked_for_progress_updates(monkeypatch):
     _pin_stable_rss(monkeypatch)
 
     call_sizes = []
-
-    class FakeRustFeaturizer:
-        def featurize_pairs(self, pairs, num_threads=None):
-            del num_threads
-            call_sizes.append(len(pairs))
-            return [[0.0] * featurizer_mod.NUM_FEATURES for _ in pairs]
-
-    fake_rust_featurizer = FakeRustFeaturizer()
+    fake_rust_featurizer = FakeIndexedRustFeaturizer(sorted(dataset.signatures.keys()), call_sizes=call_sizes)
     pairs = _build_pairs(5)
 
     monkeypatch.setattr(featurizer_mod, "_use_rust_featurizer", lambda _rc=None: True)
@@ -214,9 +220,6 @@ def test_rust_batch_prefers_indexed_api_when_available(monkeypatch):
             if selected_indices is None:
                 return np.zeros((len(pairs), featurizer_mod.NUM_FEATURES), dtype=np.float64)
             return np.zeros((len(pairs), len(selected_indices)), dtype=np.float64)
-
-        def featurize_pairs_matrix(self, *_args, **_kwargs):
-            raise AssertionError("Expected indexed batch API to be used")
 
     fake_rust_featurizer = FakeRustFeaturizer()
     pairs = _build_pairs(5)
@@ -317,13 +320,7 @@ def test_rust_batch_uses_same_process_featurizer_without_cache_flag(monkeypatch)
     dataset = build_dummy_dataset("dummy_rust_chunking_same_process_featurizer", load_name_counts=True)
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
     featurizer_calls = {"count": 0}
-
-    class FakeRustFeaturizer:
-        def featurize_pairs(self, pairs, num_threads=None):
-            del num_threads
-            return [[0.0] * featurizer_mod.NUM_FEATURES for _ in pairs]
-
-    fake_rust_featurizer = FakeRustFeaturizer()
+    fake_rust_featurizer = FakeIndexedRustFeaturizer(sorted(dataset.signatures.keys()))
     pairs = [("0", "1", 0.0)]
 
     monkeypatch.setattr(featurizer_mod, "_use_rust_featurizer", lambda _rc=None: True)
@@ -363,13 +360,7 @@ def test_rust_batch_prediction_matches_observed_real_workload(monkeypatch):
     dataset = build_dummy_dataset("dummy_rust_chunking_prediction", load_name_counts=True)
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
     pairs = _build_pairs(12_000)
-
-    class FakeRustFeaturizer:
-        def featurize_pairs(self, pairs, num_threads=None):
-            del num_threads
-            return np.zeros((len(pairs), featurizer_mod.NUM_FEATURES), dtype=np.float64)
-
-    fake_rust_featurizer = FakeRustFeaturizer()
+    fake_rust_featurizer = FakeIndexedRustFeaturizer(sorted(dataset.signatures.keys()))
     total_ram_bytes = 2 * 1024 * 1024 * 1024
     plan = memory_budget.compute_rust_batch_chunk_plan(
         num_features=featurizer_mod.NUM_FEATURES,

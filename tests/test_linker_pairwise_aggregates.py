@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 from s2and import feature_port, memory_budget
-from s2and.feature_port import build_pair_feature_matrix_rust
 from s2and.incremental_linking import linker_pairwise
 from tests.helpers import build_dummy_dataset, import_s2and_rust
 
@@ -69,17 +68,17 @@ def test_candidate_batch_rejects_uint32_wraparound_indices() -> None:
     with pytest.raises(ValueError, match="uint32 range"):
         linker_pairwise.LinkerCandidateBatch(
             row_count=1,
-            left_signature_indices=[-1],
-            right_signature_indices=[0],
-            pair_row_indices=[0],
+            left_signature_indices=np.asarray([-1], dtype=np.int64),
+            right_signature_indices=np.asarray([0], dtype=np.int64),
+            pair_row_indices=np.asarray([0], dtype=np.int64),
         )
 
     with pytest.raises(ValueError, match="uint32 range"):
         linker_pairwise.LinkerCandidateBatch(
             row_count=1,
-            left_signature_indices=[0],
-            right_signature_indices=[int(np.iinfo(np.uint32).max) + 1],
-            pair_row_indices=[0],
+            left_signature_indices=np.asarray([0], dtype=np.int64),
+            right_signature_indices=np.asarray([int(np.iinfo(np.uint32).max) + 1], dtype=np.int64),
+            pair_row_indices=np.asarray([0], dtype=np.int64),
         )
 
 
@@ -633,12 +632,18 @@ def test_candidate_batch_aggregates_match_existing_rust_matrix_path() -> None:
         pair_row_indices=np.asarray(row_indices, dtype=np.uint32),
     )
 
-    matrix = build_pair_feature_matrix_rust(
+    matrix, *_ = feature_port.build_linker_pair_features_and_aggregate_stats_arrays_rust(
         dataset,
-        pairs,
-        selected_indices=feature_indices,
+        candidate_batch.left_signature_indices,
+        candidate_batch.right_signature_indices,
+        candidate_batch.pair_row_indices,
+        candidate_batch.row_count,
+        matrix_indices=feature_indices,
+        aggregate_indices=feature_indices,
         num_threads=2,
         nan_value=0.0,
+        aggregate_nan_value=0.0,
+        featurizer=rust_featurizer,
     )
     expected_counts = np.zeros(2, dtype=np.uint64)
     expected_sums = np.zeros((2, len(feature_indices)), dtype=np.float64)

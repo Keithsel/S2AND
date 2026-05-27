@@ -1120,7 +1120,6 @@ def _load_minimal_raw_specter_dataset(
     *,
     clusterer: Any,
     n_jobs: int,
-    rust_build_path: str | None,
 ) -> ANDData:
     raw_datasets = dict(bundle.assets["raw_metadata"]["datasets"])
     embedding_datasets = dict(bundle.assets.get("embeddings", {}).get("datasets", {}))
@@ -1217,9 +1216,6 @@ def _build_minimal_raw_dataset_context(
     dataset_name: str,
     clusterer: Any,
     n_jobs: int,
-    rust_build_path: str | None,
-    name_counts_path: str | None,
-    allow_normalization_version_mismatch: bool,
     max_exemplars: int,
 ) -> MinimalRawDatasetContext:
     started = time.perf_counter()
@@ -1228,7 +1224,6 @@ def _build_minimal_raw_dataset_context(
         dataset_name,
         clusterer=clusterer,
         n_jobs=n_jobs,
-        rust_build_path=rust_build_path,
     )
     runtime_context = build_runtime_context(
         "joint_safe_link_minimal_raw_featureization",
@@ -1237,9 +1232,7 @@ def _build_minimal_raw_dataset_context(
     featurizer = feature_port._get_rust_featurizer(  # noqa: SLF001
         dataset,
         runtime_context=runtime_context,
-        rust_build_path=cast(Any, rust_build_path),
-        allow_normalization_version_mismatch=allow_normalization_version_mismatch,
-        name_counts_path=name_counts_path,
+        rust_build_path="from_dataset",
     )
     constraint_backend = _build_incremental_constraint_backend(
         dataset,
@@ -3114,9 +3107,6 @@ def _materialize_minimal_raw_feature_bundle(
     max_exemplars: int,
     max_top_k: int,
     reuse_existing_features: bool,
-    rust_build_path: str | None,
-    name_counts_path: str | None,
-    allow_normalization_version_mismatch: bool,
     pairwise_model_nan_value: float,
     pairwise_aggregate_nan_value: float,
     row_nan_policy: str,
@@ -3309,9 +3299,6 @@ def _materialize_minimal_raw_feature_bundle(
                 dataset_name=dataset_name,
                 clusterer=clusterer,
                 n_jobs=n_jobs,
-                rust_build_path=rust_build_path,
-                name_counts_path=name_counts_path,
-                allow_normalization_version_mismatch=allow_normalization_version_mismatch,
                 max_exemplars=max_exemplars,
             )
         try:
@@ -3762,9 +3749,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             max_exemplars=int(args.max_exemplars),
             max_top_k=int(args.max_top_k),
             reuse_existing_features=bool(args.reuse_existing_features),
-            rust_build_path=args.minimal_raw_rust_build_path,
-            name_counts_path=args.minimal_raw_name_counts_path,
-            allow_normalization_version_mismatch=bool(args.allow_normalization_version_mismatch),
             pairwise_model_nan_value=pairwise_model_nan_value,
             pairwise_aggregate_nan_value=pairwise_aggregate_nan_value,
             row_nan_policy=str(args.row_nan_policy),
@@ -4037,28 +4021,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--reuse-existing-features",
         action="store_true",
         help="Reuse already materialized output tables and dataset partials in the output directory.",
-    )
-    parser.add_argument(
-        "--minimal-raw-rust-build-path",
-        choices=("from_json_paths", "from_dataset"),
-        default=None,
-        help=(
-            "Optional compatibility RustFeaturizer constructor override for minimal-raw-rust materialization. "
-            "Defaults to the normal dataset lifecycle policy."
-        ),
-    )
-    parser.add_argument(
-        "--minimal-raw-name-counts-path",
-        default=None,
-        help="Optional Rust JSON ingest name-count artifact path for minimal-raw-rust materialization.",
-    )
-    parser.add_argument(
-        "--allow-normalization-version-mismatch",
-        action="store_true",
-        help=(
-            "Allow Rust JSON ingest to use artifact-backed name counts when normalization metadata is missing "
-            "or does not match the expected normalization version."
-        ),
     )
     parser.add_argument("--run-full", action="store_true", help="Explicitly allow an unbounded official run.")
     parser.add_argument("--allow-metric-drift", action="store_true", help="Do not fail if final metrics differ.")

@@ -4,7 +4,6 @@ import os
 import pickle
 import platform
 import re
-import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
@@ -483,9 +482,6 @@ class ANDData:
         self.original_papers_path = papers if isinstance(papers, str) else None
         self.signatures_path = self.original_signatures_path
         self.papers_path = self.original_papers_path
-        self.rust_ingest_signatures_path: str | None = None
-        self.rust_ingest_papers_path: str | None = None
-        self._rust_ingest_tmpdir = None  # TemporaryDirectory; prevent leak
         self._s2and_python_pair_ngrams_ready: bool = False
         self._rust_cluster_seeds_require_id: int | None = None
         self._rust_cluster_seeds_require_len: int | None = None
@@ -507,7 +503,6 @@ class ANDData:
             from_dataset_paper_preprocess_available=rust_capabilities.from_dataset_paper_preprocess_available,
             use_sinonym_overwrite=use_sinonym_overwrite,
         )
-        defer_rust_json_ingest_write_for_sinonym = self.rust_lifecycle_policy.defer_rust_json_ingest_write_for_sinonym
         pair_sampling_mode = _resolve_pair_sampling_mode(
             pair_sampling_mode=pair_sampling_mode,
             pair_sampling_block=pair_sampling_block,
@@ -537,7 +532,6 @@ class ANDData:
         signatures_stage_start = time.perf_counter()
         logger.info("loading signatures")
         raw_signatures = self.maybe_load_json(signatures)
-        raw_signatures_for_json: dict[Any, Any] | None = None
         self.signatures = {}
         # convert dictionary to namedtuples for memory reduction
         for signature_id, signature in raw_signatures.items():
@@ -591,23 +585,6 @@ class ANDData:
         logger.info("loading papers (subset referenced by signatures)")
         raw_papers = self.maybe_load_json(papers)
         filtered_papers = {pid: p for pid, p in raw_papers.items() if str(pid) in needed_paper_ids}
-        rust_json_ingest_from_paths = bool(
-            self.rust_lifecycle_policy.rust_build_path == "from_json_paths"
-            and self.signatures_path is not None
-            and self.papers_path is not None
-        )
-        if (
-            rust_json_ingest_from_paths
-            and len(filtered_papers) < len(raw_papers)
-            and not defer_rust_json_ingest_write_for_sinonym
-        ):
-            if raw_signatures_for_json is None:
-                raw_signatures_for_json = dict(raw_signatures)
-            self._materialize_rust_json_ingest_filtered_payload(
-                raw_signatures_for_json=raw_signatures_for_json,
-                filtered_papers_for_json=filtered_papers,
-                source_papers_count=len(raw_papers),
-            )
         self.papers = {}
         # convert dictionary to namedtuples for memory reduction
         for paper_id, paper in filtered_papers.items():
@@ -675,18 +652,6 @@ class ANDData:
                 self.papers, sinonym_results, allow_overwrite_pos=allow_overwrite_pos
             )
             logger.info(f"Sinonym overwrote {paper_overwrite_count} paper author name(s)")
-            if defer_rust_json_ingest_write_for_sinonym:
-                if raw_signatures_for_json is None:
-                    raw_signatures_for_json = dict(raw_signatures)
-                self._sync_in_memory_names_to_rust_json_payload(
-                    raw_signatures_for_json=raw_signatures_for_json,
-                    filtered_papers_for_json=filtered_papers,
-                )
-                self._materialize_rust_json_ingest_filtered_payload(
-                    raw_signatures_for_json=raw_signatures_for_json,
-                    filtered_papers_for_json=filtered_papers,
-                    source_papers_count=len(raw_papers),
-                )
 
         self.name = name
         self.mode = mode
@@ -877,90 +842,6 @@ class ANDData:
         """Return whether pair sampling also balances homonym/synonym cases."""
 
         return self.pair_sampling_mode == "within_block_balanced_homonym_synonym"
-
-    def _sync_in_memory_names_to_rust_json_payload(
-        self,
-        *,
-        raw_signatures_for_json: dict[Any, Any],
-        filtered_papers_for_json: dict[Any, Any],
-    ) -> None:
-        for signature_id, signature in self.signatures.items():
-            signature_payload = raw_signatures_for_json.get(signature_id)
-            if signature_payload is None:
-                signature_payload = raw_signatures_for_json.get(str(signature_id))
-            if not isinstance(signature_payload, dict):
-                continue
-            author_info_payload = signature_payload.get("author_info")
-            if not isinstance(author_info_payload, dict):
-                continue
-            author_info_payload["first"] = signature.author_info_first
-            author_info_payload["middle"] = signature.author_info_middle
-            author_info_payload["last"] = signature.author_info_last
-            author_info_payload["block"] = signature.author_info_block
-
-        for paper_id, paper_payload in filtered_papers_for_json.items():
-            paper = self.papers.get(paper_id)
-            if paper is None:
-                paper = self.papers.get(str(paper_id))
-            if paper is None or not isinstance(paper_payload, dict):
-                continue
-            author_payloads = paper_payload.get("authors")
-            if not isinstance(author_payloads, list):
-                continue
-            position_to_name: dict[Any, str] = {}
-            for author in paper.authors:
-                position_to_name[author.position] = author.author_name
-                position_to_name[str(author.position)] = author.author_name
-            for author_payload in author_payloads:
-                if not isinstance(author_payload, dict):
-                    continue
-                author_name = position_to_name.get(author_payload.get("position"))
-                if author_name is not None:
-                    author_payload["author_name"] = author_name
-
-    def _materialize_rust_json_ingest_filtered_payload(
-        self,
-        *,
-        raw_signatures_for_json: dict[Any, Any],
-        filtered_papers_for_json: dict[Any, Any],
-        source_papers_count: int,
-    ) -> None:
-        filtered_paths_start = time.perf_counter()
-        if self._rust_ingest_tmpdir is None:
-            self._rust_ingest_tmpdir = tempfile.TemporaryDirectory(prefix="s2and_rust_json_ingest_")
-        filtered_dir = self._rust_ingest_tmpdir.name
-        filtered_signatures_path = os.path.join(filtered_dir, "signatures_filtered.json")
-        filtered_papers_path = os.path.join(filtered_dir, "papers_filtered.json")
-        with open(filtered_signatures_path, "w", encoding="utf-8") as signatures_file:
-            json.dump(raw_signatures_for_json, signatures_file)
-        with open(filtered_papers_path, "w", encoding="utf-8") as papers_file:
-            json.dump(filtered_papers_for_json, papers_file)
-        self.rust_ingest_signatures_path = filtered_signatures_path
-        self.rust_ingest_papers_path = filtered_papers_path
-        logger.info(
-            "Rust JSON ingest: materialized filtered JSON payloads signatures=%d papers=%d source_papers=%d "
-            "seconds=%.3f",
-            len(raw_signatures_for_json),
-            len(filtered_papers_for_json),
-            source_papers_count,
-            time.perf_counter() - filtered_paths_start,
-        )
-
-    def cleanup_rust_ingest_tmpdir(self) -> None:
-        """Remove temporary Rust-ingest JSON files materialized for this dataset."""
-
-        tmpdir = self._rust_ingest_tmpdir
-        self._rust_ingest_tmpdir = None
-        self.rust_ingest_signatures_path = None
-        self.rust_ingest_papers_path = None
-        if tmpdir is not None:
-            tmpdir.cleanup()
-
-    def __del__(self) -> None:
-        try:
-            self.cleanup_rust_ingest_tmpdir()
-        except Exception:
-            pass
 
     def _compute_signature_name_counts(
         self,

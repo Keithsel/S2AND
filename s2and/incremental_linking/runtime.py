@@ -423,8 +423,11 @@ def _predict_incremental_link_or_abstain_compact(
                 retrieval_ranks=candidate_batch.retrieval_ranks,
                 component_keys=component_keys,
             )
+            # Margin is reported against the highest-scoring non-best candidate from the
+            # full query group, not just the forced subset, so a single ORCID-forced row
+            # still produces a meaningful "beats the alternatives" margin.
             runner_up_score = _forced_runner_up_score(
-                forced_orcid_rows,
+                group,
                 best_row=best_row,
                 probabilities=probabilities,
                 retrieval_ranks=candidate_batch.retrieval_ranks,
@@ -445,7 +448,7 @@ def _predict_incremental_link_or_abstain_compact(
                 component_keys=component_keys,
             )
             runner_up_score = _forced_runner_up_score(
-                forced_constraint_rows,
+                group,
                 best_row=best_row,
                 probabilities=probabilities,
                 retrieval_ranks=candidate_batch.retrieval_ranks,

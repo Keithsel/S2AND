@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -88,8 +88,8 @@ def test_canonical_pubmed_large_block_arrow_subblocking_and_incremental_no_andda
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rust_module = pytest.importorskip("s2and_rust")
-    if not hasattr(rust_module, "make_subblocks_with_telemetry_arrow"):
-        raise pytest.skip.Exception("s2and_rust.make_subblocks_with_telemetry_arrow is unavailable")
+    if not hasattr(rust_module, "make_subblocks_with_telemetry_arrow_native_graph"):
+        raise pytest.skip.Exception("s2and_rust.make_subblocks_with_telemetry_arrow_native_graph is unavailable")
     if not hasattr(rust_module, "RawBlockQueryCandidatePlanner"):
         raise pytest.skip.Exception("s2and_rust.RawBlockQueryCandidatePlanner is unavailable")
 
@@ -156,14 +156,14 @@ def test_canonical_pubmed_large_block_arrow_subblocking_and_incremental_no_andda
 
     pred_clusters, dists = clusterer.predict(
         {workload.target_block: block_signature_ids},
-        dataset,
+        cast(Any, dataset),
         batching_threshold=64,
         backend="rust",
         total_ram_bytes=1_000_000_000_000,
         restore_rust_cluster_seeds_on_exit=False,
     )
 
-    graph = clusterer._last_arrow_graph_subblocking_telemetry
+    graph = cast(dict[str, Any], clusterer._last_arrow_graph_subblocking_telemetry)
     assert pred_clusters
     assert dists is None
     assert graph["enabled"] == 1
@@ -176,16 +176,19 @@ def test_canonical_pubmed_large_block_arrow_subblocking_and_incremental_no_andda
     assert graph["graph_fallback_errors"] == []
     assert graph["fallback_invocation_count"] > 0
 
-    result = clusterer.predict_incremental(
-        workload.block_signatures,
-        dataset,
-        prevent_new_incompatibilities=False,
-        batching_threshold=1,
-        runtime_context=build_runtime_context("large_block_arrow_runtime_test", backend="rust"),
-        total_ram_bytes=1_000_000_000_000,
+    result = cast(
+        dict[str, Any],
+        clusterer.predict_incremental(
+            workload.block_signatures,
+            cast(Any, dataset),
+            prevent_new_incompatibilities=False,
+            batching_threshold=1,
+            runtime_context=build_runtime_context("large_block_arrow_runtime_test", backend="rust"),
+            total_ram_bytes=1_000_000_000_000,
+        ),
     )
 
-    telemetry = result["incremental_linker_telemetry"]
+    telemetry = cast(dict[str, Any], result["incremental_linker_telemetry"])
     assert result["incremental_linker_query_view"] == "raw_arrow"
     assert telemetry["arrow_promoted_incremental"] == 1
     assert telemetry["seed_setup_cluster_seeds_source"] == "arrow"

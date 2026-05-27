@@ -49,10 +49,10 @@ def test_backend_use_rust_mismatch_raises(backend: str, use_rust: bool):
         (False, False, "from_dataset"),
         (False, True, "from_dataset"),
         (True, False, "from_dataset"),
-        (True, True, "from_json_paths"),
+        (True, True, "from_dataset"),
     ],
 )
-def test_rust_inference_build_path_requires_both_json_paths(
+def test_rust_inference_build_path_is_from_dataset(
     has_signatures_path: bool,
     has_papers_path: bool,
     expected_build_path: str,
@@ -128,7 +128,7 @@ def test_rust_training_from_dataset_does_not_skip_without_capability():
     assert policy.skip_python_paper_preprocess is False
 
 
-def test_rust_inference_with_sinonym_overwrite_keeps_from_json_paths():
+def test_rust_inference_with_sinonym_overwrite_uses_from_dataset():
     policy = build_rust_lifecycle_policy(
         backend="rust",
         mode="inference",
@@ -138,13 +138,12 @@ def test_rust_inference_with_sinonym_overwrite_keeps_from_json_paths():
         use_rust=True,
         use_sinonym_overwrite=True,
     )
-    assert policy.mode == "rust_inference_json_sinonym"
-    assert policy.rust_build_path == "from_json_paths"
-    assert policy.skip_python_paper_preprocess is True
-    assert policy.defer_rust_json_ingest_write_for_sinonym is True
+    assert policy.mode == "rust_inference_from_dataset"
+    assert policy.rust_build_path == "from_dataset"
+    assert policy.skip_python_paper_preprocess is False
 
 
-def test_rust_inference_without_sinonym_overwrite_does_not_defer_json_ingest_write():
+def test_rust_inference_without_sinonym_overwrite_uses_from_dataset():
     policy = build_rust_lifecycle_policy(
         backend="rust",
         mode="inference",
@@ -154,8 +153,7 @@ def test_rust_inference_without_sinonym_overwrite_does_not_defer_json_ingest_wri
         use_rust=True,
         use_sinonym_overwrite=False,
     )
-    assert policy.rust_build_path == "from_json_paths"
-    assert policy.defer_rust_json_ingest_write_for_sinonym is False
+    assert policy.rust_build_path == "from_dataset"
 
 
 @pytest.mark.parametrize("preprocess", [False, True])

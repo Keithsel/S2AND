@@ -21,6 +21,18 @@ assert s2and_rust is not None and not isinstance(s2and_rust, Exception)
 _S2AND_RUST = cast(Any, s2and_rust)
 
 
+def test_removed_json_ingest_and_debug_feature_surfaces_are_absent():
+    for method_name in (
+        "from_json_paths",
+        "featurize_pair",
+        "featurize_pairs",
+        "featurize_pairs_matrix",
+        "save",
+        "load",
+    ):
+        assert not hasattr(_S2AND_RUST.RustFeaturizer, method_name)
+
+
 def _build_minimal_dataset(name: str) -> ANDData:
     signatures = {
         "s1": {
@@ -124,10 +136,29 @@ def _build_minimal_dataset(name: str) -> ANDData:
 def _rust_minimal_featurizer(name: str) -> tuple[Any, int, int]:
     dataset = _build_minimal_dataset(name)
     rust_featurizer = _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
-    signature_id_to_index = {
-        str(signature_id): index for index, signature_id in enumerate(rust_featurizer.signature_ids())
-    }
+    signature_id_to_index = _signature_id_to_index(rust_featurizer)
     return rust_featurizer, signature_id_to_index["s1"], signature_id_to_index["s2"]
+
+
+def _signature_id_to_index(rust_featurizer: Any) -> dict[str, int]:
+    return {str(signature_id): index for index, signature_id in enumerate(rust_featurizer.signature_ids())}
+
+
+def _indexed_pair_matrix(
+    rust_featurizer: Any,
+    left_signature_id: str,
+    right_signature_id: str,
+    selected_indices: list[int] | None = None,
+) -> np.ndarray:
+    signature_id_to_index = _signature_id_to_index(rust_featurizer)
+    return np.asarray(
+        rust_featurizer.featurize_pairs_matrix_indexed(
+            [(signature_id_to_index[left_signature_id], signature_id_to_index[right_signature_id])],
+            selected_indices,
+            1,
+            np.nan,
+        )
+    )
 
 
 def test_from_dataset_fastpath_parity_for_field_sensitive_values():
@@ -161,7 +192,7 @@ def test_from_dataset_fastpath_parity_for_field_sensitive_values():
 
     python_features, _ = _single_pair_featurize(("s1", "s2"), dataset=dataset)
     rust_featurizer = _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
-    rust_features = rust_featurizer.featurize_pair("s1", "s2")
+    rust_features = _indexed_pair_matrix(rust_featurizer, "s1", "s2")[0]
     feature_names = featurizer_mod.FeaturizationInfo().get_feature_names()
     venue_idx = feature_names.index("venue_overlap")
     journal_idx = feature_names.index("journal_overlap")
@@ -173,17 +204,11 @@ def test_from_dataset_fastpath_parity_for_field_sensitive_values():
         assert equalish(ref_val, got_val), f"Mismatch idx={idx}: ref={ref_val} got={got_val}"
 
 
-def test_from_dataset_raw_papers_match_preprocessed_for_language_and_coauthors():
+def test_from_dataset_raw_papers_match_preprocessed_for_language_names_and_ngrams():
     dataset_preprocessed = _build_minimal_dataset("rust_contract_raw_vs_preprocessed")
-    for signature_id in ("s1", "s2"):
-        dataset_preprocessed.signatures[signature_id] = dataset_preprocessed.signatures[signature_id]._replace(
-            author_info_coauthors=None,
-            author_info_coauthor_blocks=None,
-            author_info_coauthor_n_grams=None,
-        )
 
     rust_preprocessed = _S2AND_RUST.RustFeaturizer.from_dataset(dataset_preprocessed, 0.0, 10000.0, 1)
-    expected_features = rust_preprocessed.featurize_pair("s1", "s2")
+    expected_features = _indexed_pair_matrix(rust_preprocessed, "s1", "s2")[0]
     expected_constraint = rust_preprocessed.get_constraint("s1", "s2")
 
     dataset_raw = copy.deepcopy(dataset_preprocessed)
@@ -191,6 +216,8 @@ def test_from_dataset_raw_papers_match_preprocessed_for_language_and_coauthors()
     dataset_raw.papers["1"] = dataset_raw.papers["1"]._replace(
         title="This paper presents a method for author disambiguation in digital libraries.",
         authors=[Author(author_name="Alice Smith", position=0), Author(author_name="Bob Jones", position=1)],
+        venue="Conf A",
+        journal_name="Journal X",
         predicted_language=None,
         is_reliable=None,
         title_ngrams_words=None,
@@ -201,6 +228,8 @@ def test_from_dataset_raw_papers_match_preprocessed_for_language_and_coauthors()
     dataset_raw.papers["2"] = dataset_raw.papers["2"]._replace(
         title="Cet article presente une methode pour la desambiguation des auteurs dans les bibliotheques numeriques.",
         authors=[Author(author_name="Alice Smith", position=0), Author(author_name="Carol Lee", position=1)],
+        venue="Conf A",
+        journal_name="Journal Y",
         predicted_language=None,
         is_reliable=None,
         title_ngrams_words=None,
@@ -208,9 +237,35 @@ def test_from_dataset_raw_papers_match_preprocessed_for_language_and_coauthors()
         venue_ngrams=None,
         journal_ngrams=None,
     )
+    raw_affiliations = {"s1": ["Alpha Institute"], "s2": ["Beta Lab"]}
+    for signature_id in ("s1", "s2"):
+        dataset_raw.signatures[signature_id] = dataset_raw.signatures[signature_id]._replace(
+            author_info_first_normalized_without_apostrophe=None,
+            author_info_first_normalized=None,
+            author_info_middle_normalized_without_apostrophe=None,
+            author_info_last_normalized=None,
+            author_info_suffix_normalized=None,
+            author_info_affiliations=raw_affiliations[signature_id],
+            author_info_affiliations_n_grams=None,
+            author_info_coauthors=None,
+            author_info_coauthor_blocks=None,
+            author_info_coauthor_n_grams=None,
+        )
+
+    for paper in dataset_raw.papers.values():
+        assert paper.predicted_language is None
+        assert paper.title_ngrams_words is None
+        assert paper.title_ngrams_chars is None
+        assert paper.venue_ngrams is None
+        assert paper.journal_ngrams is None
+    for signature in dataset_raw.signatures.values():
+        assert signature.author_info_first_normalized_without_apostrophe is None
+        assert signature.author_info_last_normalized is None
+        assert signature.author_info_affiliations_n_grams is None
+        assert signature.author_info_coauthor_n_grams is None
 
     rust_raw = _S2AND_RUST.RustFeaturizer.from_dataset(dataset_raw, 0.0, 10000.0, 1)
-    observed_features = rust_raw.featurize_pair("s1", "s2")
+    observed_features = _indexed_pair_matrix(rust_raw, "s1", "s2")[0]
     observed_constraint = rust_raw.get_constraint("s1", "s2")
 
     assert len(expected_features) == len(observed_features)
@@ -242,25 +297,22 @@ def test_from_dataset_rejects_namedtuple_field_order_mismatch():
 
 def test_matrix_entrypoints_preserve_duplicate_selected_indices_and_empty_early_return():
     rust_featurizer, left_index, right_index = _rust_minimal_featurizer("rust_matrix_duplicate_indices")
-    full_cols = len(rust_featurizer.featurize_pair("s1", "s2"))
+    full_matrix = np.asarray(
+        rust_featurizer.featurize_pairs_matrix_indexed([(left_index, right_index)], None, 1, np.nan)
+    )
+    full_cols = full_matrix.shape[1]
     selected_indices = [2, 2, 3]
 
-    full_matrix = np.asarray(rust_featurizer.featurize_pairs_matrix([("s1", "s2")], None, 1, np.nan))
-    selected_matrix = np.asarray(rust_featurizer.featurize_pairs_matrix([("s1", "s2")], selected_indices, 1, np.nan))
-    indexed_matrix = np.asarray(
+    selected_matrix = np.asarray(
         rust_featurizer.featurize_pairs_matrix_indexed([(left_index, right_index)], selected_indices, 1, np.nan)
     )
 
     assert selected_matrix.shape == (1, 3)
     np.testing.assert_allclose(selected_matrix, full_matrix[:, selected_indices], equal_nan=True)
-    np.testing.assert_allclose(indexed_matrix, selected_matrix, equal_nan=True)
 
-    with pytest.raises(ValueError, match=f"selected_indices contains out-of-range index {full_cols}"):
-        rust_featurizer.featurize_pairs_matrix([("s1", "s2")], [full_cols], 1, np.nan)
     with pytest.raises(ValueError, match=f"selected_indices contains out-of-range index {full_cols}"):
         rust_featurizer.featurize_pairs_matrix_indexed([(left_index, right_index)], [full_cols], 1, np.nan)
 
-    assert np.asarray(rust_featurizer.featurize_pairs_matrix([], [full_cols], 1, np.nan)).shape == (0, 0)
     assert np.asarray(rust_featurizer.featurize_pairs_matrix_indexed([], [full_cols], 1, np.nan)).shape == (0, 0)
     assert np.asarray(
         rust_featurizer.featurize_block_upper_triangle_matrix_indexed(
@@ -271,7 +323,9 @@ def test_matrix_entrypoints_preserve_duplicate_selected_indices_and_empty_early_
 
 def test_aggregate_entrypoints_validate_indices_and_preserve_tuple_shapes():
     rust_featurizer, left_index, right_index = _rust_minimal_featurizer("rust_aggregate_index_contracts")
-    full_cols = len(rust_featurizer.featurize_pair("s1", "s2"))
+    full_cols = np.asarray(
+        rust_featurizer.featurize_pairs_matrix_indexed([(left_index, right_index)], None, 1, np.nan)
+    ).shape[1]
     selected_indices = [2, 2, 3]
     aggregate_indices = [2, 3, 2]
     left_indices = np.asarray([left_index], dtype=np.uint32)

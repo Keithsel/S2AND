@@ -1,3 +1,9 @@
+"""Profile production inference routes.
+
+Arrow is the production inference boundary. JSON/ANDData runs are opt-in
+compatibility baselines for parity and profiling only.
+"""
+
 import argparse
 import cProfile
 import io
@@ -479,7 +485,9 @@ def _compare_runs(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Profile prod-style evaluation through Arrow by default.")
+    parser = argparse.ArgumentParser(
+        description="Profile production Arrow inference; JSON/ANDData baselines are opt-in compatibility routes."
+    )
     parser.add_argument("--mode", choices=["compare", "single"], default="compare")
     parser.add_argument("--backend", choices=["python", "rust"], default="rust")
     parser.add_argument("--input-format", choices=["arrow", "json"], default="arrow")

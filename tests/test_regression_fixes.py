@@ -528,6 +528,8 @@ def test_incremental_cluster_eval_val_uses_val_block_for_pairwise_metrics(monkey
 def test_make_subblocks_handles_specter_edge_case_without_unbound_local(monkeypatch):
     class Signature:
         def __init__(self, first_name, middle_name, orcid=None):
+            self.author_info_first = first_name
+            self.author_info_middle = middle_name
             self.author_info_first_normalized_without_apostrophe = first_name
             self.author_info_middle_normalized_without_apostrophe = middle_name
             self.author_info_orcid = orcid

@@ -8,6 +8,7 @@ import pytest
 
 from s2and.arrow_inputs import require_name_counts_index_artifact
 from s2and.incremental_linking.feature_block import write_arrow_batch_lookup_index, write_arrow_ipc_table
+from scripts.verification.validate_local_arrow_release import validate_release_root
 
 
 def _touch_json(path: Path, payload: dict | None = None) -> None:
@@ -117,6 +118,21 @@ def test_docs_work_plan_arrow_release_layout_required_files(tmp_path: Path) -> N
         dataset_root / "signatures.signatures_batch_index.bin",
         key_column="signature_id",
     )
+    write_arrow_batch_lookup_index(
+        dataset_root / "papers.arrow",
+        dataset_root / "papers.papers_batch_index.bin",
+        key_column="paper_id",
+    )
+    write_arrow_batch_lookup_index(
+        dataset_root / "paper_authors.arrow",
+        dataset_root / "paper_authors.paper_authors_batch_index.bin",
+        key_column="paper_id",
+    )
+    write_arrow_batch_lookup_index(
+        dataset_root / "specter2.arrow",
+        dataset_root / "specter2.specter_batch_index.bin",
+        key_column="paper_id",
+    )
     dataset_manifest = {
         "signature_count": 1,
         "paper_count": 1,
@@ -125,7 +141,11 @@ def test_docs_work_plan_arrow_release_layout_required_files(tmp_path: Path) -> N
             "papers": "papers.arrow",
             "paper_authors": "paper_authors.arrow",
             "specter2": "specter2.arrow",
+            "name_counts_index": "../name_counts_index",
             "signatures_batch_index": "signatures.signatures_batch_index.bin",
+            "papers_batch_index": "papers.papers_batch_index.bin",
+            "paper_authors_batch_index": "paper_authors.paper_authors_batch_index.bin",
+            "specter2_batch_index": "specter2.specter_batch_index.bin",
         },
     }
     _touch_json(dataset_root / "manifest.json", dataset_manifest)
@@ -142,6 +162,10 @@ def test_docs_work_plan_arrow_release_layout_required_files(tmp_path: Path) -> N
                     "manifest_path": f"{dataset_name}/manifest.json",
                     "manifest_size_bytes": len(dataset_manifest_bytes),
                     "manifest_sha256": hashlib.sha256(dataset_manifest_bytes).hexdigest(),
+                    "validation_requirements": {
+                        "require_embeddings": True,
+                        "require_name_counts_index": True,
+                    },
                 }
             ],
             "audit": {
@@ -152,3 +176,10 @@ def test_docs_work_plan_arrow_release_layout_required_files(tmp_path: Path) -> N
     )
 
     _validate_required_release_files(release_root, dataset_name)
+    assert validate_release_root(release_root, include_replay_bundles=False) == {
+        "release_root": str(release_root.resolve()),
+        "dataset_manifest_count": 1,
+        "replay_dataset_manifest_count": 0,
+        "name_counts_index": str(release_root.resolve() / "name_counts_index"),
+        "network_access": False,
+    }

@@ -1,10 +1,9 @@
-use pyo3::prelude::*;
-use pyo3::types::PyAny;
-use pyo3::Bound;
+use crate::text_unidecode_data::TEXT_UNIDECODE_DATA;
+use pyo3::prelude::PyResult;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 pub(crate) fn ensure_unidecode_for_text(
-    unidecode_fn: &Bound<'_, PyAny>,
     text: &str,
     unidecode_char_map: &mut HashMap<char, String>,
 ) -> PyResult<()> {
@@ -15,10 +14,28 @@ pub(crate) fn ensure_unidecode_for_text(
         if ch.is_ascii() || unidecode_char_map.contains_key(&ch) {
             continue;
         }
-        let mapped: String = unidecode_fn.call1((ch.to_string(),))?.extract()?;
-        unidecode_char_map.insert(ch, mapped);
+        unidecode_char_map.insert(ch, text_unidecode_char(ch).to_string());
     }
     Ok(())
+}
+
+static TEXT_UNIDECODE_REPLACES: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+fn text_unidecode_replaces() -> &'static [&'static str] {
+    TEXT_UNIDECODE_REPLACES
+        .get_or_init(|| TEXT_UNIDECODE_DATA.split('\0').collect())
+        .as_slice()
+}
+
+fn text_unidecode_char(ch: char) -> &'static str {
+    let codepoint = ch as usize;
+    if codepoint == 0 {
+        return "\0";
+    }
+    text_unidecode_replaces()
+        .get(codepoint - 1)
+        .copied()
+        .unwrap_or("")
 }
 
 pub(crate) fn normalize_ascii_text_compat(text: &str, special_case_apostrophes: bool) -> String {
@@ -42,10 +59,22 @@ pub(crate) fn normalize_ascii_text_compat(text: &str, special_case_apostrophes: 
     normalized
 }
 
+pub(crate) fn normalize_text_compat_native(text: &str, special_case_apostrophes: bool) -> String {
+    normalize_text_compat_with_map(text, special_case_apostrophes, None)
+}
+
 pub(crate) fn normalize_text_compat_from_map(
     text: &str,
     special_case_apostrophes: bool,
     unidecode_char_map: &HashMap<char, String>,
+) -> String {
+    normalize_text_compat_with_map(text, special_case_apostrophes, Some(unidecode_char_map))
+}
+
+fn normalize_text_compat_with_map(
+    text: &str,
+    special_case_apostrophes: bool,
+    unidecode_char_map: Option<&HashMap<char, String>>,
 ) -> String {
     if text.is_empty() {
         return String::new();
@@ -60,16 +89,11 @@ pub(crate) fn normalize_text_compat_from_map(
             transliterated.push(ch.to_ascii_lowercase());
             continue;
         }
-        if let Some(mapped) = unidecode_char_map.get(&ch) {
-            for mapped_ch in mapped.chars() {
-                for lowered in mapped_ch.to_lowercase() {
-                    transliterated.push(lowered);
-                }
-            }
-        } else {
-            for lowered in ch.to_lowercase() {
-                transliterated.push(lowered);
-            }
+        let mapped = unidecode_char_map
+            .and_then(|char_map| char_map.get(&ch).map(String::as_str))
+            .unwrap_or_else(|| text_unidecode_char(ch));
+        for mapped_ch in mapped.chars() {
+            transliterated.push(mapped_ch.to_ascii_lowercase());
         }
     }
 
@@ -127,6 +151,10 @@ fn is_name_dash(ch: char) -> bool {
 
 pub(crate) fn contains_name_dash(value: &str) -> bool {
     value.chars().any(is_name_dash)
+}
+
+pub(crate) fn contains_non_ascii_name_dash(value: &str) -> bool {
+    value.chars().any(|ch| ch != '-' && is_name_dash(ch))
 }
 
 pub(crate) fn split_first_middle_hyphen_aware_compat(

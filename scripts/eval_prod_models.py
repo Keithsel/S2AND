@@ -74,10 +74,33 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import os
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from typing import Any, cast
+
+import numpy as np
+
+TRAIN_MODE_ANDDATA_CURRENT = "anddata-current"
+TRAIN_MODE_ANDDATA_PYTHON = "anddata-python"
+TRAIN_MODE_JSON_RUST = "json-rust"
+TRAIN_MODE_ARROW_RUST = "arrow-rust"
+TRAIN_MODE_CHOICES = (
+    TRAIN_MODE_ANDDATA_CURRENT,
+    TRAIN_MODE_ANDDATA_PYTHON,
+    TRAIN_MODE_JSON_RUST,
+    TRAIN_MODE_ARROW_RUST,
+)
+TRAIN_MODE_COMPARISON = (
+    TRAIN_MODE_ANDDATA_PYTHON,
+    TRAIN_MODE_JSON_RUST,
+    TRAIN_MODE_ARROW_RUST,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -114,6 +137,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Retrain models from scratch instead of loading prod pickles",
     )
     parser.add_argument(
+        "--train-modes",
+        nargs="*",
+        choices=TRAIN_MODE_CHOICES,
+        default=None,
+        help=(
+            "Training backend modes to run when --train is set. The default preserves the historical "
+            "ANDData training behavior. Use --compare-train-modes for the qian parity harness."
+        ),
+    )
+    parser.add_argument(
+        "--compare-train-modes",
+        action="store_true",
+        help=(
+            "Run the qian-only pairwise training parity harness: ANDData/Python, "
+            "ANDData/Rust from_dataset, and Arrow/Rust from_arrow_paths."
+        ),
+    )
+    parser.add_argument(
         "--use-arrow",
         action="store_true",
         help=(
@@ -134,6 +175,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "s2and/data for --dataset full."
         ),
     )
+    parser.add_argument(
+        "--json-data-root",
+        default=None,
+        help="JSON/pickle dataset root for --train. Defaults to s2and/data-backup.",
+    )
+    parser.add_argument("--train-pairs-size", type=int, default=100000)
+    parser.add_argument("--val-pairs-size", type=int, default=10000)
+    parser.add_argument("--test-pairs-size", type=int, default=10000)
+    parser.add_argument("--pairwise-n-iter", type=int, default=25)
+    parser.add_argument("--cluster-n-iter", type=int, default=25)
     return parser
 
 
@@ -162,6 +213,94 @@ def _default_arrow_data_root(project_root_path: str, dataset_label: str) -> str 
         return os.path.join(project_root_path, "s2and", "data", "s2and_mini_arrow")
     if dataset_label == "full":
         return os.path.join(project_root_path, "s2and", "data")
+    return None
+
+
+def _default_json_data_root(project_root_path: str, dataset_label: str) -> str:
+    if dataset_label == "mini":
+        return os.path.join(project_root_path, "s2and", "data-backup", "s2and_mini")
+    return os.path.join(project_root_path, "s2and", "data-backup")
+
+
+def _resolve_requested_train_modes(
+    requested_modes: Sequence[str] | None,
+    *,
+    compare_train_modes: bool,
+) -> list[str]:
+    if compare_train_modes:
+        if requested_modes:
+            raise ValueError("Pass either --compare-train-modes or --train-modes, not both")
+        return list(TRAIN_MODE_COMPARISON)
+    if not requested_modes:
+        return [TRAIN_MODE_ANDDATA_CURRENT]
+    return [str(mode) for mode in requested_modes]
+
+
+def _validate_train_mode_scope(train_modes: Sequence[str], datasets: Sequence[str]) -> None:
+    if any(mode != TRAIN_MODE_ANDDATA_CURRENT for mode in train_modes) and list(datasets) != ["qian"]:
+        raise ValueError("Non-default training modes are currently qian-only; pass --datasets qian")
+
+
+def _assert_training_mode_metrics_identical(
+    results: Mapping[tuple[str, str], Sequence[Mapping[str, tuple]]],
+    *,
+    specter_suffixes_to_check: Sequence[str],
+    train_modes: Sequence[str],
+    datasets: Sequence[str],
+) -> None:
+    if len(train_modes) <= 1:
+        return
+    baseline_mode = str(train_modes[0])
+    for specter_suffix in specter_suffixes_to_check:
+        baseline_metrics = results[(str(specter_suffix), baseline_mode)]
+        for train_mode in train_modes[1:]:
+            observed_metrics = results[(str(specter_suffix), str(train_mode))]
+            for dataset_index, dataset_name in enumerate(datasets):
+                expected = baseline_metrics[dataset_index]
+                observed = observed_metrics[dataset_index]
+                if set(expected) != set(observed):
+                    raise AssertionError(
+                        f"Training mode metrics keys differ for dataset={dataset_name} "
+                        f"specter_suffix={specter_suffix} mode={train_mode}: "
+                        f"expected={sorted(expected)} observed={sorted(observed)}"
+                    )
+                for metric_name, expected_value in expected.items():
+                    observed_value = observed[metric_name]
+                    if not np.allclose(
+                        np.asarray(expected_value, dtype=np.float64),
+                        np.asarray(observed_value, dtype=np.float64),
+                        equal_nan=True,
+                        atol=0.0,
+                        rtol=0.0,
+                    ):
+                        raise AssertionError(
+                            "Training mode metrics differ for "
+                            f"dataset={dataset_name} specter_suffix={specter_suffix} "
+                            f"metric={metric_name} baseline_mode={baseline_mode} mode={train_mode}: "
+                            f"expected={expected_value} observed={observed_value}"
+                        )
+
+
+@contextlib.contextmanager
+def _temporary_s2and_backend(backend: str | None):
+    previous = os.environ.get("S2AND_BACKEND")
+    if backend is not None:
+        os.environ["S2AND_BACKEND"] = backend
+    try:
+        yield
+    finally:
+        if backend is not None:
+            if previous is None:
+                os.environ.pop("S2AND_BACKEND", None)
+            else:
+                os.environ["S2AND_BACKEND"] = previous
+
+
+def _backend_for_train_mode(train_mode: str) -> str | None:
+    if train_mode == TRAIN_MODE_ANDDATA_PYTHON:
+        return "python"
+    if train_mode == TRAIN_MODE_JSON_RUST:
+        return "rust"
     return None
 
 
@@ -486,6 +625,320 @@ def cluster_eval_arrow(
     return metrics, b3_metrics_per_signature
 
 
+@dataclass(frozen=True)
+class PairwiseTrainingSplits:
+    train_pairs: list[tuple[str, str, int | float]]
+    val_pairs: list[tuple[str, str, int | float]]
+    test_pairs: list[tuple[str, str, int | float]]
+    train_block_dict: dict[str, list[str]]
+    val_block_dict: dict[str, list[str]]
+    test_block_dict: dict[str, list[str]]
+    signature_to_cluster_id: dict[str, str]
+
+
+def build_eval_anddata(
+    *,
+    data_root: str,
+    dataset_name: str,
+    specter_suffix: str,
+    n_jobs: int,
+    random_seed: int,
+    train_pairs_size: int,
+    val_pairs_size: int,
+    test_pairs_size: int,
+) -> Any:
+    from s2and.data import ANDData
+
+    return ANDData(
+        signatures=resolve_dataset_file(data_root, dataset_name, f"{dataset_name}_signatures.json", "signatures.json"),
+        papers=resolve_dataset_file(data_root, dataset_name, f"{dataset_name}_papers.json", "papers.json"),
+        name=dataset_name,
+        mode="train",
+        specter_embeddings=resolve_dataset_file(
+            data_root,
+            dataset_name,
+            f"{dataset_name}{specter_suffix}",
+            specter_suffix.lstrip("_"),
+        ),
+        clusters=resolve_dataset_file(data_root, dataset_name, f"{dataset_name}_clusters.json", "clusters.json"),
+        block_type="s2",
+        train_pairs=None,
+        val_pairs=None,
+        test_pairs=None,
+        train_pairs_size=train_pairs_size,
+        val_pairs_size=val_pairs_size,
+        test_pairs_size=test_pairs_size,
+        n_jobs=n_jobs,
+        load_name_counts=True,
+        preprocess=True,
+        random_seed=random_seed,
+        name_tuples="filtered",
+    )
+
+
+def pair_splits_from_anddata(anddata: Any) -> PairwiseTrainingSplits:
+    train_block_dict, val_block_dict, test_block_dict = anddata.split_cluster_signatures()
+    train_pairs, val_pairs, test_pairs = anddata.split_pairs(train_block_dict, val_block_dict, test_block_dict)
+    return PairwiseTrainingSplits(
+        train_pairs=train_pairs,
+        val_pairs=val_pairs,
+        test_pairs=test_pairs,
+        train_block_dict=train_block_dict,
+        val_block_dict=val_block_dict,
+        test_block_dict=test_block_dict,
+        signature_to_cluster_id={
+            str(key): str(value) for key, value in (anddata.signature_to_cluster_id or {}).items()
+        },
+    )
+
+
+def _sample_within_block_random_pairs(
+    blocks: Mapping[str, Sequence[str]],
+    signature_to_cluster_id: Mapping[str, str],
+    *,
+    sample_size: int,
+    random_seed: int,
+) -> list[tuple[str, str, int | float]]:
+    from s2and.sampling import random_sampling
+
+    possible: list[tuple[str, str, int | float]] = []
+    for signatures in blocks.values():
+        signature_ids = [str(signature_id) for signature_id in signatures]
+        for index, left in enumerate(signature_ids):
+            for right in signature_ids[index + 1 :]:
+                possible.append((left, right, int(signature_to_cluster_id[left] == signature_to_cluster_id[right])))
+    return random_sampling(possible, min(len(possible), int(sample_size)), int(random_seed))
+
+
+def pair_splits_from_arrow_paths(
+    arrow_paths: Mapping[str, str],
+    *,
+    random_seed: int,
+    train_pairs_size: int,
+    val_pairs_size: int,
+    test_pairs_size: int,
+) -> PairwiseTrainingSplits:
+    train_block_dict, val_block_dict, test_block_dict = split_blocks_like_anddata(
+        read_arrow_s2_blocks(str(arrow_paths["signatures"])),
+        random_seed=random_seed,
+    )
+    signature_to_cluster_id = read_signature_to_cluster_id(str(arrow_paths["clusters"]))
+    return PairwiseTrainingSplits(
+        train_pairs=_sample_within_block_random_pairs(
+            train_block_dict,
+            signature_to_cluster_id,
+            sample_size=train_pairs_size,
+            random_seed=random_seed,
+        ),
+        val_pairs=_sample_within_block_random_pairs(
+            val_block_dict,
+            signature_to_cluster_id,
+            sample_size=val_pairs_size,
+            random_seed=random_seed,
+        ),
+        test_pairs=_sample_within_block_random_pairs(
+            test_block_dict,
+            signature_to_cluster_id,
+            sample_size=test_pairs_size,
+            random_seed=random_seed,
+        ),
+        train_block_dict=train_block_dict,
+        val_block_dict=val_block_dict,
+        test_block_dict=test_block_dict,
+        signature_to_cluster_id=signature_to_cluster_id,
+    )
+
+
+def _feature_indices(featurizer_info: Any) -> list[int]:
+    indices: set[int] = set()
+    for feature_name in featurizer_info.features_to_use:
+        indices.update(featurizer_info.feature_group_to_index[feature_name])
+    return sorted(indices)
+
+
+def _feature_tuple_from_rust_featurizer(
+    rust_featurizer: Any,
+    pairs: Sequence[tuple[str, str, int | float]],
+    *,
+    featurizer_info: Any,
+    nameless_featurizer_info: Any | None,
+    n_jobs: int,
+    nan_value: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    selected_indices = _feature_indices(featurizer_info)
+    nameless_indices = _feature_indices(nameless_featurizer_info) if nameless_featurizer_info is not None else []
+    labels = np.asarray([float(pair[2]) for pair in pairs], dtype=np.float64)
+    if not pairs:
+        nameless_empty = (
+            np.empty((0, len(nameless_indices)), dtype=np.float64) if nameless_featurizer_info is not None else None
+        )
+        return np.empty((0, len(selected_indices)), dtype=np.float64), labels, nameless_empty
+
+    index_by_signature_id = {
+        str(signature_id): index for index, signature_id in enumerate(rust_featurizer.signature_ids())
+    }
+    indexed_pairs = [(index_by_signature_id[str(left)], index_by_signature_id[str(right)]) for left, right, _ in pairs]
+    features = np.asarray(
+        rust_featurizer.featurize_pairs_matrix_indexed(indexed_pairs, selected_indices, int(n_jobs), nan_value),
+        dtype=np.float64,
+    )
+    nameless_features = None
+    if nameless_featurizer_info is not None:
+        nameless_features = np.asarray(
+            rust_featurizer.featurize_pairs_matrix_indexed(indexed_pairs, nameless_indices, int(n_jobs), nan_value),
+            dtype=np.float64,
+        )
+    return features, labels, nameless_features
+
+
+def arrow_training_feature_splits(
+    arrow_paths: Mapping[str, str],
+    splits: PairwiseTrainingSplits,
+    *,
+    featurizer_info: Any,
+    nameless_featurizer_info: Any,
+    n_jobs: int,
+    nan_value: float,
+) -> tuple[
+    tuple[np.ndarray, np.ndarray, np.ndarray | None],
+    tuple[np.ndarray, np.ndarray, np.ndarray | None],
+    tuple[np.ndarray, np.ndarray, np.ndarray | None],
+    Any,
+]:
+    from s2and import feature_port
+
+    predict_arrow_paths = {str(key): value for key, value in arrow_paths.items() if key != "clusters"}
+    rust_featurizer = feature_port.build_rust_featurizer_from_arrow_paths(
+        predict_arrow_paths,
+        name_tuples="filtered",
+        load_name_counts=True,
+        num_threads=n_jobs,
+    )
+    return (
+        _feature_tuple_from_rust_featurizer(
+            rust_featurizer,
+            splits.train_pairs,
+            featurizer_info=featurizer_info,
+            nameless_featurizer_info=nameless_featurizer_info,
+            n_jobs=n_jobs,
+            nan_value=nan_value,
+        ),
+        _feature_tuple_from_rust_featurizer(
+            rust_featurizer,
+            splits.val_pairs,
+            featurizer_info=featurizer_info,
+            nameless_featurizer_info=nameless_featurizer_info,
+            n_jobs=n_jobs,
+            nan_value=nan_value,
+        ),
+        _feature_tuple_from_rust_featurizer(
+            rust_featurizer,
+            splits.test_pairs,
+            featurizer_info=featurizer_info,
+            nameless_featurizer_info=nameless_featurizer_info,
+            n_jobs=n_jobs,
+            nan_value=nan_value,
+        ),
+        rust_featurizer,
+    )
+
+
+def build_pairwise_clusterer_from_features(
+    train: tuple[np.ndarray, np.ndarray, np.ndarray | None],
+    val: tuple[np.ndarray, np.ndarray, np.ndarray | None],
+    *,
+    featurization_info: Any,
+    nameless_featurization_info: Any,
+    n_jobs: int,
+    random_seed: int,
+    pairwise_n_iter: int,
+    cluster_n_iter: int,
+) -> Any:
+    from s2and.model import Clusterer, PairwiseModeler
+
+    X_train, y_train, nameless_X_train = train
+    X_val, y_val, nameless_X_val = val
+    if nameless_X_train is None or nameless_X_val is None:
+        raise RuntimeError("Nameless training features are required")
+
+    pairwise_modeler = PairwiseModeler(
+        n_iter=pairwise_n_iter,
+        estimator=None,
+        search_space=None,
+        monotone_constraints=featurization_info.lightgbm_monotone_constraints,
+        random_state=random_seed,
+    )
+    pairwise_modeler.fit(X_train, y_train, X_val, y_val)
+
+    nameless_pairwise_modeler = PairwiseModeler(
+        n_iter=pairwise_n_iter,
+        estimator=None,
+        search_space=None,
+        monotone_constraints=nameless_featurization_info.lightgbm_monotone_constraints,
+        random_state=random_seed,
+    )
+    nameless_pairwise_modeler.fit(nameless_X_train, y_train, nameless_X_val, y_val)
+
+    return Clusterer(
+        featurization_info,
+        pairwise_modeler.classifier,
+        n_jobs=n_jobs,
+        n_iter=cluster_n_iter,
+        use_cache=False,
+        nameless_classifier=nameless_pairwise_modeler.classifier,
+        nameless_featurizer_info=nameless_featurization_info,
+        random_state=random_seed,
+        use_default_constraints_as_supervision=False,
+    )
+
+
+def fit_clusterer_from_arrow_validation(
+    clusterer: Any,
+    splits: PairwiseTrainingSplits,
+    rust_featurizer: Any,
+    *,
+    random_seed: int,
+) -> Any:
+    from hyperopt import Trials, fmin, space_eval, tpe
+
+    from s2and.eval import b3_precision_recall_fscore
+    from s2and.model_pairwise import intify
+
+    val_block_dict = clusterer.filter_blocks(splits.val_block_dict, clusterer.val_blocks_size)
+    val_cluster_to_signatures = construct_cluster_to_signatures(splits.signature_to_cluster_id, val_block_dict)
+    val_dists = clusterer.make_distance_matrices_from_rust_featurizer(val_block_dict, rust_featurizer)
+    weight = float(sum(len(signatures) for signatures in val_block_dict.values()))
+    if weight <= 0:
+        raise ValueError("Arrow validation split has no signatures after filtering")
+
+    def obj(params):
+        clusterer.set_params(params)
+        pred_clusters, _ = clusterer.predict_from_rust_featurizer(
+            val_block_dict,
+            rust_featurizer,
+            dists=val_dists,
+        )
+        _precision, _recall, f1, _per_signature, _pred_ratios, _true_ratios = b3_precision_recall_fscore(
+            val_cluster_to_signatures,
+            pred_clusters,
+        )
+        return -float(np.average([f1], weights=[weight]))
+
+    clusterer.hyperopt_trials_store = Trials()
+    _ = fmin(
+        fn=obj,
+        space=clusterer.search_space,
+        algo=partial(tpe.suggest, n_startup_jobs=5),
+        max_evals=clusterer.n_iter,
+        trials=clusterer.hyperopt_trials_store,
+        rstate=np.random.default_rng(random_seed),
+    )
+    best_params = space_eval(clusterer.search_space, clusterer.hyperopt_trials_store.argmin)
+    clusterer.best_params = {key: intify(value) for key, value in best_params.items()}
+    clusterer.set_params(clusterer.best_params)
+    return clusterer
+
+
 # feature categories (all except reference_features)
 features_to_use = [
     "name_similarity",
@@ -510,13 +963,9 @@ nameless_features_to_use = [
 
 
 def main() -> None:
-    import numpy as np
-
     from s2and.consts import DEFAULT_CHUNK_SIZE, FEATURIZER_VERSION, PROJECT_ROOT_PATH
-    from s2and.data import ANDData
     from s2and.eval import cluster_eval
     from s2and.featurizer import FeaturizationInfo, featurize
-    from s2and.model import Clusterer, PairwiseModeler
     from s2and.production_model import load_production_model
     from s2and.warnings_utils import suppress_sklearn_feature_name_warnings
 
@@ -530,6 +979,11 @@ def main() -> None:
     if args.use_arrow and train_flag:
         raise ValueError("--use-arrow is for production-model evaluation and cannot be combined with --train")
     os.environ["OMP_NUM_THREADS"] = str(n_jobs)
+    train_modes = (
+        _resolve_requested_train_modes(args.train_modes, compare_train_modes=bool(args.compare_train_modes))
+        if train_flag
+        else ["production"]
+    )
 
     if args.dataset == "mini":
         data_original = os.path.join(PROJECT_ROOT_PATH, "s2and", "data", "s2and_mini")
@@ -547,6 +1001,9 @@ def main() -> None:
             raise ValueError("--use-arrow currently supports --dataset mini and --dataset full only")
         datasets = ["inventors_s2and"]
     datasets = _resolve_requested_datasets(datasets, args.datasets, args.dataset)
+    if train_flag:
+        data_original = args.json_data_root or _default_json_data_root(PROJECT_ROOT_PATH, args.dataset)
+        _validate_train_mode_scope(train_modes, datasets)
     active_specter_suffixes = _resolve_requested_specter_suffixes(specter_suffixes, args.specter_suffixes)
     missing_arrow_error = (
         first_missing_arrow_dataset_error(arrow_data_root, datasets, active_specter_suffixes)
@@ -568,7 +1025,12 @@ def main() -> None:
     )
     print(f"Datasets: {datasets}")
     print(f"SPECTER suffixes: {active_specter_suffixes}")
+    if train_flag:
+        print(f"Train modes: {train_modes}")
+        print(f"JSON data root: {data_original}")
     if use_arrow:
+        print(f"Arrow data root: {arrow_data_root}")
+    elif train_flag and TRAIN_MODE_ARROW_RUST in train_modes:
         print(f"Arrow data root: {arrow_data_root}")
     print()
 
@@ -578,156 +1040,195 @@ def main() -> None:
         featurizer_version=FEATURIZER_VERSION,
     )
 
-    results = {}
+    results: dict[tuple[str, str], list[dict[str, tuple]]] = {}
     for specter_suffix in active_specter_suffixes:
-        clusterer = None
-
-        if not train_flag:
-            model_name = MODELS[specter_suffix]
-            model_path = os.path.join(PROJECT_ROOT_PATH, "s2and", "data", model_name)
-            if not os.path.exists(model_path):
-                raise FileNotFoundError(
-                    f"Missing model artifact at {model_path}. "
-                    "Either use --train to retrain, or place the model artifact in s2and/data/."
-                )
-            print(f"=== specter_suffix: {specter_suffix}, model: {model_name} ===")
-            clusterer = load_production_model(model_path)
-            clusterer.use_cache = False
-            clusterer.n_jobs = n_jobs
-        else:
-            print(f"=== specter_suffix: {specter_suffix}, training from scratch ===")
-
-        cluster_metrics_all = []
-        for dataset_name in datasets:
-            print(f"-- dataset: {dataset_name} --")
-            if use_arrow:
-                if clusterer is None:
-                    raise RuntimeError("Arrow evaluation requires a loaded production Clusterer")
-                if arrow_data_root is None:
-                    raise RuntimeError(
-                        "Arrow evaluation requires --arrow-data-root or a supported default dataset root"
+        for train_mode in train_modes:
+            clusterer = None
+            if not train_flag:
+                model_name = MODELS[specter_suffix]
+                model_path = os.path.join(PROJECT_ROOT_PATH, "s2and", "data", model_name)
+                if not os.path.exists(model_path):
+                    raise FileNotFoundError(
+                        f"Missing model artifact at {model_path}. "
+                        "Either use --train to retrain, or place the model artifact in s2and/data/."
                     )
-                arrow_paths = resolve_arrow_dataset_paths(arrow_data_root, dataset_name, specter_suffix)
-                cluster_metrics, _b3_metrics_per_signature = cluster_eval_arrow(
-                    arrow_paths,
-                    clusterer,
-                    random_seed=random_seed,
-                    n_jobs=n_jobs,
-                )
+                print(f"=== specter_suffix: {specter_suffix}, model: {model_name} ===")
+                clusterer = load_production_model(model_path)
+                clusterer.use_cache = False
+                clusterer.n_jobs = n_jobs
+            else:
+                print(f"=== specter_suffix: {specter_suffix}, train_mode: {train_mode} ===")
+
+            cluster_metrics_all = []
+            for dataset_name in datasets:
+                print(f"-- dataset: {dataset_name} --")
+                if use_arrow:
+                    if clusterer is None:
+                        raise RuntimeError("Arrow evaluation requires a loaded production Clusterer")
+                    if arrow_data_root is None:
+                        raise RuntimeError(
+                            "Arrow evaluation requires --arrow-data-root or a supported default dataset root"
+                        )
+                    arrow_paths = resolve_arrow_dataset_paths(arrow_data_root, dataset_name, specter_suffix)
+                    cluster_metrics, _b3_metrics_per_signature = cluster_eval_arrow(
+                        arrow_paths,
+                        clusterer,
+                        random_seed=random_seed,
+                        n_jobs=n_jobs,
+                    )
+                    print(cluster_metrics)
+                    cluster_metrics_all.append(cluster_metrics)
+                    continue
+
+                if train_flag and train_mode == TRAIN_MODE_ARROW_RUST:
+                    if arrow_data_root is None:
+                        raise RuntimeError("Arrow Rust training requires --arrow-data-root or a supported default root")
+                    arrow_paths = resolve_arrow_dataset_paths(arrow_data_root, dataset_name, specter_suffix)
+                    splits = pair_splits_from_arrow_paths(
+                        arrow_paths,
+                        random_seed=random_seed,
+                        train_pairs_size=int(args.train_pairs_size),
+                        val_pairs_size=int(args.val_pairs_size),
+                        test_pairs_size=int(args.test_pairs_size),
+                    )
+                    train, val, _test, rust_featurizer = arrow_training_feature_splits(
+                        arrow_paths,
+                        splits,
+                        featurizer_info=featurization_info,
+                        nameless_featurizer_info=nameless_featurization_info,
+                        n_jobs=n_jobs,
+                        nan_value=np.nan,
+                    )
+                    clusterer = build_pairwise_clusterer_from_features(
+                        train,
+                        val,
+                        featurization_info=featurization_info,
+                        nameless_featurization_info=nameless_featurization_info,
+                        n_jobs=n_jobs,
+                        random_seed=random_seed,
+                        pairwise_n_iter=int(args.pairwise_n_iter),
+                        cluster_n_iter=int(args.cluster_n_iter),
+                    )
+                    clusterer = fit_clusterer_from_arrow_validation(
+                        clusterer,
+                        splits,
+                        rust_featurizer,
+                        random_seed=random_seed,
+                    )
+                    cluster_metrics, _b3_metrics_per_signature = cluster_eval_arrow(
+                        arrow_paths,
+                        clusterer,
+                        random_seed=random_seed,
+                        n_jobs=n_jobs,
+                    )
+                    print(cluster_metrics)
+                    cluster_metrics_all.append(cluster_metrics)
+                    continue
+
+                backend = _backend_for_train_mode(train_mode)
+                with _temporary_s2and_backend(backend):
+                    anddata = build_eval_anddata(
+                        data_root=data_original,
+                        dataset_name=dataset_name,
+                        specter_suffix=specter_suffix,
+                        n_jobs=n_jobs,
+                        random_seed=random_seed,
+                        train_pairs_size=int(args.train_pairs_size),
+                        val_pairs_size=int(args.val_pairs_size),
+                        test_pairs_size=int(args.test_pairs_size),
+                    )
+                    train = None
+                    val = None
+
+                    if train_flag:
+                        train, val, _test = featurize(
+                            anddata,
+                            featurization_info,
+                            n_jobs=n_jobs,
+                            use_cache=False,
+                            chunk_size=DEFAULT_CHUNK_SIZE,
+                            nameless_featurizer_info=nameless_featurization_info,
+                            nan_value=np.nan,
+                        )
+
+                if train_flag:
+                    if train is None or val is None:
+                        raise RuntimeError("Training mode did not produce train/val features")
+                    evaluation_anddata = anddata
+                    if backend == "rust":
+                        with _temporary_s2and_backend("python"):
+                            evaluation_anddata = build_eval_anddata(
+                                data_root=data_original,
+                                dataset_name=dataset_name,
+                                specter_suffix=specter_suffix,
+                                n_jobs=n_jobs,
+                                random_seed=random_seed,
+                                train_pairs_size=int(args.train_pairs_size),
+                                val_pairs_size=int(args.val_pairs_size),
+                                test_pairs_size=int(args.test_pairs_size),
+                            )
+                    clusterer = build_pairwise_clusterer_from_features(
+                        cast(tuple[np.ndarray, np.ndarray, np.ndarray | None], train),
+                        cast(tuple[np.ndarray, np.ndarray, np.ndarray | None], val),
+                        featurization_info=featurization_info,
+                        nameless_featurization_info=nameless_featurization_info,
+                        n_jobs=n_jobs,
+                        random_seed=random_seed,
+                        pairwise_n_iter=int(args.pairwise_n_iter),
+                        cluster_n_iter=int(args.cluster_n_iter),
+                    )
+                    with _temporary_s2and_backend("python"):
+                        clusterer.fit(evaluation_anddata)
+                else:
+                    evaluation_anddata = anddata
+
+                if clusterer is None:
+                    raise RuntimeError("Clusterer was not initialized. Check --train flag and model artifact path.")
+
+                with _temporary_s2and_backend("python" if train_flag else None):
+                    cluster_metrics, _b3_metrics_per_signature = cluster_eval(
+                        evaluation_anddata,
+                        clusterer,
+                        split="test",
+                        use_s2_clusters=False,
+                    )
                 print(cluster_metrics)
                 cluster_metrics_all.append(cluster_metrics)
-                continue
 
-            signatures_path = resolve_dataset_file(
-                data_original, dataset_name, f"{dataset_name}_signatures.json", "signatures.json"
-            )
-            papers_path = resolve_dataset_file(
-                data_original, dataset_name, f"{dataset_name}_papers.json", "papers.json"
-            )
-            clusters_path = resolve_dataset_file(
-                data_original, dataset_name, f"{dataset_name}_clusters.json", "clusters.json"
-            )
-            embeddings_path = resolve_dataset_file(
-                data_original, dataset_name, f"{dataset_name}{specter_suffix}", specter_suffix.lstrip("_")
-            )
-            anddata = ANDData(
-                signatures=signatures_path,
-                papers=papers_path,
-                name=dataset_name,
-                mode="train",
-                specter_embeddings=embeddings_path,
-                clusters=clusters_path,
-                block_type="s2",
-                train_pairs=None,
-                val_pairs=None,
-                test_pairs=None,
-                train_pairs_size=100000,
-                val_pairs_size=10000,
-                test_pairs_size=10000,
-                n_jobs=n_jobs,
-                load_name_counts=True,
-                preprocess=True,
-                random_seed=random_seed,
-                name_tuples="filtered",
-            )
+            results[(specter_suffix, train_mode)] = cluster_metrics_all
+            b3s = [m["B3 (P, R, F1)"][-1] for m in cluster_metrics_all]
+            print(f"B3 F1s: {b3s}, mean: {sum(b3s) / len(b3s):.3f}")
+            print()
 
-            if train_flag:
-                train, val, _test = featurize(
-                    anddata,
-                    featurization_info,
-                    n_jobs=n_jobs,
-                    use_cache=False,
-                    chunk_size=DEFAULT_CHUNK_SIZE,
-                    nameless_featurizer_info=nameless_featurization_info,
-                    nan_value=np.nan,
-                )
-                X_train, y_train, nameless_X_train = train
-                X_val, y_val, nameless_X_val = val
-
-                pairwise_modeler = PairwiseModeler(
-                    n_iter=25,
-                    estimator=None,
-                    search_space=None,
-                    monotone_constraints=featurization_info.lightgbm_monotone_constraints,
-                    random_state=random_seed,
-                )
-                pairwise_modeler.fit(X_train, y_train, X_val, y_val)
-
-                nameless_pairwise_modeler = PairwiseModeler(
-                    n_iter=25,
-                    estimator=None,
-                    search_space=None,
-                    monotone_constraints=nameless_featurization_info.lightgbm_monotone_constraints,
-                    random_state=random_seed,
-                )
-                nameless_pairwise_modeler.fit(nameless_X_train, y_train, nameless_X_val, y_val)
-
-                clusterer = Clusterer(
-                    featurization_info,
-                    pairwise_modeler.classifier,
-                    n_jobs=n_jobs,
-                    use_cache=False,
-                    nameless_classifier=nameless_pairwise_modeler.classifier,
-                    nameless_featurizer_info=nameless_featurization_info,
-                    random_state=random_seed,
-                    use_default_constraints_as_supervision=False,
-                )
-                clusterer.fit(anddata)
-
-            if clusterer is None:
-                raise RuntimeError("Clusterer was not initialized. Check --train flag and model artifact path.")
-
-            cluster_metrics, _b3_metrics_per_signature = cluster_eval(
-                anddata,
-                clusterer,
-                split="test",
-                use_s2_clusters=False,
-            )
-            print(cluster_metrics)
-            cluster_metrics_all.append(cluster_metrics)
-
-        results[specter_suffix] = cluster_metrics_all
-        b3s = [m["B3 (P, R, F1)"][-1] for m in cluster_metrics_all]
-        print(f"B3 F1s: {b3s}, mean: {sum(b3s) / len(b3s):.3f}")
+    if train_flag and len(train_modes) > 1:
+        _assert_training_mode_metrics_identical(
+            results,
+            specter_suffixes_to_check=active_specter_suffixes,
+            train_modes=train_modes,
+            datasets=datasets,
+        )
+        print("Training mode parity check: passed")
         print()
 
     # summary
     print("=" * 60)
     print("Summary")
     print("=" * 60)
-    if "_specter.pickle" in results and "_specter2.pkl" in results:
-        result_specter1 = results["_specter.pickle"]
-        result_specter2 = results["_specter2.pkl"]
+    production_key_s1 = ("_specter.pickle", "production")
+    production_key_s2 = ("_specter2.pkl", "production")
+    if production_key_s1 in results and production_key_s2 in results:
+        result_specter1 = results[production_key_s1]
+        result_specter2 = results[production_key_s2]
 
         for i, dataset_name in enumerate(datasets):
             print(f"Performance with SPECTERv1 data, on {dataset_name} (B3): {result_specter1[i]['B3 (P, R, F1)']}")
             print(f"Performance with SPECTERv2 data, on {dataset_name} (B3): {result_specter2[i]['B3 (P, R, F1)']}")
             print()
     else:
-        for specter_suffix, metrics_by_dataset in results.items():
+        for (specter_suffix, train_mode), metrics_by_dataset in results.items():
             for i, dataset_name in enumerate(datasets):
                 print(
-                    f"Performance with {specter_suffix} data, on {dataset_name} (B3): "
+                    f"Performance with {specter_suffix} data, mode={train_mode}, on {dataset_name} (B3): "
                     f"{metrics_by_dataset[i]['B3 (P, R, F1)']}"
                 )
             print()

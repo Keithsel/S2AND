@@ -87,7 +87,8 @@
       "row_count": 2871,
       "record_count": 2871,
       "key_column_hash": 607743565014278955,
-      "source_fingerprint": 1123841135725622699,
+      "source_fingerprint": 12510881335105496974,
+      "source_fingerprint_kind": "fnv1a64_full_file",
       "record_batch_count": 1,
       "actual_max_batch_rows": 2871,
       "max_record_batch_rows": 16384
@@ -99,7 +100,8 @@
       "row_count": 2871,
       "record_count": 2871,
       "key_column_hash": 17948583095397703583,
-      "source_fingerprint": 5282088373386211127,
+      "source_fingerprint": 14619223989410193752,
+      "source_fingerprint_kind": "fnv1a64_full_file",
       "record_batch_count": 1,
       "actual_max_batch_rows": 2871,
       "max_record_batch_rows": 16384
@@ -111,7 +113,8 @@
       "row_count": 12361,
       "record_count": 12361,
       "key_column_hash": 17948583095397703583,
-      "source_fingerprint": 4243736360547859004,
+      "source_fingerprint": 8074534609117996704,
+      "source_fingerprint_kind": "fnv1a64_full_file",
       "record_batch_count": 1,
       "actual_max_batch_rows": 12361,
       "max_record_batch_rows": 16384
@@ -123,7 +126,8 @@
       "row_count": 2871,
       "record_count": 2871,
       "key_column_hash": 17948583095397703583,
-      "source_fingerprint": 1442493885799096514,
+      "source_fingerprint": 13108892874319287705,
+      "source_fingerprint_kind": "fnv1a64_full_file",
       "record_batch_count": 2,
       "actual_max_batch_rows": 2048,
       "max_record_batch_rows": 2048
@@ -135,7 +139,8 @@
       "row_count": 2871,
       "record_count": 2871,
       "key_column_hash": 17948583095397703583,
-      "source_fingerprint": 1442493885799096514,
+      "source_fingerprint": 13108892874319287705,
+      "source_fingerprint_kind": "fnv1a64_full_file",
       "record_batch_count": 2,
       "actual_max_batch_rows": 2048,
       "max_record_batch_rows": 2048

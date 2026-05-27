@@ -1,6 +1,4 @@
 import logging
-import math
-import os
 import threading
 import time
 import weakref
@@ -9,36 +7,25 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
-import numpy as np
-
 from s2and.arrow_inputs import validate_arrow_prediction_artifacts
 from s2and.consts import CLUSTER_SEEDS_LOOKUP
 from s2and.data import ANDData
 from s2and.runtime import (
     detect_rust_runtime_capabilities,
     load_s2and_rust_extension,
-    min_supported_rust_extension_version_string,
 )
 from s2and.rust_calls import (
     build_block_upper_triangle_feature_matrix_indexed_rust,
     build_linker_pair_aggregate_stats_arrays_rust,
     build_linker_pair_distance_accumulators_rust,
     build_linker_pair_features_and_aggregate_stats_arrays_rust,
-    build_pair_feature_matrix_rust,
-    featurize_pair_rust,
     get_constraint_labels_index_arrays_rust,
     get_constraint_rust,
     get_constraints_block_upper_triangle_indexed_rust,
     get_constraints_matrix_indexed_rust,
     update_rust_cluster_seeds,
 )
-from s2and.rust_lifecycle import (
-    RustBuildPath,
-    RustJsonIngestContract,
-    RustLifecyclePolicy,
-    build_rust_json_ingest_contract,
-    rust_json_ingest_paths,
-)
+from s2and.rust_lifecycle import RustBuildPath, RustLifecyclePolicy
 from s2and.thread_config import resolve_n_jobs
 
 # Treat extension as Any for typing; it is optional and loaded on first use.
@@ -73,19 +60,6 @@ class _InFlightFeaturizerBuild:
         self.build_path = build_path
 
 
-@dataclass(frozen=True, slots=True)
-class _RustNameCountsOverlay:
-    first: float | None
-    first_last: float | None
-    last: float | None
-    last_first_initial: float | None
-
-
-@dataclass(frozen=True, slots=True)
-class _RustSignatureNameCountsOverlay:
-    author_info_name_counts: _RustNameCountsOverlay
-
-
 _RustFeaturizerCacheKey = tuple[RustBuildPath, bool, int, str | None, str | None]
 _RustFeaturizerBuildCountKey = tuple[RustBuildPath, bool, str | None, str | None]
 
@@ -101,9 +75,6 @@ _RUST_FEATURIZER_BUILD_COUNTS: "weakref.WeakKeyDictionary[ANDData, dict[_RustFea
     weakref.WeakKeyDictionary()
 )
 _RUST_BUILD_ERROR = "s2and_rust extension not built. Build with: maturin develop -m s2and_rust/Cargo.toml"
-# Default remains "legacy_compat" until canonical artifacts (name counts, name tuples,
-# ORCID prefix counts) are regenerated per docs/normalization_migration.md.
-DEFAULT_NORMALIZATION_VERSION = "legacy_compat"
 RUST_FEATURIZER_EMPTY_WAIT_MAX_RETRIES = 3
 RUST_FEATURIZER_EMPTY_WAIT_BACKOFF_SECONDS = 0.01
 
@@ -182,49 +153,14 @@ def _normalize_normalization_version(normalization_version: str | None) -> str |
     return str(normalization_version).strip() or None
 
 
-def _resolve_json_ingest_name_counts_path(name_counts_path: str | None) -> str | None:
-    """Return explicit-or-env Rust JSON name-count artifact path."""
-
-    configured = _normalize_name_counts_path(name_counts_path)
-    if configured is not None:
-        return configured
-    return _normalize_name_counts_path(os.environ.get("S2AND_RUST_NAME_COUNTS_JSON"))
-
-
-def _resolve_json_ingest_normalization_version(normalization_version: str | None = None) -> str:
-    """Return the expected normalization version passed to Rust JSON ingest."""
-
-    configured = _normalize_normalization_version(normalization_version)
-    if configured is not None:
-        return configured
-    return (
-        _normalize_normalization_version(os.environ.get("S2AND_NORMALIZATION_VERSION")) or DEFAULT_NORMALIZATION_VERSION
-    )
-
-
 def _effective_name_counts_cache_inputs(
     dataset: Any,
     *,
     requested_build_path: RustBuildPath,
     name_counts_path: str | None,
 ) -> tuple[str | None, str | None]:
-    if requested_build_path != "from_json_paths":
-        return _normalize_name_counts_path(name_counts_path), None
-    rust_module = _require_rust_runtime()
-    rust_featurizer_cls = getattr(rust_module, "RustFeaturizer", None)
-    if rust_featurizer_cls is None:
-        raise RuntimeError("s2and_rust extension does not expose RustFeaturizer")
-    plan = _resolve_json_ingest_name_counts_plan(
-        dataset,
-        rust_featurizer_cls=rust_featurizer_cls,
-        name_counts_path=name_counts_path,
-    )
-    if str(plan["name_counts_source"]) != "artifact":
-        return None, None
-    return (
-        _normalize_name_counts_path(cast(str | None, plan["name_counts_path"])),
-        _resolve_json_ingest_normalization_version(),
-    )
+    del dataset, requested_build_path
+    return _normalize_name_counts_path(name_counts_path), None
 
 
 def _cluster_seeds_version_for_cache(dataset: Any) -> int:
@@ -385,359 +321,6 @@ def _dataset_rust_lifecycle_policy(dataset: Any) -> RustLifecyclePolicy | None:
     return None
 
 
-def _name_count_value_present(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, float):
-        return not math.isnan(value)
-    if isinstance(value, np.floating):
-        return not math.isnan(float(value))
-    return True
-
-
-def _extract_overlay_name_counts_values(
-    counts: Any,
-) -> tuple[float | None, float | None, float | None, float | None] | None:
-    if counts is None:
-        return None
-
-    if all(hasattr(counts, field) for field in ("first", "last", "first_last", "last_first_initial")):
-        return (
-            counts.first,
-            counts.last,
-            counts.first_last,
-            counts.last_first_initial,
-        )
-
-    if isinstance(counts, tuple | list) and len(counts) >= 4:
-        return (
-            counts[0],
-            counts[1],
-            counts[2],
-            counts[3],
-        )
-
-    return None
-
-
-def _build_signature_name_counts_overlay_entry(signature: Any) -> _RustSignatureNameCountsOverlay | None:
-    counts = getattr(signature, "author_info_name_counts", None)
-    values = _extract_overlay_name_counts_values(counts)
-    if values is None:
-        return None
-    first, last, first_last, last_first_initial = values
-    if not any(_name_count_value_present(v) for v in values):
-        return None
-    return _RustSignatureNameCountsOverlay(
-        author_info_name_counts=_RustNameCountsOverlay(
-            first=first,
-            first_last=first_last,
-            last=last,
-            last_first_initial=last_first_initial,
-        )
-    )
-
-
-def _signature_has_materialized_name_counts(signature: Any) -> bool:
-    return _build_signature_name_counts_overlay_entry(signature) is not None
-
-
-def _signature_name_counts_overlay_payload_from_dataset(dataset: Any) -> tuple[int, int, dict[str, Any]]:
-    signatures = getattr(dataset, "signatures", None)
-    if signatures is None:
-        return 0, 0, {}
-    dataset_name_for_logs = _dataset_name_for_logs(dataset)
-    try:
-        signatures_total = int(len(signatures))
-    except (TypeError, AttributeError) as length_exc:
-        logger.warning(
-            "Rust JSON ingest: failed to compute signatures length for name-count overlay dataset=%s: %s",
-            dataset_name_for_logs,
-            length_exc,
-        )
-        signatures_total = 0
-
-    payload: dict[str, Any] = {}
-    try:
-        signature_items = signatures.items()
-    except (TypeError, AttributeError) as items_exc:
-        logger.exception(
-            "Rust JSON ingest: failed to iterate signatures for name-count overlay dataset=%s",
-            dataset_name_for_logs,
-        )
-        raise RuntimeError(
-            "Rust JSON ingest failed while iterating signatures for name-count overlay payload "
-            f"(dataset={dataset_name_for_logs})"
-        ) from items_exc
-
-    try:
-        for signature_id, signature in signature_items:
-            overlay_entry = _build_signature_name_counts_overlay_entry(signature)
-            if overlay_entry is not None:
-                payload[str(signature_id)] = overlay_entry
-    except (TypeError, AttributeError) as overlay_exc:
-        logger.exception(
-            "Rust JSON ingest: failed to materialize signature name-count overlay payload dataset=%s",
-            dataset_name_for_logs,
-        )
-        raise RuntimeError(
-            "Rust JSON ingest failed while materializing signature name-count overlay payload "
-            f"(dataset={dataset_name_for_logs})"
-        ) from overlay_exc
-    return signatures_total, len(payload), payload
-
-
-def _resolve_json_ingest_name_counts_plan(
-    dataset: Any,
-    *,
-    rust_featurizer_cls: Any,
-    signature_name_counts_payload: dict[str, Any] | None = None,
-    name_counts_path: str | None = None,
-) -> dict[str, Any]:
-    """Resolve the name-count source plan for Rust JSON ingest."""
-
-    rust_can_overlay_signature_counts = hasattr(rust_featurizer_cls, "update_signature_name_counts")
-    if signature_name_counts_payload is not None:
-        dataset_signature_counts_payload = {}
-        for signature_id, signature in signature_name_counts_payload.items():
-            overlay_entry = _build_signature_name_counts_overlay_entry(signature)
-            if overlay_entry is not None:
-                dataset_signature_counts_payload[str(signature_id)] = overlay_entry
-        signatures_with_counts = len(dataset_signature_counts_payload)
-        signatures_total = signatures_with_counts
-        try:
-            signatures_total = int(len(getattr(dataset, "signatures", {})))
-        except Exception:
-            pass
-    else:
-        signatures_total, signatures_with_counts, dataset_signature_counts_payload = (
-            _signature_name_counts_overlay_payload_from_dataset(dataset)
-        )
-    dataset_has_signature_counts = signatures_with_counts > 0
-    configured_name_counts_path = _resolve_json_ingest_name_counts_path(name_counts_path)
-    artifact_configured = configured_name_counts_path is not None
-    use_dataset_signature_counts = dataset_has_signature_counts and rust_can_overlay_signature_counts
-    name_counts_source = "none"
-    name_counts_path = None
-    if use_dataset_signature_counts:
-        name_counts_source = "dataset"
-    elif not dataset_has_signature_counts and artifact_configured:
-        name_counts_source = "artifact"
-        name_counts_path = configured_name_counts_path
-    return {
-        "dataset_signature_counts_payload": dataset_signature_counts_payload,
-        "signatures_total": int(signatures_total),
-        "signatures_with_counts": int(signatures_with_counts),
-        "dataset_has_signature_counts": bool(dataset_has_signature_counts),
-        "artifact_configured": bool(artifact_configured),
-        "rust_can_overlay_signature_counts": bool(rust_can_overlay_signature_counts),
-        "name_counts_source": str(name_counts_source),
-        "name_counts_path": name_counts_path,
-    }
-
-
-def inspect_json_ingest_name_counts_source(
-    dataset: Any,
-    *,
-    signature_name_counts_payload: dict[str, Any] | None = None,
-    name_counts_path: str | None = None,
-) -> dict[str, Any]:
-    """Inspect the name-count source Rust JSON ingest would use for ``dataset``."""
-
-    rust_module = _require_rust_runtime()
-    rust_featurizer_cls = getattr(rust_module, "RustFeaturizer", None)
-    if rust_featurizer_cls is None:
-        raise RuntimeError("s2and_rust extension does not expose RustFeaturizer")
-    return _resolve_json_ingest_name_counts_plan(
-        dataset,
-        rust_featurizer_cls=rust_featurizer_cls,
-        signature_name_counts_payload=signature_name_counts_payload,
-        name_counts_path=name_counts_path,
-    )
-
-
-def _from_json_paths_with_contract(rust_featurizer_cls: Any, contract: RustJsonIngestContract) -> Any:
-    return rust_featurizer_cls.from_json_paths(
-        contract.signatures_path,
-        contract.papers_path,
-        contract.cluster_seeds_path,
-        contract.specter_embeddings,
-        contract.name_tuples_path,
-        contract.name_counts_path,
-        contract.preprocess,
-        contract.compute_reference_features,
-        contract.cluster_seed_require_value,
-        contract.cluster_seed_disallow_value,
-        contract.num_threads,
-        contract.expected_normalization_version,
-        contract.allow_normalization_version_mismatch,
-    )
-
-
-def _build_rust_featurizer_from_json_paths(
-    dataset: Any,
-    num_threads: int,
-    *,
-    signature_name_counts_payload: dict[str, Any] | None = None,
-    allow_normalization_version_mismatch: bool = False,
-    name_counts_path: str | None = None,
-    expected_normalization_version: str | None = None,
-) -> tuple[Any, dict[str, float]]:
-    pre_build_start = time.perf_counter()
-    rust_module = _require_rust_runtime()
-    rust_featurizer_cls = getattr(rust_module, "RustFeaturizer", None)
-    if rust_featurizer_cls is None or not hasattr(rust_featurizer_cls, "from_json_paths"):
-        raise RuntimeError("s2and_rust extension does not expose RustFeaturizer.from_json_paths")
-
-    signatures_path, papers_path = rust_json_ingest_paths(dataset)
-    if not signatures_path or not papers_path:
-        raise RuntimeError("Dataset does not expose signatures_path/papers_path for Rust JSON ingest")
-
-    plan = _resolve_json_ingest_name_counts_plan(
-        dataset,
-        rust_featurizer_cls=rust_featurizer_cls,
-        signature_name_counts_payload=signature_name_counts_payload,
-        name_counts_path=name_counts_path,
-    )
-    dataset_signature_counts_payload = plan["dataset_signature_counts_payload"]
-    signatures_total = int(plan["signatures_total"])
-    signatures_with_counts = int(plan["signatures_with_counts"])
-    dataset_has_signature_counts = bool(plan["dataset_has_signature_counts"])
-    artifact_configured = bool(plan["artifact_configured"])
-    rust_can_overlay_signature_counts = bool(plan["rust_can_overlay_signature_counts"])
-    name_counts_source = str(plan["name_counts_source"])
-    name_counts_path = plan["name_counts_path"]
-    if dataset_has_signature_counts and not rust_can_overlay_signature_counts:
-        logger.warning(
-            "Rust JSON ingest: extension lacks update_signature_name_counts; "
-            "cannot use precomputed signature name counts from dataset. "
-            "name-count features will be NaN."
-        )
-    elif not dataset_has_signature_counts and name_counts_source == "none":
-        logger.warning(
-            "Rust JSON ingest: no signature name counts available and no name-count artifact selected; "
-            "name-count features will be NaN."
-        )
-
-    # Normalization version validation is delegated to Rust when using artifact name counts.
-    normalization_check_executed = False
-    normalization_version_for_rust: str | None = None
-    allow_mismatch_for_rust = False
-    if name_counts_source == "artifact":
-        normalization_check_executed = True
-        logger.warning(
-            "Rust JSON ingest: selected artifact name-count source path=%s; this can increase latency/RSS.",
-            name_counts_path,
-        )
-        normalization_version_for_rust = _resolve_json_ingest_normalization_version(expected_normalization_version)
-        allow_mismatch_for_rust = bool(allow_normalization_version_mismatch)
-
-    logger.info(
-        "Telemetry stage: stage=rust_json_ingest_name_counts_source "
-        "name_counts_source=%s signatures_total=%d signatures_with_counts=%d "
-        "overlay_api_available=%s artifact_configured=%s "
-        "normalization_check_executed=%s normalization_version_delegated_to_rust=%s "
-        "allow_normalization_version_mismatch=%s dataset=%s",
-        name_counts_source,
-        signatures_total,
-        signatures_with_counts,
-        rust_can_overlay_signature_counts,
-        artifact_configured,
-        normalization_check_executed,
-        normalization_version_for_rust is not None,
-        allow_mismatch_for_rust,
-        _dataset_name_for_logs(dataset),
-    )
-
-    pre_build_seconds = time.perf_counter() - pre_build_start
-    ffi_start = time.perf_counter()
-    contract = build_rust_json_ingest_contract(
-        dataset,
-        name_counts_path=name_counts_path,
-        cluster_seed_require_value=CLUSTER_SEEDS_LOOKUP["require"],
-        cluster_seed_disallow_value=CLUSTER_SEEDS_LOOKUP["disallow"],
-        num_threads=num_threads,
-        name_tuples_path=None,
-        expected_normalization_version=normalization_version_for_rust,
-        allow_normalization_version_mismatch=allow_mismatch_for_rust,
-    )
-    featurizer = _from_json_paths_with_contract(rust_featurizer_cls, contract)
-    ffi_seconds = time.perf_counter() - ffi_start
-    get_json_ingest_telemetry = getattr(featurizer, "json_ingest_telemetry", None)
-    if not callable(get_json_ingest_telemetry):
-        raise RuntimeError(
-            "s2and_rust RustFeaturizer.from_json_paths must expose json_ingest_telemetry; "
-            f"rebuild/install s2and_rust>={min_supported_rust_extension_version_string()}."
-        )
-    telemetry = get_json_ingest_telemetry()
-    if telemetry is None:
-        raise RuntimeError(
-            "s2and_rust RustFeaturizer.from_json_paths returned no json_ingest_telemetry; "
-            f"rebuild/install s2and_rust>={min_supported_rust_extension_version_string()}."
-        )
-    stage_seconds = dict(telemetry.get("stage_seconds", {}))
-    logger.info(
-        "Telemetry stage: stage=rust_json_ingest_stage_seconds "
-        "json_parse=%.3f paper_preprocess=%.3f signature_preprocess=%.3f "
-        "reference_counter=%.3f cluster_seed=%.3f dataset=%s",
-        float(stage_seconds.get("json_parse_seconds", 0.0)),
-        float(stage_seconds.get("paper_preprocess_seconds", 0.0)),
-        float(stage_seconds.get("signature_preprocess_seconds", 0.0)),
-        float(stage_seconds.get("reference_counter_seconds", 0.0)),
-        float(stage_seconds.get("cluster_seed_seconds", 0.0)),
-        _dataset_name_for_logs(dataset),
-    )
-    counts = dict(telemetry.get("counts", {}))
-    if counts:
-        logger.info(
-            "Telemetry stage: stage=rust_json_ingest_default_counts "
-            "missing_specter_papers=%d defaulted_name_count_signatures=%d "
-            "defaulted_name_count_first=%d defaulted_name_count_first_last=%d "
-            "defaulted_name_count_last=%d defaulted_name_count_last_first_initial=%d "
-            "defaulted_signature_author_positions=%d defaulted_paper_author_positions=%d dataset=%s",
-            int(counts.get("missing_specter_paper_count", 0)),
-            int(counts.get("defaulted_name_count_signature_count", 0)),
-            int(counts.get("defaulted_name_count_first_count", 0)),
-            int(counts.get("defaulted_name_count_first_last_count", 0)),
-            int(counts.get("defaulted_name_count_last_count", 0)),
-            int(counts.get("defaulted_name_count_last_first_initial_count", 0)),
-            int(counts.get("defaulted_signature_author_position_count", 0)),
-            int(counts.get("defaulted_paper_author_position_count", 0)),
-            _dataset_name_for_logs(dataset),
-        )
-
-    post_build_seconds = 0.0
-    if name_counts_source == "dataset":
-        overlay_start = time.perf_counter()
-        updated_count = featurizer.update_signature_name_counts(dataset_signature_counts_payload)
-        post_build_seconds = time.perf_counter() - overlay_start
-        if int(updated_count) != len(dataset_signature_counts_payload):
-            raise RuntimeError(
-                "Rust JSON ingest signature name-count overlay updated "
-                f"{int(updated_count)} of {len(dataset_signature_counts_payload)} signatures"
-            )
-        logger.info(
-            "Telemetry stage: stage=rust_json_signature_name_counts_overlay "
-            "seconds=%.3f updated_signatures=%d dataset=%s",
-            post_build_seconds,
-            int(updated_count),
-            _dataset_name_for_logs(dataset),
-        )
-    elif name_counts_source == "none":
-        logger.warning(
-            "Rust JSON ingest: using name_counts_source=none; name-count features will be NaN. "
-            "signatures_total=%d signatures_with_counts=%d",
-            signatures_total,
-            signatures_with_counts,
-        )
-
-    return featurizer, {
-        "pre_build_seconds": pre_build_seconds,
-        "ffi_seconds": ffi_seconds,
-        "post_build_seconds": post_build_seconds,
-    }
-
-
 def _rust_featurizer_method(method_name: str, purpose: str) -> Any:
     rust_module = _require_rust_runtime()
     rust_featurizer_cls = getattr(rust_module, "RustFeaturizer", None)
@@ -745,15 +328,6 @@ def _rust_featurizer_method(method_name: str, purpose: str) -> Any:
     if not callable(method):
         raise RuntimeError(f"RustFeaturizer.{method_name} is required for {purpose}")
     return method
-
-
-def _resolve_direct_name_counts_path(load_name_counts: bool, name_counts_path: str | None) -> str | None:
-    normalized_name_counts_path = _normalize_name_counts_path(name_counts_path)
-    if not load_name_counts or normalized_name_counts_path is not None:
-        return normalized_name_counts_path
-    from s2and.consts import _PACKAGE_DATA_DIR
-
-    return os.path.join(_PACKAGE_DATA_DIR, "name_counts_rust.json")
 
 
 def build_rust_featurizer_from_arrow_paths(
@@ -816,25 +390,9 @@ def build_rust_featurizer(
     pre_build_start = time.perf_counter()
     rust_module = _require_rust_runtime()
     num_threads = resolve_n_jobs(getattr(dataset, "n_jobs", 1))
-    selected_build_path = path
-    signatures_path, papers_path = rust_json_ingest_paths(dataset)
-    if selected_build_path == "from_json_paths":
-        if not signatures_path or not papers_path:
-            raise RuntimeError(
-                "Rust JSON ingest build path requested but signatures_path/papers_path are missing "
-                f"(dataset={_dataset_name_for_logs(dataset)} signatures_path={signatures_path!r} "
-                f"papers_path={papers_path!r})."
-            )
-        outer_pre_build_seconds = time.perf_counter() - pre_build_start
-        featurizer, timings = _build_rust_featurizer_from_json_paths(
-            dataset,
-            num_threads,
-            allow_normalization_version_mismatch=allow_normalization_version_mismatch,
-            name_counts_path=name_counts_path,
-            expected_normalization_version=expected_normalization_version,
-        )
-        timings["pre_build_seconds"] += outer_pre_build_seconds
-        return featurizer, "from_json_paths", timings
+    del allow_normalization_version_mismatch, name_counts_path, expected_normalization_version
+    if path != "from_dataset":
+        raise ValueError(f"rust_build_path must be from_dataset; got {path!r}.")
     pre_build_seconds = time.perf_counter() - pre_build_start
     ffi_seconds = 0.0
     ffi_start = time.perf_counter()
@@ -863,25 +421,13 @@ def _resolve_requested_build_path(
     rust_build_path: RustBuildPath | None = None,
 ) -> RustBuildPath:
     if rust_build_path is not None:
-        if rust_build_path not in {"from_dataset", "from_json_paths"}:
-            raise ValueError(
-                "rust_build_path must be one of from_dataset/from_json_paths; " f"got {rust_build_path!r}."
-            )
+        if rust_build_path != "from_dataset":
+            raise ValueError(f"rust_build_path must be from_dataset; got {rust_build_path!r}.")
         return rust_build_path
 
-    dataset_mode_normalized = dataset_mode.strip().lower()
-    has_signatures_path = bool(dataset.signatures_path)
-    has_papers_path = bool(dataset.papers_path)
-    legacy_requested_build_path: RustBuildPath = (
-        "from_json_paths"
-        if dataset_mode_normalized == "inference" and has_signatures_path and has_papers_path
-        else "from_dataset"
-    )
+    del dataset_mode
     rust_lifecycle_policy = _dataset_rust_lifecycle_policy(dataset)
-    requested_build_path = (
-        rust_lifecycle_policy.rust_build_path if rust_lifecycle_policy is not None else legacy_requested_build_path
-    )
-    return requested_build_path
+    return rust_lifecycle_policy.rust_build_path if rust_lifecycle_policy is not None else "from_dataset"
 
 
 def _build_rust_featurizer_strict(
@@ -1257,16 +803,13 @@ __all__ = [
     "build_linker_pair_aggregate_stats_arrays_rust",
     "build_linker_pair_distance_accumulators_rust",
     "build_linker_pair_features_and_aggregate_stats_arrays_rust",
-    "build_pair_feature_matrix_rust",
     "build_rust_featurizer_from_arrow_paths",
     "clear_rust_featurizer_cache",
     "evict_rust_featurizer",
-    "featurize_pair_rust",
     "get_constraint_labels_index_arrays_rust",
     "get_constraint_rust",
     "get_constraints_block_upper_triangle_indexed_rust",
     "get_constraints_matrix_indexed_rust",
-    "inspect_json_ingest_name_counts_source",
     "rust_featurizer_available",
     "rust_signature_preprocess_available",
     "s2and_rust",

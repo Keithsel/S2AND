@@ -36,9 +36,6 @@ RAW_PLANNER_ARROW_MAX_RECORD_BATCH_ROWS = {
     contract.table_key: contract.max_record_batch_rows for contract in RAW_PLANNER_ARROW_BATCH_INDEX_CONTRACTS
 }
 FILTERED_READ_ARROW_TABLE_KEYS = ("signatures", "papers", "paper_authors")
-FILTERED_READ_BATCH_INDEX_KEYS = tuple(
-    RAW_PLANNER_ARROW_BATCH_INDEX_KEYS[table_key] for table_key in FILTERED_READ_ARROW_TABLE_KEYS
-)
 DECLARED_ARROW_SIDECAR_KEYS = (
     "cluster_seeds",
     "cluster_seed_disallows",
@@ -279,10 +276,12 @@ def validate_arrow_prediction_artifacts(
 
     if require_specter and "specter" not in normalized and "specter2" in normalized:
         normalized["specter"] = normalized["specter2"]
+        invalid_paths.pop("specter", None)
         if "specter" in missing_keys:
             missing_keys.remove("specter")
     if require_specter and "specter_batch_index" not in normalized and "specter2_batch_index" in normalized:
         normalized["specter_batch_index"] = normalized["specter2_batch_index"]
+        invalid_paths.pop("specter_batch_index", None)
     if not require_specter:
         normalized.pop("specter", None)
         normalized.pop("specter_batch_index", None)

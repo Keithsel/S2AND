@@ -153,6 +153,39 @@ impl RawNameCountIndexFile {
                 path.display()
             )));
         }
+        for index in 0..record_count {
+            let record_offset = NAME_COUNTS_INDEX_HEADER_LEN + index * NAME_COUNTS_INDEX_RECORD_LEN;
+            let name_offset_raw = read_u64_le_unchecked(&bytes, record_offset + 16);
+            let name_offset = usize::try_from(name_offset_raw).map_err(|_| {
+                pyo3::exceptions::PyOverflowError::new_err(format!(
+                    "name-count index file {} record {} for kind {} has name offset that overflows usize: {}",
+                    path.display(),
+                    index,
+                    kind.key(),
+                    name_offset_raw
+                ))
+            })?;
+            let name_len = read_u32_le_unchecked(&bytes, record_offset + 24) as usize;
+            let name_end = name_offset.checked_add(name_len).ok_or_else(|| {
+                pyo3::exceptions::PyOverflowError::new_err(format!(
+                    "name-count index file {} record {} for kind {} name range overflows",
+                    path.display(),
+                    index,
+                    kind.key()
+                ))
+            })?;
+            if name_end > blob_len {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "name-count index file {} record {} for kind {} has name range [{}, {}) outside blob length {}",
+                    path.display(),
+                    index,
+                    kind.key(),
+                    name_offset,
+                    name_end,
+                    blob_len
+                )));
+            }
+        }
         if record_count > 1 {
             let read_pair = |index: usize| {
                 let offset = NAME_COUNTS_INDEX_HEADER_LEN + index * NAME_COUNTS_INDEX_RECORD_LEN;

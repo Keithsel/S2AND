@@ -71,8 +71,6 @@ RAW_CANDIDATE_PLAN_ROW_KEYS: tuple[str, ...] = (
     *(raw_key for raw_key, _signal_key, _dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS),
 )
 RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS: tuple[str, ...] = (
-    "left_signature_indices",
-    "right_signature_indices",
     "pair_row_indices",
 )
 RAW_CANDIDATE_PLAN_PAIR_ID_KEYS: tuple[str, ...] = (
@@ -197,6 +195,17 @@ def _raw_plan_array(plan: Mapping[str, Any], key: str, dtype: Any, expected_leng
     return values
 
 
+def _validate_uint32_indices_below(values: np.ndarray, *, key: str, upper_bound: int, bound_name: str) -> None:
+    if len(values) == 0:
+        return
+    invalid = values >= int(upper_bound)
+    if bool(np.any(invalid)):
+        invalid_value = int(values[invalid][0])
+        raise ValueError(
+            f"raw candidate plan {key} contains index {invalid_value} outside {bound_name}={int(upper_bound)}"
+        )
+
+
 def _raw_plan_nonnegative_count(plan: Mapping[str, Any], key: str) -> int:
     value = int(_required_raw_plan_value(plan, key))
     if value < 0:
@@ -235,14 +244,6 @@ def validate_raw_candidate_plan_schema(plan: Mapping[str, Any]) -> None:
     )
     if missing:
         raise KeyError(f"raw candidate plan is missing required keys: {missing}")
-    has_pair_signature_ids = all(key in plan for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS)
-    if any(key in plan for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS) and not has_pair_signature_ids:
-        raise KeyError(
-            "raw candidate plan must include both left_signature_ids and right_signature_ids when either is present"
-        )
-    if not has_pair_signature_ids and "seed_signature_ids" not in plan:
-        raise KeyError("raw candidate plan without pair signature ids must include seed_signature_ids")
-
     query_count = _raw_plan_sequence_length(plan, "query_signature_ids")
     if query_count == 0:
         raise ValueError("raw candidate plan query_signature_ids must be non-empty")
@@ -253,14 +254,20 @@ def validate_raw_candidate_plan_schema(plan: Mapping[str, Any]) -> None:
                 f"raw candidate plan {key} length must match query_signature_ids: {length} != {query_count}"
             )
     for key in RAW_CANDIDATE_PLAN_ROW_KEYS:
-        _raw_plan_array(plan, key, object, row_count)
-    for key in RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS:
-        _raw_plan_array(plan, key, np.uint32, pair_count)
-    if has_pair_signature_ids:
-        for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS:
-            length = _raw_plan_sequence_length(plan, key)
-            if length != pair_count:
-                raise ValueError(f"raw candidate plan {key} length must match pair_count: {length} != {pair_count}")
+        values = _raw_plan_array(plan, key, object, row_count)
+        if key == "row_query_signature_indices":
+            _validate_uint32_indices_below(
+                as_uint32_1d(key, values),
+                key=key,
+                upper_bound=query_count,
+                bound_name="query_signature_ids length",
+            )
+    pair_row_indices = _raw_plan_array(plan, "pair_row_indices", np.uint32, pair_count)
+    _validate_uint32_indices_below(pair_row_indices, key="pair_row_indices", upper_bound=row_count, bound_name="row_count")
+    for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS:
+        length = _raw_plan_sequence_length(plan, key)
+        if length != pair_count:
+            raise ValueError(f"raw candidate plan {key} length must match pair_count: {length} != {pair_count}")
 
 
 def _signature_indices_from_ids(
@@ -325,42 +332,16 @@ def build_linker_retrieval_batch_from_raw_candidate_plan(
         field_name="query_signature_ids",
     )
     row_query_signature_indices = query_indices_by_offset[row_query_offsets]
-    if "left_signature_ids" in plan and "right_signature_ids" in plan:
-        left_signature_indices = _signature_indices_from_ids(
-            [str(value) for value in _required_raw_plan_value(plan, "left_signature_ids")],
-            signature_id_to_index,
-            field_name="left_signature_ids",
-        )
-        right_signature_indices = _signature_indices_from_ids(
-            [str(value) for value in _required_raw_plan_value(plan, "right_signature_ids")],
-            signature_id_to_index,
-            field_name="right_signature_ids",
-        )
-    else:
-        seed_signature_ids = [str(value) for value in _required_raw_plan_value(plan, "seed_signature_ids")]
-        signature_ids_by_plan_index = (*query_signature_ids, *seed_signature_ids)
-
-        def _remap_plan_signature_indices(key: str) -> np.ndarray:
-            raw_indices = _raw_plan_array(plan, key, np.uint32, pair_count)
-            remapped: list[int] = []
-            for raw_index in raw_indices:
-                plan_index = int(raw_index)
-                if plan_index >= len(signature_ids_by_plan_index):
-                    raise ValueError(
-                        f"raw candidate plan {key} contains signature index {plan_index} outside "
-                        f"signature table length {len(signature_ids_by_plan_index)}"
-                    )
-                signature_id = signature_ids_by_plan_index[plan_index]
-                try:
-                    remapped.append(int(signature_id_to_index[signature_id]))
-                except KeyError as exc:
-                    raise KeyError(
-                        f"{key} contains signature_id not present in signature_id_to_index: {signature_id!r}"
-                    ) from exc
-            return as_uint32_1d(key, remapped)
-
-        left_signature_indices = _remap_plan_signature_indices("left_signature_indices")
-        right_signature_indices = _remap_plan_signature_indices("right_signature_indices")
+    left_signature_indices = _signature_indices_from_ids(
+        [str(value) for value in _required_raw_plan_value(plan, "left_signature_ids")],
+        signature_id_to_index,
+        field_name="left_signature_ids",
+    )
+    right_signature_indices = _signature_indices_from_ids(
+        [str(value) for value in _required_raw_plan_value(plan, "right_signature_ids")],
+        signature_id_to_index,
+        field_name="right_signature_ids",
+    )
     if len(left_signature_indices) != pair_count or len(right_signature_indices) != pair_count:
         raise ValueError(
             "raw candidate plan pair_count does not match left/right signature id lengths: "

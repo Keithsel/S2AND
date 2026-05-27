@@ -152,9 +152,9 @@ def _drop_unlabeled_singleton_orcid_rows(
     labels = (
         pd.to_numeric(rows["label"], errors="coerce").fillna(0).astype(np.int8) if "label" in rows.columns else None
     )
-    query_ids_before = set(rows["query_group_id"].astype(str)) if "query_group_id" in rows.columns else set[str]()
+    query_ids_before = set(rows["query_group_id"].astype(str)) if "query_group_id" in rows.columns else set()
     cleaned = rows.loc[~drop_mask].reset_index(drop=True)
-    query_ids_after = set(cleaned["query_group_id"].astype(str)) if "query_group_id" in cleaned.columns else set[str]()
+    query_ids_after = set(cleaned["query_group_id"].astype(str)) if "query_group_id" in cleaned.columns else set()
     summary["rows_removed"] = int(drop_mask.sum())
     summary["rows_after"] = int(len(cleaned))
     summary["queries_removed"] = int(len(query_ids_before - query_ids_after))

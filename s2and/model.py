@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import threading
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -13,7 +14,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, Self, TypeVar, cast
+from typing import Any, Literal, Self, TypeAlias, TypeVar, cast
 
 import lightgbm as lgb
 import numpy as np
@@ -99,15 +100,17 @@ _MISSING = object()
 DEFAULT_INCREMENTAL_LINKER_ARTIFACT_DIR = Path(_PACKAGE_DATA_DIR) / "production_model_v1.21" / "incremental_linker"
 _ALTERED_PRESPLIT_CACHE_MAX_ENTRIES = 128
 _CLUSTER_SEEDS_ARROW_CACHE_MAX_ENTRIES = 16
+_PATH_CACHE_KEY: TypeAlias = tuple[str, int | None, int | None, str | None]
 _CLUSTER_SEEDS_ARROW_CACHE: OrderedDict[
-    tuple[str, int | None, int | None, int | None, str | None],
+    _PATH_CACHE_KEY,
     tuple[tuple[str, str], ...],
 ] = OrderedDict()
 _CLUSTER_SEED_DISALLOWS_ARROW_CACHE_MAX_ENTRIES = 16
 _CLUSTER_SEED_DISALLOWS_ARROW_CACHE: OrderedDict[
-    tuple[str, int | None, int | None, int | None, str | None],
+    _PATH_CACHE_KEY,
     tuple[tuple[str, str], ...],
 ] = OrderedDict()
+_CLUSTER_SEEDS_ARROW_CACHE_LOCK = threading.Lock()
 
 # Keep canonical pickle import paths stable after splitting module internals.
 for _export in (FastCluster, PairwiseModeler, VotingClassifier, intify):
@@ -294,18 +297,18 @@ def _path_sample_digest(path: Path, size: int) -> str:
     return digest.hexdigest()
 
 
-def _path_cache_fingerprint(path_value: Any) -> tuple[str, int | None, int | None, int | None, str | None]:
+def _path_cache_fingerprint(path_value: Any) -> _PATH_CACHE_KEY:
     path = Path(str(path_value))
     try:
         stat = path.stat()
     except OSError:
-        return str(path_value), None, None, None, None
+        return str(path_value), None, None, None
     size = int(stat.st_size)
     try:
         digest = _path_sample_digest(path, size)
     except OSError:
         digest = None
-    return str(path), size, int(stat.st_mtime_ns), int(stat.st_ctime_ns), digest
+    return str(path), size, int(stat.st_mtime_ns), digest
 
 
 def _arrow_paths_cache_fingerprint(arrow_paths: Mapping[str, Any] | None) -> tuple[tuple[str, Any], ...]:
@@ -706,16 +709,22 @@ def _resolve_dataset_arrow_paths_for_compat_discovery(
 
 def _read_cluster_seeds_arrow(path: Path) -> dict[str, str]:
     cache_key = _path_cache_fingerprint(path)
-    cached_items = _CLUSTER_SEEDS_ARROW_CACHE.get(cache_key)
-    if cached_items is not None:
-        _CLUSTER_SEEDS_ARROW_CACHE.move_to_end(cache_key)
-        return dict(cached_items)
+    with _CLUSTER_SEEDS_ARROW_CACHE_LOCK:
+        cached_items = _CLUSTER_SEEDS_ARROW_CACHE.get(cache_key)
+        if cached_items is not None:
+            _CLUSTER_SEEDS_ARROW_CACHE.move_to_end(cache_key)
+            return dict(cached_items)
 
     cluster_seeds_require = _read_cluster_seeds_arrow_file(path)
-    _CLUSTER_SEEDS_ARROW_CACHE[cache_key] = tuple(cluster_seeds_require.items())
-    _CLUSTER_SEEDS_ARROW_CACHE.move_to_end(cache_key)
-    while len(_CLUSTER_SEEDS_ARROW_CACHE) > _CLUSTER_SEEDS_ARROW_CACHE_MAX_ENTRIES:
-        _CLUSTER_SEEDS_ARROW_CACHE.popitem(last=False)
+    with _CLUSTER_SEEDS_ARROW_CACHE_LOCK:
+        cached_items = _CLUSTER_SEEDS_ARROW_CACHE.get(cache_key)
+        if cached_items is not None:
+            _CLUSTER_SEEDS_ARROW_CACHE.move_to_end(cache_key)
+            return dict(cached_items)
+        _CLUSTER_SEEDS_ARROW_CACHE[cache_key] = tuple(cluster_seeds_require.items())
+        _CLUSTER_SEEDS_ARROW_CACHE.move_to_end(cache_key)
+        while len(_CLUSTER_SEEDS_ARROW_CACHE) > _CLUSTER_SEEDS_ARROW_CACHE_MAX_ENTRIES:
+            _CLUSTER_SEEDS_ARROW_CACHE.popitem(last=False)
     return cluster_seeds_require
 
 
@@ -867,16 +876,22 @@ def _cluster_seeds_require_inverse(
 
 def _read_cluster_seed_disallows_arrow(path: Path) -> set[tuple[str, str]]:
     cache_key = _path_cache_fingerprint(path)
-    cached_items = _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.get(cache_key)
-    if cached_items is not None:
-        _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.move_to_end(cache_key)
-        return set(cached_items)
+    with _CLUSTER_SEEDS_ARROW_CACHE_LOCK:
+        cached_items = _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.get(cache_key)
+        if cached_items is not None:
+            _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.move_to_end(cache_key)
+            return set(cached_items)
 
     disallow_pairs = set(read_cluster_seed_disallows_arrow(path))
-    _CLUSTER_SEED_DISALLOWS_ARROW_CACHE[cache_key] = tuple(disallow_pairs)
-    _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.move_to_end(cache_key)
-    while len(_CLUSTER_SEED_DISALLOWS_ARROW_CACHE) > _CLUSTER_SEED_DISALLOWS_ARROW_CACHE_MAX_ENTRIES:
-        _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.popitem(last=False)
+    with _CLUSTER_SEEDS_ARROW_CACHE_LOCK:
+        cached_items = _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.get(cache_key)
+        if cached_items is not None:
+            _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.move_to_end(cache_key)
+            return set(cached_items)
+        _CLUSTER_SEED_DISALLOWS_ARROW_CACHE[cache_key] = tuple(disallow_pairs)
+        _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.move_to_end(cache_key)
+        while len(_CLUSTER_SEED_DISALLOWS_ARROW_CACHE) > _CLUSTER_SEED_DISALLOWS_ARROW_CACHE_MAX_ENTRIES:
+            _CLUSTER_SEED_DISALLOWS_ARROW_CACHE.popitem(last=False)
     return disallow_pairs
 
 

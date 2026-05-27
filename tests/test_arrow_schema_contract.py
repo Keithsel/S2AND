@@ -11,7 +11,7 @@ EXPECTED_REQUIRED_COLUMNS = {
     "cluster_seed_disallows": {"signature_id_1", "signature_id_2"},
     "cluster_seeds": {"signature_id", "cluster_id"},
     "paper_authors": {"paper_id", "position", "author_name"},
-    "papers": {"paper_id", "title", "venue", "journal_name", "year"},
+    "papers": {"paper_id", "title", "venue", "journal_name"},
     "signatures": {
         "signature_id",
         "paper_id",

@@ -563,42 +563,31 @@ def test_get_rust_featurizer_retries_empty_wait_then_builds(monkeypatch):
     assert build_calls["count"] == 1
 
 
-def test_train_dataset_with_json_paths_uses_from_dataset():
-    dataset = DummyDataset("train_dataset", mode="train")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
+@pytest.mark.parametrize(
+    ("mode", "with_json_paths", "explicit_build_path"),
+    [
+        ("train", True, None),
+        ("inference", False, None),
+        ("inference", True, None),
+        ("inference", True, "from_dataset"),
+    ],
+)
+def test_rust_featurizer_build_always_resolves_to_from_dataset(
+    mode: str,
+    with_json_paths: bool,
+    explicit_build_path: str | None,
+):
+    dataset = DummyDataset(f"{mode}_paths{int(with_json_paths)}_explicit{explicit_build_path or 'none'}", mode=mode)
+    if with_json_paths:
+        dataset.signatures_path = "signatures.json"
+        dataset.papers_path = "papers.json"
 
-    feature_port._get_rust_featurizer(dataset)
+    if explicit_build_path is None:
+        feature_port._get_rust_featurizer(dataset)
+    else:
+        feature_port._get_rust_featurizer(dataset, rust_build_path=explicit_build_path)
 
-    assert DummyRustFeaturizer.created == ["train_dataset"]
-
-
-def test_inference_without_json_paths_uses_from_dataset():
-    dataset = DummyDataset("inference_no_paths", mode="inference")
-
-    feature_port._get_rust_featurizer(dataset)
-
-    assert DummyRustFeaturizer.created == ["inference_no_paths"]
-
-
-def test_inference_with_json_paths_uses_from_dataset():
-    dataset = DummyDataset("inference_dataset", mode="inference")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
-
-    feature_port._get_rust_featurizer(dataset)
-
-    assert DummyRustFeaturizer.created == ["inference_dataset"]
-
-
-def test_rust_build_path_argument_allows_from_dataset_with_json_paths():
-    dataset = DummyDataset("inference_dataset", mode="inference")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
-
-    feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
-
-    assert DummyRustFeaturizer.created == ["inference_dataset"]
+    assert DummyRustFeaturizer.created == [dataset.name]
 
 
 def test_explicit_from_json_paths_is_rejected():

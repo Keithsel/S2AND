@@ -1575,7 +1575,7 @@ def _sorted_subblock_merge_candidates(
     for pair in combinations(mergeable_keys, 2):
         size_1, first_name_1, middle_name_1, name_for_splits_1, lookup_1 = metadata[pair[0]]
         size_2, first_name_2, middle_name_2, name_for_splits_2, lookup_2 = metadata[pair[1]]
-        if size_1 + size_2 >= maximum_size:
+        if size_1 + size_2 > maximum_size:
             continue
         both_multi_letter = len(first_name_1) > 1 and len(first_name_2) > 1
         both_single_letter_with_middle = (
@@ -1698,9 +1698,9 @@ def make_subblocks_with_telemetry(
     maximum_size using middle names and the SPECTER clustering algorithm. Finally, it merges any subblocks
     smaller than maximum_size that share name attributes.
 
-    There is an optional ORCID repair pass: when `use_orcid_subblocking` is true, signatures with
-    the same normalized ORCID are co-located when one existing subblock can absorb the full ORCID
-    group without exceeding `maximum_size`.
+    There is an optional ORCID repair pass: when `use_orcid_subblocking` is true, whole subblocks
+    that contain the same normalized ORCID are merged only when the combined subblocks fit within
+    `maximum_size`.
 
     Args:
         signature_ids (list[str/int]): List of signature IDs.
@@ -1958,67 +1958,94 @@ def make_subblocks_with_telemetry(
             sig_id_to_subblock_id[sig_id] = subblock_id
 
     if use_orcid_subblocking:
-        # Final ORCID repair pass. It is intentionally cap-preserving: if no existing target
-        # subblock can absorb the full same-ORCID group, leave the split in place and report it.
+        # Final ORCID repair pass. It only coarsens existing subblocks: extracting only
+        # same-ORCID signatures from a source subblock can fragment otherwise good name
+        # buckets. If the whole set of subblocks containing an ORCID cannot fit under
+        # the capacity cap, leave the split in place and report it.
         orcid_to_sig_ids = defaultdict(list)
         for sig_id in sig_id_to_subblock_id:
             orcid = normalize_orcid_for_subblocking(getattr(anddata.signatures[sig_id], "author_info_orcid", None))
             if orcid is not None:
                 orcid_to_sig_ids[orcid].append(sig_id)
+        subblock_ids = list(output)
+        subblock_index = {subblock_id: index for index, subblock_id in enumerate(subblock_ids)}
+        parent = list(range(len(subblock_ids)))
+
+        def find_subblock_root(index: int) -> int:
+            parent_index = parent[index]
+            if parent_index != index:
+                parent[index] = find_subblock_root(parent_index)
+            return parent[index]
+
+        def union_subblocks(left: str, right: str) -> None:
+            left_root = find_subblock_root(subblock_index[left])
+            right_root = find_subblock_root(subblock_index[right])
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        orcid_to_subblock_ids: dict[str, list[str]] = {}
         for orcid, orcid_sig_ids in orcid_to_sig_ids.items():
-            current_subblock_counts = Counter(sig_id_to_subblock_id[sig_id] for sig_id in orcid_sig_ids)
-            unique_subblock_ids = sorted(current_subblock_counts)
-            if len(unique_subblock_ids) > 1:
-                unique_subblock_ids = sorted(
-                    unique_subblock_ids,
-                    key=lambda x: (x.count("specter") * 10 + x.count("|"), x),
-                )
-                total_orcid_sig_count = len(orcid_sig_ids)
-                feasible_subblock_ids = [
-                    subblock_id
-                    for subblock_id in unique_subblock_ids
-                    if len(output[subblock_id]) + (total_orcid_sig_count - current_subblock_counts[subblock_id])
-                    <= maximum_size
-                ]
-                if not feasible_subblock_ids:
+            seen_subblocks: set[str] = set()
+            unique_subblock_ids: list[str] = []
+            for sig_id in orcid_sig_ids:
+                subblock_id = sig_id_to_subblock_id[sig_id]
+                if subblock_id in seen_subblocks:
+                    continue
+                seen_subblocks.add(subblock_id)
+                unique_subblock_ids.append(subblock_id)
+            if len(unique_subblock_ids) <= 1:
+                continue
+            orcid_to_subblock_ids[orcid] = unique_subblock_ids
+            first_subblock_id = unique_subblock_ids[0]
+            for subblock_id in unique_subblock_ids[1:]:
+                union_subblocks(first_subblock_id, subblock_id)
+
+        components_by_root: dict[int, list[str]] = defaultdict(list)
+        component_roots: list[int] = []
+        seen_roots: set[int] = set()
+        for subblock_id in subblock_ids:
+            root = find_subblock_root(subblock_index[subblock_id])
+            components_by_root[root].append(subblock_id)
+            if root not in seen_roots:
+                seen_roots.add(root)
+                component_roots.append(root)
+
+        skipped_orcid_counts_by_root: dict[int, list[tuple[str, int]]] = defaultdict(list)
+        for orcid, unique_subblock_ids in orcid_to_subblock_ids.items():
+            root = find_subblock_root(subblock_index[unique_subblock_ids[0]])
+            skipped_orcid_counts_by_root[root].append((orcid, len(orcid_to_sig_ids[orcid])))
+
+        merge_actions: list[tuple[str, list[str], list[str]]] = []
+        for root in component_roots:
+            unique_subblock_ids = components_by_root[root]
+            if len(unique_subblock_ids) <= 1:
+                continue
+            unique_subblock_ids = sorted(
+                unique_subblock_ids,
+                key=lambda x: (x.count("specter") * 10 + x.count("|"), x),
+            )
+            total_subblock_sig_count = sum(len(output[subblock_id]) for subblock_id in unique_subblock_ids)
+            if total_subblock_sig_count > maximum_size:
+                for orcid, total_orcid_sig_count in skipped_orcid_counts_by_root[root]:
                     telemetry["orcid_merge_skipped_due_to_capacity_count"] += 1
                     telemetry["orcid_merge_skipped_due_to_capacity_signature_count"] += int(total_orcid_sig_count)
                     logger.warning(
-                        "Skipping ORCID merge for %s across %d subblocks; no target fits within maximum_size=%d",
+                        "Skipping ORCID merge for %s across %d subblocks; whole-subblock merge exceeds maximum_size=%d",
                         orcid,
                         len(unique_subblock_ids),
                         maximum_size,
                     )
-                    continue
-                subblock_id_to_move_to = sorted(
-                    feasible_subblock_ids,
-                    key=lambda subblock_id: (
-                        -current_subblock_counts[subblock_id],
-                        subblock_id.count("specter") * 10 + subblock_id.count("|"),
-                        subblock_id,
-                    ),
-                )[0]
-                sig_ids_to_move = []
-                moved_sig_ids_by_source = defaultdict(set)
-                for sig_id in orcid_sig_ids:
-                    original_subblock_id = sig_id_to_subblock_id[sig_id]
-                    if original_subblock_id != subblock_id_to_move_to:
-                        sig_ids_to_move.append(sig_id)
-                        moved_sig_ids_by_source[original_subblock_id].add(sig_id)
+                continue
+            key_of_keys = ", ".join(unique_subblock_ids)
+            signature_ids_stacked = []
+            for subblock_id in unique_subblock_ids:
+                signature_ids_stacked.extend(output[subblock_id])
+            merge_actions.append((key_of_keys, signature_ids_stacked, unique_subblock_ids))
 
-                output[subblock_id_to_move_to].extend(sig_ids_to_move)
-                for sig_id in sig_ids_to_move:
-                    sig_id_to_subblock_id[sig_id] = subblock_id_to_move_to
-                for original_subblock_id, moved_sig_ids in moved_sig_ids_by_source.items():
-                    if original_subblock_id not in output:
-                        continue
-                    remaining_sig_ids = [
-                        sig_id for sig_id in output[original_subblock_id] if sig_id not in moved_sig_ids
-                    ]
-                    if remaining_sig_ids:
-                        output[original_subblock_id] = remaining_sig_ids
-                    else:
-                        del output[original_subblock_id]
+        for key_of_keys, signature_ids_stacked, unique_subblock_ids in merge_actions:
+            for subblock_id in unique_subblock_ids:
+                del output[subblock_id]
+            output[key_of_keys] = signature_ids_stacked
 
     # let's assert that we have done a complete partition
     assert set(np.hstack([output[k] for k in output])) == set(signature_ids)

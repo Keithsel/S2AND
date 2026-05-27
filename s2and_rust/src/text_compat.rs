@@ -1,7 +1,5 @@
-use crate::text_unidecode_data::TEXT_UNIDECODE_DATA;
 use pyo3::prelude::PyResult;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
 pub(crate) fn ensure_unidecode_for_text(
     text: &str,
@@ -19,23 +17,27 @@ pub(crate) fn ensure_unidecode_for_text(
     Ok(())
 }
 
-static TEXT_UNIDECODE_REPLACES: OnceLock<Vec<&'static str>> = OnceLock::new();
-
-fn text_unidecode_replaces() -> &'static [&'static str] {
-    TEXT_UNIDECODE_REPLACES
-        .get_or_init(|| TEXT_UNIDECODE_DATA.split('\0').collect())
-        .as_slice()
-}
-
 fn text_unidecode_char(ch: char) -> &'static str {
-    let codepoint = ch as usize;
-    if codepoint == 0 {
-        return "\0";
+    match ch as u32 {
+        0x0080 | 0x0082 | 0x0083 | 0x0084 | 0x0085 | 0x0086 | 0x0087 | 0x0088 | 0x0089 | 0x008A
+        | 0x008B | 0x008C | 0x008E | 0x0091 | 0x0092 | 0x0093 | 0x0094 | 0x0095 | 0x0096
+        | 0x0097 | 0x0098 | 0x0099 | 0x009A | 0x009B | 0x009C | 0x009E | 0x009F | 0x02E5
+        | 0x02E6 | 0x02E7 | 0x02E8 | 0x02E9 | 0x02EA | 0x02EB | 0xFDF0 | 0xFDF1 | 0xFDF2
+        | 0xFDF3 | 0xFDF4 | 0xFDF5 | 0xFDF6 | 0xFDF7 | 0xFDF8 | 0xFDF9 | 0xFDFA | 0xFDFB => "",
+        0x02FF | 0x03FF | 0x04FF | 0x05FF | 0x06FF | 0x07FF | 0x09FF | 0x0AFF | 0x0BFF | 0x0CFF
+        | 0x0DFF | 0x0EFF | 0x0FFF | 0x10FF | 0x11FF | 0x13FF | 0x16FF | 0x17FF | 0x18FF
+        | 0x1EFF | 0x1FFF | 0x20FF | 0x21FF | 0x22FF | 0x23FF | 0x24FF | 0x25FF | 0x26FF
+        | 0x27FF | 0x2EFF | 0x2FFF | 0x30FF | 0x31FF | 0x32FF | 0x33FF | 0x4DFF | 0x9FFF
+        | 0xA4FF | 0xD7FF | 0xFAFF | 0xFDFF => "[?] ",
+        0x25F4 | 0x25F5 | 0x25F6 | 0x25F7 => "#",
+        0x02EF | 0x02F0 | 0x02F1 | 0x02F2 | 0x02F3 | 0x02F4 | 0x02F5 | 0x02F6 | 0x02F7 | 0x02F8
+        | 0x02F9 | 0x02FA | 0x02FB | 0x02FC | 0x02FD | 0x02FE | 0x03F4 | 0x03F5 | 0x03F6
+        | 0x03F7 | 0x03F8 | 0x03F9 | 0x03FC | 0x03FD | 0x03FE | 0x0AF0 | 0x0AF1 | 0x0AF9
+        | 0x13F5 | 0x13F8 | 0x13F9 | 0x13FA | 0x13FB | 0x13FC | 0x13FD | 0x1EFA | 0x1EFB
+        | 0x1EFC | 0x1EFD | 0x1EFE | 0x25F8 | 0x25F9 | 0x25FA | 0x25FB | 0x25FC | 0x25FD
+        | 0x25FE | 0xFDFC | 0xFDFD => "[?]",
+        _ => unidecode::unidecode_char(ch),
     }
-    text_unidecode_replaces()
-        .get(codepoint - 1)
-        .copied()
-        .unwrap_or("")
 }
 
 pub(crate) fn normalize_ascii_text_compat(text: &str, special_case_apostrophes: bool) -> String {
@@ -209,4 +211,26 @@ pub(crate) fn compute_block_compat(name: &str) -> String {
         return String::new();
     };
     format!("{} {}", first_initial, name_parts[name_parts.len() - 1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_text_compat_native, text_unidecode_char};
+
+    #[test]
+    fn text_unidecode_char_matches_python_text_unidecode_compat_overrides() {
+        assert_eq!(text_unidecode_char('\u{0080}'), "");
+        assert_eq!(text_unidecode_char('\u{02EF}'), "[?]");
+        assert_eq!(text_unidecode_char('\u{02FF}'), "[?] ");
+        assert_eq!(text_unidecode_char('\u{25F4}'), "#");
+        assert_eq!(text_unidecode_char('\u{FDFD}'), "[?]");
+    }
+
+    #[test]
+    fn normalize_text_compat_preserves_python_boundaries_for_overrides() {
+        assert_eq!(
+            normalize_text_compat_native("a\u{0080}b \u{03F4}c \u{02FF}d", false),
+            "ab c d",
+        );
+    }
 }

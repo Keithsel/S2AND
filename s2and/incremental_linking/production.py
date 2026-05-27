@@ -442,6 +442,15 @@ def merge_promoted_incremental_batch_telemetry(
                 elif merged[key] != value:
                     conflict_counts[key] = conflict_counts.get(key, 0) + 1
                 continue
+            if merge_policy == "constant":
+                if key not in merged:
+                    merged[key] = value
+                elif merged[key] != value:
+                    raise ValueError(
+                        f"promoted incremental telemetry field {key!r} must be constant across batches: "
+                        f"{merged[key]!r} != {value!r}"
+                    )
+                continue
             if merge_policy == "sum_numeric" and isinstance(value, int | float) and not isinstance(value, bool):
                 previous = merged.get(key, 0)
                 if isinstance(previous, int | float) and not isinstance(previous, bool):
@@ -649,7 +658,6 @@ def predict_incremental_promoted_linker(
             )
             if 0 < int(batch_limits.query_batch_size) < len(query_batch):
                 current_limits = batch_limits
-                final_limits = batch_limits
                 current_query_batch_size = int(batch_limits.query_batch_size)
                 continue
             raise_if_promoted_incremental_batch_over_budget(batch_limits)
@@ -682,6 +690,7 @@ def predict_incremental_promoted_linker(
             batch_telemetries.append(batch_telemetry)
             next_query_index += len(query_batch)
             batch_sizes.append(len(query_batch))
+            final_limits = batch_limits
             batch_rss_after_bytes, batch_rss_source = memory_budget.current_rss_bytes_best_effort(
                 int(batch_limits.total_ram_bytes)
             )
@@ -793,7 +802,6 @@ def predict_incremental_promoted_linker(
                     raise_if_promoted_incremental_batch_over_budget(calibrated_limits)
                     current_limits = calibrated_limits
                     current_query_batch_size = max(1, int(calibrated_limits.query_batch_size))
-                    final_limits = calibrated_limits
                     calibration_applied = True
                     logger.info(
                         "Telemetry: incremental_promoted_query_batch_calibration "
@@ -1047,7 +1055,6 @@ def predict_incremental_promoted_linker_from_arrow_paths(
                 orcid_enabled=bool(orcid_enabled),
                 num_threads=clusterer.n_jobs,
                 max_exemplars=4,
-                include_pair_signature_ids=False,
                 include_component_members=True,
             )
             raw_window_plan_seconds += time.perf_counter() - raw_window_start
@@ -1075,13 +1082,7 @@ def predict_incremental_promoted_linker_from_arrow_paths(
             if raw_request_planner is None:
                 raise RuntimeError("reusable raw Arrow planner was not initialized")
             raw_window_planner_plan_start = time.perf_counter()
-            raw_candidate_plan = raw_request_planner.plan(
-                list(query_plan_window),
-                top_k=retrieval_top_k,
-                query_view="auto",
-                include_pair_signature_ids=False,
-                include_component_members=True,
-            )
+            raw_candidate_plan = raw_request_planner.plan(list(query_plan_window))
             raw_window_planner_plan_call_count += 1
             raw_window_planner_plan_seconds += time.perf_counter() - raw_window_planner_plan_start
             raw_window_featurizer_start = time.perf_counter()

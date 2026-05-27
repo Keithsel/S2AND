@@ -620,36 +620,26 @@ def _build_and_cache_rust_featurizer(
     inflight_build: _InFlightFeaturizerBuild,
     build_context: _RustFeaturizerBuildContext,
 ) -> Any:
-    featurizer: Any | None = None
     build_path = build_context.requested_build_path
     cache_key = build_context.cache_key
-    build_count = 0
     try:
-        build_timings: dict[str, float] = {
-            "pre_build_seconds": 0.0,
-            "ffi_seconds": 0.0,
-            "post_build_seconds": 0.0,
-        }
-        if featurizer is None:
-            featurizer, build_path, build_timings, build_count, build_seconds = _build_rust_featurizer_strict(
-                dataset,
-                requested_build_path=build_context.requested_build_path,
-                allow_normalization_version_mismatch=build_context.allow_normalization_version_mismatch,
-                name_counts_path=build_context.name_counts_path,
-                expected_normalization_version=build_context.expected_normalization_version,
-            )
-            logger.info(
-                "Telemetry: rust_core_build seconds=%.3f dataset=%s path=%s count=%d pre=%.3f ffi=%.3f post=%.3f",
-                build_seconds,
-                build_context.dataset_name_for_logs,
-                build_path,
-                build_count,
-                build_timings.get("pre_build_seconds", 0.0),
-                build_timings.get("ffi_seconds", 0.0),
-                build_timings.get("post_build_seconds", 0.0),
-            )
-        else:
-            build_count = _rust_featurizer_build_count(dataset, cache_key)
+        featurizer, build_path, build_timings, build_count, build_seconds = _build_rust_featurizer_strict(
+            dataset,
+            requested_build_path=build_context.requested_build_path,
+            allow_normalization_version_mismatch=build_context.allow_normalization_version_mismatch,
+            name_counts_path=build_context.name_counts_path,
+            expected_normalization_version=build_context.expected_normalization_version,
+        )
+        logger.info(
+            "Telemetry: rust_core_build seconds=%.3f dataset=%s path=%s count=%d pre=%.3f ffi=%.3f post=%.3f",
+            build_seconds,
+            build_context.dataset_name_for_logs,
+            build_path,
+            build_count,
+            build_timings.get("pre_build_seconds", 0.0),
+            build_timings.get("ffi_seconds", 0.0),
+            build_timings.get("post_build_seconds", 0.0),
+        )
 
         with _RUST_FEATURIZER_CACHE_LOCK:
             _prune_stale_cluster_seed_cache_entries_locked(dataset, build_context.cluster_seeds_version)
@@ -685,8 +675,6 @@ def _build_and_cache_rust_featurizer(
                     del _RUST_FEATURIZER_INFLIGHT_BUILDS[dataset]
         raise
 
-    if featurizer is None:
-        raise RuntimeError("Rust featurizer was not initialized")
     return featurizer
 
 

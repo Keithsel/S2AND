@@ -303,7 +303,7 @@ Name-count values are intentionally not part of the signature table.
 
 ### `papers.arrow`
 
-One row per paper referenced by `signatures.arrow`. Required columns:
+One row per paper referenced by `signatures.arrow`. Columns:
 
 | Column | Arrow type | Nulls | Meaning |
 |---|---:|---:|---|
@@ -312,7 +312,7 @@ One row per paper referenced by `signatures.arrow`. Required columns:
 | `abstract` | `string` | yes | Abstract-presence signal: `"Has Abstract"` or `""` |
 | `venue` | `string` | yes | Venue text used as runtime preprocessing input |
 | `journal_name` | `string` | yes | Journal text used as runtime preprocessing input |
-| `year` | `int64` | yes | Publication year |
+| `year` | `int64` | no | Publication year |
 | `predicted_language` | `string` | yes | Optional cached/compatibility language override |
 | `is_reliable` | `bool` | yes | Optional cached/compatibility reliability override paired with `predicted_language` |
 

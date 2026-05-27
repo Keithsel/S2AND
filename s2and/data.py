@@ -495,13 +495,10 @@ class ANDData:
         self.rust_lifecycle_policy = build_rust_lifecycle_policy(
             backend=self.runtime_context.resolved_backend,
             mode=mode,
-            has_signatures_path=self.signatures_path is not None,
-            has_papers_path=self.papers_path is not None,
             preprocess=preprocess,
             compute_reference_features=compute_reference_features,
             use_rust=self.runtime_context.use_rust,
             from_dataset_paper_preprocess_available=rust_capabilities.from_dataset_paper_preprocess_available,
-            use_sinonym_overwrite=use_sinonym_overwrite,
         )
         pair_sampling_mode = _resolve_pair_sampling_mode(
             pair_sampling_mode=pair_sampling_mode,

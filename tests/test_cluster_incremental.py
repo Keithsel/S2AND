@@ -1198,6 +1198,18 @@ def test_promoted_incremental_batch_telemetry_does_not_sum_raw_plan_seed_counts(
     assert merged["raw_arrow_plan_cluster_count"] == 2
 
 
+def test_promoted_incremental_batch_telemetry_rejects_conflicting_constant_fields() -> None:
+    with pytest.raises(ValueError, match="must be constant across batches"):
+        production_module.merge_promoted_incremental_batch_telemetry(
+            [
+                {"query_count": 1, "raw_arrow_plan_seed_signature_count": 10},
+                {"query_count": 1, "raw_arrow_plan_seed_signature_count": 11},
+            ],
+            batch_sizes=[1, 1],
+            configured_batch_size=1,
+        )
+
+
 def test_promoted_incremental_batch_telemetry_keeps_numeric_after_mixed_type_conflict() -> None:
     merged = production_module.merge_promoted_incremental_batch_telemetry(
         [
@@ -1317,6 +1329,103 @@ def _mock_promoted_limits(
         single_query_predicted_persistent_bytes=100 if not single_query_exceeds_budget else 20_000,
         single_query_exceeds_budget=bool(single_query_exceeds_budget),
     )
+
+
+def test_promoted_incremental_final_limits_ignore_shrink_only_iterations(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeArtifact:
+        metadata = SimpleNamespace(retrieval_top_k=25)
+
+    class FakeClusterer:
+        n_jobs = 1
+        suppress_orcid = True
+        use_default_constraints_as_supervision = False
+
+        def _build_incremental_seed_setup(self, *_args: object, **_kwargs: object):
+            return {"seed": "c_seed"}, {}, {"c_seed": ["seed"]}
+
+        def _finish_incremental_with_seed_links(self, *_args: object, **_kwargs: object):
+            return {"c_seed": ["seed", "q1", "q2"]}
+
+    limit_calls: list[tuple[int, int | None]] = []
+
+    def fake_compute_limits(**kwargs: object) -> model_module.memory_budget.PromotedPhaseALimits:
+        limit_calls.append((int(kwargs["query_count"]), cast(int | None, kwargs.get("max_query_batch_size"))))
+        if len(limit_calls) == 1:
+            return _mock_promoted_limits(
+                query_count=int(kwargs["query_count"]),
+                query_batch_size=2,
+                operational_estimate_source="initial",
+                predicted_peak_delta_bytes=100,
+            )
+        if len(limit_calls) == 2:
+            return _mock_promoted_limits(
+                query_count=int(kwargs["query_count"]),
+                query_batch_size=1,
+                operational_estimate_source="shrink-only",
+                predicted_peak_delta_bytes=111,
+            )
+        return _mock_promoted_limits(
+            query_count=int(kwargs["query_count"]),
+            query_batch_size=1,
+            operational_estimate_source="executed",
+            predicted_peak_delta_bytes=222,
+        )
+
+    monkeypatch.setattr(
+        production_module.artifact_module,
+        "load_incremental_linking_artifact",
+        lambda _path: FakeArtifact(),
+    )
+    monkeypatch.setattr(production_module, "compute_promoted_incremental_limits", fake_compute_limits)
+    monkeypatch.setattr(production_module.memory_budget, "emit_memory_telemetry", lambda _payload: None)
+    monkeypatch.setattr(
+        production_module.query_adapter_module,
+        "build_incremental_linker_inputs",
+        lambda **kwargs: SimpleNamespace(
+            retriever=object(),
+            query_views=tuple("full" for _ in kwargs["query_signature_ids"]),
+            query_by_signature_id={str(sig): object() for sig in kwargs["query_signature_ids"]},
+            query_view_by_signature_id={str(sig): "full" for sig in kwargs["query_signature_ids"]},
+            summary_by_component={},
+        ),
+    )
+    monkeypatch.setattr(
+        production_module.query_adapter_module,
+        "build_name_count_rarity_row_signals",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        production_module.runtime_module,
+        "_predict_incremental_link_or_abstain_production_private",
+        lambda *_args, **kwargs: SimpleNamespace(
+            linked_signature_clusters={kwargs["query_signature_ids"][0]: "c_seed"},
+            telemetry={"query_count": len(kwargs["query_signature_ids"]), "candidate_row_count": 0, "pair_count": 0},
+        ),
+    )
+
+    result = production_module.predict_incremental_promoted_linker(
+        FakeClusterer(),
+        ["seed", "q1", "q2"],
+        cast(ANDData, SimpleNamespace()),
+        artifact_dir=tmp_path,
+        prevent_new_incompatibilities=False,
+        partial_supervision={},
+        runtime_context=cast(Any, SimpleNamespace(run_id="test-final-limits")),
+        total_ram_bytes=None,
+        batching_threshold=None,
+        resolve_total_ram_bytes=lambda _value: (100_000, "test"),
+        build_incremental_result=lambda clusters, **kwargs: {"clusters": clusters, **kwargs},
+        get_rust_featurizer=lambda *_args, **_kwargs: object(),
+        build_incremental_constraint_backend=lambda *_args, **_kwargs: object(),
+    )
+
+    telemetry = result["incremental_linker_telemetry"]
+    assert telemetry["query_batch_size_max"] == 1
+    assert telemetry["memory_final_operational_estimate_source"] == "executed"
+    assert telemetry["memory_final_predicted_peak_delta_bytes"] == 222
 
 
 def _build_minimal_incremental_clusterer() -> Clusterer:

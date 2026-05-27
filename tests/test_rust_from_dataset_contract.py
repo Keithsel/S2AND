@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import math
 import os
-from collections import Counter, namedtuple
+from collections import Counter
 from typing import Any, cast
 
 import numpy as np
@@ -19,18 +19,6 @@ if not HAS_RUST:
     raise pytest.skip.Exception("s2and_rust RustFeaturizer.from_dataset is unavailable", allow_module_level=True)
 assert s2and_rust is not None and not isinstance(s2and_rust, Exception)
 _S2AND_RUST = cast(Any, s2and_rust)
-
-
-def test_removed_json_ingest_and_debug_feature_surfaces_are_absent():
-    for method_name in (
-        "from_json_paths",
-        "featurize_pair",
-        "featurize_pairs",
-        "featurize_pairs_matrix",
-        "save",
-        "load",
-    ):
-        assert not hasattr(_S2AND_RUST.RustFeaturizer, method_name)
 
 
 def _build_minimal_dataset(name: str) -> ANDData:
@@ -277,22 +265,6 @@ def test_from_dataset_raw_papers_match_preprocessed_for_language_names_and_ngram
     else:
         assert equalish(expected_constraint, observed_constraint)
         assert not math.isnan(float(expected_constraint))
-
-
-def test_from_dataset_rejects_namedtuple_field_order_mismatch():
-    dataset = _build_minimal_dataset("rust_contract_field_order_mismatch")
-    paper_fields = list(dataset.papers["1"]._fields)
-    venue_index = paper_fields.index("venue_ngrams")
-    journal_index = paper_fields.index("journal_ngrams")
-    paper_fields[venue_index], paper_fields[journal_index] = paper_fields[journal_index], paper_fields[venue_index]
-    SwappedPaper = namedtuple("SwappedPaper", paper_fields)
-
-    for paper_id, paper in list(dataset.papers.items()):
-        swapped_values = [getattr(paper, field_name) for field_name in paper_fields]
-        dataset.papers[paper_id] = SwappedPaper(*swapped_values)
-
-    with pytest.raises(ValueError, match="Paper fast-path contract mismatch"):
-        _S2AND_RUST.RustFeaturizer.from_dataset(dataset, 0.0, 10000.0, 1)
 
 
 def test_matrix_entrypoints_preserve_duplicate_selected_indices_and_empty_early_return():

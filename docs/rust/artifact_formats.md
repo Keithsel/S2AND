@@ -10,7 +10,7 @@ It replaces the older artifact-divergence migration log.
 | Artifact / data family | Target format | Runtime role |
 |---|---|---|
 | Signatures | `signatures.arrow` Arrow IPC table | Required direct-Rust input. Contains identity, paper id, author name fields, affiliations, ORCID, position, optional block/email/source ids. It does not contain embedded name-count columns. |
-| Papers | `papers.arrow` Arrow IPC table | Required direct-Rust input. Contains title, abstract-presence signal, venue, journal, year, language, and reliability fields. |
+| Papers | `papers.arrow` Arrow IPC table | Required direct-Rust input. Contains title, abstract-presence signal, venue, optional year, language, and reliability fields. |
 | Paper authors | `paper_authors.arrow` Arrow IPC table | Required for coauthor and paper-author row signals. |
 | Cluster seeds | `cluster_seeds.arrow` Arrow IPC table | Required for seeded/incremental Arrow prediction. Omit for unseeded full prediction. |
 | Cluster seed disallows | `cluster_seed_disallows.arrow` Arrow IPC table | Optional for seeded/incremental Arrow prediction. Include it when pairwise seed disallow constraints are present; omitted means no disallows. |

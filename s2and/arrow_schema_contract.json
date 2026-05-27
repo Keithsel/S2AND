@@ -23,7 +23,7 @@
       {"name": "abstract", "datatype": "string", "required": false},
       {"name": "venue", "datatype": "string", "required": true},
       {"name": "journal_name", "datatype": "string", "required": true},
-      {"name": "year", "datatype": "int64", "required": true},
+      {"name": "year", "datatype": "int64", "required": false},
       {"name": "predicted_language", "datatype": "string", "required": false},
       {"name": "is_reliable", "datatype": "bool", "required": false}
     ],

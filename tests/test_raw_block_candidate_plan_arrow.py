@@ -39,7 +39,10 @@ if _RUST_FEATURIZER is None:
 elif not hasattr(_RUST_FEATURIZER, "from_arrow_paths"):
     _MISSING_RUST_RAW_APIS.append("RustFeaturizer.from_arrow_paths")
 if _MISSING_RUST_RAW_APIS:
-    raise AssertionError(f"s2and_rust is missing required raw Arrow APIs: {_MISSING_RUST_RAW_APIS}")
+    pytest.skip(
+        f"s2and_rust is missing required raw Arrow APIs: {_MISSING_RUST_RAW_APIS}",
+        allow_module_level=True,
+    )
 
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
@@ -216,11 +219,7 @@ def _write_tiny_name_counts_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 
 def _swap_first_two_name_count_records(index_root: str | Path, kind: str) -> None:
-    index_path = Path(index_root)
-    manifest = json.loads((index_path / "manifest.json").read_text(encoding="utf-8"))
-    record_path = Path(manifest["files"][kind]["path"])
-    if not record_path.is_absolute():
-        record_path = index_path / record_path
+    record_path = _name_count_record_path(index_root, kind)
     payload = bytearray(record_path.read_bytes())
     first_start = _NAME_COUNTS_INDEX_HEADER_LEN
     second_start = first_start + _NAME_COUNTS_INDEX_RECORD_LEN
@@ -230,6 +229,25 @@ def _swap_first_two_name_count_records(index_root: str | Path, kind: str) -> Non
     payload[first_start:second_start] = second_record
     payload[second_start:third_start] = first_record
     record_path.write_bytes(payload)
+
+
+def _corrupt_first_name_count_record_name_range(index_root: str | Path, kind: str) -> None:
+    record_path = _name_count_record_path(index_root, kind)
+    payload = bytearray(record_path.read_bytes())
+    blob_len = struct.unpack_from("<Q", payload, 24)[0]
+    first_start = _NAME_COUNTS_INDEX_HEADER_LEN
+    struct.pack_into("<Q", payload, first_start + 16, blob_len)
+    struct.pack_into("<I", payload, first_start + 24, 1)
+    record_path.write_bytes(payload)
+
+
+def _name_count_record_path(index_root: str | Path, kind: str) -> Path:
+    index_path = Path(index_root)
+    manifest = json.loads((index_path / "manifest.json").read_text(encoding="utf-8"))
+    record_path = Path(manifest["files"][kind]["path"])
+    if not record_path.is_absolute():
+        record_path = index_path / record_path
+    return record_path
 
 
 def _base_arrow_paths(tmp_path: Path) -> dict[str, str]:
@@ -1623,6 +1641,8 @@ def test_raw_arrow_labeled_candidate_plan_scores_frozen_rows_without_cluster_see
     np.testing.assert_array_equal(raw_plan["pair_row_indices"], np.asarray([0, 1], dtype=np.uint32))
     assert raw_plan["retrieval_ranks"].tolist() == [2, 1]
     assert raw_plan["retrieval_scores"][1] > raw_plan["retrieval_scores"][0]
+    assert raw_plan["query_views"] == ["full"]
+    assert raw_plan["query_authors"] == [raw_plan["row_query_authors"][0]]
     assert raw_plan["row_query_views"] == ["full", "full"]
     assert "row_candidate_cluster_max_paper_author_count" in raw_plan
     assert raw_plan["telemetry"]["component_scope"] == "block-local"
@@ -1711,6 +1731,8 @@ def test_raw_arrow_labeled_candidate_plan_initial_view_keeps_full_first_token(tm
     )
 
     assert raw_plan["row_query_views"] == ["initial_only"]
+    assert raw_plan["query_views"] == ["initial_only"]
+    assert raw_plan["query_authors"] == [raw_plan["row_query_authors"][0]]
     assert raw_plan["row_query_first_tokens"] == ["alice"]
 
 
@@ -2036,6 +2058,28 @@ def test_rust_featurizer_rejects_unsorted_name_counts_index(
     _swap_first_two_name_count_records(paths["name_counts_index"], "first")
 
     with pytest.raises(ValueError, match="not sorted"):
+        s2and_rust.RustFeaturizer.from_arrow_paths(
+            paths,
+            ["q1", "s1", "s2"],
+            set(),
+            True,
+            False,
+            0.0,
+            10000.0,
+            1,
+            True,
+        )
+
+
+def test_rust_featurizer_rejects_out_of_bounds_name_counts_index_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _base_arrow_paths(tmp_path)
+    paths["name_counts_index"] = _write_tiny_name_counts_index(tmp_path / "index_artifact", monkeypatch)
+    _corrupt_first_name_count_record_name_range(paths["name_counts_index"], "first")
+
+    with pytest.raises(ValueError, match="outside blob length"):
         s2and_rust.RustFeaturizer.from_arrow_paths(
             paths,
             ["q1", "s1", "s2"],

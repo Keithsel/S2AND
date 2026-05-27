@@ -48,7 +48,6 @@ from s2and.incremental_linking.policy import (
 )
 from s2and.incremental_linking.retrieval import (
     RAW_CANDIDATE_PLAN_PAIR_ID_KEYS,
-    RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS,
     RAW_CANDIDATE_PLAN_ROW_KEYS,
     LinkerRetrievalBatch,
     build_linker_retrieval_batch_from_raw_candidate_plan,
@@ -1824,35 +1823,9 @@ def subset_raw_candidate_plan_for_query_ids(
             else:
                 out[key] = _slice_sequence_or_array(raw_candidate_plan[key], row_start, row_stop)
 
-        old_query_count = len(plan_query_ids)
-        new_query_count = len(requested_query_ids)
-
-        def remap_contiguous_signature_indices(values: Any) -> np.ndarray:
-            raw_values = as_uint32_1d("signature_indices", values)[pair_start:pair_stop]
-            remapped = np.empty(len(raw_values), dtype=np.uint32)
-            query_mask = raw_values < old_query_count
-            if np.any(query_mask):
-                query_values = raw_values[query_mask]
-                outside_selected_queries = (query_values < old_query_start) | (query_values >= old_query_stop)
-                if np.any(outside_selected_queries):
-                    invalid_index = int(query_values[outside_selected_queries][0])
-                    raise ValueError(
-                        "raw candidate plan fast-path contains a query signature index outside the selected "
-                        f"contiguous query range: {invalid_index}"
-                    )
-                remapped[query_mask] = raw_values[query_mask] - old_query_start
-            if np.any(~query_mask):
-                remapped[~query_mask] = new_query_count + (raw_values[~query_mask] - old_query_count)
-            return remapped
-
-        for key in RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS:
-            if key in {"left_signature_indices", "right_signature_indices"}:
-                out[key] = remap_contiguous_signature_indices(raw_candidate_plan[key])
-            else:
-                out[key] = (pair_row_indices[pair_start:pair_stop] - row_start).astype(np.uint32, copy=False)
+        out["pair_row_indices"] = (pair_row_indices[pair_start:pair_stop] - row_start).astype(np.uint32, copy=False)
         for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS:
-            if key in raw_candidate_plan:
-                out[key] = _slice_sequence_or_array(raw_candidate_plan[key], pair_start, pair_stop)
+            out[key] = _slice_sequence_or_array(raw_candidate_plan[key], pair_start, pair_stop)
 
         component_members = raw_candidate_plan.get("component_members")
         if isinstance(component_members, Mapping):
@@ -1895,41 +1868,9 @@ def subset_raw_candidate_plan_for_query_ids(
         else:
             out[key] = _subset_sequence_or_array(raw_candidate_plan[key], row_mask)
 
-    old_query_count = len(plan_query_ids)
-    new_query_count = len(requested_query_ids)
-    old_to_new_query_lookup = np.full(old_query_count, -1, dtype=np.int64)
-    for old_offset, new_offset in old_to_new_query_offset.items():
-        old_to_new_query_lookup[int(old_offset)] = int(new_offset)
-
-    def remap_signature_indices(values: Any) -> np.ndarray:
-        raw_values = as_uint32_1d("signature_indices", values)[pair_mask]
-        remapped = np.empty(len(raw_values), dtype=np.uint32)
-        query_mask = raw_values < old_query_count
-        if np.any(query_mask):
-            raw_query_values = raw_values[query_mask]
-            query_remapped = old_to_new_query_lookup[raw_query_values]
-            if np.any(query_remapped < 0):
-                bad_index = int(raw_query_values[np.flatnonzero(query_remapped < 0)[0]])
-                raise ValueError(
-                    "raw candidate plan contains a query signature index outside the requested query subset: "
-                    f"{bad_index}"
-                )
-            remapped[query_mask] = query_remapped.astype(np.uint32, copy=False)
-        if np.any(~query_mask):
-            remapped[~query_mask] = (new_query_count + (raw_values[~query_mask] - old_query_count)).astype(
-                np.uint32,
-                copy=False,
-            )
-        return remapped
-
-    for key in RAW_CANDIDATE_PLAN_PAIR_INDEX_KEYS:
-        if key in {"left_signature_indices", "right_signature_indices"}:
-            out[key] = remap_signature_indices(raw_candidate_plan[key])
-        else:
-            out[key] = old_row_to_new[pair_row_indices[pair_mask]].astype(np.uint32, copy=False)
+    out["pair_row_indices"] = old_row_to_new[pair_row_indices[pair_mask]].astype(np.uint32, copy=False)
     for key in RAW_CANDIDATE_PLAN_PAIR_ID_KEYS:
-        if key in raw_candidate_plan:
-            out[key] = _subset_sequence_or_array(raw_candidate_plan[key], pair_mask)
+        out[key] = _subset_sequence_or_array(raw_candidate_plan[key], pair_mask)
 
     component_members = raw_candidate_plan.get("component_members")
     if isinstance(component_members, Mapping):
@@ -2047,17 +1988,10 @@ def predict_incremental_link_or_abstain_from_raw_arrow_paths(
             orcid_enabled=resolved_orcid_enabled,
             num_threads=n_jobs_resolved,
             max_exemplars=int(max_exemplars),
-            include_pair_signature_ids=True,
             include_component_members=True,
             full_scan_without_index=False,
         )
-        raw_candidate_plan = raw_planner.plan(
-            list(query_signature_id_strings),
-            top_k=top_k_resolved,
-            query_view=str(query_view),
-            include_pair_signature_ids=True,
-            include_component_members=True,
-        )
+        raw_candidate_plan = raw_planner.plan(list(query_signature_id_strings))
         build_telemetry = getattr(raw_planner, "build_telemetry", None)
         if not callable(build_telemetry):
             raise RuntimeError(

@@ -26,7 +26,6 @@ use std::time::Instant;
 mod name_counts;
 mod promoted_linker;
 mod text_compat;
-mod text_unidecode_data;
 
 use name_counts::{NameCountsData, RawNameCountIndex, RawNameCountKind, RawNameCountMaps};
 use text_compat::{
@@ -2105,14 +2104,12 @@ impl<'a> ArrowStringColumn<'a> {
     }
 }
 
-enum ArrowI64Column<'a> {
-    Int64(&'a Int64Array),
-}
+struct ArrowI64Column<'a>(&'a Int64Array);
 
 impl<'a> ArrowI64Column<'a> {
     fn from_i64_array(array: &'a dyn Array, context: &str) -> PyResult<Self> {
         match array.data_type() {
-            DataType::Int64 => Ok(Self::Int64(
+            DataType::Int64 => Ok(Self(
                 array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     pyo3::exceptions::PyTypeError::new_err(format!(
                         "{context} is not an Int64 array"
@@ -2126,9 +2123,7 @@ impl<'a> ArrowI64Column<'a> {
     }
 
     fn optional_value(&self, row: usize, _context: &str) -> PyResult<Option<i64>> {
-        match self {
-            Self::Int64(values) => Ok((!values.is_null(row)).then(|| values.value(row))),
-        }
+        Ok((!self.0.is_null(row)).then(|| self.0.value(row)))
     }
 
     fn required_value(&self, row: usize, context: &str) -> PyResult<i64> {
@@ -2422,8 +2417,11 @@ fn read_raw_arrow_papers_from_batches(
         let journal_col = batch.column(arrow_column_index(&batch, "journal_name", path)?);
         let journal_values =
             ArrowStringColumn::from_string_array(journal_col.as_ref(), "journal_name")?;
-        let year_col = batch.column(arrow_column_index(&batch, "year", path)?);
-        let year_values = ArrowI64Column::from_i64_array(year_col.as_ref(), "year")?;
+        let year_col = arrow_optional_column_index(&batch, "year").map(|index| batch.column(index));
+        let year_values = match year_col.as_ref() {
+            Some(col) => Some(ArrowI64Column::from_i64_array(col.as_ref(), "year")?),
+            None => None,
+        };
         let predicted_language_col = arrow_optional_column_index(&batch, "predicted_language")
             .map(|index| batch.column(index));
         let predicted_language_values = match predicted_language_col.as_ref() {
@@ -2462,7 +2460,10 @@ fn read_raw_arrow_papers_from_batches(
                             .unwrap_or_default(),
                         venue: venue_values.optional_owned(row).unwrap_or_default(),
                         journal_name: journal_values.optional_owned(row).unwrap_or_default(),
-                        year: year_values.optional_value(row, "year")?,
+                        year: match year_values.as_ref() {
+                            Some(values) => values.optional_value(row, "year")?,
+                            None => None,
+                        },
                         predicted_language: predicted_language_values
                             .as_ref()
                             .and_then(|col| col.optional_owned(row)),
@@ -5936,13 +5937,14 @@ impl NativeGraphUnionFind {
         }
     }
 
-    fn find(&mut self, item: usize) -> usize {
-        let parent = self.parent[item];
-        if parent != item {
-            let root = self.find(parent);
-            self.parent[item] = root;
+    fn find(&mut self, mut item: usize) -> usize {
+        while self.parent[item] != item {
+            let parent = self.parent[item];
+            let grandparent = self.parent[parent];
+            self.parent[item] = grandparent;
+            item = grandparent;
         }
-        self.parent[item]
+        item
     }
 
     fn union_if_capacity(&mut self, left: usize, right: usize, maximum_size: usize) -> bool {
@@ -6649,13 +6651,6 @@ impl OrderedSubblocks {
             .map(|(_key, values)| values)
     }
 
-    fn get_mut(&mut self, key: &str) -> Option<&mut Vec<String>> {
-        self.entries
-            .iter_mut()
-            .find(|(existing_key, _)| existing_key == key)
-            .map(|(_key, values)| values)
-    }
-
     fn iter(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
         self.entries.iter().map(|(key, values)| (key, values))
     }
@@ -6946,7 +6941,7 @@ fn sorted_subblock_merge_candidates(
             let right_key = &mergeable_keys[right_index];
             let left = metadata.get(left_key).expect("merge metadata exists");
             let right = metadata.get(right_key).expect("merge metadata exists");
-            if left.size + right.size >= maximum_size {
+            if left.size + right.size > maximum_size {
                 continue;
             }
             let both_multi_letter = py_len(&left.first_name) > 1 && py_len(&right.first_name) > 1;
@@ -7069,9 +7064,6 @@ fn merge_small_subblocks(
                     }
                 } else if let Some(right_id) = pair_2_cluster_id {
                     merging_log.insert(right_id, proposed_cluster.clone());
-                    if let Some(left_id) = pair_1_cluster_id {
-                        merging_log.remove(&left_id);
-                    }
                     for key in proposed_cluster {
                         inverse_merging_log.insert(key, right_id);
                     }
@@ -7116,20 +7108,39 @@ fn merge_small_subblocks(
     Ok(())
 }
 
+fn find_orcid_subblock_root(parent: &mut [usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        let parent_index = parent[index];
+        let grandparent_index = parent[parent_index];
+        parent[index] = grandparent_index;
+        index = grandparent_index;
+    }
+    index
+}
+
+fn union_orcid_subblocks(parent: &mut [usize], left: usize, right: usize) {
+    let left_root = find_orcid_subblock_root(parent, left);
+    let right_root = find_orcid_subblock_root(parent, right);
+    if left_root != right_root {
+        parent[right_root] = left_root;
+    }
+}
+
 fn apply_orcid_subblocking(
     output: &mut OrderedSubblocks,
     row_by_signature_id: &HashMap<String, SubblockingSignatureRow>,
     maximum_size: usize,
     telemetry: &mut SubblockingTelemetry,
 ) {
-    let mut sig_id_to_subblock_id: HashMap<String, String> = HashMap::new();
+    let subblock_ids: Vec<String> = output.iter().map(|(key, _values)| key.clone()).collect();
+    let mut sig_id_to_subblock_index: HashMap<String, usize> = HashMap::new();
     let mut sig_id_order = Vec::<String>::new();
-    for (subblock_id, sig_ids) in output.iter() {
+    for (subblock_index, (_subblock_id, sig_ids)) in output.entries.iter().enumerate() {
         for sig_id in sig_ids {
-            if !sig_id_to_subblock_id.contains_key(sig_id) {
+            if !sig_id_to_subblock_index.contains_key(sig_id) {
                 sig_id_order.push(sig_id.clone());
             }
-            sig_id_to_subblock_id.insert(sig_id.clone(), subblock_id.clone());
+            sig_id_to_subblock_index.insert(sig_id.clone(), subblock_index);
         }
     }
 
@@ -7154,94 +7165,107 @@ fn apply_orcid_subblocking(
             .push(sig_id.clone());
     }
 
-    for orcid in orcid_order {
-        let Some(orcid_sig_ids) = orcid_to_sig_ids.get(&orcid) else {
+    let mut parent: Vec<usize> = (0..subblock_ids.len()).collect();
+    let mut orcid_to_subblock_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    for orcid in orcid_order.iter() {
+        let Some(orcid_sig_ids) = orcid_to_sig_ids.get(orcid) else {
             continue;
         };
-        let mut current_subblock_counts: HashMap<String, usize> = HashMap::new();
+        let mut seen_subblock_indices = HashSet::<usize>::new();
+        let mut unique_subblock_indices = Vec::<usize>::new();
         for sig_id in orcid_sig_ids {
-            if let Some(subblock_id) = sig_id_to_subblock_id.get(sig_id) {
-                *current_subblock_counts
-                    .entry(subblock_id.clone())
-                    .or_insert(0) += 1;
+            let Some(subblock_index) = sig_id_to_subblock_index.get(sig_id).copied() else {
+                continue;
+            };
+            if seen_subblock_indices.insert(subblock_index) {
+                unique_subblock_indices.push(subblock_index);
             }
         }
-        let mut unique_subblock_ids: Vec<String> =
-            current_subblock_counts.keys().cloned().collect();
-        if unique_subblock_ids.len() <= 1 {
+        if unique_subblock_indices.len() <= 1 {
             continue;
         }
+        let first_subblock_index = unique_subblock_indices[0];
+        for subblock_index in unique_subblock_indices.iter().skip(1).copied() {
+            union_orcid_subblocks(&mut parent, first_subblock_index, subblock_index);
+        }
+        orcid_to_subblock_indices.insert(orcid.clone(), unique_subblock_indices);
+    }
+
+    let mut components_by_root: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut component_roots = Vec::<usize>::new();
+    let mut seen_roots = HashSet::<usize>::new();
+    for subblock_index in 0..subblock_ids.len() {
+        let root = find_orcid_subblock_root(&mut parent, subblock_index);
+        components_by_root
+            .entry(root)
+            .or_default()
+            .push(subblock_index);
+        if seen_roots.insert(root) {
+            component_roots.push(root);
+        }
+    }
+
+    let mut skipped_orcid_counts_by_root: HashMap<usize, Vec<(String, usize)>> = HashMap::new();
+    for orcid in orcid_order.iter() {
+        let Some(unique_subblock_indices) = orcid_to_subblock_indices.get(orcid) else {
+            continue;
+        };
+        let root = find_orcid_subblock_root(&mut parent, unique_subblock_indices[0]);
+        let total_orcid_sig_count = orcid_to_sig_ids.get(orcid).map_or(0usize, Vec::len);
+        skipped_orcid_counts_by_root
+            .entry(root)
+            .or_default()
+            .push((orcid.clone(), total_orcid_sig_count));
+    }
+
+    let mut merge_actions = Vec::<(String, Vec<String>, Vec<String>)>::new();
+    for root in component_roots {
+        let Some(component_indices) = components_by_root.get(&root) else {
+            continue;
+        };
+        if component_indices.len() <= 1 {
+            continue;
+        }
+        let mut unique_subblock_ids: Vec<String> = component_indices
+            .iter()
+            .map(|index| subblock_ids[*index].clone())
+            .collect();
         unique_subblock_ids.sort_by(|left, right| {
             let left_score = left.matches("specter").count() * 10 + left.matches('|').count();
             let right_score = right.matches("specter").count() * 10 + right.matches('|').count();
             left_score.cmp(&right_score).then_with(|| left.cmp(right))
         });
 
-        let total_orcid_sig_count = orcid_sig_ids.len();
-        let feasible_subblock_ids: Vec<String> = unique_subblock_ids
+        let total_subblock_sig_count: usize = unique_subblock_ids
             .iter()
-            .filter(|subblock_id| {
-                let current_count = current_subblock_counts
-                    .get(*subblock_id)
-                    .copied()
-                    .unwrap_or(0);
-                output.get(subblock_id).map_or(0, Vec::len)
-                    + (total_orcid_sig_count - current_count)
-                    <= maximum_size
-            })
-            .cloned()
-            .collect();
-        if feasible_subblock_ids.is_empty() {
-            telemetry.orcid_merge_skipped_due_to_capacity_count += 1;
-            telemetry.orcid_merge_skipped_due_to_capacity_signature_count += total_orcid_sig_count;
+            .map(|subblock_id| output.get(subblock_id).map_or(0, Vec::len))
+            .sum();
+        if total_subblock_sig_count > maximum_size {
+            if let Some(skipped_orcid_counts) = skipped_orcid_counts_by_root.get(&root) {
+                for (_orcid, total_orcid_sig_count) in skipped_orcid_counts {
+                    telemetry.orcid_merge_skipped_due_to_capacity_count += 1;
+                    telemetry.orcid_merge_skipped_due_to_capacity_signature_count +=
+                        *total_orcid_sig_count;
+                }
+            }
             continue;
         }
 
-        let subblock_id_to_move_to = feasible_subblock_ids
-            .iter()
-            .min_by(|left, right| {
-                let left_count = current_subblock_counts.get(*left).copied().unwrap_or(0);
-                let right_count = current_subblock_counts.get(*right).copied().unwrap_or(0);
-                let left_score = left.matches("specter").count() * 10 + left.matches('|').count();
-                let right_score =
-                    right.matches("specter").count() * 10 + right.matches('|').count();
-                right_count
-                    .cmp(&left_count)
-                    .then_with(|| left_score.cmp(&right_score))
-                    .then_with(|| left.cmp(right))
-            })
-            .expect("feasible_subblock_ids is not empty")
-            .clone();
-        let mut sig_ids_to_move = Vec::<String>::new();
-        let mut moved_sig_ids_by_source: HashMap<String, HashSet<String>> = HashMap::new();
-        for sig_id in orcid_sig_ids {
-            let Some(original_subblock_id) = sig_id_to_subblock_id.get(sig_id).cloned() else {
-                continue;
-            };
-            if original_subblock_id != subblock_id_to_move_to {
-                sig_ids_to_move.push(sig_id.clone());
-                moved_sig_ids_by_source
-                    .entry(original_subblock_id)
-                    .or_default()
-                    .insert(sig_id.clone());
+        let key_of_keys = unique_subblock_ids.join(", ");
+        let mut signature_ids_stacked = Vec::<String>::with_capacity(total_subblock_sig_count);
+        for subblock_id in unique_subblock_ids.iter() {
+            if let Some(values) = output.get(subblock_id) {
+                signature_ids_stacked.extend(values.iter().cloned());
             }
         }
+        merge_actions.push((key_of_keys, signature_ids_stacked, unique_subblock_ids));
+    }
 
-        if let Some(target_values) = output.get_mut(&subblock_id_to_move_to) {
-            target_values.extend(sig_ids_to_move.iter().cloned());
+    for (key_of_keys, signature_ids_stacked, unique_subblock_ids) in merge_actions {
+        for subblock_id in unique_subblock_ids.iter() {
+            output.remove(subblock_id);
         }
-        for sig_id in sig_ids_to_move {
-            sig_id_to_subblock_id.insert(sig_id, subblock_id_to_move_to.clone());
-        }
-        for (original_subblock_id, moved_sig_ids) in moved_sig_ids_by_source {
-            let Some(source_values) = output.get_mut(&original_subblock_id) else {
-                continue;
-            };
-            source_values.retain(|sig_id| !moved_sig_ids.contains(sig_id));
-            if source_values.is_empty() {
-                output.remove(&original_subblock_id);
-            }
-        }
+        output.insert(key_of_keys, signature_ids_stacked);
     }
 }
 
@@ -7333,7 +7357,7 @@ fn make_subblocks_with_telemetry_from_rows_native_graph(
         }
     }
 
-    if single_signature_ids.len() < maximum_size {
+    if single_signature_ids.len() <= maximum_size {
         if !single_signature_ids.is_empty() {
             output.insert(first_letter.clone(), single_signature_ids);
         }
@@ -11663,11 +11687,21 @@ struct RawArrowPlannerPaths {
 
 impl RawArrowPlannerPaths {
     fn from_py_dict(paths: &Bound<'_, PyDict>) -> PyResult<Self> {
+        Self::from_py_dict_with_cluster_seeds_path(
+            paths,
+            Some(required_path_from_py_dict(paths, "cluster_seeds")?),
+        )
+    }
+
+    fn from_py_dict_with_cluster_seeds_path(
+        paths: &Bound<'_, PyDict>,
+        cluster_seeds_path: Option<String>,
+    ) -> PyResult<Self> {
         Ok(Self {
             signatures_path: required_path_from_py_dict(paths, "signatures")?,
             papers_path: required_path_from_py_dict(paths, "papers")?,
             paper_authors_path: required_path_from_py_dict(paths, "paper_authors")?,
-            cluster_seeds_path: required_path_from_py_dict(paths, "cluster_seeds")?,
+            cluster_seeds_path: cluster_seeds_path.unwrap_or_default(),
             cluster_seed_disallows_path: optional_path_from_py_dict(
                 paths,
                 "cluster_seed_disallows",
@@ -11692,23 +11726,7 @@ impl RawArrowPlannerPaths {
 fn raw_arrow_feature_paths_from_py_dict(
     paths: &Bound<'_, PyDict>,
 ) -> PyResult<RawArrowPlannerPaths> {
-    Ok(RawArrowPlannerPaths {
-        signatures_path: required_path_from_py_dict(paths, "signatures")?,
-        papers_path: required_path_from_py_dict(paths, "papers")?,
-        paper_authors_path: required_path_from_py_dict(paths, "paper_authors")?,
-        cluster_seeds_path: String::new(),
-        cluster_seed_disallows_path: optional_path_from_py_dict(paths, "cluster_seed_disallows")?,
-        specter_path: optional_path_from_py_dict(paths, "specter")?,
-        name_counts_arrow_path: optional_path_from_py_dict(paths, "name_counts")?,
-        name_counts_index_path: optional_name_counts_index_path_from_py_dict(paths)?,
-        signatures_batch_index_path: optional_path_from_py_dict(paths, "signatures_batch_index")?,
-        papers_batch_index_path: optional_path_from_py_dict(paths, "papers_batch_index")?,
-        paper_authors_batch_index_path: optional_path_from_py_dict(
-            paths,
-            "paper_authors_batch_index",
-        )?,
-        specter_batch_index_path: optional_path_from_py_dict(paths, "specter_batch_index")?,
-    })
+    RawArrowPlannerPaths::from_py_dict_with_cluster_seeds_path(paths, None)
 }
 
 struct RawArrowPlannerBuildTelemetry {
@@ -12162,7 +12180,6 @@ struct RawBlockQueryCandidatePlanner {
     orcid_enabled: bool,
     num_threads: Option<usize>,
     max_exemplars: usize,
-    include_pair_signature_ids: bool,
     include_component_members: bool,
     full_scan_without_index: bool,
 }
@@ -12178,7 +12195,6 @@ impl RawBlockQueryCandidatePlanner {
         orcid_enabled = true,
         num_threads = None,
         max_exemplars = 4,
-        include_pair_signature_ids = false,
         include_component_members = false,
         full_scan_without_index = false
     ))]
@@ -12191,7 +12207,6 @@ impl RawBlockQueryCandidatePlanner {
         orcid_enabled: bool,
         num_threads: Option<usize>,
         max_exemplars: usize,
-        include_pair_signature_ids: bool,
         include_component_members: bool,
         full_scan_without_index: bool,
     ) -> PyResult<Self> {
@@ -12496,7 +12511,6 @@ impl RawBlockQueryCandidatePlanner {
             orcid_enabled,
             num_threads,
             max_exemplars,
-            include_pair_signature_ids,
             include_component_members,
             full_scan_without_index,
         })
@@ -12574,55 +12588,13 @@ impl RawBlockQueryCandidatePlanner {
         Ok(payload.unbind())
     }
 
-    #[pyo3(signature = (
-        query_signature_ids,
-        top_k = None,
-        query_view = None,
-        include_pair_signature_ids = None,
-        include_component_members = None
-    ))]
+    #[pyo3(signature = (query_signature_ids))]
     fn plan(
         &mut self,
         py: Python<'_>,
         query_signature_ids: Vec<String>,
-        top_k: Option<usize>,
-        query_view: Option<String>,
-        include_pair_signature_ids: Option<bool>,
-        include_component_members: Option<bool>,
     ) -> PyResult<Py<PyDict>> {
         validate_raw_arrow_query_signature_ids(&query_signature_ids)?;
-        if let Some(value) = top_k {
-            if value != self.top_k {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "RawBlockQueryCandidatePlanner was built with top_k={}, got plan top_k={value}",
-                    self.top_k
-                )));
-            }
-        }
-        if let Some(value) = query_view.as_ref() {
-            if value != &self.query_view {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "RawBlockQueryCandidatePlanner was built with query_view={:?}, got plan query_view={value:?}",
-                    self.query_view
-                )));
-            }
-        }
-        if let Some(value) = include_pair_signature_ids {
-            if value != self.include_pair_signature_ids {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "RawBlockQueryCandidatePlanner was built with include_pair_signature_ids={}, got {value}",
-                    self.include_pair_signature_ids
-                )));
-            }
-        }
-        if let Some(value) = include_component_members {
-            if value != self.include_component_members {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "RawBlockQueryCandidatePlanner was built with include_component_members={}, got {value}",
-                    self.include_component_members
-                )));
-            }
-        }
         let missing: Vec<&String> = query_signature_ids
             .iter()
             .filter(|signature_id| !self.planner_query_signature_id_set.contains(*signature_id))
@@ -13049,87 +13021,36 @@ impl RawBlockQueryCandidatePlanner {
         let retrieval_secs = retrieval_start.elapsed().as_secs_f64();
 
         let pair_signature_ids_start = Instant::now();
-        let mut left_signature_ids: Option<Vec<String>> = None;
-        let mut right_signature_ids: Option<Vec<String>> = None;
-        if self.include_pair_signature_ids {
-            let mut left_ids = Vec::<String>::with_capacity(left_signature_indices.len());
-            let mut right_ids = Vec::<String>::with_capacity(right_signature_indices.len());
-            let signature_index_count = query_signature_ids.len() + seed_signature_ids.len();
-            let signature_id_for_index = |index: u32| -> Option<&String> {
-                let offset = index as usize;
-                if offset < query_signature_ids.len() {
-                    query_signature_ids.get(offset)
-                } else {
-                    seed_signature_ids.get(offset - query_signature_ids.len())
-                }
+        let mut left_signature_ids = Vec::<String>::with_capacity(left_signature_indices.len());
+        let mut right_signature_ids = Vec::<String>::with_capacity(right_signature_indices.len());
+        let signature_index_count = query_signature_ids.len() + seed_signature_ids.len();
+        let signature_id_for_index = |index: u32| -> Option<&String> {
+            let offset = index as usize;
+            if offset < query_signature_ids.len() {
+                query_signature_ids.get(offset)
+            } else {
+                seed_signature_ids.get(offset - query_signature_ids.len())
+            }
+        };
+        for index in left_signature_indices.iter() {
+            let Some(signature_id) = signature_id_for_index(*index) else {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "left signature index {} is outside signature id table of length {}",
+                    index, signature_index_count
+                )));
             };
-            for index in left_signature_indices.iter() {
-                let Some(signature_id) = signature_id_for_index(*index) else {
-                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                        "left signature index {} is outside signature id table of length {}",
-                        index, signature_index_count
-                    )));
-                };
-                left_ids.push(signature_id.clone());
-            }
-            for index in right_signature_indices.iter() {
-                let Some(signature_id) = signature_id_for_index(*index) else {
-                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                        "right signature index {} is outside signature id table of length {}",
-                        index, signature_index_count
-                    )));
-                };
-                right_ids.push(signature_id.clone());
-            }
-            left_signature_ids = Some(left_ids);
-            right_signature_ids = Some(right_ids);
+            left_signature_ids.push(signature_id.clone());
+        }
+        for index in right_signature_indices.iter() {
+            let Some(signature_id) = signature_id_for_index(*index) else {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "right signature index {} is outside signature id table of length {}",
+                    index, signature_index_count
+                )));
+            };
+            right_signature_ids.push(signature_id.clone());
         }
         let pair_signature_ids_secs = pair_signature_ids_start.elapsed().as_secs_f64();
-
-        let mut payload_seed_signature_ids = if self.include_pair_signature_ids {
-            Vec::new()
-        } else {
-            seed_signature_ids.clone()
-        };
-        if !self.include_pair_signature_ids {
-            let query_signature_count = query_signature_ids.len();
-            let mut compact_seed_signature_ids = Vec::<String>::new();
-            let mut seed_index_remap = HashMap::<usize, u32>::new();
-            for signature_index in left_signature_indices
-                .iter_mut()
-                .chain(right_signature_indices.iter_mut())
-            {
-                let old_offset = *signature_index as usize;
-                if old_offset < query_signature_count {
-                    continue;
-                }
-                let old_seed_offset = old_offset - query_signature_count;
-                if old_seed_offset >= seed_signature_ids.len() {
-                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                        "signature index {} is outside signature id table of length {}",
-                        old_offset,
-                        query_signature_count + seed_signature_ids.len()
-                    )));
-                }
-                let new_offset = match seed_index_remap.entry(old_seed_offset) {
-                    Entry::Occupied(entry) => *entry.get(),
-                    Entry::Vacant(entry) => {
-                        let new_offset =
-                            u32::try_from(query_signature_count + compact_seed_signature_ids.len())
-                                .map_err(|_| {
-                                    pyo3::exceptions::PyOverflowError::new_err(
-                                        "compact raw Arrow signature index exceeds u32",
-                                    )
-                                })?;
-                        compact_seed_signature_ids
-                            .push(seed_signature_ids[old_seed_offset].clone());
-                        *entry.insert(new_offset)
-                    }
-                };
-                *signature_index = new_offset;
-            }
-            payload_seed_signature_ids = compact_seed_signature_ids;
-        }
 
         let component_members_payload_start = Instant::now();
         let component_members = if self.include_component_members {
@@ -13275,7 +13196,7 @@ impl RawBlockQueryCandidatePlanner {
         telemetry.set_item("unidecode_char_count", self.state.unidecode_char_map.len())?;
         telemetry.set_item(
             "payload_seed_signature_count",
-            payload_seed_signature_ids.len(),
+            0usize,
         )?;
         telemetry.set_item("planner_seed_state_reused", 1)?;
         telemetry.set_item("timings", &timings)?;
@@ -13288,24 +13209,12 @@ impl RawBlockQueryCandidatePlanner {
         payload.set_item("query_signature_ids", query_signature_ids)?;
         payload.set_item("query_views", query_views)?;
         payload.set_item("query_authors", query_authors)?;
-        payload.set_item("seed_signature_ids", payload_seed_signature_ids)?;
+        payload.set_item("seed_signature_ids", Vec::<String>::new())?;
         if let Some(component_members) = component_members {
             payload.set_item("component_members", component_members)?;
         }
-        payload.set_item(
-            "left_signature_indices",
-            left_signature_indices.to_pyarray(py),
-        )?;
-        payload.set_item(
-            "right_signature_indices",
-            right_signature_indices.to_pyarray(py),
-        )?;
-        if let Some(left_signature_ids) = left_signature_ids {
-            payload.set_item("left_signature_ids", left_signature_ids)?;
-        }
-        if let Some(right_signature_ids) = right_signature_ids {
-            payload.set_item("right_signature_ids", right_signature_ids)?;
-        }
+        payload.set_item("left_signature_ids", left_signature_ids)?;
+        payload.set_item("right_signature_ids", right_signature_ids)?;
         payload.set_item("pair_row_indices", pair_row_indices.to_pyarray(py))?;
         payload.set_item(
             "row_query_signature_indices",
@@ -13567,11 +13476,7 @@ fn raw_arrow_labeled_component_members(
     component_key: &str,
     raw_members: &[String],
     signatures: &HashMap<String, RawArrowSignature>,
-    component_scope: &str,
 ) -> Vec<String> {
-    if component_scope != "block-local" {
-        return raw_members.to_vec();
-    }
     let Some((block_key, _cluster_key)) = component_key.split_once("::") else {
         return raw_members.to_vec();
     };
@@ -13639,11 +13544,9 @@ fn raw_arrow_counter_present(counter: &Option<CounterData>) -> bool {
     row_component_keys,
     stored_retrieval_ranks,
     component_members,
-    component_scope = "block-local",
     orcid_enabled = false,
     num_threads = None,
     max_exemplars = 4,
-    include_pair_signature_ids = true,
     full_scan_without_index = false
 ))]
 fn raw_arrow_labeled_candidate_plan<'py>(
@@ -13655,11 +13558,9 @@ fn raw_arrow_labeled_candidate_plan<'py>(
     row_component_keys: Vec<String>,
     stored_retrieval_ranks: Vec<u16>,
     component_members: &Bound<'py, PyAny>,
-    component_scope: &str,
     orcid_enabled: bool,
     num_threads: Option<usize>,
     max_exemplars: usize,
-    include_pair_signature_ids: bool,
     full_scan_without_index: bool,
 ) -> PyResult<Py<PyDict>> {
     let total_start = Instant::now();
@@ -13678,18 +13579,8 @@ fn raw_arrow_labeled_candidate_plan<'py>(
             stored_retrieval_ranks.len()
         )));
     }
-    if component_scope != "block-local" && component_scope != "frozen" {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "component_scope must be 'block-local' or 'frozen', got {component_scope:?}"
-        )));
-    }
     if row_count == 0 {
         return raw_arrow_labeled_empty_plan(py);
-    }
-    if !include_pair_signature_ids {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "raw_arrow_labeled_candidate_plan requires include_pair_signature_ids=True for non-empty plans",
-        ));
     }
 
     let paths = raw_arrow_feature_paths_from_py_dict(paths)?;
@@ -13837,7 +13728,6 @@ fn raw_arrow_labeled_candidate_plan<'py>(
             component_key,
             raw_members,
             &query_inputs.signatures,
-            component_scope,
         );
         for signature_id in members.iter() {
             if !features_by_signature_id.contains_key(signature_id) {
@@ -14225,6 +14115,65 @@ fn raw_arrow_labeled_candidate_plan<'py>(
         row_best_author_count_log_absdiff.push(evidence.best_author_count_log_absdiff);
     }
 
+    let mut query_view_by_signature_id = HashMap::<String, String>::new();
+    let mut query_author_by_signature_id = HashMap::<String, String>::new();
+    for ((signature_id, resolved_view), query_author) in row_query_signature_ids
+        .iter()
+        .zip(resolved_row_query_views.iter())
+        .zip(row_query_authors.iter())
+    {
+        match query_view_by_signature_id.entry(signature_id.clone()) {
+            Entry::Occupied(entry) => {
+                if entry.get() != resolved_view {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "query signature_id {signature_id:?} has multiple resolved query views"
+                    )));
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(resolved_view.clone());
+            }
+        }
+        match query_author_by_signature_id.entry(signature_id.clone()) {
+            Entry::Occupied(entry) => {
+                if entry.get() != query_author {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "query signature_id {signature_id:?} has multiple query authors"
+                    )));
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(query_author.clone());
+            }
+        }
+    }
+    let query_views = query_signature_ids
+        .iter()
+        .map(|signature_id| {
+            query_view_by_signature_id
+                .get(signature_id)
+                .cloned()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!(
+                        "query signature_id {signature_id:?} is missing a resolved query view"
+                    ))
+                })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let query_authors = query_signature_ids
+        .iter()
+        .map(|signature_id| {
+            query_author_by_signature_id
+                .get(signature_id)
+                .cloned()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!(
+                        "query signature_id {signature_id:?} is missing a query author"
+                    ))
+                })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
     let timings = PyDict::new(py);
     timings.set_item("read_signatures_secs", query_inputs.read_signatures_secs)?;
     timings.set_item("read_papers_secs", query_inputs.read_papers_secs)?;
@@ -14250,7 +14199,7 @@ fn raw_arrow_labeled_candidate_plan<'py>(
     telemetry.set_item("query_signature_count", query_signature_ids.len())?;
     telemetry.set_item("row_count", row_count)?;
     telemetry.set_item("pair_count", left_signature_ids.len())?;
-    telemetry.set_item("component_scope", component_scope)?;
+    telemetry.set_item("component_scope", "block-local")?;
     telemetry.set_item("orcid_enabled", orcid_enabled)?;
     telemetry.set_item(
         "signature_batches_read",
@@ -14298,12 +14247,10 @@ fn raw_arrow_labeled_candidate_plan<'py>(
     payload.set_item("row_query_authors", row_query_authors)?;
     payload.set_item("row_query_group_ids", row_query_group_ids)?;
     payload.set_item("row_component_keys", row_component_keys)?;
-    payload.set_item("query_views", Vec::<String>::new())?;
-    payload.set_item("query_authors", Vec::<String>::new())?;
-    if include_pair_signature_ids {
-        payload.set_item("left_signature_ids", left_signature_ids)?;
-        payload.set_item("right_signature_ids", right_signature_ids)?;
-    }
+    payload.set_item("query_views", query_views)?;
+    payload.set_item("query_authors", query_authors)?;
+    payload.set_item("left_signature_ids", left_signature_ids)?;
+    payload.set_item("right_signature_ids", right_signature_ids)?;
     payload.set_item("pair_row_indices", pair_row_indices.to_pyarray(py))?;
     payload.set_item("retrieval_scores", row_retrieval_scores.to_pyarray(py))?;
     payload.set_item("retrieval_ranks", row_retrieval_ranks.to_pyarray(py))?;
@@ -14455,7 +14402,7 @@ mod tests {
         ("papers", "abstract", "string", false),
         ("papers", "venue", "string", true),
         ("papers", "journal_name", "string", true),
-        ("papers", "year", "int64", true),
+        ("papers", "year", "int64", false),
         ("papers", "predicted_language", "string", false),
         ("papers", "is_reliable", "bool", false),
         ("signatures", "signature_id", "string", true),
@@ -14783,7 +14730,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_text_compat_uses_native_text_unidecode_data() {
+    fn normalize_text_compat_uses_native_unidecode() {
         assert_eq!(
             normalize_text_compat_native("te'\u{6F22}\u{5B57}xt", false),
             "te han zi xt",

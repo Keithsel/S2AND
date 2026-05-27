@@ -25,7 +25,6 @@ RESULT_MARKERS: dict[str, tuple[str, str]] = {
     "profile": ("===S2AND_PROFILE_RESULT_START===", "===S2AND_PROFILE_RESULT_END==="),
     "compare": ("===S2AND_COMPARE_RESULT_START===", "===S2AND_COMPARE_RESULT_END==="),
     "largest_block": ("===S2AND_LARGEST_BLOCK_RESULT_START===", "===S2AND_LARGEST_BLOCK_RESULT_END==="),
-    "big_block": ("===S2AND_BIG_BLOCK_RESULT_START===", "===S2AND_BIG_BLOCK_RESULT_END==="),
 }
 
 DEFAULT_ENV_KEYS = (

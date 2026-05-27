@@ -27,7 +27,7 @@ def _legacy_sorted_subblock_merge_candidates(output, maximum_size, first_k_lette
     small_enough_keys = [k for k, v in output.items() if len(v) < maximum_size]
     small_enough_pairs_counts = []
     for pair in list(combinations(small_enough_keys, 2)):
-        if len(output[pair[0]]) + len(output[pair[1]]) < maximum_size:
+        if len(output[pair[0]]) + len(output[pair[1]]) <= maximum_size:
             pair_0_split = pair[0].split("|")
             pair_1_split = pair[1].split("|")
 
@@ -146,6 +146,17 @@ def test_sorted_subblock_merge_candidates_middle_prefix_score_is_order_invariant
     }
 
     assert score_for(short_first) == score_for(long_first) == 1e10 + 2
+
+
+def test_sorted_subblock_merge_candidates_keeps_exact_maximum_size_pair() -> None:
+    output = {
+        "alex|middle=a": ["s1", "s2"],
+        "alex|middle=b": ["s3", "s4", "s5"],
+    }
+
+    assert _sorted_subblock_merge_candidates(output, maximum_size=5, first_k_letter_counts_sorted={}) == [
+        (("alex|middle=a", "alex|middle=b"), 1e10)
+    ]
 
 
 def test_projection_neighbor_edge_scores_match_slow_reference() -> None:

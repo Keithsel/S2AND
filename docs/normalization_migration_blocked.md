@@ -82,17 +82,21 @@ Current State (post-Sinonym hyphen pass)
   - Canonical first/middle fields keep dash-like given names together.
   - Current subblocking quality is recovered by keeping ASCII-hyphen compounds together while spilling non-ASCII dash
     compounds into first + middle for subblocking keys only.
-  - This is not semantically desirable, but it matches current legacy artifacts and restored measured quality:
+  - This is not semantically desirable, but it matches current legacy artifacts and restored measured quality on the
+    active 20260525 Arrow artifacts with sparse graph fallback:
     - `s_lee`, `maximum_size=2500`: keep-all-dash recall `0.978647821860`; current repair recall
       `0.983113309912` versus historical graph `0.983118072979`.
     - `s_park`, `maximum_size=2500`: keep-all-dash recall `0.973201405109`; current repair recall
       `0.979665201080`, matching the historical graph value.
-    - `h_wang`, `maximum_size=5000`: current repair recall `0.911857828379`, above the historical graph floor
-      `0.911296989543`.
+    - `h_wang`, `maximum_size=5000`: current sparse graph repair recall `0.914999198749`, above the historical graph
+      floor `0.911296989543`.
   - Uniform single-key alternatives were tested and were worse on the active artifacts:
     - Keep all dashed compounds together regressed `s_lee` and `s_park`.
     - Spill all dashed compounds increased single-letter first-name signatures, fallback work, and regressed
       `s_lee`/`h_wang`.
+    - Local-count adaptive key choice also regressed `s_park`: splitting a dashed compound whenever the split view was
+      locally larger gave recall `0.971676243404`; requiring the split view to be at least 2x larger gave
+      `0.973458134081`, still below the `0.979665201080` gate.
   - The clean replacement should be alias-aware or canonical-artifact-based, not another single-key dash heuristic.
 
 Fix during the blocked canonical migration (real-data findings)
@@ -132,10 +136,13 @@ Fix during the blocked canonical migration (real-data findings)
     wait for regenerated name counts, name tuples, and ORCID prefix counts.
 - Subblocking dash handling should not permanently encode ASCII/non-ASCII semantics:
   - Current repair is acceptable only as a localized `legacy_compat` quality repair.
-  - A cleaner near-term experiment can be done before full canonical cutover if it keeps canonical dash semantics uniform
-    while emitting compatibility aliases for subblocking merge/graph evidence.
+  - The failed local-count adaptive key experiment shows that subblocking cannot safely choose one key from nearby
+    spelling counts alone; large split cohorts can be semantically broader and noisier than the dashed compound cohort.
+  - A cleaner near-term experiment can still be done before full canonical cutover if it keeps canonical dash semantics
+    uniform while emitting compatibility aliases for subblocking merge/graph evidence.
   - Candidate design: one canonical key for all dash-like compounds, plus split aliases used only for merge candidates,
-    prefix-count lookup, and graph/co-location evidence when capacity constraints are satisfied.
+    prefix-count lookup, graph/co-location evidence, or a generated policy artifact when capacity constraints are
+    satisfied.
   - Required evidence before replacing the current repair: full `s_lee`, `s_park`, and `h_wang` subblocking metrics must
     meet or beat the current repair; telemetry must not materially increase fallback invocations/signatures or final
     subblock fragmentation.

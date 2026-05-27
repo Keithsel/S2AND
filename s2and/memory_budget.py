@@ -12,6 +12,7 @@ from typing import Any, cast
 
 logger = logging.getLogger("s2and")
 
+MEMORY_TELEMETRY_JSONL_ENV = "S2AND_MEMORY_TELEMETRY_JSONL"
 _MEMORY_TELEMETRY_LOCK = threading.Lock()
 _MEMORY_TELEMETRY_JSONL_PATH: Path | None = None
 
@@ -174,13 +175,18 @@ def configure_memory_telemetry_jsonl(path: str | Path | None) -> None:
 def memory_telemetry_jsonl_path() -> Path | None:
     """Return the configured structured memory telemetry sink, if any."""
 
-    return _MEMORY_TELEMETRY_JSONL_PATH
+    if _MEMORY_TELEMETRY_JSONL_PATH is not None:
+        return _MEMORY_TELEMETRY_JSONL_PATH
+    env_path = os.environ.get(MEMORY_TELEMETRY_JSONL_ENV)
+    if env_path is None or not env_path.strip():
+        return None
+    return Path(env_path)
 
 
 def emit_memory_telemetry(record: Mapping[str, Any]) -> None:
     """Append one structured memory telemetry record when a sink is configured."""
 
-    output_path = _MEMORY_TELEMETRY_JSONL_PATH
+    output_path = memory_telemetry_jsonl_path()
     if output_path is None:
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)

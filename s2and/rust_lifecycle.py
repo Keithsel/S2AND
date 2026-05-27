@@ -76,13 +76,10 @@ def build_rust_lifecycle_policy(
     *,
     backend: Backend,
     mode: str,
-    has_signatures_path: bool,
-    has_papers_path: bool,
     preprocess: bool,
     compute_reference_features: bool = False,
     use_rust: bool,
     from_dataset_paper_preprocess_available: bool = False,
-    use_sinonym_overwrite: bool = False,
 ) -> RustLifecyclePolicy:
     expected_use_rust = backend == "rust"
     if use_rust is not expected_use_rust:
@@ -93,8 +90,6 @@ def build_rust_lifecycle_policy(
 
     if backend == "python":
         return PYTHON_ONLY_POLICY
-
-    del has_signatures_path, has_papers_path, use_sinonym_overwrite
 
     is_inference = _is_inference_mode(mode)
 

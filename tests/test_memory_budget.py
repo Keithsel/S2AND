@@ -48,6 +48,23 @@ def test_emit_memory_telemetry_writes_jsonl(tmp_path):
     assert record["value"] == 7
 
 
+def test_emit_memory_telemetry_uses_env_fallback(monkeypatch, tmp_path):
+    output_path = tmp_path / "memory_telemetry_env.jsonl"
+    previous_path = memory_budget.memory_telemetry_jsonl_path()
+    try:
+        memory_budget.configure_memory_telemetry_jsonl(None)
+        monkeypatch.setenv(memory_budget.MEMORY_TELEMETRY_JSONL_ENV, str(output_path))
+
+        memory_budget.emit_memory_telemetry({"stage": "env_stage", "value": 11})
+    finally:
+        memory_budget.configure_memory_telemetry_jsonl(previous_path)
+
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert record["event"] == "memory_telemetry"
+    assert record["stage"] == "env_stage"
+    assert record["value"] == 11
+
+
 def test_resolve_total_ram_cgroup_uses_safety_factor():
     resolved, source = memory_budget.resolve_total_ram_bytes(
         None,

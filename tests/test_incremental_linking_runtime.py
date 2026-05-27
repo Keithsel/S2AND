@@ -188,6 +188,46 @@ def test_subset_raw_candidate_plan_preserves_unretrieved_component_members() -> 
     assert subset["component_members"] == {"c1": ["s1"], "c2": ["s2"]}
 
 
+def _minimal_raw_candidate_plan(**overrides: Any) -> dict[str, Any]:
+    raw_plan = {
+        "schema_version": RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
+        "query_signature_ids": ["q0"],
+        "query_views": ["full"],
+        "query_authors": ["Alice"],
+        "row_count": 1,
+        "pair_count": 1,
+        "row_query_signature_indices": np.asarray([0], dtype=np.uint32),
+        "row_component_keys": ["c1"],
+        "retrieval_scores": np.asarray([0.9], dtype=np.float32),
+        "retrieval_ranks": np.asarray([1], dtype=np.uint16),
+        "pair_row_indices": np.asarray([0], dtype=np.uint32),
+        "left_signature_indices": np.asarray([0], dtype=np.uint32),
+        "right_signature_indices": np.asarray([1], dtype=np.uint32),
+        "seed_signature_ids": ["s1"],
+    }
+    for raw_key, _signal_key, dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS:
+        raw_plan[raw_key] = np.asarray([""] if dtype is object else [0], dtype=dtype)
+    raw_plan.update(overrides)
+    return raw_plan
+
+
+def test_raw_candidate_plan_rejects_pair_row_index_outside_row_count() -> None:
+    raw_plan = _minimal_raw_candidate_plan(pair_row_indices=np.asarray([5], dtype=np.uint32))
+
+    with pytest.raises(ValueError, match="pair_row_indices.*row_count=1"):
+        runtime_module.subset_raw_candidate_plan_for_query_ids(raw_plan, ["q0"])
+
+
+def test_raw_candidate_plan_rejects_row_query_index_outside_query_count() -> None:
+    raw_plan = _minimal_raw_candidate_plan(row_query_signature_indices=np.asarray([1], dtype=np.uint32))
+
+    with pytest.raises(ValueError, match="row_query_signature_indices.*query_signature_ids length=1"):
+        build_linker_retrieval_batch_from_raw_candidate_plan(
+            raw_plan,
+            signature_id_to_index={"q0": 0, "s1": 1},
+        )
+
+
 def test_raw_candidate_plan_rejects_negative_retrieval_rank() -> None:
     raw_plan = {
         "schema_version": RAW_CANDIDATE_PLAN_SCHEMA_VERSION,

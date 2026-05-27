@@ -860,10 +860,7 @@ def _component_member_details_by_key(
     signature_id_to_index: Mapping[str, int],
     *,
     dataset: ANDData,
-    component_scope: str = "block-local",
 ) -> dict[str, ComponentMembers]:
-    if component_scope not in {"frozen", "block-local"}:
-        raise ValueError(f"unknown component_scope={component_scope!r}")
     members = pd.read_parquet(path)
     required = {"candidate_component_key", "member_index", "signature_id"}
     missing = sorted(required - set(members.columns))
@@ -872,8 +869,7 @@ def _component_member_details_by_key(
     out: dict[str, ComponentMembers] = {}
     for component_key, group in members.groupby("candidate_component_key", sort=False):
         member_ids = tuple(str(value) for value in group.sort_values("member_index")["signature_id"].astype(str))
-        if component_scope == "block-local":
-            member_ids = _block_local_member_ids(dataset, str(component_key), member_ids)
+        member_ids = _block_local_member_ids(dataset, str(component_key), member_ids)
         member_indices: list[int] = []
         for signature_id in member_ids:
             try:
@@ -1251,7 +1247,6 @@ def _build_minimal_raw_dataset_context(
         member_path,
         signature_id_to_index,
         dataset=dataset,
-        component_scope=row_component_scope,
     )
     component_indices = {
         component_key: details.signature_indices for component_key, details in component_details.items()
@@ -2834,11 +2829,9 @@ def _materialize_arrow_rust_dataset_rows(
         dataset_rows["candidate_component_key"].astype(str).tolist(),
         pd.to_numeric(dataset_rows["retrieval_rank"], errors="raise").astype(np.uint16).tolist(),
         context.component_members,
-        component_scope=context.row_component_scope,
         orcid_enabled=False,
         num_threads=max(1, int(n_jobs)),
         max_exemplars=int(max_exemplars),
-        include_pair_signature_ids=True,
         full_scan_without_index=False,
     )
     raw_plan_seconds = float(time.perf_counter() - plan_started)

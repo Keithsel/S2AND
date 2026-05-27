@@ -16,8 +16,6 @@ def test_python_backend_always_returns_python_only_policy():
         policy = build_rust_lifecycle_policy(
             backend="python",
             mode=mode,
-            has_signatures_path=True,
-            has_papers_path=True,
             preprocess=True,
             use_rust=False,
         )
@@ -36,124 +34,46 @@ def test_backend_use_rust_mismatch_raises(backend: str, use_rust: bool):
         build_rust_lifecycle_policy(
             backend=backend,  # type: ignore[arg-type]
             mode="train",
-            has_signatures_path=False,
-            has_papers_path=False,
             preprocess=True,
             use_rust=use_rust,
         )
 
 
+def test_rust_inference_does_not_skip_python_paper_preprocess():
+    policy = build_rust_lifecycle_policy(
+        backend="rust",
+        mode="inference",
+        preprocess=True,
+        use_rust=True,
+    )
+    assert policy.rust_build_path == "from_dataset"
+    assert policy.skip_python_paper_preprocess is False
+
+
 @pytest.mark.parametrize(
-    ("has_signatures_path", "has_papers_path", "expected_build_path"),
+    ("compute_reference_features", "from_dataset_paper_preprocess_available", "expected_mode", "expected_skip"),
     [
-        (False, False, "from_dataset"),
-        (False, True, "from_dataset"),
-        (True, False, "from_dataset"),
-        (True, True, "from_dataset"),
+        (False, True, "rust_training_skip_preprocess", True),
+        (True, True, "rust_training_from_dataset", False),
+        (False, False, "rust_training_from_dataset", False),
     ],
 )
-def test_rust_inference_build_path_is_from_dataset(
-    has_signatures_path: bool,
-    has_papers_path: bool,
-    expected_build_path: str,
+def test_rust_training_from_dataset_skip_preprocess_semantics(
+    compute_reference_features: bool,
+    from_dataset_paper_preprocess_available: bool,
+    expected_mode: str,
+    expected_skip: bool,
 ):
     policy = build_rust_lifecycle_policy(
         backend="rust",
-        mode="inference",
-        has_signatures_path=has_signatures_path,
-        has_papers_path=has_papers_path,
-        preprocess=True,
-        use_rust=True,
-    )
-    assert policy.rust_build_path == expected_build_path
-
-
-def test_rust_inference_without_paths_does_not_skip_python_paper_preprocess():
-    policy = build_rust_lifecycle_policy(
-        backend="rust",
-        mode="inference",
-        has_signatures_path=False,
-        has_papers_path=False,
-        preprocess=True,
-        use_rust=True,
-    )
-    assert policy.rust_build_path == "from_dataset"
-    assert policy.skip_python_paper_preprocess is False
-
-
-def test_rust_training_from_dataset_skips_python_paper_preprocess_when_capability_present():
-    policy = build_rust_lifecycle_policy(
-        backend="rust",
         mode="train",
-        has_signatures_path=False,
-        has_papers_path=False,
         preprocess=True,
-        compute_reference_features=False,
+        compute_reference_features=compute_reference_features,
         use_rust=True,
-        from_dataset_paper_preprocess_available=True,
+        from_dataset_paper_preprocess_available=from_dataset_paper_preprocess_available,
     )
-    assert policy.mode == "rust_training_skip_preprocess"
-    assert policy.rust_build_path == "from_dataset"
-    assert policy.skip_python_paper_preprocess is True
-
-
-def test_rust_training_from_dataset_does_not_skip_with_reference_features():
-    policy = build_rust_lifecycle_policy(
-        backend="rust",
-        mode="train",
-        has_signatures_path=False,
-        has_papers_path=False,
-        preprocess=True,
-        compute_reference_features=True,
-        use_rust=True,
-        from_dataset_paper_preprocess_available=True,
-    )
-    assert policy.mode == "rust_training_from_dataset"
-    assert policy.rust_build_path == "from_dataset"
-    assert policy.skip_python_paper_preprocess is False
-
-
-def test_rust_training_from_dataset_does_not_skip_without_capability():
-    policy = build_rust_lifecycle_policy(
-        backend="rust",
-        mode="train",
-        has_signatures_path=False,
-        has_papers_path=False,
-        preprocess=True,
-        compute_reference_features=False,
-        use_rust=True,
-        from_dataset_paper_preprocess_available=False,
-    )
-    assert policy.rust_build_path == "from_dataset"
-    assert policy.skip_python_paper_preprocess is False
-
-
-def test_rust_inference_with_sinonym_overwrite_uses_from_dataset():
-    policy = build_rust_lifecycle_policy(
-        backend="rust",
-        mode="inference",
-        has_signatures_path=True,
-        has_papers_path=True,
-        preprocess=True,
-        use_rust=True,
-        use_sinonym_overwrite=True,
-    )
-    assert policy.mode == "rust_inference_from_dataset"
-    assert policy.rust_build_path == "from_dataset"
-    assert policy.skip_python_paper_preprocess is False
-
-
-def test_rust_inference_without_sinonym_overwrite_uses_from_dataset():
-    policy = build_rust_lifecycle_policy(
-        backend="rust",
-        mode="inference",
-        has_signatures_path=True,
-        has_papers_path=True,
-        preprocess=True,
-        use_rust=True,
-        use_sinonym_overwrite=False,
-    )
-    assert policy.rust_build_path == "from_dataset"
+    assert policy.mode == expected_mode
+    assert policy.skip_python_paper_preprocess is expected_skip
 
 
 @pytest.mark.parametrize("preprocess", [False, True])
@@ -163,8 +83,6 @@ def test_defer_signature_ngrams_requires_preprocess_and_rust(preprocess: bool, u
     policy = build_rust_lifecycle_policy(
         backend=backend,
         mode="train",
-        has_signatures_path=True,
-        has_papers_path=True,
         preprocess=preprocess,
         use_rust=use_rust,
     )
@@ -181,8 +99,6 @@ def test_defer_signature_fields_requires_rust_and_non_inference(
     policy = build_rust_lifecycle_policy(
         backend=backend,
         mode=mode,
-        has_signatures_path=True,
-        has_papers_path=True,
         preprocess=True,
         use_rust=use_rust,
     )

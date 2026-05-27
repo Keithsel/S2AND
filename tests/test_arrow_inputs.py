@@ -178,6 +178,29 @@ def test_validate_arrow_prediction_artifacts_accepts_selected_specter2_alias(tmp
     assert normalized["specter_batch_index"] == paths["specter2_batch_index"]
 
 
+def test_validate_arrow_prediction_artifacts_clears_invalid_legacy_specter_after_alias(tmp_path: Path) -> None:
+    paths = _touch_paths(tmp_path, ("signatures", "papers", "paper_authors", "specter2"))
+    paths.update(
+        _touch_paths(
+            tmp_path,
+            ("signatures_batch_index", "papers_batch_index", "paper_authors_batch_index", "specter2_batch_index"),
+            suffix=".bin",
+        )
+    )
+    paths["specter"] = None  # type: ignore[assignment]
+    paths["specter_batch_index"] = None  # type: ignore[assignment]
+
+    normalized = validate_arrow_prediction_artifacts(
+        paths,
+        require_specter=True,
+        require_name_counts_index=False,
+        require_batch_indexes=True,
+    )
+
+    assert normalized["specter"] == paths["specter2"]
+    assert normalized["specter_batch_index"] == paths["specter2_batch_index"]
+
+
 def test_require_filtered_arrow_batch_indexes_ignores_specter_index_without_specter(tmp_path: Path) -> None:
     paths = {}
     for key in ("signatures", "papers", "paper_authors"):

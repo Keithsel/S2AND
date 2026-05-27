@@ -37,12 +37,33 @@ The single-letter first-name path is handled later in bulk prediction. Multi-let
 their resulting clusters become temporary cluster seeds, and single-letter subblocks run through a synthetic
 incremental pass so initial-only signatures can attach back to established clusters.
 
+## Dash compatibility repair
+
+Subblocking currently has a localized legacy repair for dash-like given names. Canonical first/middle normalization
+keeps all dash-like given-name compounds together, but the subblocking key layer then preserves different behavior for
+ASCII hyphen versus Unicode dash-like characters:
+
+- ASCII-hyphen compounds stay together for subblocking, for example `Sang-Min` -> `first="sang min", middle=""`.
+- Non-ASCII dash compounds spill to first + middle for subblocking, for example `Sang<U+2010>Min` ->
+  `first="sang", middle="min"`.
+
+This is not intended as permanent semantic policy. It is a measured compatibility repair for current artifacts: uniform
+single-key alternatives regressed real subblocking quality on the active `s_lee`, `s_park`, and `h_wang` checks. Keep
+the repair scoped to subblocking keys; do not copy it into generic `normalize_text(...)`, title/venue normalization,
+ORCID parsing, or pairwise feature normalization. The Python implementation uses precomputed normalized first/middle
+fields when present and only inspects the raw first name to detect the dash form. The Rust Arrow path reads
+`author_first`/`author_middle`, normalizes them internally, and applies the same subblocking-only repair.
+
+Any replacement must meet the current quality gates on full artifacts before landing. The migration notes in
+[normalization_migration_blocked.md](normalization_migration_blocked.md) track the tested alternatives and the path to a
+cleaner canonical policy.
+
 ## ORCID policy
 
 `make_subblocks(...)` and `make_subblocks_with_telemetry(...)` have a `use_orcid_subblocking` flag. When enabled, the
-final repair pass groups same-ORCID signatures into one subblock only when an existing target subblock can absorb the
-whole ORCID group without exceeding `maximum_size`. Otherwise the split is preserved and telemetry records the
-capacity skip.
+final repair pass can merge whole subblocks that contain the same ORCID, but it never extracts only ORCID signatures
+from an existing subblock. The merge runs only when the combined whole subblocks fit within `maximum_size`; otherwise
+the split is preserved and telemetry records the capacity skip.
 
 The ORCID key is canonicalized to match Rust Arrow ingestion: keep digits and `X`/`x`, require exactly 16 ORCID
 characters, uppercase the check digit, and format as `0000-0000-0000-0000`. Blank or invalid values are ignored.

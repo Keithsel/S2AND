@@ -174,8 +174,8 @@ Maintenance checklist:
 3. Optional: rerun transfer-mini compare and write the JSON under `scratch/baselines_YYYYMMDD/` (see `baselines.md`).
 
 Current watchlist items for this area are tracked in
-[../general_todo_plan.md](../general_todo_plan.md), especially the
-reference-feature training gate and blocked normalization migration.
+[../work_plan.md](../work_plan.md), especially the reference-feature training
+gate and blocked normalization migration.
 
 ---
 

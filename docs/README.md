@@ -41,7 +41,6 @@ This directory holds both user-facing guides and internal engineering notes.
 ## Planning and migration docs
 
 - Rust and platform backlog: [work_plan.md](work_plan.md)
-- General TODO plan: [general_todo_plan.md](general_todo_plan.md)
 - Normalization migration plan [blocked]: [normalization_migration_blocked.md](normalization_migration_blocked.md)
 
 ## Scope notes

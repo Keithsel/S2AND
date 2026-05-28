@@ -550,10 +550,9 @@ class ANDData:
                 author_info_coauthor_n_grams=None,
                 author_info_email=signature["author_info"]["email"],
                 author_info_orcid=(
-                    signature["author_info"]["source_ids"][0]
+                    (signature["author_info"].get("source_ids") or [None])[0]
                     if use_orcid_id
-                    and "source_id_source" in signature["author_info"]
-                    and signature["author_info"]["source_id_source"] == "ORCID"
+                    and signature["author_info"].get("source_id_source") == "ORCID"
                     else None
                 ),
                 author_info_name_counts=None,
@@ -692,7 +691,8 @@ class ANDData:
                             self.cluster_seeds_require[signature_id_a] = cluster_num
                             root_added = True
                         self.cluster_seeds_require[signature_id_b] = cluster_num
-                cluster_num += 1
+                if root_added:
+                    cluster_num += 1
             self.max_seed_cluster_id = cluster_num
         logger.info("loaded cluster seeds")
         # Versioned seed state for Rust sync dedupe.
@@ -2415,6 +2415,7 @@ def apply_sinonym_overwrites_to_papers(
         if not by_pos:
             continue
         new_authors = []
+        changed = False
         for a in paper.authors:
             repl = by_pos.get(a.position) if isinstance(by_pos, dict) else None
             if repl:
@@ -2431,9 +2432,10 @@ def apply_sinonym_overwrites_to_papers(
                     if new_name and new_name != a.author_name:
                         new_authors.append(Author(author_name=new_name, position=a.position))
                         updates += 1
+                        changed = True
                         continue
             new_authors.append(a)
-        if new_authors and new_authors != list(paper.authors):
+        if changed:
             papers[key] = paper._replace(authors=new_authors)
     return updates
 

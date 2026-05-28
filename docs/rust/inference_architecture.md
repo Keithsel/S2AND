@@ -83,8 +83,7 @@ runtime contract, but the implementation details live in the operational docs:
 [../production_inference.md](../production_inference.md) owns caller-visible
 telemetry and routing semantics, while [arrow_dataset_spec.md](arrow_dataset_spec.md)
 owns the Arrow table contracts. Active cleanup work is tracked in
-[../work_plan.md](../work_plan.md) and summarized in
-[../general_todo_plan.md](../general_todo_plan.md).
+[../work_plan.md](../work_plan.md).
 
 ## Current Verification Focus
 

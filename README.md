@@ -383,7 +383,6 @@ Notes:
 ### Docs
 
 - Index (start here): `docs/README.md`
-- Consolidated TODO plan: `docs/general_todo_plan.md`
 - Rust/Arrow execution backlog: `docs/work_plan.md`
 
 ---

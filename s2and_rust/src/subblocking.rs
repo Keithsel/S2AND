@@ -1039,7 +1039,9 @@ pub(crate) fn add_sparse_native_graph_edge_scores(
                 }
             }
         }
-        if config.max_candidate_edges > 0 && edge_scores.len() > config.max_candidate_edges * 2 {
+        if config.max_candidate_edges > 0
+            && edge_scores.len() > config.max_candidate_edges.saturating_mul(2)
+        {
             prune_native_graph_edge_scores(edge_scores, config.max_candidate_edges);
         }
     }

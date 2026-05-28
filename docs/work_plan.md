@@ -379,3 +379,170 @@ Act only when:
   time or allocation volume, or the change removes a real `ANDData` dependency.
 - Stop optimizing once measured improvement falls below 10% for the selected
   workload.
+
+### 9. Feature-Space Parity And Correctness Bugs
+
+These bugs change the values produced by featurization for currently-valid
+inputs. Defer until they can be fixed together so feature-parity baselines and
+trained models can be re-established in a single pass. Source: 2026-05-27
+bug-validation pass (see commit log near this work plan edit).
+
+Required when picking these up:
+
+- Fix Python and Rust sides together where a bug exists in both.
+- Re-record `compare_existing_arrow_anddata_feature_parity.py` baselines after
+  each fix; expect intentional drift on the fixed columns.
+- Re-train production pairwise models if cumulative feature drift exceeds the
+  current `1e-5` tolerance on any non-changed column.
+
+Open bugs:
+
+- **Rust ignores `name_counts_last_first_initial_semantics="legacy_full_first_token"`.**
+  Python branches at [s2and/data.py:890-894](../s2and/data.py#L890-L894); Rust
+  unconditionally uses the first initial at
+  [s2and_rust/src/ingest_dataset.rs:961-966](../s2and_rust/src/ingest_dataset.rs#L961-L966).
+  Datasets built in Python legacy mode silently disagree with Rust on
+  `last_first_initial` lookup keys. Add the semantic switch on the Rust side
+  and plumb the flag through `from_dataset(...)` / Arrow ingest.
+
+- **`query_author` missing from Rust retrieval `row_signals`.**
+  Raw-Arrow path at
+  [s2and/incremental_linking/retrieval.py:486-492](../s2and/incremental_linking/retrieval.py#L486-L492)
+  includes `query_author`; Rust path at
+  [s2and/incremental_linking/retrieval.py:595-611](../s2and/incremental_linking/retrieval.py#L595-L611)
+  omits it. Downstream features that read `query_author` (e.g.
+  `top_meta_query_author_len`) silently become zero only on the Rust path.
+
+- **Sinonym overwrite leaves stale normalized fields when run outside `__init__`.**
+  [s2and/data.py:2385-2389](../s2and/data.py#L2385-L2389) replaces only raw
+  `author_info_first/middle/last`. Inside `__init__` the subsequent
+  `preprocess_signatures()` call at
+  [s2and/data.py:815](../s2and/data.py#L815) rebuilds normalized fields, so the
+  canonical path is safe. Any call site that mutates signatures post-init
+  produces stale `_normalized_*` / `name_counts`. Invalidate or re-derive in
+  `apply_sinonym_overwrites` so the invariant is explicit.
+
+- **Strict vs lenient paper-author positions between Rust and Python.**
+  Rust at
+  [s2and_rust/src/raw_arrow/readers.rs:294,305-311](../s2and_rust/src/raw_arrow/readers.rs#L294)
+  errors on null position and duplicate `(paper_id, position)`. Python at
+  [s2and/incremental_linking/query_adapter.py:163-166](../s2and/incremental_linking/query_adapter.py#L163-L166)
+  silently falls back to enumeration index on type errors. Pick one policy and
+  document the divergence if intentional.
+
+- **Self-cite signal returns 1.0 when both signatures share a self-citing paper (parity bug).**
+  Same bug exists in Python at
+  [s2and/featurizer.py:1183](../s2and/featurizer.py#L1183) and Rust at
+  [s2and_rust/src/rust_featurizer.rs:188-193](../s2and_rust/src/rust_featurizer.rs#L188-L193).
+  When `s1.paper_id == s2.paper_id` and the paper appears in its own reference
+  list, both produce 1.0. Fix both sides simultaneously to preserve parity.
+
+- **"MISSING" email collision (parity bug).**
+  Python at
+  [s2and/featurizer.py:1117-1124](../s2and/featurizer.py#L1117-L1124) and Rust
+  at [s2and_rust/src/features.rs:460-463](../s2and_rust/src/features.rs#L460-L463)
+  both map emails without `@` to suffix `"missing"`, so two malformed emails
+  produce a false suffix match. Return an `Option`/`None` suffix instead and
+  treat absent `@` as missing. Fix both sides.
+
+- **`equal_middle` falls through to 0 for multi-token middles (parity bug).**
+  Python at [s2and/text.py:735-742](../s2and/text.py#L735-L742) and Rust at
+  [s2and_rust/src/features.rs:381-399](../s2and_rust/src/features.rs#L381-L399)
+  only compare the first character when one side is a single initial; later
+  tokens of a joined multi-token middle that match the other side's initial
+  return 0. Split both sides on whitespace and compare initial sets when either
+  side is a single character.
+
+- **Subblocking ORCID gating asymmetry between layers.**
+  Rust at
+  [s2and_rust/src/raw_arrow_features.rs:120](../s2and_rust/src/raw_arrow_features.rs#L120)
+  gates the ORCID hash on a per-call `orcid_enabled` flag; Python relies on
+  `author_info_orcid` being `None` when `use_orcid_id=False` at
+  [s2and/data.py:554](../s2and/data.py#L554). End-to-end output matches on the
+  default code path; mismatched flag combinations between ingest and
+  subblocking would diverge. Align the gating surface so the same flag controls
+  both layers in both implementations.
+
+- **Unicode `is_alphabetic` / `is_uppercase` divergence in the fastText 0.9 gate.**
+  Python at [s2and/text.py:360-365](../s2and/text.py#L360-L365) uses
+  `c.isalpha()` / `c.isupper()`; Rust at
+  [s2and_rust/src/language_detection.rs:80-86](../s2and_rust/src/language_detection.rs#L80-L86)
+  uses `ch.is_alphabetic()` / `ch.is_uppercase()`. Python's `isalpha` counts
+  modifier letters (category Lm); Rust's `is_alphabetic` does not. Modifier
+  letters and certain superscripts shift the uppercase ratio and can flip the
+  fastText preprocessing branch, producing different language labels.
+
+- **`detect_language` reports `is_reliable=True` when only one detector responded.**
+  [s2and/text.py:387-398](../s2and/text.py#L387-L398) treats `un_ft` or `un_2`
+  as a successful agreement, so single-detector signals are weighted the same
+  as two-detector agreement downstream. Decide whether single-detector should
+  be reliable; if not, fix and propagate the new `is_reliable` semantics.
+
+## Blocked
+
+### Normalization Canonicalization Migration
+
+Blocked until canonical artifacts and retraining can move together. Full plan:
+[normalization_migration_blocked.md](normalization_migration_blocked.md). The
+ASCII/non-ASCII dash behavior, tuple probing fallbacks, ORCID prefix
+fallbacks, and block compaction workarounds are measured legacy-compatibility
+repairs, not the canonical target. Code TODO comments in
+[../s2and/data.py](../s2and/data.py) and the production count scripts point at
+this migration; do not schedule them as separate cleanup work before canonical
+artifacts exist.
+
+Verification gate (compatibility behavior stays stable):
+
+```powershell
+uv run pytest -q tests/test_surname_hyphen_aware.py tests/test_subblocking_telemetry.py tests/test_text.py tests/test_rust_from_dataset_contract.py tests/test_cluster_incremental.py
+```
+
+## Watchlist
+
+
+### Compact Incremental Partial Supervision
+
+[../s2and/incremental_linking/runtime.py](../s2and/incremental_linking/runtime.py)
+raises `NotImplementedError` when compact-linker retrieved-candidate scoring
+receives `partial_supervision`; that failure mode is asserted in
+[../tests/test_incremental_linking_runtime.py](../tests/test_incremental_linking_runtime.py).
+This is separate from `FastCluster.transform(...)`, which is intentionally
+unsupported inductive-mode API and covered by
+[../tests/test_model_pairwise_exceptions.py](../tests/test_model_pairwise_exceptions.py).
+
+Do nothing unless a production compact-linker request path actually needs
+partial supervision. If needed, first add a typed request fixture proving the
+desired merge semantics, then wire the compact runtime behavior with explicit
+tests for require/disallow conflicts.
+
+Verification gate:
+
+```powershell
+uv run pytest -q tests/test_incremental_linking_runtime.py::test_private_retrieved_candidate_slice_rejects_partial_supervision
+uv run pytest -q tests/test_model_pairwise_exceptions.py
+```
+
+## Documentation Cleanup
+
+- If licensing policy is corrected, update [../README.md](../README.md),
+  [../pyproject.toml](../pyproject.toml), root [../LICENSE](../LICENSE), and
+  dataset docs together. The current MIT / CC-BY-4.0 / ODC-BY mismatch is
+  already preserved in README as a known issue.
+
+## Standing Guardrails
+
+These are not TODOs, but they should shape future work:
+
+- Keep production artifact validation routed through `s2and.arrow_inputs`.
+- Keep production Rust inference on `Clusterer.predict_from_arrow_paths(...)`
+  or complete Arrow paths to `Clusterer.predict(...)`.
+- Keep full scans and compatibility fallbacks explicit test-only or
+  parity-only options.
+
+## Non-Goals
+
+- Do not remove normalization shims before regenerated canonical artifacts are  validated.
+- Do not add another strict/compatibility discovery layer beside
+  `s2and.arrow_inputs`.
+- Do not run S3/network release smokes as default pytest.
+

@@ -67,8 +67,7 @@ pub(crate) use rust_featurizer::RustFeaturizer;
 use subblocking::*;
 use text_compat::{
     compute_block_compat, contains_name_dash, ensure_unidecode_for_text,
-    first_normalized_token_python_compat, normalize_text_compat_from_map,
-    split_first_middle_hyphen_aware_compat,
+    normalize_text_compat_from_map, split_first_middle_hyphen_aware_compat,
 };
 
 fn py_len(s: &str) -> usize {
@@ -116,6 +115,18 @@ fn fnv64_update(mut h: u64, bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(FNV_PRIME);
     }
     h
+}
+
+#[inline]
+pub(crate) fn vector_norm_f32(values: &[f32]) -> f64 {
+    values
+        .iter()
+        .map(|value| {
+            let val = *value as f64;
+            val * val
+        })
+        .sum::<f64>()
+        .sqrt()
 }
 
 #[inline(always)]
@@ -708,21 +719,6 @@ mod tests {
         assert_eq!(
             text_compat::normalize_text_compat_native("O\u{2019}Neil", true),
             "oneil",
-        );
-    }
-
-    #[test]
-    fn first_normalized_token_uses_python_space_split() {
-        let prefixes = HashSet::new();
-        assert_eq!(
-            first_normalized_token_python_compat("", "alan", &prefixes),
-            ""
-        );
-
-        let prefixes = HashSet::from(["dr".to_string()]);
-        assert_eq!(
-            first_normalized_token_python_compat("dr", "alice", &prefixes),
-            "alice"
         );
     }
 

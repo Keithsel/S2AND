@@ -935,16 +935,7 @@ impl RustFeaturizer {
             } else {
                 None
             };
-            let specter_norm = specter.as_ref().map(|values| {
-                values
-                    .iter()
-                    .map(|value| {
-                        let value_f64 = *value as f64;
-                        value_f64 * value_f64
-                    })
-                    .sum::<f64>()
-                    .sqrt()
-            });
+            let specter_norm = specter.as_ref().map(|values| vector_norm_f32(values));
 
             papers.insert(
                 paper_id,
@@ -1637,16 +1628,7 @@ impl RustFeaturizer {
             HashMap::with_capacity(preprocessed_papers.len());
         for (paper_id, paper) in preprocessed_papers.into_iter() {
             let specter = specter_by_paper.get(&paper_id).cloned();
-            let specter_norm = specter.as_ref().map(|values| {
-                values
-                    .iter()
-                    .map(|value| {
-                        let value_f64 = *value as f64;
-                        value_f64 * value_f64
-                    })
-                    .sum::<f64>()
-                    .sqrt()
-            });
+            let specter_norm = specter.as_ref().map(|values| vector_norm_f32(values));
             papers.insert(
                 paper_id,
                 PaperData {

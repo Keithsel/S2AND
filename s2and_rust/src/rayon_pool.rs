@@ -4,19 +4,45 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const RAYON_POOL_CACHE_MAX_ENTRIES: usize = 8;
 
-static RAYON_POOL_CACHE: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
+struct CachedRayonPool {
+    pool: Arc<rayon::ThreadPool>,
+    last_used: u64,
+}
 
-fn rayon_pool_cache() -> &'static Mutex<HashMap<usize, Arc<rayon::ThreadPool>>> {
-    RAYON_POOL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+struct RayonPoolCache {
+    pools: HashMap<usize, CachedRayonPool>,
+    access_counter: u64,
+}
+
+impl RayonPoolCache {
+    fn new() -> Self {
+        Self {
+            pools: HashMap::new(),
+            access_counter: 0,
+        }
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.access_counter = self.access_counter.wrapping_add(1);
+        self.access_counter
+    }
+}
+
+static RAYON_POOL_CACHE: OnceLock<Mutex<RayonPoolCache>> = OnceLock::new();
+
+fn rayon_pool_cache() -> &'static Mutex<RayonPoolCache> {
+    RAYON_POOL_CACHE.get_or_init(|| Mutex::new(RayonPoolCache::new()))
 }
 
 fn cached_rayon_pool(thread_count: usize) -> Option<Arc<rayon::ThreadPool>> {
     if thread_count == 0 {
         return None;
     }
-    if let Ok(cache) = rayon_pool_cache().lock() {
-        if let Some(pool) = cache.get(&thread_count) {
-            return Some(Arc::clone(pool));
+    if let Ok(mut cache) = rayon_pool_cache().lock() {
+        let touch = cache.tick();
+        if let Some(entry) = cache.pools.get_mut(&thread_count) {
+            entry.last_used = touch;
+            return Some(Arc::clone(&entry.pool));
         }
     }
 
@@ -26,15 +52,28 @@ fn cached_rayon_pool(thread_count: usize) -> Option<Arc<rayon::ThreadPool>> {
         .ok()?;
     let built_pool = Arc::new(built_pool);
     if let Ok(mut cache) = rayon_pool_cache().lock() {
-        if cache.len() >= RAYON_POOL_CACHE_MAX_ENTRIES && !cache.contains_key(&thread_count) {
-            if let Some(remove_key) = cache.keys().copied().find(|key| *key != thread_count) {
-                cache.remove(&remove_key);
+        if cache.pools.len() >= RAYON_POOL_CACHE_MAX_ENTRIES
+            && !cache.pools.contains_key(&thread_count)
+        {
+            if let Some(victim_key) = cache
+                .pools
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            {
+                cache.pools.remove(&victim_key);
             }
         }
+        let touch = cache.tick();
         let pooled = cache
+            .pools
             .entry(thread_count)
-            .or_insert_with(|| Arc::clone(&built_pool));
-        return Some(Arc::clone(pooled));
+            .or_insert_with(|| CachedRayonPool {
+                pool: Arc::clone(&built_pool),
+                last_used: touch,
+            });
+        pooled.last_used = touch;
+        return Some(Arc::clone(&pooled.pool));
     }
     Some(built_pool)
 }

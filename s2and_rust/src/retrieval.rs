@@ -971,8 +971,8 @@ pub(crate) fn year_score(query_year: Option<i64>, summary: &RetrievalSummaryData
     let distance = ((query_year_value as f64) - year_mean).abs();
     let mut score = (1.0 - (distance / RETRIEVAL_YEAR_SCORE_DECAY_YEARS)).max(0.0);
     if let (Some(year_min), Some(year_max)) = (summary.year_min, summary.year_max) {
-        if query_year_value < year_min - RETRIEVAL_YEAR_SCORE_RANGE_GAP
-            || query_year_value > year_max + RETRIEVAL_YEAR_SCORE_RANGE_GAP
+        if query_year_value < year_min.saturating_sub(RETRIEVAL_YEAR_SCORE_RANGE_GAP)
+            || query_year_value > year_max.saturating_add(RETRIEVAL_YEAR_SCORE_RANGE_GAP)
         {
             score -= RETRIEVAL_YEAR_SCORE_RANGE_PENALTY;
         }
@@ -1013,7 +1013,7 @@ pub(crate) fn has_impossible_year_conflict(
     let (Some(year_min), Some(year_max)) = (summary.year_min, summary.year_max) else {
         return false;
     };
-    query_year_value < year_min - max_year_gap || query_year_value > year_max + max_year_gap
+    query_year_value < year_min.saturating_sub(max_year_gap) || query_year_value > year_max.saturating_add(max_year_gap)
 }
 
 pub(crate) fn extract_retrieval_summary(
@@ -1035,16 +1035,7 @@ pub(crate) fn extract_retrieval_summary(
     let year_mean: Option<f64> = obj.getattr("year_mean")?.extract()?;
     let orcid_hashes = extract_orcid_hashes(&obj.getattr("orcid_values")?)?;
     let specter_centroid = extract_specter_vec(&obj.getattr("specter_centroid")?)?;
-    let specter_centroid_norm = specter_centroid.as_ref().map(|values| {
-        values
-            .iter()
-            .map(|value| {
-                let val = *value as f64;
-                val * val
-            })
-            .sum::<f64>()
-            .sqrt()
-    });
+    let specter_centroid_norm = specter_centroid.as_ref().map(|values| vector_norm_f32(values));
     let exemplar_vectors = if include_exemplars {
         extract_specter_vec_list(&obj.getattr("exemplar_vectors")?)?
     } else {
@@ -1052,16 +1043,7 @@ pub(crate) fn extract_retrieval_summary(
     };
     let exemplar_norms = exemplar_vectors
         .iter()
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| {
-                    let val = *value as f64;
-                    val * val
-                })
-                .sum::<f64>()
-                .sqrt()
-        })
+        .map(|values| vector_norm_f32(values))
         .collect();
 
     Ok(RetrievalSummaryData {
@@ -1102,16 +1084,7 @@ pub(crate) fn extract_retrieval_query(obj: &Bound<'_, PyAny>) -> PyResult<Retrie
     let year: Option<i64> = obj.getattr("year")?.extract()?;
     let orcid_hash = extract_optional_orcid_hash(&obj.getattr("orcid")?)?;
     let specter = extract_specter_vec(&obj.getattr("specter")?)?;
-    let specter_norm = specter.as_ref().map(|values| {
-        values
-            .iter()
-            .map(|value| {
-                let val = *value as f64;
-                val * val
-            })
-            .sum::<f64>()
-            .sqrt()
-    });
+    let specter_norm = specter.as_ref().map(|values| vector_norm_f32(values));
     let specter = specter.map(Arc::new);
 
     Ok(RetrievalQueryData {

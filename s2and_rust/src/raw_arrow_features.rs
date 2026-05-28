@@ -19,7 +19,7 @@ use crate::{
     build_name_counts_data_from_artifact, counter_data_from_hash_count_map, extract_specter_vec,
     fnv64, hash_string_values, prefilter_affiliation_text, py_len, query_terms_from_values,
     raw_arrow_year_mean, term_set_from_normalized_text, validate_row_signal_year,
-    RetrievalQueryData, RetrievalSummaryData, RETRIEVAL_MEGA_AUTHOR_THRESHOLD,
+    vector_norm_f32, RetrievalQueryData, RetrievalSummaryData, RETRIEVAL_MEGA_AUTHOR_THRESHOLD,
 };
 pub(crate) fn build_raw_arrow_feature(
     signature: &RawArrowSignature,
@@ -44,13 +44,12 @@ pub(crate) fn build_raw_arrow_feature(
         raw_name_counts,
         &signature.author_first,
         &first,
-        &first,
         &signature.author_last,
         &last_normalized,
     );
-    let middle_initials: HashSet<String> = middle
+    let middle_initials: HashSet<char> = middle
         .split_whitespace()
-        .filter_map(|token| token.chars().next().map(|ch| ch.to_string()))
+        .filter_map(|token| token.chars().next())
         .collect();
 
     let mut coauthor_blocks = HashSet::new();
@@ -116,7 +115,18 @@ pub(crate) fn build_raw_arrow_feature(
         .collect();
     let venue_hashes = hash_string_values(&venue_terms);
     let title_hashes = hash_string_values(&title_terms);
-    let middle_initial_hashes = hash_string_values(&middle_initials);
+    let middle_initial_hashes = {
+        let mut hashes: Vec<u64> = middle_initials
+            .iter()
+            .map(|ch| {
+                let mut buf = [0u8; 4];
+                fnv64(ch.encode_utf8(&mut buf).as_bytes())
+            })
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        hashes
+    };
     let orcid_hash = if orcid_enabled {
         signature
             .orcid
@@ -128,16 +138,7 @@ pub(crate) fn build_raw_arrow_feature(
     let specter = specter_by_paper_id
         .and_then(|values| values.get(&signature.paper_id))
         .map(Arc::clone);
-    let specter_norm = specter.as_ref().map(|values| {
-        values
-            .iter()
-            .map(|value| {
-                let val = *value as f64;
-                val * val
-            })
-            .sum::<f64>()
-            .sqrt()
-    });
+    let specter_norm = specter.as_ref().map(|values| vector_norm_f32(values));
     let query_author = [
         signature.author_first.as_str(),
         signature.author_middle.as_str(),
@@ -239,17 +240,6 @@ pub(crate) fn mask_raw_arrow_query(
         specter_norm: base.specter_norm,
     };
     Ok((masked, resolved_view.to_string()))
-}
-
-pub(crate) fn vector_norm_f32(values: &[f32]) -> f64 {
-    values
-        .iter()
-        .map(|value| {
-            let val = *value as f64;
-            val * val
-        })
-        .sum::<f64>()
-        .sqrt()
 }
 
 pub(crate) fn euclidean_distance_f32(left: &[f32], right: &[f32]) -> f64 {

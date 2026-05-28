@@ -434,14 +434,18 @@ def build_logistic_gate_matrix(
         retrieval_ranks=retrieval_ranks,
         component_keys=component_keys,
     )
-    first_name_bucket = _object_array(feature_values, "first_name_bucket", row_count)
     query_view = _object_array(feature_values, "query_view", row_count)
-    if (
-        "first_name_bucket" not in feature_values
-        and "query_first_token" in feature_values
-        and "query_view" in feature_values
-    ):
+    if "first_name_bucket" in feature_values:
+        first_name_bucket = _object_array(feature_values, "first_name_bucket", row_count)
+    elif "query_first_token" in feature_values and "query_view" in feature_values:
         first_name_bucket = first_name_bucket_array(feature_values["query_first_token"], feature_values["query_view"])
+    else:
+        if any(name.startswith("first_name_bucket_") for name in resolved_feature_names):
+            raise ValueError(
+                "logistic gate first_name_bucket_* features require 'first_name_bucket' or both"
+                " 'query_first_token' and 'query_view' in feature_values"
+            )
+        first_name_bucket = _object_array(feature_values, "first_name_bucket", row_count)
     has_query_first_token = "query_first_token" in feature_values
     has_query_author = "query_author" in feature_values
     query_first_token = _object_array(feature_values, "query_first_token", row_count)

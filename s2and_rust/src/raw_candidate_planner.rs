@@ -478,17 +478,16 @@ impl RawBlockQueryCandidatePlanner {
         };
 
         let mut seed_signature_ids = Vec::<String>::new();
-        let mut seed_seen = HashSet::<String>::new();
         let mut component_keys_by_member = HashMap::<String, Vec<String>>::new();
         for component_key in component_order.iter() {
             if let Some(members) = members_by_component.get(component_key) {
                 for signature_id in members {
-                    component_keys_by_member
-                        .entry(signature_id.clone())
-                        .or_default()
-                        .push(component_key.clone());
-                    if seed_seen.insert(signature_id.clone()) {
-                        seed_signature_ids.push(signature_id.clone());
+                    if let Some(existing) = component_keys_by_member.get_mut(signature_id) {
+                        existing.push(component_key.clone());
+                    } else {
+                        let owned_id = signature_id.clone();
+                        component_keys_by_member.insert(owned_id.clone(), vec![component_key.clone()]);
+                        seed_signature_ids.push(owned_id);
                     }
                 }
             }

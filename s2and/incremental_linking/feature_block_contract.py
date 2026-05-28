@@ -423,6 +423,10 @@ def feature_block_for_signature_order(
 
     signatures = tuple(signatures_by_id[signature_id] for signature_id in signature_order.signature_ids)
     paper_ids = set(row.paper_id for row in signatures)
+    available_paper_ids = {row.paper_id for row in feature_block.papers}
+    missing_papers = paper_ids - available_paper_ids
+    if missing_papers:
+        raise ValueError(f"FeatureBlock is missing papers referenced by selected signatures: {sorted(missing_papers)}")
     papers = tuple(row for row in feature_block.papers if row.paper_id in paper_ids)
     paper_id_set = set(row.paper_id for row in papers)
     paper_authors = tuple(row for row in feature_block.paper_authors if row.paper_id in paper_id_set)

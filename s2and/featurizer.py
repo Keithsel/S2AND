@@ -1244,7 +1244,7 @@ def _single_pair_featurize(
     )
 
     # unifying feature type in features array
-    features = [float(val) if type(val) in [np.float32, np.float64, float] else int(val) for val in features]
+    features = [float(val) if isinstance(val, np.floating | float) else int(val) for val in features]
 
     return features, index
 

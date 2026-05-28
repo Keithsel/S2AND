@@ -25,15 +25,13 @@ for the Rust integration.
 
 - **`baselines.md` is the gate authority.** Any promotion decision must cite an artifact from there.
 - **Point-in-time profiling evidence** belongs in `profiling/YYYY-MM-DD.md`, not inline in design docs.
-- **Next steps + backlog** live in `docs/work_plan.md`; the cross-doc
-  consolidation lives in `docs/general_todo_plan.md`.
+- **Next steps + backlog** live in `docs/work_plan.md`.
 - **Artifacts** (benchmark JSONs, logs) live under `scratch/` (gitignored).
 
 ---
 
 ## Quick links
 
-- Consolidated TODO plan: [`docs/general_todo_plan.md`](../general_todo_plan.md)
 - Rust/Arrow execution backlog: [`docs/work_plan.md`](../work_plan.md)
 - Verification commands: [`runtime.md` -- Verification Commands section](runtime.md)
 - Gate commands + artifact conventions: [`baselines.md`](baselines.md)

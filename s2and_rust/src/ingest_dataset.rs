@@ -572,15 +572,6 @@ pub(crate) fn preprocess_stage_signatures(
     signature_inputs
         .par_iter()
         .map(|entry| {
-            let middle_normalized =
-                normalize_text_compat_from_map(&entry.raw_middle, false, unidecode_char_map);
-            let first_normalized =
-                normalize_text_compat_from_map(&entry.raw_first, false, unidecode_char_map);
-            let first_normalized_token = first_normalized_token_python_compat(
-                &first_normalized,
-                &middle_normalized,
-                name_prefixes,
-            );
             let (first_without_apostrophe, middle_without_apostrophe) =
                 split_first_middle_hyphen_aware_compat(
                     &entry.raw_first,
@@ -657,7 +648,6 @@ pub(crate) fn preprocess_stage_signatures(
             let name_counts = build_name_counts_data_from_artifact(
                 raw_name_counts,
                 &entry.raw_first,
-                &first_normalized_token,
                 &first_without_apostrophe,
                 &entry.raw_last,
                 &last_normalized,
@@ -933,7 +923,6 @@ pub(crate) fn canonical_last_for_counts(raw_last: &str, normalized_last: &str) -
 pub(crate) fn build_name_counts_data_from_artifact(
     raw_name_counts: &RawNameCountMaps,
     raw_first: &str,
-    _first_normalized_token: &str,
     first_without_apostrophe: &str,
     raw_last: &str,
     last_normalized: &str,
@@ -955,9 +944,6 @@ pub(crate) fn build_name_counts_data_from_artifact(
     }
 
     let last_for_counts = canonical_last_for_counts(raw_last, last_normalized);
-    let first_last_key = format!("{} {}", first_for_counts, last_for_counts)
-        .trim()
-        .to_string();
     let first_initial = first_for_counts
         .chars()
         .next()
@@ -976,7 +962,8 @@ pub(crate) fn build_name_counts_data_from_artifact(
         f64::NAN
     };
     let first_last = if py_len(&first_for_counts) > 1 {
-        match raw_name_counts.get(RawNameCountKind::FirstLast, &first_last_key) {
+        let first_last_key = format!("{} {}", first_for_counts, last_for_counts);
+        match raw_name_counts.get(RawNameCountKind::FirstLast, first_last_key.trim()) {
             Some(value) => value,
             None => 1.0,
         }

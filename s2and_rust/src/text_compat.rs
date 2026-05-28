@@ -122,21 +122,6 @@ fn normalize_text_compat_with_map(
     normalized
 }
 
-pub(crate) fn first_normalized_token_python_compat(
-    first_normalized: &str,
-    middle_normalized: &str,
-    name_prefixes: &HashSet<String>,
-) -> String {
-    let joined = format!("{} {}", first_normalized, middle_normalized);
-    let mut parts: Vec<String> = joined.split(' ').map(|token| token.to_string()).collect();
-    if let Some(prefix) = parts.first() {
-        if name_prefixes.contains(prefix) {
-            parts.remove(0);
-        }
-    }
-    parts.get(0).cloned().unwrap_or_default()
-}
-
 fn is_name_dash(ch: char) -> bool {
     matches!(
         ch,

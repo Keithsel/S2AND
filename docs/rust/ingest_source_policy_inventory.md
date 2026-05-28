@@ -1,6 +1,6 @@
 # Rust Ingest Source Policy Inventory
 
-Status date: 2026-05-28
+Status date: 2026-05-27
 
 This inventory documents the maintained Rust ingest sources after removing the
 legacy JSON constructor. The goal is to keep Arrow and `ANDData` ownership
@@ -13,12 +13,13 @@ separate unless a policy has an explicit parity contract.
 | Arrow IPC | `RustFeaturizer.from_arrow_paths(...)` | Production raw Arrow constructor for selected rows. |
 | `ANDData` | `RustFeaturizer.from_dataset(...)` | Python-reference, training/eval, parity, and compatibility constructor. |
 
-Shared Arrow staging exists today in `StageSignatureInput`,
-`StagePaperInput`, `preprocess_stage_papers(...)`, and
-`preprocess_stage_signatures(...)` in `s2and_rust/src/lib.rs`. Production
-Arrow rows are runtime preprocessing inputs. `ANDData` intentionally reads
-mostly precomputed Python fields unless a field is missing and must be
-recomputed for compatibility.
+Shared Arrow staging is split across two files: the `StageSignatureInput` and
+`StagePaperInput` structs live in `s2and_rust/src/lib.rs`, while the
+`preprocess_stage_papers(...)` and `preprocess_stage_signatures(...)`
+functions live in `s2and_rust/src/ingest_dataset.rs`. Production Arrow rows
+are runtime preprocessing inputs. `ANDData` intentionally reads mostly
+precomputed Python fields unless a field is missing and must be recomputed
+for compatibility.
 
 ## Policy Matrix
 
@@ -65,7 +66,7 @@ Before any code deduplication, keep these focused tests in scope:
 
 ## Last Revalidation
 
-Status 2026-05-28: this policy inventory was rechecked against the current
+Status 2026-05-27: this policy inventory was rechecked against the current
 Arrow validation, Rust ingest, and `ANDData` compatibility code paths. The
 current lightweight regression command is:
 

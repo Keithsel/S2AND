@@ -157,10 +157,10 @@ class LinkOrAbstainProductionResult(LinkOrAbstainRetrievedCandidatesResult):
 
 
 def _ordered_group_indices(query_indices: np.ndarray) -> tuple[np.ndarray, ...]:
-    groups: list[np.ndarray] = []
-    for query_index in tuple(dict.fromkeys(int(value) for value in query_indices)):
-        groups.append(np.flatnonzero(query_indices == np.uint32(query_index)))
-    return tuple(groups)
+    groups_by_query: dict[Any, list[int]] = {}
+    for row_index, query_index in enumerate(query_indices.tolist()):
+        groups_by_query.setdefault(query_index, []).append(row_index)
+    return tuple(np.asarray(indices, dtype=np.int64) for indices in groups_by_query.values())
 
 
 def _best_row_for_group(

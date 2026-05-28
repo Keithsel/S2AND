@@ -38,7 +38,7 @@ Boundary rules:
 
 No dedicated memory-estimate backlog is active right now. These predictors are
 treated as best-effort; the active TODO plan is in
-[general_todo_plan.md](general_todo_plan.md).
+[work_plan.md](work_plan.md).
 
 Regression coverage:
 - `tests/test_memory_budget.py`

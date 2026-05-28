@@ -1201,13 +1201,15 @@ def _current_name_counts_generation_name(index_dir: Path) -> str | None:
     if manifest_paths is None:
         return None
     generation_names: set[str] = set()
-    generations_dir = (index_dir / "generations").resolve()
+    generations_dir = index_dir / "generations"
     for path in manifest_paths.values():
-        resolved = path.resolve()
         try:
-            relative = resolved.relative_to(generations_dir)
+            relative = path.relative_to(generations_dir)
         except ValueError:
-            return None
+            try:
+                relative = path.resolve().relative_to(generations_dir.resolve())
+            except ValueError:
+                return None
         if len(relative.parts) < 2:
             return None
         generation_names.add(relative.parts[0])

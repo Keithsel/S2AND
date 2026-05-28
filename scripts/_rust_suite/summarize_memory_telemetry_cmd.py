@@ -8,9 +8,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from _rust_suite.calibrate_cmd import _open_text_log  # type: ignore
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1]
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from s2and.memory_calibration import iter_memory_telemetry_records, percentile
+from _rust_suite.calibrate_cmd import _open_text_log  # type: ignore  # noqa: E402
+
+from s2and.memory_calibration import iter_memory_telemetry_records, percentile  # noqa: E402
 
 
 @dataclass(frozen=True)

@@ -23,7 +23,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-import psutil
+try:
+    import psutil
+except ModuleNotFoundError:
+    psutil = None  # type: ignore[assignment]
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -33,8 +36,14 @@ from _rust_suite.common import PROJECT_ROOT  # type: ignore  # noqa: E402
 
 
 def _rss_gb() -> float:
-    proc = psutil.Process()
-    return proc.memory_info().rss / (1024**3)
+    if psutil is not None:
+        proc = psutil.Process()
+        return proc.memory_info().rss / (1024**3)
+    from s2and.memory_budget import current_rss_bytes_best_effort, detect_total_ram_bytes_best_effort
+
+    total_ram_bytes, _source = detect_total_ram_bytes_best_effort()
+    rss_bytes, _rss_source = current_rss_bytes_best_effort(total_ram_bytes or 1 << 40)
+    return rss_bytes / (1024**3)
 
 
 def _import_rust_module():

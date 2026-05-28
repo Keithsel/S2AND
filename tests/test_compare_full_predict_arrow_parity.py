@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+import sys
+
 import numpy as np
 import pytest
 
 pa = pytest.importorskip("pyarrow")
 
+from scripts.verification import compare_full_predict_arrow_parity as parity_module  # noqa: E402
 from scripts.verification.compare_full_predict_arrow_parity import (  # noqa: E402
     _assert_exact,
     _build_arg_parser,
@@ -84,6 +88,35 @@ def test_parity_parser_compares_features_by_default(tmp_path) -> None:
     )
 
     assert args.compare_features is False
+
+
+def test_parity_main_writes_output_json_before_asserting_mismatch(tmp_path, monkeypatch) -> None:
+    report = {
+        "distance_comparison": {"block-a": {"allclose_equal_nan": False}},
+        "clusters_exact_match": True,
+    }
+    output_json = tmp_path / "report.json"
+    monkeypatch.setattr(parity_module, "run", lambda _args: report)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_full_predict_arrow_parity.py",
+            "--fixture-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--output-json",
+            str(output_json),
+            "--block-size",
+            "2",
+        ],
+    )
+
+    with pytest.raises(AssertionError, match="distance mismatch"):
+        parity_module.main()
+
+    assert json.loads(output_json.read_text(encoding="utf-8")) == report
 
 
 def test_parity_fixture_meta_paths_resolve_relative_to_fixture_dir(tmp_path) -> None:

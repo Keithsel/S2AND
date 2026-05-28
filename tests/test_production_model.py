@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -226,6 +227,28 @@ def test_pairwise_stage_finalizes_into_loadable_production_bundle(tmp_path: Path
             output_bundle,
             bundle_version="9.9",
             source_model_version="9.9",
+        )
+
+
+def test_finalize_production_bundle_rejects_invalid_incremental_linker_artifact(tmp_path: Path) -> None:
+    source_bundle = Path(_NATIVE_BUNDLE_PATH)
+    corrupt_linker = tmp_path / "corrupt_incremental_linker"
+    shutil.copytree(source_bundle / "incremental_linker", corrupt_linker)
+    metadata_path = corrupt_linker / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["booster_sha256"] = "0" * 64
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="booster_sha256 mismatch"):
+        finalize_production_bundle(
+            pairwise_bundle_dir=source_bundle,
+            output_bundle_dir=tmp_path / "production_model_v9.8",
+            incremental_linker_artifact_dir=corrupt_linker,
+            target_json=source_bundle / "reproducibility" / "incremental_linker_training_target.json",
+            bundle_version="9.8",
+            pairwise_model_version="9.8",
+            incremental_linker_version="9.8",
+            validate=True,
         )
 
 

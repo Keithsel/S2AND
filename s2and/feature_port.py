@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import threading
 import time
@@ -5,6 +6,8 @@ import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
+
+import numpy as np
 
 from s2and.arrow_inputs import validate_arrow_prediction_artifacts
 from s2and.consts import CLUSTER_SEEDS_LOOKUP
@@ -173,6 +176,13 @@ def _fingerprint_token_digest(tokens: list[tuple[str, int]]) -> int:
 
 
 def _collection_value_token(value: Any) -> int:
+    if isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        hasher = hashlib.blake2b(digest_size=8)
+        hasher.update(str(array.dtype).encode("utf-8"))
+        hasher.update(str(tuple(array.shape)).encode("utf-8"))
+        hasher.update(array.view(np.uint8).tobytes())
+        return int.from_bytes(hasher.digest(), "little", signed=False)
     try:
         return hash(value) & 0xFFFFFFFFFFFFFFFF
     except TypeError:
@@ -558,8 +568,7 @@ def _get_or_wait_for_cached(
             return entry.featurizer, None
         if entries:
             logger.info(
-                "Telemetry: rust_featurizer_cache cache=option_miss dataset=%s mode=%s op=%s run=%s "
-                "cached_keys=%s",
+                "Telemetry: rust_featurizer_cache cache=option_miss dataset=%s mode=%s op=%s run=%s " "cached_keys=%s",
                 build_context.dataset_name_for_logs,
                 build_context.dataset_mode,
                 build_context.operation,

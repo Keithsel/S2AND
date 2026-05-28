@@ -323,20 +323,20 @@ Done when:
 
 Current state:
 
-- Treat `Clusterer._predict_incremental_helper(...)` as internal-only test
-  plumbing for now. It is not an external compatibility API.
-- Focused tests no longer monkeypatch `_predict_incremental_helper(...)`;
-  return-contract coverage goes through `Clusterer.predict_incremental(...)`.
+- The old `Clusterer._predict_incremental_helper(...)` shim was renamed to the
+  explicitly internal Python fallback path.
+- Focused tests no longer monkeypatch or reference
+  `_predict_incremental_helper(...)`; return-contract coverage goes through
+  `Clusterer.predict_incremental(...)`.
 
 Remaining:
 
-- Before any rename/removal, do a final scoped search for helper monkeypatches
-  and keep new tests on public routing surfaces or explicit test hooks.
+- None for this shim.
 
 Done when:
 
-- No tests monkeypatch `_predict_incremental_helper(...)`, and focused
-  incremental tests pass.
+- No tests monkeypatch or reference `_predict_incremental_helper(...)`, and
+  focused incremental tests pass.
 
 ### 8. Performance Targets
 

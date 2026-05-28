@@ -242,6 +242,24 @@ def test_rust_retrieval_batch_rejects_unknown_per_query_view_before_retrieval() 
         )
 
 
+def test_retrieval_batch_rejects_duplicate_query_signature_indices_for_per_query_views() -> None:
+    class RetrieverShouldNotRun:
+        def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):
+            del args, kwargs
+            raise AssertionError("duplicate query_signature_indices should be rejected before retrieval")
+
+    with pytest.raises(ValueError, match="query_signature_indices must be unique"):
+        build_linker_retrieval_batch_rust(
+            retriever=RetrieverShouldNotRun(),
+            queries=[object(), object()],
+            query_signature_indices=np.asarray([7, 7], dtype=np.uint32),
+            component_member_indices_by_key={},
+            top_k=1,
+            query_view=["full", "initial_only"],
+            n_jobs=1,
+        )
+
+
 def test_rust_retrieval_batch_rejects_stale_pair_plan_schema() -> None:
     class StaleRetriever:
         def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):

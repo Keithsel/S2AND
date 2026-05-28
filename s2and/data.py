@@ -575,13 +575,19 @@ class ANDData:
             len(self.signatures),
         )
 
-        # Determine the set of papers referenced by signatures
+        # Determine the set of papers referenced by signatures.
         needed_paper_ids: set[str] = set(str(sig.paper_id) for sig in self.signatures.values())
 
         papers_stage_start = time.perf_counter()
         logger.info("loading papers (subset referenced by signatures)")
         raw_papers = self.maybe_load_json(papers)
-        filtered_papers = {pid: p for pid, p in raw_papers.items() if str(pid) in needed_paper_ids}
+        retained_paper_ids = set(needed_paper_ids)
+        if compute_reference_features:
+            for pid, paper in raw_papers.items():
+                if str(pid) not in needed_paper_ids:
+                    continue
+                retained_paper_ids.update(str(reference_id) for reference_id in paper.get("references", []))
+        filtered_papers = {pid: p for pid, p in raw_papers.items() if str(pid) in retained_paper_ids}
         self.papers = {}
         # convert dictionary to namedtuples for memory reduction
         for paper_id, paper in filtered_papers.items():
@@ -1798,22 +1804,38 @@ class ANDData:
             and isinstance(val_signatures, dict)
             and isinstance(test_signatures, dict)
         )
+        use_block_sampling = self.pair_sampling_block
+        train_signature_ids = (
+            [] if use_block_sampling else [sig for signatures in train_signatures.values() for sig in signatures]
+        )
+        val_signature_ids = (
+            [] if use_block_sampling else [sig for signatures in val_signatures.values() for sig in signatures]
+        )
+        test_signature_ids = (
+            [] if use_block_sampling else [sig for signatures in test_signatures.values() for sig in signatures]
+        )
+
         train_pairs = self.pair_sampling(
             self.train_pairs_size,
-            [],
+            train_signature_ids,
             train_signatures,
         )
         val_pairs = (
             self.pair_sampling(
                 self.val_pairs_size,
-                [],
+                val_signature_ids,
                 val_signatures,
             )
             if len(val_signatures) > 0
             else []
         )
 
-        test_pairs = self.pair_sampling(self.test_pairs_size, [], test_signatures, self.all_test_pairs_flag)
+        test_pairs = self.pair_sampling(
+            self.test_pairs_size,
+            test_signature_ids,
+            test_signatures,
+            self.all_test_pairs_flag,
+        )
 
         return train_pairs, val_pairs, test_pairs
 

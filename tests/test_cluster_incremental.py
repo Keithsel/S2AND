@@ -405,6 +405,11 @@ def test_predict_incremental_return_contract(clusterer_dataset_factory):
     assert clusters_only == payload["clusters"]
 
 
+def test_predict_incremental_old_helper_name_is_not_exposed():
+    legacy_helper_name = "_predict_incremental_" "helper"
+    assert not hasattr(Clusterer, legacy_helper_name)
+
+
 def test_promoted_incremental_orcid_fanout_by_query_counts_matching_components() -> None:
     dataset = SimpleNamespace(
         signatures={
@@ -1448,7 +1453,7 @@ def test_next_unused_cluster_id_prevents_overwrite():
     start = model_module._next_unused_cluster_id(pred_clusters, 2)
     assert start == 3
 
-    # Simulate the singleton recluster append loop in _predict_incremental_helper.
+    # Simulate the singleton recluster append loop in Python incremental prediction.
     for signatures in (["new_a"], ["new_b"]):
         cluster_id = model_module._next_unused_cluster_id(pred_clusters, start)
         pred_clusters[str(cluster_id)] = signatures

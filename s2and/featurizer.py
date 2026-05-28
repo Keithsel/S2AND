@@ -99,7 +99,8 @@ def _ensure_python_pair_signature_ngrams(
 
     has_missing_ngrams, inspected_signature_count = _has_missing_signature_ngrams_for_pairs(dataset, signature_pairs)
     if not has_missing_ngrams:
-        dataset._s2and_python_pair_ngrams_ready = True
+        if inspected_signature_count == len(getattr(dataset, "signatures", {})):
+            dataset._s2and_python_pair_ngrams_ready = True
         return
 
     materialize_start = time.perf_counter()
@@ -1759,7 +1760,7 @@ def many_pairs_featurize(
     coauthor_similarity_index: int | None = None
     coauthor_similarity_values: np.ndarray | None = None
     if delete_training_data:
-        coauthor_similarity_index = featurizer_info.get_feature_names().index("coauthor_similarity")
+        coauthor_similarity_index = featurizer_info.feature_group_to_index["coauthor_similarity"][1]
         coauthor_similarity_values = np.full(len(signature_pairs), -float(LARGE_INTEGER), dtype=np.float64)
 
     indices_needed_for_compute: list[int] = sorted(

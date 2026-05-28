@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import pytest
 
 import s2and.feature_port as feature_port
@@ -53,9 +54,7 @@ class DummyRustFeaturizer:
 
     def update_cluster_seeds(self, _require_map, _disallow_set):
         self.cluster_seeds_require_state = {str(key): str(value) for key, value in dict(_require_map).items()}
-        self.cluster_seeds_disallow_state = {
-            (str(left), str(right)) for left, right in set(_disallow_set)
-        }
+        self.cluster_seeds_disallow_state = {(str(left), str(right)) for left, right in set(_disallow_set)}
 
     def cluster_seeds_require(self):
         return list(getattr(self, "cluster_seeds_require_state", {}).items())
@@ -259,6 +258,31 @@ def test_rust_featurizer_cache_tracks_material_mutation_beyond_prefix_sample():
     assert second is not first
     assert DummyRustFeaturizer.created == [dataset.name, dataset.name]
     assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset)]
+
+
+def test_rust_featurizer_cache_tracks_in_place_numpy_embedding_mutation(monkeypatch):
+    class EmbeddingRustFeaturizer(DummyRustFeaturizer):
+        snapshots: list[float] = []
+
+        @classmethod
+        def from_dataset(cls, dataset, _require_value, _disallow_value, _num_threads=None):
+            cls.snapshots.append(float(dataset.specter_embeddings["p"][0]))
+            return cls(dataset.name)
+
+    class EmbeddingRustModule:
+        __version__ = "0.51.0"
+        RustFeaturizer = EmbeddingRustFeaturizer
+
+    monkeypatch.setattr(feature_port, "s2and_rust", EmbeddingRustModule)
+    dataset = DummyDataset("embedding_mutation_cache_dataset", mode="train")
+    dataset.specter_embeddings = {"p": np.asarray([0.0], dtype=np.float32)}
+
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset.specter_embeddings["p"][0] = 1.0
+    second = feature_port._get_rust_featurizer(dataset)
+
+    assert second is not first
+    assert EmbeddingRustFeaturizer.snapshots == [0.0, 1.0]
 
 
 def test_update_rust_cluster_seeds_reuses_cached_featurizer_without_default_version_bump():

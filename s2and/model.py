@@ -5657,7 +5657,7 @@ class Clusterer:
                 arrow_paths=resolved_arrow_paths_for_incremental,
             )
             return dict(incremental_result["clusters"]) if return_clusters_only else incremental_result
-        incremental_result = self._predict_incremental_helper(
+        incremental_result = self._predict_incremental_python_fallback(
             block_signatures,
             dataset,
             prevent_new_incompatibilities=prevent_new_incompatibilities,
@@ -5667,7 +5667,7 @@ class Clusterer:
         )
         return dict(incremental_result["clusters"]) if return_clusters_only else incremental_result
 
-    def _predict_incremental_helper(
+    def _predict_incremental_python_fallback(
         self,
         block_signatures: list[str],
         dataset: ANDData,
@@ -5676,7 +5676,7 @@ class Clusterer:
         runtime_context: RuntimeContext | None = None,
         total_ram_bytes: int | None = None,
     ) -> dict[str, Any]:
-        """Internal incremental execution path used by `predict_incremental`.
+        """Internal Python incremental execution path used by `predict_incremental`.
 
         This is not an external compatibility API. For behavior/parameters,
         refer to `predict_incremental`.
@@ -5765,7 +5765,7 @@ class Clusterer:
             )
 
         logger.info(
-            "Telemetry: constraint_batch stage=_predict_incremental_helper total_pairs=%d "
+            "Telemetry: constraint_batch stage=predict_incremental_python_fallback total_pairs=%d "
             "partial_supervision_hits=%d "
             "unresolved_pairs=%d rust_batch_calls=%d api_mode=%s seconds=%.3f run_id=%s",
             constraint_telemetry.total_pairs,

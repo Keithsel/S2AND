@@ -91,7 +91,7 @@ uv run python scripts/verification/validate_local_arrow_release.py --release-roo
 uv run python scripts/convert_to_arrow.py validate --dataset-dir <dataset-dir>
 ```
 
-### P1: Retire Or Rename The Incremental Helper Only After A Final Search
+### Done: Retire Or Rename The Incremental Helper After A Final Search
 
 Goal: avoid preserving `_predict_incremental_helper(...)` as accidental API.
 
@@ -103,21 +103,18 @@ Doc evidence:
 
 Code check:
 
-- [model.py](../s2and/model.py) still defines `_predict_incremental_helper(...)`
-  and routes through it from `predict_incremental(...)`.
-- Current scoped search found only one test comment mentioning helper behavior,
-  not an active monkeypatch of `_predict_incremental_helper(...)`.
+- [model.py](../s2and/model.py) now routes the Python fallback through the
+  explicit internal `_predict_incremental_python_fallback(...)` method.
+- The final scoped search found no `_predict_incremental_helper(...)`
+  references or monkeypatches under `tests` or `s2and`.
 
-Concrete next actions:
-
-- Before changing it, rerun the scoped search:
+Completed check:
 
 ```powershell
 rg -n --hidden --glob '!**/.venv/**' --glob '!**/.git/**' --glob '!**/data/**' --glob '!**/data-backup/**' --glob '!dist/**' --glob '!scratch/**' "monkeypatch.*_predict_incremental_helper|_predict_incremental_helper" tests s2and
 ```
 
-- Keep new behavior tests on `Clusterer.predict_incremental(...)` or explicit
-  test hooks.
+- Behavior coverage stays on `Clusterer.predict_incremental(...)`.
 
 Verification gate:
 
@@ -184,8 +181,9 @@ Code check:
 - Rust staging and ingestion helpers now live in
   [ingest_dataset.rs](../s2and_rust/src/ingest_dataset.rs), with
   `RustFeaturizer` wiring in [rust_featurizer.rs](../s2and_rust/src/rust_featurizer.rs).
-- Rust and Python normalization parity tests exist in
-  [test_text_rust_normalization_parity.py](../tests/test_text_rust_normalization_parity.py).
+- Rust and Python normalization parity tests are covered by
+  [test_text.py](../tests/test_text.py) and
+  [test_rust_from_dataset_contract.py](../tests/test_rust_from_dataset_contract.py).
 
 Concrete next actions:
 
@@ -199,7 +197,7 @@ Concrete next actions:
 Verification gate:
 
 ```powershell
-uv run pytest -q tests/test_rust_from_dataset_contract.py tests/test_raw_block_candidate_plan_arrow.py tests/test_text_rust_normalization_parity.py
+uv run pytest -q tests/test_rust_from_dataset_contract.py tests/test_raw_block_candidate_plan_arrow.py tests/test_text.py
 ```
 
 ### P2: Run A Release-Grade Performance Pass Before Optimizing
@@ -275,7 +273,8 @@ Code check:
 - Transitional tests exist in
   [test_surname_hyphen_aware.py](../tests/test_surname_hyphen_aware.py),
   [test_subblocking_telemetry.py](../tests/test_subblocking_telemetry.py),
-  and [test_text_rust_normalization_parity.py](../tests/test_text_rust_normalization_parity.py).
+  [test_text.py](../tests/test_text.py), and
+  [test_rust_from_dataset_contract.py](../tests/test_rust_from_dataset_contract.py).
 
 Concrete next actions when unblocked:
 
@@ -291,7 +290,7 @@ Concrete next actions when unblocked:
 Verification gate:
 
 ```powershell
-uv run pytest -q tests/test_surname_hyphen_aware.py tests/test_subblocking_telemetry.py tests/test_text_rust_normalization_parity.py tests/test_cluster_incremental.py
+uv run pytest -q tests/test_surname_hyphen_aware.py tests/test_subblocking_telemetry.py tests/test_text.py tests/test_rust_from_dataset_contract.py tests/test_cluster_incremental.py
 ```
 
 ### Watchlist: Training Reference Features

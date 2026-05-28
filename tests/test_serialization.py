@@ -38,6 +38,29 @@ class LegacyLabelEncoderCarrier:
         )
 
 
+class SafeLabelEncoderCarrierWithoutWarning:
+    def __init__(self, classes: np.ndarray) -> None:
+        self._classes = classes
+        self._le = LabelEncoder()
+        self._le.classes_ = classes
+
+
+class LabelEncoderWarningOnly:
+    def __getstate__(self):
+        return {}
+
+    def __setstate__(self, state):
+        del state
+        warnings.warn(
+            InconsistentVersionWarning(
+                estimator_name="LabelEncoder",
+                current_sklearn_version=sklearn_version,
+                original_sklearn_version="0.23.2",
+            ),
+            stacklevel=2,
+        )
+
+
 class _DummyFeaturizerInfo:
     def __init__(self, featurizer_version: int):
         self.featurizer_version = int(featurizer_version)
@@ -77,6 +100,28 @@ def test_load_pickle_replays_warning_when_mapping_does_not_match(tmp_path):
     }
     pickle_path = tmp_path / "unsafe_model.pkl"
     _dump_pickle(pickle_path, unsafe_object)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        load_pickle_with_verified_label_encoder_compat(pickle_path)
+
+    inconsistent_warnings = [w for w in caught if isinstance(w.message, InconsistentVersionWarning)]
+    assert len(inconsistent_warnings) == 1
+    warning_message = inconsistent_warnings[0].message
+    assert isinstance(warning_message, InconsistentVersionWarning)
+    assert warning_message.estimator_name == "LabelEncoder"
+
+
+def test_load_pickle_replays_label_encoder_warning_when_safe_carrier_did_not_warn(tmp_path):
+    payload = {
+        "safe": [
+            SafeLabelEncoderCarrierWithoutWarning(classes=np.array([0.0, 1.0])),
+            SafeLabelEncoderCarrierWithoutWarning(classes=np.array([2.0, 3.0])),
+        ],
+        "warning_only": LabelEncoderWarningOnly(),
+    }
+    pickle_path = tmp_path / "mixed_warning_model.pkl"
+    _dump_pickle(pickle_path, payload)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

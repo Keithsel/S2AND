@@ -120,6 +120,17 @@ def test_subset_raw_candidate_plan_rejects_duplicate_query_ids() -> None:
         subset_raw_candidate_plan_for_query_ids(raw_plan, ["q0", "q0"])
 
 
+def test_raw_arrow_plan_bundle_rejects_duplicate_query_signature_ids() -> None:
+    raw_plan = _minimal_raw_candidate_plan(
+        query_signature_ids=["q0", "q0"],
+        query_views=["full", "full"],
+        query_authors=["Alice", "Alice"],
+    )
+
+    with pytest.raises(ValueError, match="query_signature_ids must be unique"):
+        RawArrowPlanBundle.from_mapping(raw_plan)
+
+
 def test_raw_candidate_plan_seed_setup_rejects_duplicate_seed_signature() -> None:
     raw_plan = {"component_members": {"c1": ["s1", "s2"], "c2": ["s1"]}}
 

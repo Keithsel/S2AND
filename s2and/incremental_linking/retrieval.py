@@ -315,6 +315,9 @@ def validate_raw_candidate_plan_schema(plan: Mapping[str, Any]) -> None:
     query_count = _raw_plan_sequence_length(plan, "query_signature_ids")
     if query_count == 0:
         raise ValueError("raw candidate plan query_signature_ids must be non-empty")
+    query_signature_ids = [str(value) for value in _required_raw_plan_value(plan, "query_signature_ids")]
+    if len(set(query_signature_ids)) != len(query_signature_ids):
+        raise ValueError("raw candidate plan query_signature_ids must be unique")
     for key in ("query_views", "query_authors"):
         length = _raw_plan_sequence_length(plan, key)
         if length != query_count:
@@ -510,6 +513,11 @@ def build_linker_retrieval_batch_rust(
     """Retrieve candidates in Rust and return the shared numeric candidate-batch contract."""
 
     normalized_query_views = normalize_query_views(query_view, len(queries))
+    query_signature_indices_array = as_uint32_1d("query_signature_indices", query_signature_indices)
+    if not isinstance(normalized_query_views, str):
+        query_index_values = [int(value) for value in query_signature_indices_array]
+        if len(set(query_index_values)) != len(query_index_values):
+            raise ValueError("query_signature_indices must be unique when per-query query_view values are provided")
     rust_retriever = _rust_retriever_object(retriever)
     method = getattr(rust_retriever, "top_k_hybrid_centroid_pair_plan", None)
     if method is None:
@@ -526,7 +534,7 @@ def build_linker_retrieval_batch_rust(
             )
         plan = method(
             list(queries),
-            as_uint32_1d("query_signature_indices", query_signature_indices),
+            query_signature_indices_array,
             _as_uint32_mapping(component_member_indices_by_key),
             int(top_k),
             None if n_jobs is None else int(n_jobs),
@@ -545,7 +553,7 @@ def build_linker_retrieval_batch_rust(
     else:
         plan = method(
             list(queries),
-            as_uint32_1d("query_signature_indices", query_signature_indices),
+            query_signature_indices_array,
             _as_uint32_mapping(component_member_indices_by_key),
             int(top_k),
             None if n_jobs is None else int(n_jobs),
@@ -573,7 +581,11 @@ def build_linker_retrieval_batch_rust(
             raise RuntimeError("Rust retrieval plan did not provide row_query_signature_indices")
         query_view_by_query_index = {
             int(query_index): str(current_query_view)
-            for query_index, current_query_view in zip(query_signature_indices, normalized_query_views, strict=True)
+            for query_index, current_query_view in zip(
+                query_signature_indices_array,
+                normalized_query_views,
+                strict=True,
+            )
         }
         query_views = np.asarray(
             [query_view_by_query_index[int(query_index)] for query_index in row_query_signature_indices],

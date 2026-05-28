@@ -196,5 +196,5 @@ uv run pytest -q
 
 **Runtime policy coverage:**
 ```
-uv run pytest -q tests/test_runtime.py tests/test_runtime_policy.py
+uv run pytest -q tests/test_runtime.py tests/test_rust_lifecycle.py
 ```

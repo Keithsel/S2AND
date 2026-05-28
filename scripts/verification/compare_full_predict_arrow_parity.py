@@ -554,10 +554,10 @@ def main() -> None:
     args = parser.parse_args()
 
     report = run(args)
-    if not args.allow_mismatch:
-        _assert_exact(report)
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if not args.allow_mismatch:
+        _assert_exact(report)
     print(json.dumps({k: v for k, v in report.items() if k not in {"incumbent_clusters", "arrow_clusters"}}, indent=2))
 
 

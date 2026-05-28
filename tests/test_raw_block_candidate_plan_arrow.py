@@ -1669,7 +1669,7 @@ def test_raw_arrow_candidate_plan_bridge_maps_signature_ids_to_linker_indices(tm
     assert "candidate_cluster_max_paper_author_count" in retrieval_batch.row_signals
 
 
-def test_raw_arrow_candidate_plan_bridge_accepts_bundle_from_rust_plan(tmp_path: Path) -> None:
+def test_raw_arrow_plan_bundle_derives_signature_order_from_rust_plan(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
 
     raw_plan = _raw_candidate_plan_arrow(
@@ -1681,15 +1681,11 @@ def test_raw_arrow_candidate_plan_bridge_accepts_bundle_from_rust_plan(tmp_path:
         num_threads=1,
     )
     bundle = RawArrowPlanBundle.from_mapping(raw_plan)
-    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(bundle)
 
-    candidate_batch = retrieval_batch.candidate_batch
     assert bundle.row_count == raw_plan["row_count"]
     assert bundle.pair_count == raw_plan["pair_count"]
     assert bundle.signature_order.signature_ids == ("q1", "s1", "s2")
-    assert cast(Any, candidate_batch.row_query_signature_indices).tolist() == [0, 0]
-    assert candidate_batch.left_signature_indices.tolist() == [0, 0]
-    assert candidate_batch.right_signature_indices.tolist() == [1, 2]
+    assert bundle.signature_order.query_signature_ids == ("q1",)
 
 
 def test_raw_arrow_labeled_candidate_plan_scores_frozen_rows_without_cluster_seeds(tmp_path: Path) -> None:

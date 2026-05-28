@@ -2114,7 +2114,7 @@ def _predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
     )
 
     retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(
-        raw_plan_bundle,
+        raw_plan_bundle.plan,
         signature_id_to_index=featurizer_signature_id_to_index,
     )
     stage_start = time.perf_counter()

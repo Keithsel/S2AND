@@ -43,7 +43,6 @@ from s2and.incremental_linking.feature_block_arrow import feature_block_from_arr
 from s2and.incremental_linking.features import LinkerFeatureMatrix
 from s2and.incremental_linking.retrieval import (
     RAW_CANDIDATE_PLAN_SCHEMA_VERSION,
-    RawArrowPlanBundle,
     build_linker_retrieval_batch_from_raw_candidate_plan,
 )
 from s2and.incremental_linking.runtime import (
@@ -51,7 +50,7 @@ from s2and.incremental_linking.runtime import (
     LinkOrAbstainCompactResult,
     LinkOrAbstainProductionResult,
     LinkOrAbstainRetrievedCandidatesResult,
-    predict_incremental_link_or_abstain_from_preplanned_raw_arrow,
+    _predict_incremental_link_or_abstain_from_preplanned_raw_arrow,
     predict_incremental_link_or_abstain_from_raw_arrow_paths,
 )
 from s2and.model import Clusterer
@@ -1509,18 +1508,6 @@ def test_raw_candidate_plan_bridge_accepts_feature_block_signature_order() -> No
     np.testing.assert_allclose(retrieval_batch.row_signals["retrieval_score"], [0.9, 0.2])
 
 
-def test_raw_candidate_plan_bridge_accepts_raw_arrow_plan_bundle() -> None:
-    bundle = RawArrowPlanBundle.from_mapping(_raw_plan())
-
-    retrieval_batch = build_linker_retrieval_batch_from_raw_candidate_plan(bundle)
-
-    candidate_batch = retrieval_batch.candidate_batch
-    assert bundle.signature_order.signature_ids == ("q", "s1", "s2", "s3")
-    assert cast(Any, candidate_batch.row_query_signature_indices).tolist() == [0, 0]
-    assert candidate_batch.left_signature_indices.tolist() == [0, 0, 0]
-    assert candidate_batch.right_signature_indices.tolist() == [1, 2, 3]
-
-
 def test_raw_candidate_plan_bridge_reports_missing_signature_id() -> None:
     with pytest.raises(KeyError, match="right_signature_ids contains signature_id not present"):
         build_linker_retrieval_batch_from_raw_candidate_plan(
@@ -1813,13 +1800,14 @@ def test_raw_arrow_partial_supervision_require_unknown_seed_rejected() -> None:
     raw_plan["component_members"] = {}
 
     with pytest.raises(ValueError, match="partial_supervision_require_unknown_seed_signature"):
-        predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+        _predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
             _raw_test_clusterer(),
             _raw_test_artifact(),
             arrow_paths={},
             query_signature_ids=["q"],
             raw_candidate_plan=raw_plan,
             rust_featurizer=FakeFeaturizer(),
+            allow_featurizer_build=False,
             partial_supervision={("q", "s1"): 0},
         )
 
@@ -1836,13 +1824,14 @@ def test_raw_arrow_scoring_requires_featurizer_with_provided_raw_plan(
     )
 
     with pytest.raises(ValueError, match="preplanned raw Arrow scoring requires rust_featurizer"):
-        predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+        _predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
             _raw_test_clusterer(),
             _raw_test_artifact(),
             arrow_paths={},
             query_signature_ids=["q"],
             raw_candidate_plan=_raw_plan(),
             rust_featurizer=None,
+            allow_featurizer_build=False,
         )
 
 
@@ -1892,7 +1881,7 @@ def test_raw_arrow_scoring_requires_planner_build_telemetry(monkeypatch: pytest.
         )
 
 
-def test_preplanned_raw_arrow_scoring_surface_uses_provided_plan(
+def test_preplanned_raw_arrow_scoring_uses_provided_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -1939,13 +1928,14 @@ def test_preplanned_raw_arrow_scoring_surface_uses_provided_plan(
         lambda *args, **kwargs: fake_from_retrieval(**kwargs),
     )
 
-    result = predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+    result = _predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
         _raw_test_clusterer(),
         _raw_test_artifact(),
         arrow_paths={},
         query_signature_ids=["q"],
         raw_candidate_plan=_raw_plan(),
         rust_featurizer=FakeFeaturizer(),
+        allow_featurizer_build=False,
         top_k=2,
         n_jobs=1,
     )
@@ -2089,13 +2079,14 @@ def test_preplanned_raw_arrow_scoring_uses_provided_rust_featurizer(
         lambda *args, **kwargs: fake_from_retrieval(**kwargs),
     )
 
-    result = predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+    result = _predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
         _raw_test_clusterer(),
         _raw_test_artifact(),
         arrow_paths={},
         query_signature_ids=["q"],
         raw_candidate_plan=_raw_plan(),
         rust_featurizer=fake_featurizer,
+        allow_featurizer_build=False,
         top_k=2,
         n_jobs=1,
     )
@@ -2115,13 +2106,14 @@ def test_preplanned_raw_arrow_scoring_rejects_mismatched_raw_plan_query_ids() ->
             return ["q", "s1", "s2", "s3"]
 
     with pytest.raises(ValueError, match="must exactly match requested query_signature_ids"):
-        predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+        _predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
             _raw_test_clusterer(),
             _raw_test_artifact(),
             arrow_paths={},
             query_signature_ids=["s1"],
             raw_candidate_plan=_raw_plan(),
             rust_featurizer=FakeFeaturizer(),
+            allow_featurizer_build=False,
             top_k=2,
             n_jobs=1,
         )

@@ -786,7 +786,10 @@ def compute_promoted_phase_a_limits(
         current_rss_fn=current_rss_fn,
     )
     stage_budget_bytes = compute_stage_budget_bytes(snapshot.available_bytes, stage_budget_fraction)
-    max_batch = parsed_query_count if max_query_batch_size is None else int(max_query_batch_size)
+    if max_query_batch_size is None:
+        max_batch = 1 if parsed_query_count == 0 else parsed_query_count
+    else:
+        max_batch = int(max_query_batch_size)
     if max_batch <= 0:
         raise ValueError(f"max_query_batch_size must be positive, got {max_query_batch_size}")
     max_batch = max(1, min(parsed_query_count if parsed_query_count > 0 else 1, max_batch))

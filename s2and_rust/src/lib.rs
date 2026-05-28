@@ -485,6 +485,18 @@ fn validate_retrieval_rank_top_k(top_k: usize) -> PyResult<()> {
     Ok(())
 }
 
+fn retrieval_rank_from_zero_based_offset(rank_offset: usize, context: &str) -> Result<u16, String> {
+    let one_based_rank = rank_offset
+        .checked_add(1)
+        .ok_or_else(|| format!("{context} retrieval rank overflowed usize"))?;
+    u16::try_from(one_based_rank).map_err(|_| {
+        format!(
+            "{context} produced retrieval rank {one_based_rank}, but retrieval_ranks are stored as uint16 and support ranks in [1, {}]",
+            u16::MAX
+        )
+    })
+}
+
 struct LinkerPairDistanceAccumulator {
     counts: Vec<u32>,
     sums: Vec<f64>,
@@ -870,7 +882,10 @@ impl RustHybridCentroidRetriever {
             result.row_retrieval_scores.push(*score);
             result
                 .row_retrieval_ranks
-                .push((rank_offset + 1).min(u16::MAX as usize) as u16);
+                .push(retrieval_rank_from_zero_based_offset(
+                    rank_offset,
+                    "Rust retrieval",
+                )?);
             result
                 .row_component_sizes
                 .push(summary.size.min(u32::MAX as usize) as u32);
@@ -13433,7 +13448,11 @@ fn raw_arrow_labeled_candidate_plan<'py>(
             scored_rows.into_iter().enumerate()
         {
             row_retrieval_scores[row_index] = score;
-            row_retrieval_ranks[row_index] = (rank_offset + 1).min(u16::MAX as usize) as u16;
+            row_retrieval_ranks[row_index] = retrieval_rank_from_zero_based_offset(
+                rank_offset,
+                "raw_arrow_labeled_candidate_plan",
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         }
     }
 
@@ -14065,6 +14084,16 @@ mod tests {
     fn validate_retrieval_top_k_rejects_uint16_rank_overflow() {
         let error = validate_retrieval_rank_top_k((u16::MAX as usize) + 1).unwrap_err();
         assert!(py_err_message(error).contains("retrieval_ranks are stored as uint16"));
+    }
+
+    #[test]
+    fn retrieval_rank_from_zero_based_offset_rejects_uint16_overflow() {
+        assert_eq!(
+            retrieval_rank_from_zero_based_offset(0, "test").expect("first rank fits"),
+            1
+        );
+        let error = retrieval_rank_from_zero_based_offset(u16::MAX as usize, "test").unwrap_err();
+        assert!(error.contains("retrieval_ranks are stored as uint16"));
     }
 
     #[test]

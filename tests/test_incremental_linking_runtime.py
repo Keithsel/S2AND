@@ -1720,7 +1720,7 @@ def test_naturalize_incremental_clusters_maps_split_ids() -> None:
     ) == {"s1": "7", "s2": "9"}
 
 
-def test_private_production_slice_links_abstains_and_naturalizes(
+def test_private_production_slice_preserves_split_ids_for_incremental_finish(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dataset = SimpleNamespace()
@@ -1761,7 +1761,7 @@ def test_private_production_slice_links_abstains_and_naturalizes(
         query_signature_ids=["q1", "q2"],
     )
 
-    assert result.linked_signature_clusters == {"q1": "7"}
+    assert result.linked_signature_clusters == {"q1": "7_0"}
     assert [decision.action for decision in result.compact_result.decisions] == ["link", "abstain"]
     assert result.telemetry["no_candidate_query_count"] == 1
     assert result.telemetry["link_count"] == 1

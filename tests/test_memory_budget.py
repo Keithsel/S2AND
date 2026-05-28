@@ -211,6 +211,25 @@ def test_compute_promoted_phase_a_limits_uses_top_k_largest_components():
     assert bool(limits.single_query_exceeds_budget) is False
 
 
+def test_compute_promoted_phase_a_limits_allows_zero_queries_with_default_batch_limit():
+    limits = memory_budget.compute_promoted_phase_a_limits(
+        query_count=0,
+        component_sizes=[100, 50],
+        retrieval_top_k=2,
+        total_ram_bytes=1_000_000_000,
+        stage_budget_fraction=0.50,
+        fixed_overhead_bytes=1024,
+        detect_cgroup_fn=lambda: (None, "unavailable"),
+        detect_total_fn=lambda: (None, "unavailable"),
+        current_rss_fn=lambda _total: (100_000_000, "rss:test"),
+    )
+
+    assert int(limits.query_batch_size) == 0
+    assert int(limits.max_query_batch_size) == 1
+    assert int(limits.predicted_candidate_rows_per_batch) == 0
+    assert int(limits.predicted_pairs_per_batch) == 0
+
+
 def test_compute_promoted_phase_a_limits_shrinks_query_batch_under_tight_budget():
     limits = memory_budget.compute_promoted_phase_a_limits(
         query_count=100,

@@ -1311,7 +1311,8 @@ def _predict_incremental_link_or_abstain_production_private(
     `s2and.model` imports. This helper wires the pieces that are already runtime
     surfaces: seed setup, Rust retrieval into `LinkerCandidateBatch`, existing
     constraint-label resolution, fused pairwise scoring/aggregation, gate
-    application, no-candidate abstains, and altered-cluster naturalization.
+    application, no-candidate abstains, and split-cluster link preservation
+    for the incremental finish step.
     """
 
     if len(queries) != len(query_signature_ids):
@@ -1344,11 +1345,10 @@ def _predict_incremental_link_or_abstain_production_private(
         )
     else:
         resolved_seed_setup = seed_setup
-    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse, _split_cluster_seeds_require_inverse = (
+    cluster_seeds_require, _recluster_map, _cluster_seeds_require_inverse, _split_cluster_seeds_require_inverse = (
         _unpack_seed_setup(resolved_seed_setup)
     )
     cluster_seeds_require = dict(cluster_seeds_require)
-    recluster_map = dict(recluster_map)
 
     signature_id_to_index = signature_id_to_index_map(featurizer)
     query_signature_id_strings = tuple(str(signature_id) for signature_id in query_signature_ids)
@@ -1437,11 +1437,10 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
         )
     else:
         resolved_seed_setup = seed_setup
-    cluster_seeds_require, recluster_map, _cluster_seeds_require_inverse, _split_cluster_seeds_require_inverse = (
+    cluster_seeds_require, _recluster_map, _cluster_seeds_require_inverse, _split_cluster_seeds_require_inverse = (
         _unpack_seed_setup(resolved_seed_setup)
     )
     cluster_seeds_require = dict(cluster_seeds_require)
-    recluster_map = dict(recluster_map)
 
     signature_id_to_index = signature_id_to_index_map(featurizer)
     signature_ids_by_index = tuple(str(signature_id) for signature_id in featurizer.signature_ids())
@@ -1570,7 +1569,6 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
         and decision.component_key is not None
         and decision.query_signature_index in query_signature_id_by_index
     }
-    linked_signature_clusters = naturalize_incremental_clusters(raw_linked_clusters, recluster_map)
     component_keys = candidate_batch.row_component_keys or ()
     retrieved_component_keys = {str(value) for value in component_keys}
     telemetry: dict[str, int | float | str] = {
@@ -1590,7 +1588,7 @@ def _predict_incremental_link_or_abstain_production_from_retrieval_private(
         telemetry=telemetry,
         retrieval_batch=retrieval_batch,
         pairwise_model_result=pairwise_model_result,
-        linked_signature_clusters=linked_signature_clusters,
+        linked_signature_clusters=raw_linked_clusters,
     )
 
 

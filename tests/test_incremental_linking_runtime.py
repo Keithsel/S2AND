@@ -202,6 +202,7 @@ def _minimal_raw_candidate_plan(**overrides: Any) -> dict[str, Any]:
         "pair_row_indices": np.asarray([0], dtype=np.uint32),
         "left_signature_ids": ["q0"],
         "right_signature_ids": ["s1"],
+        "component_members": {"c1": ["s1"]},
     }
     for raw_key, _signal_key, dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS:
         raw_plan[raw_key] = np.asarray([""] if dtype is object else [0], dtype=dtype)
@@ -262,6 +263,7 @@ def test_raw_candidate_plan_rejects_invalid_retrieval_rank(retrieval_rank: int) 
         "pair_row_indices": np.asarray([0], dtype=np.uint32),
         "left_signature_ids": ["q0"],
         "right_signature_ids": ["s1"],
+        "component_members": {"c1": ["s1"]},
     }
     for raw_key, _signal_key, dtype in RAW_CANDIDATE_PLAN_ROW_SIGNAL_FIELDS:
         raw_plan[raw_key] = np.asarray([""] if dtype is object else [0], dtype=dtype)

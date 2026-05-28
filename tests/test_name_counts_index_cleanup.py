@@ -36,7 +36,7 @@ def test_write_name_counts_index_does_not_delete_previous_published_generation(t
     assert all((path / ".published").exists() for path in generations)
 
 
-def test_write_name_counts_index_does_not_publish_manifest_when_marker_write_fails(tmp_path, monkeypatch) -> None:
+def test_write_name_counts_index_commits_manifest_before_marker_write_fails(tmp_path, monkeypatch) -> None:
     import s2and.data as data_module
 
     monkeypatch.setattr(
@@ -60,9 +60,15 @@ def test_write_name_counts_index_does_not_publish_manifest_when_marker_write_fai
     else:  # pragma: no cover - assertion guard
         raise AssertionError("write_name_counts_index should fail when .published cannot be written")
 
-    assert not (tmp_path / "manifest.json").exists()
-    generation_root = tmp_path / "generations"
-    assert not generation_root.exists() or not any(path.is_dir() for path in generation_root.iterdir())
+    index_dir = tmp_path / "name_counts_index"
+    manifest_path = index_dir / "manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    generation_root = index_dir / "generations"
+    generations = [path for path in generation_root.iterdir() if path.is_dir()]
+    assert len(generations) == 1
+    assert generations[0].name in str(manifest["files"]["first"]["path"])
+    assert not (generations[0] / ".published").exists()
 
 
 def test_cleanup_stale_name_counts_generations_keeps_manifest_generation(tmp_path: Path) -> None:

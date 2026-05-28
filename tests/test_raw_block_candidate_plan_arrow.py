@@ -127,6 +127,26 @@ def test_raw_candidate_plan_seed_setup_rejects_duplicate_seed_signature() -> Non
         _raw_candidate_plan_seed_setup(raw_plan)
 
 
+def test_raw_candidate_plan_seed_setup_requires_component_members() -> None:
+    with pytest.raises(ValueError, match="must include component_members"):
+        _raw_candidate_plan_seed_setup({"row_component_keys": ["c1"]})
+
+
+def test_raw_candidate_plan_schema_requires_component_members() -> None:
+    raw_plan = _minimal_raw_candidate_plan()
+    raw_plan.pop("component_members")
+
+    with pytest.raises(KeyError, match="component_members"):
+        build_linker_retrieval_batch_from_raw_candidate_plan(raw_plan)
+
+
+def test_raw_candidate_plan_schema_rejects_non_mapping_component_members() -> None:
+    raw_plan = _minimal_raw_candidate_plan(component_members=[])
+
+    with pytest.raises(ValueError, match="component_members must be a mapping"):
+        build_linker_retrieval_batch_from_raw_candidate_plan(raw_plan)
+
+
 def _fnv64_bytes(value: bytes) -> int:
     digest = _FNV64_OFFSET
     for byte in value:
@@ -246,7 +266,12 @@ def _name_count_record_path(index_root: str | Path, kind: str) -> Path:
     return record_path
 
 
-def _base_arrow_paths(tmp_path: Path, *, with_indexes: bool = True) -> dict[str, str]:
+def _base_arrow_paths(
+    tmp_path: Path,
+    *,
+    with_indexes: bool = True,
+    years: list[int] | None = None,
+) -> dict[str, str]:
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s1", "s2"], type=pa.string()),
@@ -269,7 +294,7 @@ def _base_arrow_paths(tmp_path: Path, *, with_indexes: bool = True) -> dict[str,
             "title": pa.array(["Graph Models", "Graph Models", "Different Topic"], type=pa.string()),
             "venue": pa.array(["NeurIPS", "NeurIPS", "ICML"], type=pa.string()),
             "journal_name": pa.array(["", "", ""], type=pa.string()),
-            "year": pa.array([2020, 2020, 2010], type=pa.int64()),
+            "year": pa.array(years or [2020, 2020, 2010], type=pa.int64()),
         }
     )
     paper_authors = pa.table(
@@ -378,6 +403,40 @@ def _raw_plan_for_base_paths(paths: dict[str, str]) -> dict[str, Any]:
         orcid_enabled=False,
         num_threads=1,
     )
+
+
+def test_raw_arrow_candidate_planner_rejects_out_of_range_seed_year(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path, years=[2020, 2**63 - 1, 2010])
+
+    with pytest.raises(ValueError, match="raw Arrow summary year is outside the supported i32 range"):
+        _raw_candidate_planner_from_query_signatures(
+            paths,
+            ["q1"],
+            top_k=2,
+            query_view="full",
+            orcid_enabled=False,
+            num_threads=1,
+        )
+
+
+def test_rust_retriever_named_signature_count_keeps_integer_precision() -> None:
+    query = build_query_features(first="alice", has_full_first=True)
+    summary = build_cluster_summary(
+        component_key="c_large",
+        size=16_777_218,
+        first_name_counts=Counter({"alice": 16_777_217, "bob": 1}),
+    )
+    retriever = s2and_rust.RustHybridCentroidRetriever([summary], include_exemplars=False)
+
+    plan = retriever.top_k_hybrid_centroid_pair_plan(
+        [query],
+        np.asarray([0], dtype=np.uint32),
+        {"c_large": [1]},
+        1,
+        num_threads=1,
+    )
+
+    assert int(plan["row_named_signature_counts"][0]) == 16_777_218
 
 
 def test_raw_arrow_candidate_plan_matches_existing_rust_retriever(tmp_path: Path) -> None:

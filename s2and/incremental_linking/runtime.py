@@ -1912,8 +1912,7 @@ def _raw_candidate_plan_seed_setup(
 ) -> tuple[dict[str, str], dict[str, str], dict[str, list[str]]]:
     component_members = raw_candidate_plan.get("component_members")
     if not isinstance(component_members, Mapping):
-        component_keys = sorted({str(value) for value in raw_candidate_plan.get("row_component_keys", ())})
-        return {}, {component_key: component_key for component_key in component_keys}, {}
+        raise ValueError("raw candidate plan must include component_members")
     cluster_seeds_require: dict[str, str] = {}
     for component_key, members in component_members.items():
         for signature_id in members:
@@ -2123,8 +2122,6 @@ def _predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
     if seed_signature_count == 0 and isinstance(plan_telemetry, Mapping):
         seed_signature_count = int(plan_telemetry.get("seed_signature_count", 0) or 0)
     seed_component_count = len(seed_setup[1])
-    if isinstance(plan_telemetry, Mapping):
-        seed_component_count = int(plan_telemetry.get("cluster_count", seed_component_count) or seed_component_count)
     raw_arrow_signal_seconds = time.perf_counter() - stage_start
 
     result = _predict_incremental_link_or_abstain_production_from_retrieval_private(

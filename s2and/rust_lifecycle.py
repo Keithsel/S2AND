@@ -71,9 +71,12 @@ def build_rust_lifecycle_policy(
     mode: str,
     preprocess: bool,
     compute_reference_features: bool = False,
+    from_dataset_available: bool = True,
     from_dataset_paper_preprocess_available: bool = False,
 ) -> RustLifecyclePolicy:
     if backend == "python":
+        return PYTHON_ONLY_POLICY
+    if not from_dataset_available:
         return PYTHON_ONLY_POLICY
 
     is_inference = _is_inference_mode(mode)

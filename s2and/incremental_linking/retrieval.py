@@ -295,6 +295,7 @@ def validate_raw_candidate_plan_schema(plan: Mapping[str, Any]) -> None:
             "query_signature_ids",
             "query_views",
             "query_authors",
+            "component_members",
             *RAW_CANDIDATE_PLAN_ROW_KEYS,
             *RAW_CANDIDATE_PLAN_PAIR_KEYS,
         )
@@ -302,6 +303,9 @@ def validate_raw_candidate_plan_schema(plan: Mapping[str, Any]) -> None:
     )
     if missing:
         raise KeyError(f"raw candidate plan is missing required keys: {missing}")
+    component_members = _required_raw_plan_value(plan, "component_members")
+    if not isinstance(component_members, Mapping):
+        raise ValueError("raw candidate plan component_members must be a mapping")
     legacy_pair_index_keys = sorted(key for key in ("left_signature_indices", "right_signature_indices") if key in plan)
     if legacy_pair_index_keys:
         raise ValueError(

@@ -45,6 +45,12 @@ def _promote_rust_featurizer_cluster_seed_version(
     )
 
 
+def _rust_cluster_seed_update_lock(dataset: ANDData) -> Any:
+    from s2and import feature_port
+
+    return feature_port._rust_cluster_seed_update_lock(dataset)  # noqa: SLF001
+
+
 def _resolve_featurizer(
     dataset: ANDData | None,
     featurizer: Any | None,
@@ -61,19 +67,38 @@ def update_rust_cluster_seeds(
     dataset: ANDData,
     runtime_context: Any | None = None,
     *,
-    bump_version: bool = True,
+    bump_version: bool = False,
 ) -> None:
-    featurizer = _get_rust_featurizer_for_cluster_seed_update(dataset, runtime_context=runtime_context)
-    current_seed_version = int(getattr(dataset, "_cluster_seeds_version", 0))
-    target_seed_version = current_seed_version + 1 if bump_version else current_seed_version
-    featurizer.update_cluster_seeds(dataset.cluster_seeds_require, dataset.cluster_seeds_disallow)
-    if bump_version:
-        dataset._cluster_seeds_version = target_seed_version
-    _promote_rust_featurizer_cluster_seed_version(
-        dataset,
-        featurizer,
-        target_seed_version=target_seed_version,
-    )
+    """Sync current Python cluster seeds into the cached Rust featurizer.
+
+    ``bump_version`` is opt-in because the model seed containers bump the
+    dataset version when seed material changes.
+    """
+
+    with _rust_cluster_seed_update_lock(dataset):
+        featurizer = _get_rust_featurizer_for_cluster_seed_update(dataset, runtime_context=runtime_context)
+        current_seed_version = int(getattr(dataset, "_cluster_seeds_version", 0))
+        target_seed_version = current_seed_version + 1 if bump_version else current_seed_version
+        previous_require = None
+        previous_disallow = None
+        cluster_seeds_require = getattr(featurizer, "cluster_seeds_require", None)
+        cluster_seeds_disallow = getattr(featurizer, "cluster_seeds_disallow", None)
+        if callable(cluster_seeds_require) and callable(cluster_seeds_disallow):
+            previous_require = dict(cluster_seeds_require())
+            previous_disallow = set(tuple(pair) for pair in cluster_seeds_disallow())
+        featurizer.update_cluster_seeds(dataset.cluster_seeds_require, dataset.cluster_seeds_disallow)
+        try:
+            _promote_rust_featurizer_cluster_seed_version(
+                dataset,
+                featurizer,
+                target_seed_version=target_seed_version,
+            )
+        except Exception:
+            if previous_require is not None and previous_disallow is not None:
+                featurizer.update_cluster_seeds(previous_require, previous_disallow)
+            raise
+        if bump_version:
+            dataset._cluster_seeds_version = target_seed_version
 
 
 def get_constraints_matrix_indexed_rust(

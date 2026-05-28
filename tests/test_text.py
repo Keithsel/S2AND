@@ -263,6 +263,33 @@ def test_fasttext_skip_env_prevents_loading(monkeypatch):
     assert load_calls["count"] == 0
 
 
+def test_fasttext_can_reenable_after_skip_env(monkeypatch):
+    import s2and.text as text_module
+
+    fake_model = object()
+    load_calls = {"count": 0}
+
+    def _fake_load_model(_path: str):
+        load_calls["count"] += 1
+        return fake_model
+
+    monkeypatch.setattr(text_module.fasttext, "load_model", _fake_load_model)
+    monkeypatch.setattr(text_module, "cached_path", lambda path: path)
+    monkeypatch.setattr(text_module, "FASTTEXT_PATH", "dummy_model_path.bin")
+    text_module.set_fasttext_loading_enabled(True)
+    text_module._FASTTEXT_MODEL = None
+    text_module._FASTTEXT_MODEL_INITIALIZED = False
+
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+    assert text_module._get_fasttext_model() is None
+
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "0")
+    text_module.set_fasttext_loading_enabled(True)
+
+    assert text_module._get_fasttext_model() is fake_model
+    assert load_calls["count"] == 1
+
+
 def test_fasttext_enable_preserves_loaded_model(monkeypatch):
     import s2and.text as text_module
 
@@ -284,6 +311,31 @@ def test_fasttext_enable_preserves_loaded_model(monkeypatch):
     text_module.set_fasttext_loading_enabled(True)
 
     assert text_module._get_fasttext_model() is fake_model
+    assert load_calls["count"] == 1
+
+
+def test_fasttext_failed_load_remains_negative_cached_after_reenable(monkeypatch):
+    import s2and.text as text_module
+
+    load_calls = {"count": 0}
+
+    def _raise_os_error(_path: str):
+        load_calls["count"] += 1
+        raise OSError("missing model")
+
+    monkeypatch.setattr(text_module.fasttext, "load_model", _raise_os_error)
+    monkeypatch.setattr(text_module, "cached_path", lambda path: path)
+    monkeypatch.delenv("S2AND_SKIP_FASTTEXT", raising=False)
+    text_module.set_fasttext_loading_enabled(True)
+    text_module._FASTTEXT_MODEL = None
+    text_module._FASTTEXT_MODEL_INITIALIZED = False
+    text_module._FASTTEXT_LOAD_FAILED = False
+
+    assert text_module._get_fasttext_model() is None
+    assert text_module._get_fasttext_model() is None
+    text_module.set_fasttext_loading_enabled(True)
+    assert text_module._get_fasttext_model() is None
+
     assert load_calls["count"] == 1
 
 

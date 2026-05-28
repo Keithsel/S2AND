@@ -41,3 +41,10 @@ def test_run_refuses_unbounded_query_batch_without_full_run() -> None:
 
     with pytest.raises(ValueError, match="--full-run"):
         cmd.run(args)
+
+
+def test_run_refuses_negative_query_limit_without_full_run() -> None:
+    args = cmd.parse_args(["--dataset", "dummy", "--query-limit", "-1"])
+
+    with pytest.raises(ValueError, match="--query-limit must be >= 0"):
+        cmd.run(args)

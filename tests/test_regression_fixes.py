@@ -442,6 +442,31 @@ def test_residual_first_initial_groups_union_normalized_orcids():
     assert {frozenset(group) for group in groups} == {frozenset({"s1", "s2"}), frozenset({"s3"})}
 
 
+def test_residual_first_initial_groups_rejects_whitespace_only_first_initials():
+    assert model_module._signature_first_initials_for_rules("  ") == frozenset()
+
+    dataset = SimpleNamespace(
+        signatures={
+            "s1": SimpleNamespace(
+                author_info_first_normalized_without_apostrophe="",
+                author_info_first="  ",
+                author_info_orcid=None,
+            ),
+            "s2": SimpleNamespace(
+                author_info_first_normalized_without_apostrophe="",
+                author_info_first="\t ",
+                author_info_orcid=None,
+            ),
+            "s3": _subblocking_signature("alice", orcid=None),
+        }
+    )
+    clusterer = SimpleNamespace(use_default_constraints_as_supervision=True, suppress_orcid=True)
+
+    groups = model_module._residual_phase_b_first_initial_groups(clusterer, dataset, ["s1", "s2", "s3"], {})
+
+    assert groups == [["s1", "s2", "s3"]]
+
+
 def _run_make_subblocks_with_fixed_first_pass(monkeypatch, signatures, first_pass_output, *, maximum_size: int):
     anddata = SimpleNamespace(signatures=signatures, random_seed=0)
     call_count = {"value": 0}

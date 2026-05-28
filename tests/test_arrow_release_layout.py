@@ -174,7 +174,7 @@ def _build_arrow_release_fixture(tmp_path: Path, dataset_name: str = "s2and_mini
             "signatures_batch_index": "signatures.signatures_batch_index.bin",
             "papers_batch_index": "papers.papers_batch_index.bin",
             "paper_authors_batch_index": "paper_authors.paper_authors_batch_index.bin",
-            "specter2_batch_index": "specter2.specter_batch_index.bin",
+            "specter_batch_index": "specter2.specter_batch_index.bin",
         },
     }
     _touch_json(dataset_root / "manifest.json", dataset_manifest)
@@ -231,7 +231,27 @@ def test_validate_release_root_reports_missing_batch_index_path(tmp_path: Path) 
 
     with pytest.raises(
         ValueError,
-        match="root dataset s2and_mini is missing batch-index path keys: papers_batch_index",
+        match=r"root dataset s2and_mini is missing required Arrow artifacts.*papers_batch_index",
+    ):
+        validate_release_root(release_root, include_replay_bundles=False)
+
+
+def test_validate_release_root_accepts_specter2_with_canonical_batch_index(tmp_path: Path) -> None:
+    release_root, _dataset_name = _build_arrow_release_fixture(tmp_path)
+
+    assert validate_release_root(release_root, include_replay_bundles=False)["dataset_manifest_count"] == 1
+
+
+def test_validate_release_root_reports_missing_specter2_canonical_batch_index(tmp_path: Path) -> None:
+    release_root, dataset_name = _build_arrow_release_fixture(tmp_path)
+    dataset_manifest = json.loads((release_root / dataset_name / "manifest.json").read_text(encoding="utf-8"))
+    paths = dataset_manifest["paths"]
+    del paths["specter_batch_index"]
+    _rewrite_dataset_manifest_paths(release_root, dataset_name, paths)
+
+    with pytest.raises(
+        ValueError,
+        match=r"root dataset s2and_mini is missing required Arrow artifacts.*specter_batch_index",
     ):
         validate_release_root(release_root, include_replay_bundles=False)
 

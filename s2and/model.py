@@ -1182,7 +1182,9 @@ def _signature_first_for_rules(signature: Any) -> str:
 def _signature_first_initials_for_rules(first: str) -> frozenset[str]:
     tokens = [token for token in first.replace("-", " ").split() if token]
     if not tokens and first:
-        tokens = [first]
+        stripped = first.strip()
+        if stripped:
+            tokens = [stripped]
     return frozenset(token[0] for token in tokens if token)
 
 

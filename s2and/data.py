@@ -497,6 +497,7 @@ class ANDData:
             mode=mode,
             preprocess=preprocess,
             compute_reference_features=compute_reference_features,
+            from_dataset_available=rust_capabilities.from_dataset_available,
             from_dataset_paper_preprocess_available=rust_capabilities.from_dataset_paper_preprocess_available,
         )
         pair_sampling_mode = _resolve_pair_sampling_mode(

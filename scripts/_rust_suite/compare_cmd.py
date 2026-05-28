@@ -117,7 +117,7 @@ def _set_backend_env(
 def _collect_rust_package_info(require_non_dev_rust: bool, require_rust_release: bool) -> dict[str, Any]:
     from s2and import feature_port
 
-    module = feature_port.s2and_rust
+    module = feature_port._ensure_s2and_rust_loaded()  # noqa: SLF001
     if module is None:
         raise RuntimeError("Rust run requested but s2and_rust extension is unavailable")
 

@@ -18,8 +18,19 @@ def _runtime_capabilities(*, core_available: bool, reason: str) -> runtime.RustR
     return runtime.RustRuntimeCapabilities(
         extension_importable=core_available,
         core_runtime_available=core_available,
+        from_dataset_available=core_available,
         from_dataset_paper_preprocess_available=core_available,
         reason=reason,
+    )
+
+
+def _arrow_only_runtime_capabilities() -> runtime.RustRuntimeCapabilities:
+    return runtime.RustRuntimeCapabilities(
+        extension_importable=True,
+        core_runtime_available=True,
+        from_dataset_available=False,
+        from_dataset_paper_preprocess_available=False,
+        reason="rust_core_available",
     )
 
 
@@ -84,6 +95,47 @@ def test_build_runtime_context_accepts_backend_argument(monkeypatch: pytest.Monk
     assert context.resolved_backend == "python"
     assert context.source == "argument"
     assert context.use_rust is False
+
+
+def test_build_runtime_context_auto_uses_python_for_from_dataset_stage_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setattr(
+        runtime,
+        "_auto_backend_capability_probe",
+        lambda: (True, "rust_core_available"),
+    )
+    monkeypatch.setattr(runtime, "detect_rust_runtime_capabilities", _arrow_only_runtime_capabilities)
+
+    context = runtime.build_runtime_context("featurization_run", emit_startup_warning=False)
+
+    assert context.resolved_backend == "python"
+    assert context.use_rust is False
+    assert context.from_dataset_available is False
+
+
+def test_build_runtime_context_allows_arrow_production_when_from_dataset_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setattr(runtime, "detect_rust_runtime_capabilities", _arrow_only_runtime_capabilities)
+
+    context = runtime.build_runtime_context("cluster_predict", backend="rust", emit_startup_warning=False)
+
+    assert context.resolved_backend == "rust"
+    assert context.use_rust is True
+    assert context.from_dataset_available is False
+
+
+def test_build_runtime_context_explicit_rust_rejects_from_dataset_stage_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setattr(runtime, "detect_rust_runtime_capabilities", _arrow_only_runtime_capabilities)
+
+    with pytest.raises(RuntimeError, match="RustFeaturizer.from_dataset is unavailable"):
+        runtime.build_runtime_context("featurization_run", backend="rust", emit_startup_warning=False)
 
 
 def test_resolve_backend_explicit_rust_raises_when_runtime_unavailable(monkeypatch: pytest.MonkeyPatch):

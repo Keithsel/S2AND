@@ -402,6 +402,107 @@ def test_arrow_graph_subblocking_rejects_null_author_position(tmp_path) -> None:
         fallback(["s1"], object(), target_subblock_size=2)
 
 
+def test_arrow_graph_subblocking_rejects_null_affiliation_items(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signatures_path = tmp_path / "signatures.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter_path = tmp_path / "specter.arrow"
+
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1"], type=pa.string()),
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "author_first": pa.array(["hui"], type=pa.string()),
+                "author_middle": pa.array([""], type=pa.string()),
+                "author_affiliations": pa.array([["lab", None]], type=pa.list_(pa.string())),
+                "author_orcid": pa.array([None], type=pa.string()),
+                "author_position": pa.array([0], type=pa.int64()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "position": pa.array([0], type=pa.int64()),
+                "author_name": pa.array(["Hui Wang"], type=pa.string()),
+            }
+        ),
+        paper_authors_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([1.0, 0.0], type=pa.float32()), 2),
+            }
+        ),
+        specter_path,
+    )
+    paths = _add_graph_batch_indexes(
+        {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter": specter_path},
+        tmp_path,
+    )
+    fallback = make_arrow_graph_subblocking_cluster_fn(paths, ["s1"])
+
+    with pytest.raises(ValueError, match="cannot contain null values"):
+        fallback(["s1"], object(), target_subblock_size=2)
+
+
+@pytest.mark.parametrize("paper_id", [None, ""])
+def test_arrow_graph_subblocking_rejects_null_or_empty_paper_id(tmp_path, paper_id) -> None:
+    pa = pytest.importorskip("pyarrow")
+
+    signatures_path = tmp_path / "signatures.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter_path = tmp_path / "specter.arrow"
+
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(["s1"], type=pa.string()),
+                "paper_id": pa.array([paper_id], type=pa.string()),
+                "author_first": pa.array(["hui"], type=pa.string()),
+                "author_middle": pa.array([""], type=pa.string()),
+                "author_affiliations": pa.array([["lab"]], type=pa.list_(pa.string())),
+                "author_orcid": pa.array([None], type=pa.string()),
+                "author_position": pa.array([0], type=pa.int64()),
+            }
+        ),
+        signatures_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "position": pa.array([0], type=pa.int64()),
+                "author_name": pa.array(["Hui Wang"], type=pa.string()),
+            }
+        ),
+        paper_authors_path,
+    )
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([1.0, 0.0], type=pa.float32()), 2),
+            }
+        ),
+        specter_path,
+    )
+    paths = _add_graph_batch_indexes(
+        {"signatures": signatures_path, "paper_authors": paper_authors_path, "specter": specter_path},
+        tmp_path,
+    )
+    fallback = make_arrow_graph_subblocking_cluster_fn(paths, ["s1"])
+
+    with pytest.raises(ValueError, match="null/empty paper_id"):
+        fallback(["s1"], object(), target_subblock_size=2)
+
+
 def test_arrow_graph_subblocking_prepare_limits_loaded_evidence_to_fallback_union(tmp_path) -> None:
     pa = pytest.importorskip("pyarrow")
 

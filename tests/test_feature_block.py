@@ -36,7 +36,6 @@ from s2and.incremental_linking.feature_block import (
     write_incremental_query_signatures_arrow,
     write_name_counts_arrow,
     write_name_counts_index,
-    write_name_pairs_arrow,
     write_raw_arrow_batch_lookup_indexes,
 )
 from s2and.incremental_linking.feature_block_arrow import feature_block_from_arrow_paths
@@ -84,7 +83,7 @@ def test_feature_block_paper_is_reliable_parses_false_string() -> None:
         venue="",
         journal_name="",
         year=None,
-        is_reliable="false",
+        is_reliable=cast(Any, "false"),
     )
 
     assert paper.is_reliable is False
@@ -1174,7 +1173,6 @@ def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
     counts_path, counts_metrics = write_name_counts_arrow(tmp_path)
     index_path, index_metrics = write_name_counts_index(tmp_path)
-    pairs_path, pairs_metrics = write_name_pairs_arrow({("ada", "a"), ("charles", "c")}, tmp_path)
 
     assert counts_metrics == {
         "reused": False,
@@ -1187,20 +1185,15 @@ def test_write_name_artifacts_arrow(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert index_metrics["reused"] is False
     assert index_metrics["row_count"] == 4
     assert index_metrics["first_count"] == 1
-    assert pairs_metrics == {"reused": False, "row_count": 2}
     with pa.memory_map(counts_path, "r") as source:
         counts = pa.ipc.open_file(source).read_all().to_pylist()
-    with pa.memory_map(pairs_path, "r") as source:
-        pairs = pa.ipc.open_file(source).read_all().to_pylist()
     manifest = json.loads((Path(index_path) / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["schema_version"] == "name_counts_index_v1"
     assert manifest["exact_string_verification"] is True
     assert manifest["files"]["first"]["path"].startswith("generations/")
     assert {"kind": "first", "name": "ada", "count": 3.0} in counts
-    assert pairs == [{"name_1": "ada", "name_2": "a"}, {"name_1": "charles", "name_2": "c"}]
     assert write_name_counts_arrow(tmp_path)[1] == {"reused": True}
     assert write_name_counts_index(tmp_path)[1] == {"reused": True}
-    assert write_name_pairs_arrow({("ada", "a")}, tmp_path)[1] == {"reused": False, "row_count": 1}
 
 
 def test_write_name_counts_index_rebuilds_fingerprintless_manifest(
@@ -1582,7 +1575,9 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
         def plan(self, query_signature_ids: list[str], **kwargs: Any) -> dict[str, Any]:
             captured["retrieval_plan_query_signature_ids"] = tuple(query_signature_ids)
             captured["retrieval_plan_kwargs"] = kwargs
-            return _raw_plan()
+            plan = _raw_plan()
+            plan["telemetry"]["cluster_count"] = 99
+            return plan
 
         def build_telemetry(self) -> dict[str, Any]:
             return {"timings": {}}
@@ -1665,10 +1660,35 @@ def test_raw_arrow_scoring_wrapper_uses_direct_arrow_featurizer(
     assert result.telemetry["raw_arrow_signature_count"] == 5
     assert result.telemetry["raw_arrow_plan_signature_count"] == 4
     assert result.telemetry["raw_arrow_seed_signature_count"] == 3
+    assert result.telemetry["seed_component_count"] == 2
+    assert result.telemetry["raw_arrow_seed_component_count"] == 2
+    assert result.telemetry["raw_arrow_plan_cluster_count"] == 99
     assert "raw_arrow_retrieval_seconds" in result.telemetry
     retrieval_paths_without_query_request = dict(captured["retrieval_paths"])
     retrieval_paths_without_query_request.pop("query_signatures")
     assert retrieval_paths_without_query_request == captured["featurizer_paths"]
+
+
+def test_raw_arrow_rejects_candidate_plan_without_component_members() -> None:
+    class FakeFeaturizer:
+        def signature_ids(self) -> list[str]:
+            return ["q", "s1", "s2", "s3"]
+
+    raw_plan = _raw_plan()
+    raw_plan.pop("component_members")
+    raw_plan["telemetry"]["cluster_count"] = 99
+
+    with pytest.raises(KeyError, match="component_members"):
+        _predict_incremental_link_or_abstain_from_preplanned_raw_arrow(
+            _raw_test_clusterer(),
+            _raw_test_artifact(),
+            arrow_paths={},
+            query_signature_ids=["q"],
+            raw_candidate_plan=raw_plan,
+            rust_featurizer=FakeFeaturizer(),
+            allow_featurizer_build=False,
+            runtime_context=SimpleNamespace(operation="raw-arrow-test", run_id="raw-arrow-test"),
+        )
 
 
 def test_raw_arrow_scoring_uses_provided_query_signatures_arrow(

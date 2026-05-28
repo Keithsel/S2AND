@@ -55,6 +55,18 @@ def test_rust_training_from_dataset_skip_preprocess_semantics(
     assert policy.skip_python_paper_preprocess is expected_skip
 
 
+def test_rust_training_requires_from_dataset_capability():
+    policy = build_rust_lifecycle_policy(
+        backend="rust",
+        mode="train",
+        preprocess=True,
+        from_dataset_available=False,
+        from_dataset_paper_preprocess_available=True,
+    )
+
+    assert policy == PYTHON_ONLY_POLICY
+
+
 @pytest.mark.parametrize("preprocess", [False, True])
 @pytest.mark.parametrize("use_rust", [False, True])
 def test_defer_signature_ngrams_requires_preprocess_and_rust(preprocess: bool, use_rust: bool):

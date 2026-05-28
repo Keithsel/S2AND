@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import mmap
+import os
 import shutil
 import struct
 import tempfile
@@ -12,7 +13,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 import numpy as np
 
@@ -39,7 +40,6 @@ from s2and.incremental_linking.feature_block_contract import (
 
 NAME_COUNTS_INDEX_SCHEMA_VERSION = "name_counts_index_v1"
 NAME_COUNTS_ARROW_MANIFEST_SCHEMA_VERSION = "name_counts_arrow_v1"
-NAME_PAIRS_ARROW_MANIFEST_SCHEMA_VERSION = "name_pairs_arrow_v1"
 ARROW_PHYSICAL_LAYOUT_SCHEMA_VERSION = "s2and_arrow_physical_v1"
 ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION = "arrow_batch_lookup_index"
 INCREMENTAL_QUERY_SIGNATURE_VIEWS = frozenset({"auto", "full", "initial_only"})
@@ -54,6 +54,7 @@ _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQQQ")
 _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT = struct.Struct("<QII")
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
+_ARROW_BATCH_LOOKUP_INDEX_SOURCE_SNAPSHOT_ATTEMPTS = 2
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,13 @@ class IncrementalQuerySignatureRequest:
     signature_id: str
     query_view: str
     query_author: str
+
+
+@dataclass(frozen=True)
+class _ArrowSourceSnapshot:
+    size: int
+    mtime_ns: int
+    fingerprint: int
 
 
 def write_incremental_query_signatures_arrow(
@@ -511,11 +519,9 @@ def _raise_if_record_batch_limit_exceeded(
     )
 
 
-def _read_arrow_batch_lookup_index_header(index_path: Path) -> dict[str, int | str]:
-    with index_path.open("rb") as infile:
-        header = infile.read(_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size)
-        if len(header) != _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size:
-            raise ValueError(f"Arrow batch lookup index is truncated: {index_path!s}")
+def _decode_arrow_batch_lookup_index_header(index_path: Path, header: bytes) -> dict[str, int | str]:
+    if len(header) != _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size:
+        raise ValueError(f"Arrow batch lookup index is truncated: {index_path!s}")
     magic = header[:8]
     if magic != _ARROW_BATCH_LOOKUP_INDEX_MAGIC:
         raise ValueError(f"Arrow batch lookup index has invalid magic bytes: {index_path!s}")
@@ -535,6 +541,12 @@ def _read_arrow_batch_lookup_index_header(index_path: Path) -> dict[str, int | s
         "key_column_hash": int(key_column_hash),
         "source_fingerprint": int(source_fingerprint),
     }
+
+
+def _read_arrow_batch_lookup_index_header(index_path: Path) -> dict[str, int | str]:
+    with index_path.open("rb") as infile:
+        header = infile.read(_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size)
+    return _decode_arrow_batch_lookup_index_header(index_path, header)
 
 
 def _batch_lookup_index_source_mismatch(
@@ -576,6 +588,14 @@ def _arrow_batch_lookup_lower_bound(index_mmap: mmap.mmap, record_count: int, ke
     return lower
 
 
+def _source_snapshot_matches_stat(snapshot: _ArrowSourceSnapshot, stat_result: os.stat_result) -> bool:
+    return snapshot.size == int(stat_result.st_size) and snapshot.mtime_ns == int(stat_result.st_mtime_ns)
+
+
+def _raise_arrow_source_changed(path: Path, *, context: str) -> NoReturn:
+    raise ValueError(f"Arrow IPC file changed while {context}: {path!s}")
+
+
 def read_arrow_batch_lookup_index_batch_indices(
     arrow_path: str | Path,
     index_path: str | Path,
@@ -590,31 +610,35 @@ def read_arrow_batch_lookup_index_batch_indices(
         return set()
     arrow_path_obj = Path(arrow_path)
     index_path_obj = Path(index_path)
-    header = _read_arrow_batch_lookup_index_header(index_path_obj)
-    source_stat = arrow_path_obj.stat()
+    source_snapshot = _stable_source_file_snapshot(arrow_path_obj, context="reading batch lookup index")
     expected_key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
-    if int(header["key_column_hash"]) != expected_key_column_hash:
-        raise ValueError(
-            f"Arrow batch lookup index '{index_path_obj!s}' was built for a different key column: "
-            f"indexed hash={int(header['key_column_hash'])} expected hash={expected_key_column_hash} "
-            f"key_column={key_column!r}"
-        )
-    source_fingerprint = _source_file_fingerprint(arrow_path_obj)
-    source_mismatch = _batch_lookup_index_source_mismatch(
-        header,
-        source_size=source_stat.st_size,
-        source_fingerprint=source_fingerprint,
-    )
-    if source_mismatch is not None:
-        raise ValueError(
-            f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': " f"{source_mismatch}"
-        )
-    record_count = int(header["record_count"])
-    expected_len = (
-        _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size + record_count * _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.size
-    )
     with index_path_obj.open("rb") as infile:
         with mmap.mmap(infile.fileno(), 0, access=mmap.ACCESS_READ) as index_mmap:
+            header = _decode_arrow_batch_lookup_index_header(
+                index_path_obj,
+                index_mmap[: _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size],
+            )
+            if int(header["key_column_hash"]) != expected_key_column_hash:
+                raise ValueError(
+                    f"Arrow batch lookup index '{index_path_obj!s}' was built for a different key column: "
+                    f"indexed hash={int(header['key_column_hash'])} expected hash={expected_key_column_hash} "
+                    f"key_column={key_column!r}"
+                )
+            source_mismatch = _batch_lookup_index_source_mismatch(
+                header,
+                source_size=source_snapshot.size,
+                source_fingerprint=source_snapshot.fingerprint,
+            )
+            if source_mismatch is not None:
+                raise ValueError(
+                    f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': "
+                    f"{source_mismatch}"
+                )
+            record_count = int(header["record_count"])
+            expected_len = (
+                _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size
+                + record_count * _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.size
+            )
             if len(index_mmap) != expected_len:
                 raise ValueError(
                     f"Arrow batch lookup index '{index_path_obj!s}' length {len(index_mmap)} does not match "
@@ -629,6 +653,8 @@ def read_arrow_batch_lookup_index_batch_indices(
                 ):
                     batch_indices.add(_arrow_batch_lookup_record_batch_index(index_mmap, record_index))
                     record_index += 1
+    if not _source_snapshot_matches_stat(source_snapshot, arrow_path_obj.stat()):
+        _raise_arrow_source_changed(arrow_path_obj, context="reading batch lookup index")
     return batch_indices
 
 
@@ -644,9 +670,8 @@ def validate_arrow_batch_lookup_index(
     arrow_path_obj = Path(arrow_path)
     index_path_obj = Path(index_path)
     header = _read_arrow_batch_lookup_index_header(index_path_obj)
-    source_stat = arrow_path_obj.stat()
+    source_snapshot = _stable_source_file_snapshot(arrow_path_obj, context="validating batch lookup index")
     key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
-    source_fingerprint = _source_file_fingerprint(arrow_path_obj)
     if int(header["key_column_hash"]) != key_column_hash:
         raise ValueError(
             f"Arrow batch lookup index '{index_path_obj!s}' was built for a different key column: "
@@ -655,8 +680,8 @@ def validate_arrow_batch_lookup_index(
         )
     source_mismatch = _batch_lookup_index_source_mismatch(
         header,
-        source_size=source_stat.st_size,
-        source_fingerprint=source_fingerprint,
+        source_size=source_snapshot.size,
+        source_fingerprint=source_snapshot.fingerprint,
     )
     if source_mismatch is not None:
         raise ValueError(
@@ -679,65 +704,18 @@ def validate_arrow_batch_lookup_index(
     }
 
 
-def write_arrow_batch_lookup_index(
-    arrow_path: str | Path,
-    index_path: str | Path,
+def _read_arrow_batch_lookup_records(
+    arrow_path: Path,
     *,
     key_column: str,
-    table_name: str = "arrow",
-    max_record_batch_rows: int | None = None,
-    overwrite: bool = True,
-) -> tuple[str, dict[str, int | str | bool]]:
-    """Write a Rust-readable key-hash to Arrow record-batch lookup index."""
-
+    table_name: str,
+    max_record_batch_rows: int | None,
+) -> tuple[list[tuple[int, int]], int, int, int]:
     import pyarrow as pa
-
-    output_path = Path(index_path)
-    if output_path.exists() and not overwrite:
-        arrow_path_obj = Path(arrow_path)
-        index_header = _read_arrow_batch_lookup_index_header(output_path)
-        source_stat = arrow_path_obj.stat()
-        key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
-        source_mismatch = _batch_lookup_index_source_mismatch(
-            index_header,
-            source_size=source_stat.st_size,
-            source_fingerprint=_source_file_fingerprint(arrow_path_obj),
-        )
-        if int(index_header["key_column_hash"]) != key_column_hash or source_mismatch is not None:
-            raise ValueError(
-                f"Arrow batch lookup index is stale for {arrow_path_obj!s}: {output_path!s}. "
-                "Rebuild it with overwrite=True."
-            )
-        layout = arrow_ipc_physical_layout(arrow_path)
-        _raise_if_record_batch_limit_exceeded(
-            arrow_path=arrow_path,
-            table_name=table_name,
-            batch_index=-1,
-            batch_rows=layout["actual_max_batch_rows"],
-            max_record_batch_rows=max_record_batch_rows,
-        )
-        if int(index_header["record_count"]) != int(layout["row_count"]):
-            raise ValueError(
-                f"Arrow batch lookup index row count mismatch for {arrow_path_obj!s}: "
-                f"index has {int(index_header['record_count'])} records, "
-                f"Arrow file has {int(layout['row_count'])} rows. Rebuild it with overwrite=True."
-            )
-        return str(output_path), {
-            "reused": True,
-            "schema_version": ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION,
-            **layout,
-            "magic": str(index_header["magic"]),
-            "record_count": int(index_header["record_count"]),
-            "key_column_hash": int(index_header["key_column_hash"]),
-            "source_fingerprint": int(index_header["source_fingerprint"]),
-            "source_fingerprint_kind": "fnv1a64_full_file",
-            "max_record_batch_rows": int(max_record_batch_rows or 0),
-        }
 
     records: list[tuple[int, int]] = []
     row_count = 0
     max_batch_rows = 0
-    arrow_path_obj = Path(arrow_path)
     with pa.memory_map(str(arrow_path), "r") as source:
         reader = pa.ipc.open_file(source)
         record_batch_count = int(reader.num_record_batches)
@@ -763,12 +741,93 @@ def write_arrow_batch_lookup_index(
                     f"for batch {batch_index}"
                 )
             records.extend((_fnv64_bytes(str(key).encode("utf-8")), batch_index) for key in keys)
+    return records, row_count, max_batch_rows, record_batch_count
+
+
+def write_arrow_batch_lookup_index(
+    arrow_path: str | Path,
+    index_path: str | Path,
+    *,
+    key_column: str,
+    table_name: str = "arrow",
+    max_record_batch_rows: int | None = None,
+    overwrite: bool = True,
+) -> tuple[str, dict[str, int | str | bool]]:
+    """Write a Rust-readable key-hash to Arrow record-batch lookup index."""
+
+    output_path = Path(index_path)
+    if output_path.exists() and not overwrite:
+        arrow_path_obj = Path(arrow_path)
+        index_header = _read_arrow_batch_lookup_index_header(output_path)
+        source_snapshot = _stable_source_file_snapshot(arrow_path_obj, context="validating reusable batch lookup index")
+        key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
+        source_mismatch = _batch_lookup_index_source_mismatch(
+            index_header,
+            source_size=source_snapshot.size,
+            source_fingerprint=source_snapshot.fingerprint,
+        )
+        if int(index_header["key_column_hash"]) != key_column_hash or source_mismatch is not None:
+            raise ValueError(
+                f"Arrow batch lookup index is stale for {arrow_path_obj!s}: {output_path!s}. "
+                "Rebuild it with overwrite=True."
+            )
+        layout_stat = arrow_path_obj.stat()
+        layout = arrow_ipc_physical_layout(arrow_path)
+        if not _source_snapshot_matches_stat(source_snapshot, layout_stat) or not _source_snapshot_matches_stat(
+            source_snapshot,
+            arrow_path_obj.stat(),
+        ):
+            _raise_arrow_source_changed(arrow_path_obj, context="validating reusable batch lookup index")
+        _raise_if_record_batch_limit_exceeded(
+            arrow_path=arrow_path,
+            table_name=table_name,
+            batch_index=-1,
+            batch_rows=layout["actual_max_batch_rows"],
+            max_record_batch_rows=max_record_batch_rows,
+        )
+        if int(index_header["record_count"]) != int(layout["row_count"]):
+            raise ValueError(
+                f"Arrow batch lookup index row count mismatch for {arrow_path_obj!s}: "
+                f"index has {int(index_header['record_count'])} records, "
+                f"Arrow file has {int(layout['row_count'])} rows. Rebuild it with overwrite=True."
+            )
+        return str(output_path), {
+            "reused": True,
+            "schema_version": ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION,
+            **layout,
+            "magic": str(index_header["magic"]),
+            "record_count": int(index_header["record_count"]),
+            "key_column_hash": int(index_header["key_column_hash"]),
+            "source_fingerprint": int(index_header["source_fingerprint"]),
+            "source_fingerprint_kind": "fnv1a64_full_file",
+            "max_record_batch_rows": int(max_record_batch_rows or 0),
+        }
+
+    arrow_path_obj = Path(arrow_path)
+    records: list[tuple[int, int]] = []
+    row_count = 0
+    max_batch_rows = 0
+    record_batch_count = 0
+    source_snapshot: _ArrowSourceSnapshot | None = None
+    for _attempt in range(_ARROW_BATCH_LOOKUP_INDEX_SOURCE_SNAPSHOT_ATTEMPTS):
+        source_stat_before = arrow_path_obj.stat()
+        records, row_count, max_batch_rows, record_batch_count = _read_arrow_batch_lookup_records(
+            arrow_path_obj,
+            key_column=key_column,
+            table_name=table_name,
+            max_record_batch_rows=max_record_batch_rows,
+        )
+        source_snapshot = _stable_source_file_snapshot(arrow_path_obj, context="building batch lookup index")
+        if _source_snapshot_matches_stat(source_snapshot, source_stat_before):
+            break
+    else:
+        _raise_arrow_source_changed(arrow_path_obj, context="building batch lookup index")
+    if source_snapshot is None:
+        raise AssertionError("source snapshot must be populated")
 
     records.sort()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    source_stat = arrow_path_obj.stat()
     key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
-    source_fingerprint = _source_file_fingerprint(arrow_path_obj)
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -783,14 +842,16 @@ def write_arrow_batch_lookup_index(
                 _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.pack(
                     _ARROW_BATCH_LOOKUP_INDEX_MAGIC,
                     len(records),
-                    source_stat.st_size,
-                    source_stat.st_mtime_ns,
+                    source_snapshot.size,
+                    source_snapshot.mtime_ns,
                     key_column_hash,
-                    source_fingerprint,
+                    source_snapshot.fingerprint,
                 )
             )
             for key_hash, batch_index in records:
                 outfile.write(_ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT.pack(key_hash, batch_index, 0))
+        if not _source_snapshot_matches_stat(source_snapshot, arrow_path_obj.stat()):
+            _raise_arrow_source_changed(arrow_path_obj, context="publishing batch lookup index")
         tmp_path.replace(output_path)
     except Exception:
         if tmp_path is not None:
@@ -803,7 +864,7 @@ def write_arrow_batch_lookup_index(
         "row_count": row_count,
         "record_count": len(records),
         "key_column_hash": key_column_hash,
-        "source_fingerprint": source_fingerprint,
+        "source_fingerprint": source_snapshot.fingerprint,
         "source_fingerprint_kind": "fnv1a64_full_file",
         "record_batch_count": record_batch_count,
         "actual_max_batch_rows": max_batch_rows,
@@ -1012,14 +1073,6 @@ def _name_counts_arrow_fingerprint(mappings: Mapping[str, Mapping[Any, Any]]) ->
     return digest
 
 
-def _name_pairs_arrow_fingerprint(pairs: Iterable[tuple[str, str]]) -> int:
-    digest = _fnv64_bytes(b"s2and-name-pairs-arrow-v1\x00")
-    for left, right in sorted((str(left), str(right)) for left, right in pairs):
-        digest = _fnv64_text(digest, left)
-        digest = _fnv64_text(digest, right)
-    return digest
-
-
 def _fnv64_update(digest: int, value: bytes) -> int:
     for byte in value:
         digest ^= byte
@@ -1031,8 +1084,7 @@ def _fnv64_bytes(value: bytes) -> int:
     return _fnv64_update(_FNV64_OFFSET, value)
 
 
-def _source_file_fingerprint(path: Path) -> int:
-    source_size = path.stat().st_size
+def _source_file_fingerprint_once(path: Path, *, source_size: int) -> int:
     digest = _fnv64_bytes(_ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN)
     digest = _fnv64_update(digest, int(source_size).to_bytes(8, "little", signed=False))
     with path.open("rb") as infile:
@@ -1042,6 +1094,24 @@ def _source_file_fingerprint(path: Path) -> int:
                 break
             digest = _fnv64_update(digest, chunk)
     return digest
+
+
+def _stable_source_file_snapshot(path: Path, *, context: str) -> _ArrowSourceSnapshot:
+    for _attempt in range(_ARROW_BATCH_LOOKUP_INDEX_SOURCE_SNAPSHOT_ATTEMPTS):
+        before = path.stat()
+        fingerprint = _source_file_fingerprint_once(path, source_size=int(before.st_size))
+        after = path.stat()
+        if int(before.st_size) == int(after.st_size) and int(before.st_mtime_ns) == int(after.st_mtime_ns):
+            return _ArrowSourceSnapshot(
+                size=int(after.st_size),
+                mtime_ns=int(after.st_mtime_ns),
+                fingerprint=int(fingerprint),
+            )
+    _raise_arrow_source_changed(path, context=context)
+
+
+def _source_file_fingerprint(path: Path) -> int:
+    return _stable_source_file_snapshot(path, context="fingerprinting source file").fingerprint
 
 
 def _name_counts_index_hashes(kind: str, name_bytes: bytes) -> tuple[int, int]:
@@ -1201,7 +1271,9 @@ def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) 
     tmp_generation_dir = Path(tempfile.mkdtemp(prefix=f".{generation_name}.", dir=str(generations_dir)))
     generation_dir = generations_dir / generation_name
     tmp_manifest_path = index_dir / f".manifest.{generation_name}.json"
-    manifest_published = False
+    previous_manifest = manifest_path.read_text(encoding="utf-8") if manifest_path.exists() else None
+    manifest_replaced = False
+    marker_written = False
     try:
         for kind, mapping in (
             ("first", first_dict),
@@ -1240,68 +1312,24 @@ def write_name_counts_index(output_dir: str | Path, *, overwrite: bool = False) 
             path = index_dir / str(entry["path"])
             if not path.exists():
                 raise FileNotFoundError(f"name-count index generation is incomplete: {path}")
-        (generation_dir / ".published").write_text("", encoding="utf-8")
         tmp_manifest_path.replace(manifest_path)
-        manifest_published = True
+        manifest_replaced = True
+        (generation_dir / ".published").write_text("", encoding="utf-8")
+        marker_written = True
     finally:
         if tmp_manifest_path.exists():
             tmp_manifest_path.unlink()
         if tmp_generation_dir.exists():
             shutil.rmtree(tmp_generation_dir)
-        if generation_dir.exists() and not manifest_published:
-            shutil.rmtree(generation_dir)
+        if generation_dir.exists() and not marker_written:
+            if previous_manifest is not None and manifest_replaced:
+                manifest_path.write_text(previous_manifest, encoding="utf-8")
+                shutil.rmtree(generation_dir)
+            elif not manifest_replaced:
+                shutil.rmtree(generation_dir)
     metrics["row_count"] = total_records
     metrics["byte_count"] = total_bytes
     return str(index_dir), metrics
-
-
-def _resolve_name_pairs(name_tuples: set[tuple[str, str]] | str | None) -> set[tuple[str, str]]:
-    from s2and.data import _load_name_tuples_from_file
-
-    if name_tuples == "filtered":
-        return _load_name_tuples_from_file("s2and_name_tuples_filtered.txt")
-    if name_tuples is None:
-        return _load_name_tuples_from_file("s2and_name_tuples.txt")
-    if isinstance(name_tuples, set):
-        return name_tuples
-    raise ValueError("name_tuples must be None, 'filtered', or a set of (first_a, first_b) tuples")
-
-
-def write_name_pairs_arrow(
-    name_tuples: set[tuple[str, str]] | str | None,
-    output_dir: str | Path,
-    *,
-    overwrite: bool = False,
-) -> tuple[str, dict[str, int | bool]]:
-    """Write name-alias pairs as a Rust-readable Arrow IPC table."""
-
-    import pyarrow as pa
-
-    output_path = Path(output_dir) / "name_pairs.arrow"
-    pairs = sorted((str(left), str(right)) for left, right in _resolve_name_pairs(name_tuples))
-    fingerprint = _name_pairs_arrow_fingerprint(pairs)
-    expected_manifest = {
-        "schema_version": NAME_PAIRS_ARROW_MANIFEST_SCHEMA_VERSION,
-        "fingerprint": fingerprint,
-    }
-    if output_path.exists() and not overwrite and _name_artifact_manifest_matches(output_path, expected_manifest):
-        return str(output_path), {"reused": True}
-
-    table = pa.table(
-        {
-            "name_1": pa.array([left for left, _right in pairs], type=pa.string()),
-            "name_2": pa.array([right for _left, right in pairs], type=pa.string()),
-        }
-    )
-    write_arrow_ipc_table(table, output_path)
-    _write_name_artifact_manifest(
-        output_path,
-        {
-            **expected_manifest,
-            "row_count": table.num_rows,
-        },
-    )
-    return str(output_path), {"reused": False, "row_count": table.num_rows}
 
 
 def _arrow_rows_by_unique_key(

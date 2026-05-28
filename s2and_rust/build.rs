@@ -14,6 +14,7 @@ fn main() {
         );
         return;
     };
+    rerun_if_changed(&python_exe);
     if let Ok(Some(python_home)) = python_home(&python_exe) {
         println!(
             "cargo:rustc-env=S2AND_RUST_PYTHONHOME={}",
@@ -57,6 +58,7 @@ fn main() {
     }
 
     for source in runtime_dlls {
+        rerun_if_changed(&source);
         let Some(file_name) = source.file_name() else {
             continue;
         };
@@ -73,6 +75,12 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {}
+
+#[cfg(windows)]
+fn rerun_if_changed(path: &std::path::Path) {
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    println!("cargo:rerun-if-changed={}", normalized.display());
+}
 
 #[cfg(windows)]
 fn python_executable() -> Option<std::path::PathBuf> {

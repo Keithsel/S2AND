@@ -52,7 +52,16 @@ class DummyRustFeaturizer:
         raise AssertionError("Disk cache path should not be used in this test")
 
     def update_cluster_seeds(self, _require_map, _disallow_set):
-        return None
+        self.cluster_seeds_require_state = {str(key): str(value) for key, value in dict(_require_map).items()}
+        self.cluster_seeds_disallow_state = {
+            (str(left), str(right)) for left, right in set(_disallow_set)
+        }
+
+    def cluster_seeds_require(self):
+        return list(getattr(self, "cluster_seeds_require_state", {}).items())
+
+    def cluster_seeds_disallow(self):
+        return list(getattr(self, "cluster_seeds_disallow_state", set()))
 
 
 class DummyRustModule:
@@ -70,6 +79,8 @@ class DummyDataset(ANDData):
         self.compute_reference_features = False
         self.preprocess = True
         self.n_jobs = 1
+        self.original_signatures_path = None
+        self.original_papers_path = None
         self.cluster_seeds_require = {}
         self.cluster_seeds_disallow = set()
         self.signatures_path = None
@@ -98,6 +109,10 @@ class SleepyCounter:
 
 def _cache_size() -> int:
     return sum(len(entries) for entries in feature_port._RUST_FEATURIZER_CACHE.values())
+
+
+def _cache_keys(dataset: DummyDataset) -> list[feature_port._RustFeaturizerCacheKey]:
+    return list(feature_port._RUST_FEATURIZER_CACHE[dataset])
 
 
 @pytest.fixture(autouse=True)
@@ -158,7 +173,7 @@ def test_rust_featurizer_cache_tracks_cluster_seed_version():
     assert second is not first
     assert DummyRustFeaturizer.created == ["seed_version_cache_dataset", "seed_version_cache_dataset"]
     assert _cache_size() == 1
-    assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [feature_port._rust_featurizer_cache_key(1)]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=1)]
 
 
 def test_rust_featurizer_cache_retries_when_seed_version_changes_during_lookup(monkeypatch):
@@ -178,7 +193,7 @@ def test_rust_featurizer_cache_retries_when_seed_version_changes_during_lookup(m
 
     assert featurizer.dataset_name == "seed_version_race_dataset"
     assert DummyRustFeaturizer.created == ["seed_version_race_dataset"]
-    assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [feature_port._rust_featurizer_cache_key(1)]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=1)]
 
 
 def test_rust_featurizer_cache_retries_when_seed_version_changes_during_build(monkeypatch):
@@ -205,10 +220,48 @@ def test_rust_featurizer_cache_retries_when_seed_version_changes_during_build(mo
 
     assert featurizer.dataset_name == "fresh"
     assert build_calls["count"] == 2
-    assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [feature_port._rust_featurizer_cache_key(1)]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=1)]
 
 
-def test_update_rust_cluster_seeds_reuses_cached_featurizer_after_version_bump():
+@pytest.mark.parametrize(
+    ("case_name", "mutate_dataset"),
+    [
+        ("compute_reference_features", lambda dataset: setattr(dataset, "compute_reference_features", True)),
+        ("preprocess", lambda dataset: setattr(dataset, "preprocess", False)),
+        ("n_jobs", lambda dataset: setattr(dataset, "n_jobs", 2)),
+        ("signatures_path", lambda dataset: setattr(dataset, "signatures_path", "new_signatures.json")),
+        ("signatures", lambda dataset: dataset.signatures.__setitem__("s1", object())),
+        ("papers", lambda dataset: dataset.papers.__setitem__("p1", object())),
+        ("specter_embeddings", lambda dataset: setattr(dataset, "specter_embeddings", {"p1": object()})),
+        ("name_tuples", lambda dataset: dataset.name_tuples.add(("bill", "william"))),
+    ],
+)
+def test_rust_featurizer_cache_tracks_material_from_dataset_fields(case_name, mutate_dataset):
+    dataset = DummyDataset(f"material_cache_{case_name}", mode="train")
+
+    first = feature_port._get_rust_featurizer(dataset)
+    mutate_dataset(dataset)
+    second = feature_port._get_rust_featurizer(dataset)
+
+    assert second is not first
+    assert DummyRustFeaturizer.created == [dataset.name, dataset.name]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset)]
+
+
+def test_rust_featurizer_cache_tracks_material_mutation_beyond_prefix_sample():
+    dataset = DummyDataset("material_cache_full_digest", mode="train")
+    dataset.signatures = {f"s{index}": object() for index in range(64)}
+
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset.signatures["s63"] = object()
+    second = feature_port._get_rust_featurizer(dataset)
+
+    assert second is not first
+    assert DummyRustFeaturizer.created == [dataset.name, dataset.name]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset)]
+
+
+def test_update_rust_cluster_seeds_reuses_cached_featurizer_without_default_version_bump():
     from s2and.rust_calls import update_rust_cluster_seeds
 
     dataset = DummyDataset("direct_seed_update_dataset", mode="train")
@@ -218,10 +271,82 @@ def test_update_rust_cluster_seeds_reuses_cached_featurizer_after_version_bump()
 
     update_rust_cluster_seeds(dataset)
 
-    assert int(dataset._cluster_seeds_version) == 2
+    assert int(dataset._cluster_seeds_version) == 1
     assert DummyRustFeaturizer.created == ["direct_seed_update_dataset"]
     assert feature_port._get_rust_featurizer(dataset) is first
-    assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [feature_port._rust_featurizer_cache_key(2)]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=1)]
+
+
+def test_update_rust_cluster_seeds_allows_explicit_version_bump():
+    from s2and.rust_calls import update_rust_cluster_seeds
+
+    dataset = DummyDataset("explicit_seed_update_bump_dataset", mode="train")
+    dataset._cluster_seeds_version = 1
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset.cluster_seeds_require["s1"] = "c1"
+
+    update_rust_cluster_seeds(dataset, bump_version=True)
+
+    assert int(dataset._cluster_seeds_version) == 2
+    assert DummyRustFeaturizer.created == ["explicit_seed_update_bump_dataset"]
+    assert feature_port._get_rust_featurizer(dataset) is first
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=2)]
+
+
+def test_update_rust_cluster_seeds_blocks_cache_prune_until_promotion():
+    from s2and.rust_calls import update_rust_cluster_seeds
+
+    dataset = DummyDataset("seed_update_promotion_race_dataset", mode="train")
+    dataset._cluster_seeds_version = 1
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset.cluster_seeds_require["s1"] = "c1"
+    dataset._cluster_seeds_version = 2
+    update_started = threading.Event()
+    release_update = threading.Event()
+    update_errors: list[Exception] = []
+    getter_errors: list[Exception] = []
+    getter_results: list[DummyRustFeaturizer] = []
+
+    def blocking_update(_require_map, _disallow_set):
+        update_started.set()
+        assert release_update.wait(timeout=2)
+
+    first.update_cluster_seeds = blocking_update
+
+    def update_worker():
+        try:
+            update_rust_cluster_seeds(dataset)
+        except Exception as exc:  # pragma: no cover - assertion guard
+            update_errors.append(exc)
+
+    def getter_worker():
+        try:
+            getter_results.append(feature_port._get_rust_featurizer(dataset))
+        except Exception as exc:  # pragma: no cover - assertion guard
+            getter_errors.append(exc)
+
+    update_thread = threading.Thread(target=update_worker)
+    update_thread.start()
+    assert update_started.wait(timeout=2)
+
+    getter_thread = threading.Thread(target=getter_worker)
+    getter_thread.start()
+    time.sleep(0.05)
+
+    assert getter_results == []
+    assert DummyRustFeaturizer.created == ["seed_update_promotion_race_dataset"]
+
+    release_update.set()
+    update_thread.join(timeout=5)
+    getter_thread.join(timeout=5)
+
+    assert not update_thread.is_alive()
+    assert not getter_thread.is_alive()
+    assert update_errors == []
+    assert getter_errors == []
+    assert getter_results == [first]
+    assert DummyRustFeaturizer.created == ["seed_update_promotion_race_dataset"]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=2)]
 
 
 def test_update_rust_cluster_seeds_leaves_version_unchanged_on_ffi_failure():
@@ -240,7 +365,31 @@ def test_update_rust_cluster_seeds_leaves_version_unchanged_on_ffi_failure():
         update_rust_cluster_seeds(dataset)
 
     assert int(dataset._cluster_seeds_version) == 1
-    assert list(feature_port._RUST_FEATURIZER_CACHE[dataset]) == [feature_port._rust_featurizer_cache_key(1)]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=1)]
+
+
+def test_update_rust_cluster_seeds_rolls_back_featurizer_on_promotion_failure(monkeypatch):
+    from s2and import rust_calls
+    from s2and.rust_calls import update_rust_cluster_seeds
+
+    dataset = DummyDataset("promotion_failure_seed_update_dataset", mode="train")
+    dataset._cluster_seeds_version = 1
+    featurizer = feature_port._get_rust_featurizer(dataset)
+    featurizer.update_cluster_seeds({"old": "c0"}, {("old", "other")})
+    dataset.cluster_seeds_require["s1"] = "c1"
+
+    def fail_promote(_dataset, _featurizer, *, target_seed_version):
+        del _dataset, _featurizer, target_seed_version
+        raise RuntimeError("promotion failed")
+
+    monkeypatch.setattr(rust_calls, "_promote_rust_featurizer_cluster_seed_version", fail_promote)
+
+    with pytest.raises(RuntimeError, match="promotion failed"):
+        update_rust_cluster_seeds(dataset, bump_version=True)
+
+    assert int(dataset._cluster_seeds_version) == 1
+    assert featurizer.cluster_seeds_require() == [("old", "c0")]
+    assert featurizer.cluster_seeds_disallow() == [("old", "other")]
 
 
 def test_rust_featurizer_cache_rejects_invalid_cluster_seed_version():
@@ -475,7 +624,7 @@ def test_concurrent_builds_for_same_dataset_share_single_inflight_build(monkeypa
 
 def test_increment_rust_featurizer_build_count_is_thread_safe():
     dataset = DummyDataset("build_count_threadsafe", mode="train")
-    cache_key = feature_port._rust_featurizer_cache_key()  # noqa: SLF001
+    cache_key = feature_port._rust_featurizer_cache_key(dataset)  # noqa: SLF001
     with feature_port._RUST_FEATURIZER_CACHE_LOCK:
         feature_port._RUST_FEATURIZER_CACHE[dataset] = {
             cache_key: feature_port._CacheEntry(
@@ -563,6 +712,36 @@ def test_get_rust_featurizer_retries_empty_wait_then_builds(monkeypatch):
     assert featurizer is expected_featurizer
     assert attempts["count"] == 2
     assert build_calls["count"] == 1
+
+
+def test_get_rust_featurizer_raises_after_repeated_stale_build(monkeypatch):
+    dataset = DummyDataset("stale_build_retry_budget", mode="train")
+    runtime_context = type("RuntimeContext", (), {"operation": "test_stale_build", "run_id": "run-stale-build"})()
+    inflight = feature_port._InFlightFeaturizerBuild()
+    build_calls = {"count": 0}
+    monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_MAX_RETRIES", 2)
+
+    def _always_build(_dataset, *, build_context):
+        del build_context
+        return None, inflight
+
+    def _always_stale(_dataset, *, inflight_build, build_context):
+        del build_context
+        assert inflight_build is inflight
+        build_calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(feature_port, "_get_or_wait_for_cached", _always_build)
+    monkeypatch.setattr(feature_port, "_build_and_cache_rust_featurizer", _always_stale)
+
+    with pytest.raises(RuntimeError, match="stale build state") as exc_info:
+        feature_port._get_rust_featurizer(dataset, runtime_context=runtime_context)
+
+    message = str(exc_info.value)
+    assert "dataset=stale_build_retry_budget" in message
+    assert "run=run-stale-build" in message
+    assert "attempts=3" in message
+    assert build_calls["count"] == 3
 
 
 @pytest.mark.parametrize(
@@ -693,7 +872,7 @@ def test_clear_during_inflight_build_discards_stale_result(monkeypatch):
 
 def test_evict_rust_featurizer_clears_build_counts():
     dataset = DummyDataset("evict_build_counts", mode="train")
-    cache_key = feature_port._rust_featurizer_cache_key()  # noqa: SLF001
+    cache_key = feature_port._rust_featurizer_cache_key(dataset)  # noqa: SLF001
 
     feature_port._get_rust_featurizer(dataset)
 

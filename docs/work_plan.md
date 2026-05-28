@@ -278,9 +278,13 @@ Remaining:
   `featurize_pairs_matrix(...)` PyO3 debug methods have also been removed.
 - Split `s2and_rust/src/lib.rs` mechanically, one low-coupling module at a
   time. Completed extractions: `promoted_linker`, `name_counts`,
-  `text_compat`, `arrow_batch_lookup`. Candidate next modules:
-  `ingest_arrow`, `ingest_dataset`, `features`, `constraints`, `retrieval`,
-  `linker`, and `subblocking`.
+  `text_compat`, `arrow_batch_lookup`, `constraints`, `orcid`,
+  `pair_indexing`, `rayon_pool`, `language_detection`, `raw_arrow::arrow_io`,
+  `raw_arrow::readers`, `raw_arrow::paths`, `raw_arrow_features`,
+  `raw_candidate_planner`, `retrieval`, `ingest_dataset`, `features` helpers,
+  `subblocking`, and `rust_featurizer` including linker-distance helpers.
+  Candidate next modules: none identified for this cleanup pass; `lib.rs` now
+  keeps shared core data types, tests, build info, and PyO3 registration.
 - Move focused tests with extracted modules where that preserves private
   visibility without unnecessary `pub(crate)` churn.
 

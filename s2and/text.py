@@ -27,6 +27,7 @@ logger = logging.getLogger("s2and")
 _FASTTEXT_MODEL = None
 _FASTTEXT_MODEL_INITIALIZED = False
 _FASTTEXT_LOADING_ENABLED = True
+_FASTTEXT_LOAD_FAILED = False
 _FASTTEXT_MODEL_LOCK = threading.Lock()
 
 
@@ -36,19 +37,30 @@ def set_fasttext_loading_enabled(enabled: bool) -> None:
     global _FASTTEXT_LOADING_ENABLED
     global _FASTTEXT_MODEL
     global _FASTTEXT_MODEL_INITIALIZED
+    global _FASTTEXT_LOAD_FAILED
     with _FASTTEXT_MODEL_LOCK:
         resolved_enabled = bool(enabled)
         if _FASTTEXT_LOADING_ENABLED == resolved_enabled:
             if not resolved_enabled:
                 _FASTTEXT_MODEL = None
                 _FASTTEXT_MODEL_INITIALIZED = True
+                _FASTTEXT_LOAD_FAILED = False
+            elif (
+                _FASTTEXT_MODEL is None
+                and _FASTTEXT_MODEL_INITIALIZED
+                and not _FASTTEXT_LOAD_FAILED
+                and os.environ.get("S2AND_SKIP_FASTTEXT", "").lower() not in {"1", "true", "yes"}
+            ):
+                _FASTTEXT_MODEL_INITIALIZED = False
             return
         _FASTTEXT_LOADING_ENABLED = resolved_enabled
         if resolved_enabled:
-            _FASTTEXT_MODEL_INITIALIZED = False
+            if _FASTTEXT_MODEL is not None or not _FASTTEXT_LOAD_FAILED:
+                _FASTTEXT_MODEL_INITIALIZED = False
             return
         _FASTTEXT_MODEL = None
         _FASTTEXT_MODEL_INITIALIZED = True
+        _FASTTEXT_LOAD_FAILED = False
 
 
 def fasttext_loading_enabled() -> bool:
@@ -63,10 +75,12 @@ def _get_fasttext_model():
 
     global _FASTTEXT_MODEL
     global _FASTTEXT_MODEL_INITIALIZED
+    global _FASTTEXT_LOAD_FAILED
     if os.environ.get("S2AND_SKIP_FASTTEXT", "").lower() in {"1", "true", "yes"}:
         with _FASTTEXT_MODEL_LOCK:
             _FASTTEXT_MODEL = None
             _FASTTEXT_MODEL_INITIALIZED = True
+            _FASTTEXT_LOAD_FAILED = False
         return None
     with _FASTTEXT_MODEL_LOCK:
         if not _FASTTEXT_LOADING_ENABLED:
@@ -77,9 +91,11 @@ def _get_fasttext_model():
             return _FASTTEXT_MODEL
         try:
             _FASTTEXT_MODEL = fasttext.load_model(cached_path(FASTTEXT_PATH))
+            _FASTTEXT_LOAD_FAILED = False
         except (OSError, RuntimeError, ValueError):
             logger.exception("Failed to load fastText language model; language detection will skip fastText")
             _FASTTEXT_MODEL = None
+            _FASTTEXT_LOAD_FAILED = True
         _FASTTEXT_MODEL_INITIALIZED = True
         return _FASTTEXT_MODEL
 

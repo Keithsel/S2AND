@@ -574,6 +574,8 @@ def _selected_row_positions(labels: pd.DataFrame, datasets: set[str] | None, lim
         mask &= labels["dataset"].astype(str).isin(datasets).to_numpy()
     positions = np.flatnonzero(mask)
     if limit_rows is not None:
+        if int(limit_rows) <= 0:
+            raise ValueError("limit_rows must be > 0")
         positions = positions[: int(limit_rows)]
     return positions.astype(np.int64, copy=False)
 
@@ -925,9 +927,11 @@ def _arrow_paths_for_dataset(
         raise ValueError(f"Arrow dataset manifest paths must be a mapping: {manifest_path}")
     paths: dict[str, str] = {}
     for key, raw_value in raw_paths.items():
-        if key == "specter2":
-            continue
         paths[str(key)] = str(_resolve_arrow_manifest_path(raw_value, dataset_dir=dataset_dir, bundle_root=bundle.root))
+    if "specter" not in paths and "specter2" in paths:
+        paths["specter"] = paths["specter2"]
+    if "specter_batch_index" not in paths and "specter2_batch_index" in paths:
+        paths["specter_batch_index"] = paths["specter2_batch_index"]
     if name_counts_index_root is not None:
         name_counts_index = Path(name_counts_index_root).resolve()
         if not name_counts_index.exists():
@@ -2997,7 +3001,7 @@ def _finalize_minimal_raw_table_plan(
     plan: MinimalRawTablePlan,
     target_features: Sequence[str],
     source_bundle: OfficialBundle,
-    mode_label: str = "minimal-raw-rust",
+    mode_label: str = "arrow-rust",
 ) -> dict[str, Any]:
     parts = [pd.read_parquet(path) for path in plan.partial_paths]
     output = pd.concat(parts, axis=0, ignore_index=True)
@@ -3029,7 +3033,7 @@ def _finalize_minimal_raw_bundle_metadata(
     target: Mapping[str, Any],
     selected_keys: Sequence[str],
     stamp_precomputed_metadata: bool,
-    source_mode: str = "minimal-raw-rust",
+    source_mode: str = "arrow-rust",
 ) -> OfficialBundle:
     payload = json.loads((output_bundle_root / "bundle.json").read_text(encoding="utf-8"))
     feature_count = int(target["feature_count"])
@@ -3106,7 +3110,7 @@ def _materialize_minimal_raw_feature_bundle(
     pairwise_model_nan_value: float,
     pairwise_aggregate_nan_value: float,
     row_nan_policy: str,
-    feature_mode: str = "minimal-raw-rust",
+    feature_mode: str = "arrow-rust",
     name_counts_index_root: Path | None = None,
 ) -> tuple[OfficialBundle, list[dict[str, Any]]]:
     _copy_bundle_support_files(
@@ -3128,6 +3132,30 @@ def _materialize_minimal_raw_feature_bundle(
     table_plan_order: list[str] = []
     pending_by_dataset: dict[str, list[MinimalRawPendingShard]] = {}
     component_membership_cache: dict[str, pd.DataFrame] = {}
+
+    def append_empty_selection_summary(
+        *,
+        table_key: str,
+        labels_path: Path,
+        output_path: Path,
+        label_filtering_summary: dict[str, Any],
+        structural_cleaning_summary: dict[str, Any],
+    ) -> None:
+        summary = {
+            "table_key": table_key,
+            "labels_path": str(labels_path.relative_to(source_bundle.root)),
+            "output_path": str(output_path),
+            "rows": 0,
+            "datasets": [],
+            "seconds": 0.0,
+            "mode": mode_label,
+            "skipped": "empty_selection",
+            "label_filtering": label_filtering_summary,
+            "structural_cleaning": structural_cleaning_summary,
+        }
+        summaries.append(summary)
+        print(json.dumps({"event": "minimal_raw_table_featureization_skipped", **summary}), flush=True)
+
     for table_key in selected_keys:
         labels_path = _asset_file(source_bundle, "featureless_rows", table_key)
         output_relpath = _output_table_relpath(table_key, labels_path)
@@ -3149,6 +3177,20 @@ def _materialize_minimal_raw_feature_bundle(
             labels,
             context=f"{mode_label}:{table_key}",
         )
+        if labels.empty:
+            append_empty_selection_summary(
+                table_key=table_key,
+                labels_path=labels_path,
+                output_path=output_path,
+                label_filtering_summary=label_filtering_summary,
+                structural_cleaning_summary={
+                    "rows_before": 0,
+                    "rows_after": 0,
+                    "rows_removed": 0,
+                    "skipped": "empty_selection",
+                },
+            )
+            continue
         if mode_label == "arrow-rust":
             labels, structural_cleaning_summary = _clean_arrow_rust_structural_rows(
                 source_bundle=source_bundle,
@@ -3166,20 +3208,13 @@ def _materialize_minimal_raw_feature_bundle(
             )
         required_output_columns = _required_materialized_output_columns(labels, target_features)
         if labels.empty:
-            summary = {
-                "table_key": table_key,
-                "labels_path": str(labels_path.relative_to(source_bundle.root)),
-                "output_path": str(output_path),
-                "rows": 0,
-                "datasets": [],
-                "seconds": 0.0,
-                "mode": mode_label,
-                "skipped": "empty_selection",
-                "label_filtering": label_filtering_summary,
-                "structural_cleaning": structural_cleaning_summary,
-            }
-            summaries.append(summary)
-            print(json.dumps({"event": "minimal_raw_table_featureization_skipped", **summary}), flush=True)
+            append_empty_selection_summary(
+                table_key=table_key,
+                labels_path=labels_path,
+                output_path=output_path,
+                label_filtering_summary=label_filtering_summary,
+                structural_cleaning_summary=structural_cleaning_summary,
+            )
             continue
         if reuse_existing_features and output_path.exists():
             row_count = _validate_reusable_parquet(
@@ -3711,13 +3746,15 @@ def _resolve_hyperopt_evals(args: argparse.Namespace) -> int:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.limit_rows is not None and int(args.limit_rows) <= 0:
+        raise SystemExit("--limit-rows must be > 0")
     target = _load_target(args.target_json)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     pairwise_model_nan_value = _nan_value_from_policy(str(args.pairwise_model_nan_policy))
     pairwise_aggregate_nan_value = _nan_value_from_policy(str(args.pairwise_aggregate_nan_policy))
     feature_nan_policy = _feature_nan_policy_summary(args)
-    if args.feature_mode in {"minimal-raw-rust", "arrow-rust"}:
+    if args.feature_mode == "arrow-rust":
         if args.limit_rows is None and not args.run_full:
             raise SystemExit(f"unbounded {args.feature_mode} feature materialization requires --run-full")
         if not args.materialize_only and (args.limit_rows is not None or args.tables or args.datasets):
@@ -3891,7 +3928,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "files": list(production_bundle_summary.files),
             "manifest_path": str(production_bundle_summary.manifest_path),
         }
-    if args.feature_mode in {"minimal-raw-rust", "arrow-rust"}:
+    if args.feature_mode == "arrow-rust":
         result["component_scope"] = "block-local"
     if hyperopt_summary is not None and not args.allow_metric_drift:
         result["metric_drift_check"] = "skipped_after_hyperopt_param_search"
@@ -3955,7 +3992,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hyperopt-seed", type=int, default=13)
     parser.add_argument(
         "--feature-mode",
-        choices=("arrow-rust", "minimal-raw-rust", "precomputed-promoted"),
+        choices=("arrow-rust", "precomputed-promoted"),
         default="arrow-rust",
         help="Feature source for the official train/calibrate/eval run.",
     )

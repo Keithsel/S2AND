@@ -1,6 +1,6 @@
 # Rust Public Surface Inventory
 
-Status date: 2026-05-26
+Status date: 2026-05-28
 
 This inventory records the current Python-visible `s2and_rust` surface before
 module splitting or API deletion. It is intentionally about ownership and
@@ -16,7 +16,17 @@ cleanup risk, not a user-facing API promise.
 | `raw_arrow_labeled_candidate_plan(...)` | `scripts/production/model/linker_train_calibrate_eval.py` | Training/materialization replay surface, not request-time inference. |
 | `promoted_linker_non_pairwise_features(...)` | `s2and/incremental_linking/row_features.py` | Production promoted-linker row feature builder. |
 | `make_subblocks_with_telemetry_arrow_native_graph(...)` | `s2and/subblocking.py` | Arrow-native graph subblocking helper used by large-block prediction. |
-| `get_build_info(...)` | `scripts/_rust_suite/common.py`, capability tests | Diagnostics and ABI metadata. |
+| `get_build_info(...)` | `s2and/runtime.py`, `scripts/_rust_suite/common.py`, capability tests | Diagnostics and ABI metadata. |
+
+## Module Constants and ABI Markers
+
+| Export | Owner / caller | Status |
+|---|---|---|
+| `RETRIEVAL_FEATURE_ORDER` | `s2and/incremental_linking_training/retrieval_policy.py`, retrieval parity tests | Retrieval feature ordering contract mirrored from Rust into Python fallback policy code. |
+| `DEFAULT_HYBRID_CENTROID_POLICY_NAME`, `DEFAULT_HYBRID_CENTROID_WEIGHTS`, `DEFAULT_INITIAL_ONLY_HYBRID_CENTROID_WEIGHTS`, `DEFAULT_HYBRID_EXEMPLAR_4_WEIGHTS` | `s2and/incremental_linking_training/retrieval_policy.py`, promoted-linker training and retrieval tests | Frozen retrieval policy constants; update Python fallback defaults and tests together with Rust. |
+| `RETRIEVAL_MIDDLE_INITIAL_CONFLICT_SCORE`, `RETRIEVAL_YEAR_SCORE_DECAY_YEARS`, `RETRIEVAL_YEAR_SCORE_RANGE_GAP`, `RETRIEVAL_YEAR_SCORE_RANGE_PENALTY`, `RETRIEVAL_HARD_FILTER_MAX_YEAR_GAP` | `s2and/incremental_linking_training/query_support.py`, retrieval parity tests | Training/query-support scoring constants. |
+| `INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS` | `s2and/runtime.py`, capability tests | Pair-plan ABI marker; `row_orcid_match` is required before enabling `incremental_linking_pair_plan_v1`. |
+| `RAW_ARROW_QUERY_SIGNATURE_PLANNER_METHODS` | `s2and/runtime.py`, capability tests | Raw query-signature planner ABI marker; capability gating requires `from_query_signatures`, `plan_query_signatures`, and `build_telemetry`. |
 
 ## `RustFeaturizer`
 
@@ -55,6 +65,14 @@ cleanup risk, not a user-facing API promise.
 | `rust_calls.build_linker_pair_features_and_aggregate_stats_arrays_rust(...)` | promoted incremental pairwise scoring | Maintained canonical array wrapper. |
 | `rust_calls.build_linker_pair_aggregate_stats_arrays_rust(...)` | promoted incremental aggregate-only path | Thin Python wrapper over `linker_pair_index_arrays_and_aggregate_stats(..., emit_matrix=False)`. |
 | `runtime.detect_rust_runtime_capabilities(...)` markers | backend selection and tests | Update markers before deleting any method they probe. |
+
+## Build Info ABI
+
+| Key | Owner / caller | Status |
+|---|---|---|
+| `crate_version`, `profile`, `debug_assertions`, `opt_level`, `target` | `scripts/_rust_suite/common.py`, capability tests | Diagnostics and version/capability reporting. |
+| `incremental_linking_pair_plan_supported_kwargs`, `incremental_linking_pair_plan_row_signals` | `s2and/runtime.py`, capability tests | Runtime gate for current pair-plan ABI. |
+| `raw_arrow_query_signature_planner_methods` | `s2and/runtime.py`, capability tests | Runtime gate for current raw query-signature planner ABI. |
 
 ## Cleanup Notes
 
@@ -124,3 +142,6 @@ cleanup risk, not a user-facing API promise.
 - Status 2026-05-27: raw query-signature planner support is capability-gated
   by `raw_arrow_query_signature_planner_v1`; `query_signatures.arrow` is
   request-local planner input, not a generic scoring artifact sidecar.
+- Status 2026-05-28: callable PyO3 exports, module constants, and
+  `get_build_info()` ABI markers were rechecked against the local
+  `s2and_rust` module.

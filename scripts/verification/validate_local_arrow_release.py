@@ -11,7 +11,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from s2and.arrow_inputs import require_name_counts_index_artifact
+from s2and.arrow_inputs import (
+    MissingArrowArtifactError,
+    require_name_counts_index_artifact,
+    validate_arrow_prediction_artifacts,
+)
 
 ROOT_MANIFEST_SCHEMA = "inference_arrow_bundle_v1"
 ROOT_HELPER_FILES = (
@@ -19,9 +23,6 @@ ROOT_HELPER_FILES = (
     "lid.176.bin",
     "production_model_v1.21/manifest.json",
 )
-REQUIRED_DATASET_PATH_KEYS = ("signatures", "papers", "paper_authors")
-REQUIRED_BATCH_INDEX_KEYS = ("signatures_batch_index", "papers_batch_index", "paper_authors_batch_index")
-EMBEDDING_PATH_KEYS = ("specter", "specter2")
 DECLARED_DIRECTORY_KEYS = frozenset({"name_counts_index"})
 
 
@@ -133,25 +134,22 @@ def _validate_dataset_manifest(
         return 0
 
     requirements = entry.get("validation_requirements")
-    if isinstance(requirements, Mapping) and bool(requirements.get("require_name_counts_index")):
-        if "name_counts_index" not in paths:
-            _record_error(errors, f"{label} is missing required path key: name_counts_index")
-
-    missing_required = [key for key in REQUIRED_DATASET_PATH_KEYS if key not in paths]
-    if missing_required:
-        _record_error(errors, f"{label} is missing required path keys: {', '.join(missing_required)}")
-
-    embedding_keys = [key for key in EMBEDDING_PATH_KEYS if key in paths]
-    if not embedding_keys:
-        _record_error(errors, f"{label} is missing an embedding path key: specter or specter2")
-
-    missing_batch_indexes = [key for key in REQUIRED_BATCH_INDEX_KEYS if key not in paths]
-    for embedding_key in embedding_keys:
-        batch_key = f"{embedding_key}_batch_index"
-        if batch_key not in paths:
-            missing_batch_indexes.append(batch_key)
-    if missing_batch_indexes:
-        _record_error(errors, f"{label} is missing batch-index path keys: {', '.join(missing_batch_indexes)}")
+    require_name_counts_index = isinstance(requirements, Mapping) and bool(
+        requirements.get("require_name_counts_index")
+    )
+    resolved_paths = {
+        str(key): str(_manifest_path(path_value, manifest_path.parent)) for key, path_value in paths.items()
+    }
+    try:
+        validate_arrow_prediction_artifacts(
+            resolved_paths,
+            require_specter=True,
+            require_name_counts_index=require_name_counts_index,
+            require_batch_indexes=True,
+            context=label,
+        )
+    except MissingArrowArtifactError as exc:
+        _record_error(errors, str(exc))
 
     for key, path_value in paths.items():
         resolved = _manifest_path(path_value, manifest_path.parent)

@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 BENCHMARK_DATASETS = ("aminer", "arnetminer", "inspire", "kisti", "medline", "pubmed", "qian", "zbmath")
 ROOT_MANIFEST_SCHEMA = "inference_arrow_bundle_v1"
+ARROW_SCHEMA_CONTRACT_PATH = _PROJECT_ROOT / "s2and" / "arrow_schema_contract.json"
 
 
 @dataclass(frozen=True)
@@ -1306,6 +1307,54 @@ def _ensure_specter_embedding_column(table: Any) -> None:
         raise ValueError(f"Arrow column 'embedding' expected fixed_size_list<float32>, got {field_type}")
 
 
+def _arrow_contract_required_columns(table_name: str) -> list[Mapping[str, Any]]:
+    contract = _load_json(ARROW_SCHEMA_CONTRACT_PATH)
+    if not isinstance(contract, Mapping):
+        raise TypeError(f"Arrow schema contract must contain an object: {ARROW_SCHEMA_CONTRACT_PATH}")
+    tables = contract.get("tables")
+    if not isinstance(tables, Mapping):
+        raise ValueError(f"Arrow schema contract is missing tables: {ARROW_SCHEMA_CONTRACT_PATH}")
+    columns = tables.get(table_name)
+    if not isinstance(columns, Sequence) or isinstance(columns, str | bytes):
+        raise ValueError(f"Arrow schema contract is missing table {table_name!r}: {ARROW_SCHEMA_CONTRACT_PATH}")
+    return [column for column in columns if isinstance(column, Mapping) and bool(column.get("required"))]
+
+
+def _ensure_arrow_contract_column_type(table: Any, table_name: str, column: str, datatype: str) -> None:
+    import pyarrow as pa
+
+    def is_string_list(value: Any) -> bool:
+        return pa.types.is_list(value) and pa.types.is_string(value.value_type)
+
+    def is_float32_fixed_size_list(value: Any) -> bool:
+        return pa.types.is_fixed_size_list(value) and pa.types.is_float32(value.value_type)
+
+    match datatype:
+        case "string":
+            predicate = pa.types.is_string
+        case "int64":
+            predicate = pa.types.is_int64
+        case "bool":
+            predicate = pa.types.is_boolean
+        case "list<string>":
+            predicate = is_string_list
+        case "fixed_size_list<float32>":
+            predicate = is_float32_fixed_size_list
+        case _:
+            raise ValueError(f"Arrow schema contract has unsupported datatype {datatype!r} for {table_name}.{column}")
+    _ensure_arrow_column_type(table, column, predicate, datatype)
+
+
+def _ensure_arrow_contract_required_columns(table: Any, table_name: str) -> None:
+    for column_spec in _arrow_contract_required_columns(table_name):
+        column = str(column_spec["name"])
+        datatype = str(column_spec["datatype"])
+        try:
+            _ensure_arrow_contract_column_type(table, table_name, column, datatype)
+        except KeyError as exc:
+            raise KeyError(f"{table_name} Arrow table is missing required column {column!r}") from exc
+
+
 def _table_values(table: Any, column: str) -> list[Any]:
     if column not in table.column_names:
         raise ValueError(f"Arrow table is missing required column {column!r}")
@@ -1375,12 +1424,9 @@ def validate_arrow_dataset_manifest(
     signatures = _read_arrow_table(paths["signatures"])
     papers = _read_arrow_table(paths["papers"])
     paper_authors = _read_arrow_table(paths["paper_authors"])
-    _ensure_string_column(signatures, "signature_id")
-    _ensure_string_column(signatures, "paper_id")
-    _ensure_string_column(papers, "paper_id")
-    _ensure_string_column(paper_authors, "paper_id")
-    _ensure_string_column(paper_authors, "author_name")
-    _ensure_integer_column(paper_authors, "position")
+    _ensure_arrow_contract_required_columns(signatures, "signatures")
+    _ensure_arrow_contract_required_columns(papers, "papers")
+    _ensure_arrow_contract_required_columns(paper_authors, "paper_authors")
     signature_ids = _required_string_values(signatures, "signature_id", label="signatures.signature_id")
     signature_paper_ids = _required_string_values(signatures, "paper_id", label="signatures.paper_id")
     paper_ids = _required_string_values(papers, "paper_id", label="papers.paper_id")
@@ -1414,8 +1460,7 @@ def validate_arrow_dataset_manifest(
 
     if require_embeddings:
         specter = _read_arrow_table(paths["specter"])
-        _ensure_string_column(specter, "paper_id")
-        _ensure_specter_embedding_column(specter)
+        _ensure_arrow_contract_required_columns(specter, "specter")
         specter_paper_ids = _required_string_values(specter, "paper_id", label="specter.paper_id")
         _ensure_unique(specter_paper_ids, label="specter.paper_id")
         missing_embeddings = sorted(set(signature_paper_ids) - set(specter_paper_ids))

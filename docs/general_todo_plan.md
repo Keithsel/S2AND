@@ -132,18 +132,22 @@ Goal: reduce `s2and_rust/src/lib.rs` without changing public behavior.
 Doc evidence:
 
 - [work_plan.md](work_plan.md) lists completed extractions:
-  `promoted_linker`, `name_counts`, `text_compat`, and `arrow_batch_lookup`.
-- Candidate next modules are `ingest_arrow`, `ingest_dataset`, `features`,
-  `constraints`, `retrieval`, `linker`, and `subblocking`.
+  `promoted_linker`, `name_counts`, `text_compat`, `arrow_batch_lookup`,
+  `constraints`, `orcid`, `pair_indexing`, `rayon_pool`,
+  `language_detection`, `raw_arrow::arrow_io`, `raw_arrow::readers`,
+  `raw_arrow::paths`, `raw_arrow_features`, `raw_candidate_planner`,
+  `retrieval`, `ingest_dataset`, `rust_featurizer` (including linker-distance
+  helpers), `features` helpers, and `subblocking`.
+- Candidate next modules: none identified for this cleanup pass; `lib.rs`
+  now keeps shared core data types, tests, build info, and PyO3 registration.
 - [public_surface_inventory.md](rust/public_surface_inventory.md) says to keep
   `RawBlockQueryCandidatePlanner` and not delete
   `RustNameCompatibleSubblockSelector` internals.
 
 Code check:
 
-- [s2and_rust/src](../s2and_rust/src) contains the extracted modules, but
-  `lib.rs` is still the dominant file and still owns subblocking, linker,
-  ingest, and feature code.
+- [s2and_rust/src](../s2and_rust/src) contains the extracted modules; `lib.rs`
+  now owns shared core data types, tests, build info, and PyO3 registration.
 
 Concrete next actions:
 
@@ -177,8 +181,9 @@ Code check:
 
 - [data.py](../s2and/data.py) still owns `ANDData` preprocessing, count
   semantics, constraints, and paper preprocessing.
-- [lib.rs](../s2and_rust/src/lib.rs) still owns multiple Rust staging and
-  ingestion paths.
+- Rust staging and ingestion helpers now live in
+  [ingest_dataset.rs](../s2and_rust/src/ingest_dataset.rs), with
+  `RustFeaturizer` wiring in [rust_featurizer.rs](../s2and_rust/src/rust_featurizer.rs).
 - Rust and Python normalization parity tests exist in
   [test_text_rust_normalization_parity.py](../tests/test_text_rust_normalization_parity.py).
 

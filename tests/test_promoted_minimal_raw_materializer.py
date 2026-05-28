@@ -696,6 +696,59 @@ def test_arrow_paths_use_manifest_name_counts_index_unless_explicit_override(
     assert paths["name_counts_index"] == str(Path(override_index).resolve())
 
 
+def test_arrow_paths_alias_specter2_manifest_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = tmp_path / "bundle"
+    dataset_dir = bundle_root / "datasets" / "toy"
+    dataset_dir.mkdir(parents=True)
+    for filename in (
+        "signatures.arrow",
+        "papers.arrow",
+        "paper_authors.arrow",
+        "specter2.arrow",
+        "signatures.signatures_batch_index.bin",
+        "papers.papers_batch_index.bin",
+        "paper_authors.paper_authors_batch_index.bin",
+        "specter2.specter_batch_index.bin",
+    ):
+        (dataset_dir / filename).write_bytes(b"placeholder")
+    patch_tiny_name_counts_loader(monkeypatch)
+    manifest_index, _metrics = write_name_counts_index(bundle_root)
+    (dataset_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "paths": {
+                    "signatures": "signatures.arrow",
+                    "papers": "papers.arrow",
+                    "paper_authors": "paper_authors.arrow",
+                    "specter2": "specter2.arrow",
+                    "signatures_batch_index": "signatures.signatures_batch_index.bin",
+                    "papers_batch_index": "papers.papers_batch_index.bin",
+                    "paper_authors_batch_index": "paper_authors.paper_authors_batch_index.bin",
+                    "specter2_batch_index": "specter2.specter_batch_index.bin",
+                    "name_counts_index": "name_counts_index",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle = OfficialBundle(
+        root=bundle_root.resolve(),
+        bundle_name="toy_bundle",
+        assets={},
+        models={},
+        expected_metrics={},
+    )
+
+    paths = _arrow_paths_for_dataset(bundle, "toy")
+
+    assert paths["specter"] == str((dataset_dir / "specter2.arrow").resolve())
+    assert paths["specter_batch_index"] == str((dataset_dir / "specter2.specter_batch_index.bin").resolve())
+    assert paths["name_counts_index"] == str(Path(manifest_index).resolve())
+
+
 def test_minimal_raw_query_first_prefix_uses_full_author_before_masked_view() -> None:
     group = pd.DataFrame(
         [

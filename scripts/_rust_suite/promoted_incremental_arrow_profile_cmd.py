@@ -343,6 +343,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--runs must be > 0")
     if args.n_jobs <= 0:
         raise ValueError("--n-jobs must be > 0")
+    if args.query_limit < 0:
+        raise ValueError("--query-limit must be >= 0")
     if args.query_limit == 0 or args.query_limit > 400:
         if not args.full_run:
             raise ValueError("Refusing large profiling run without --full-run")

@@ -1,10 +1,13 @@
 import unittest
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pandas as pd
 import pytest
 
+import s2and.data as data_module
 from s2and.data import ANDData, _parse_sinonym_name
+from s2and.rust_lifecycle import PYTHON_ONLY_POLICY
 
 
 def test_maybe_load_list_empty_file_returns_empty_list(tmp_path):
@@ -53,6 +56,75 @@ def test_preprocess_signatures_drops_empty_normalized_affiliations() -> None:
 
     assert dataset.signatures["s1"].author_info_affiliations == ["analytical engine lab"]
     assert "" not in dataset.signatures["s1"].author_info_affiliations
+
+
+def test_anddata_passes_from_dataset_capability_to_rust_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        data_module,
+        "build_runtime_context",
+        lambda _operation: SimpleNamespace(
+            requested_backend="auto",
+            resolved_backend="rust",
+            use_rust=False,
+            run_id="test-run",
+            source="default",
+        ),
+    )
+    monkeypatch.setattr(
+        data_module,
+        "detect_rust_runtime_capabilities",
+        lambda: SimpleNamespace(
+            from_dataset_available=False,
+            from_dataset_paper_preprocess_available=True,
+        ),
+    )
+
+    def _capture_lifecycle_policy(**kwargs: Any):
+        captured.update(kwargs)
+        return PYTHON_ONLY_POLICY
+
+    monkeypatch.setattr(data_module, "build_rust_lifecycle_policy", _capture_lifecycle_policy)
+
+    ANDData(
+        signatures={
+            "s1": {
+                "signature_id": "s1",
+                "paper_id": 1,
+                "author_info": {
+                    "position": 0,
+                    "block": "a lovelace",
+                    "first": "Ada",
+                    "middle": "",
+                    "last": "Lovelace",
+                    "suffix": None,
+                    "email": None,
+                    "affiliations": [],
+                },
+            }
+        },
+        papers={
+            "1": {
+                "paper_id": 1,
+                "title": "Notes",
+                "abstract": "",
+                "journal_name": "",
+                "venue": "",
+                "year": 1843,
+                "authors": [{"position": 0, "author_name": "Ada Lovelace"}],
+                "references": [],
+            }
+        },
+        name="rust_lifecycle_capability",
+        mode="inference",
+        load_name_counts=False,
+        preprocess=False,
+        name_tuples=set(),
+    )
+
+    assert captured["backend"] == "rust"
+    assert captured["from_dataset_available"] is False
+    assert captured["from_dataset_paper_preprocess_available"] is True
 
 
 class TestData(unittest.TestCase):

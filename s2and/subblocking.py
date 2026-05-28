@@ -921,7 +921,12 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
         return ()
     if isinstance(value, str | bytes):
         raise ValueError("Arrow list field unexpectedly decoded as a scalar string")
-    return tuple(str(item) for item in value if item is not None)
+    items: list[str] = []
+    for item in value:
+        if item is None:
+            raise ValueError("Arrow list field cannot contain null values")
+        items.append(str(item))
+    return tuple(items)
 
 
 def _coauthor_blocks_by_paper_from_arrow(
@@ -1140,14 +1145,23 @@ def _load_arrow_graph_subblocking_dataset(
     if missing_signature_ids:
         raise ValueError(f"signatures Arrow is missing graph-subblocking signature ids: {missing_signature_ids[:10]}")
 
-    paper_ids = tuple(dict.fromkeys(str(row["paper_id"]) for row in signatures_by_id.values()))
+    paper_id_by_signature: dict[str, str] = {}
+    for signature_id in signature_ids:
+        raw_paper_id = signatures_by_id[signature_id].get("paper_id")
+        if raw_paper_id is None or not str(raw_paper_id).strip():
+            raise ValueError(
+                "signatures Arrow cannot contain null/empty paper_id values for graph subblocking "
+                f"(signature_id={signature_id})"
+            )
+        paper_id_by_signature[signature_id] = str(raw_paper_id)
+    paper_ids = tuple(dict.fromkeys(paper_id_by_signature.values()))
     coauthors_by_paper = _coauthor_blocks_by_paper_from_arrow(paths, paper_ids, load_metrics=load_metrics)
     specter_embeddings = _specter_embeddings_from_arrow(paths, paper_ids, load_metrics=load_metrics)
 
     signature_objects: dict[str, SimpleNamespace] = {}
     for signature_id in signature_ids:
         row = signatures_by_id[signature_id]
-        paper_id = str(row["paper_id"])
+        paper_id = paper_id_by_signature[signature_id]
         if row.get("author_position") is None:
             raise ValueError(
                 "signatures Arrow cannot contain null author_position values for graph subblocking "

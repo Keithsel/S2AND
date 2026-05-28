@@ -24,6 +24,54 @@ def _fake_sources(tmp_path: Path, dataset: str) -> RuntimeDatasetSources:
     )
 
 
+def _write_signatures_table(pa: Any, path: Path, signature_ids: list[str | None], paper_ids: list[str]) -> None:
+    row_count = len(signature_ids)
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "signature_id": pa.array(signature_ids, type=pa.string()),
+                "paper_id": pa.array(paper_ids, type=pa.string()),
+                "author_first": pa.array(["Ada"] * row_count, type=pa.string()),
+                "author_middle": pa.array([""] * row_count, type=pa.string()),
+                "author_last": pa.array(["Lovelace"] * row_count, type=pa.string()),
+                "author_suffix": pa.array([""] * row_count, type=pa.string()),
+                "author_affiliations": pa.array([["Analytical Engine"]] * row_count, type=pa.list_(pa.string())),
+                "author_orcid": pa.array([""] * row_count, type=pa.string()),
+                "author_position": pa.array(list(range(row_count)), type=pa.int64()),
+            }
+        ),
+        path,
+    )
+
+
+def _write_papers_table(pa: Any, path: Path, paper_ids: list[str]) -> None:
+    row_count = len(paper_ids)
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(paper_ids, type=pa.string()),
+                "title": pa.array(["Notes"] * row_count, type=pa.string()),
+                "venue": pa.array(["Proceedings"] * row_count, type=pa.string()),
+                "journal_name": pa.array(["Journal"] * row_count, type=pa.string()),
+            }
+        ),
+        path,
+    )
+
+
+def _write_paper_authors_table(pa: Any, path: Path, paper_ids: list[str], author_names: list[str]) -> None:
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(paper_ids, type=pa.string()),
+                "position": pa.array(list(range(len(paper_ids))), type=pa.int64()),
+                "author_name": pa.array(author_names, type=pa.string()),
+            }
+        ),
+        path,
+    )
+
+
 def test_benchmark_parser_requires_explicit_dataset_selection(tmp_path: Path) -> None:
     parser = convert_to_arrow._build_parser()
 
@@ -523,26 +571,9 @@ def test_validate_manifest_require_embeddings_reports_missing_specter_rows(tmp_p
     papers_path = tmp_path / "papers.arrow"
     paper_authors_path = tmp_path / "paper_authors.arrow"
     specter_path = tmp_path / "specter.arrow"
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "signature_id": pa.array(["s1", "s2"], type=pa.string()),
-                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
-            }
-        ),
-        signatures_path,
-    )
-    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1", "p2"], type=pa.string())}), papers_path)
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
-                "position": pa.array([0, 0], type=pa.int64()),
-                "author_name": pa.array(["Ada Lovelace", "Bob Smith"], type=pa.string()),
-            }
-        ),
-        paper_authors_path,
-    )
+    _write_signatures_table(pa, signatures_path, ["s1", "s2"], ["p1", "p2"])
+    _write_papers_table(pa, papers_path, ["p1", "p2"])
+    _write_paper_authors_table(pa, paper_authors_path, ["p1", "p2"], ["Ada Lovelace", "Bob Smith"])
     write_arrow_ipc_table(
         pa.table(
             {
@@ -581,21 +612,9 @@ def test_validate_arrow_dataset_manifest_accepts_specter2_only_manifest(tmp_path
     papers_path = tmp_path / "papers.arrow"
     paper_authors_path = tmp_path / "paper_authors.arrow"
     specter2_path = tmp_path / "specter2.arrow"
-    write_arrow_ipc_table(
-        pa.table({"signature_id": pa.array(["s1"], type=pa.string()), "paper_id": pa.array(["p1"], type=pa.string())}),
-        signatures_path,
-    )
-    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), papers_path)
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "paper_id": pa.array(["p1"], type=pa.string()),
-                "position": pa.array([0], type=pa.int64()),
-                "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
-            }
-        ),
-        paper_authors_path,
-    )
+    _write_signatures_table(pa, signatures_path, ["s1"], ["p1"])
+    _write_papers_table(pa, papers_path, ["p1"])
+    _write_paper_authors_table(pa, paper_authors_path, ["p1"], ["Ada Lovelace"])
     write_arrow_ipc_table(
         pa.table(
             {
@@ -623,6 +642,96 @@ def test_validate_arrow_dataset_manifest_accepts_specter2_only_manifest(tmp_path
 
 
 @pytest.mark.parametrize(
+    ("table_name", "missing_column", "require_embeddings"),
+    [
+        ("signatures", "author_first", False),
+        ("papers", "journal_name", False),
+        ("paper_authors", "author_name", False),
+        ("specter2", "embedding", True),
+    ],
+)
+def test_validate_arrow_dataset_manifest_rejects_missing_contract_required_columns(
+    tmp_path: Path,
+    table_name: str,
+    missing_column: str,
+    require_embeddings: bool,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    signatures_path = tmp_path / "signatures.arrow"
+    papers_path = tmp_path / "papers.arrow"
+    paper_authors_path = tmp_path / "paper_authors.arrow"
+    specter2_path = tmp_path / "specter2.arrow"
+    _write_signatures_table(pa, signatures_path, ["s1"], ["p1"])
+    _write_papers_table(pa, papers_path, ["p1"])
+    _write_paper_authors_table(pa, paper_authors_path, ["p1"], ["Ada Lovelace"])
+    write_arrow_ipc_table(
+        pa.table(
+            {
+                "paper_id": pa.array(["p1"], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([0.1, 0.2], type=pa.float32()), 2),
+            }
+        ),
+        specter2_path,
+    )
+
+    if table_name == "signatures":
+        write_arrow_ipc_table(
+            pa.table(
+                {
+                    "signature_id": pa.array(["s1"], type=pa.string()),
+                    "paper_id": pa.array(["p1"], type=pa.string()),
+                    "author_middle": pa.array([""], type=pa.string()),
+                    "author_last": pa.array(["Lovelace"], type=pa.string()),
+                    "author_suffix": pa.array([""], type=pa.string()),
+                    "author_affiliations": pa.array([["Analytical Engine"]], type=pa.list_(pa.string())),
+                    "author_orcid": pa.array([""], type=pa.string()),
+                    "author_position": pa.array([0], type=pa.int64()),
+                }
+            ),
+            signatures_path,
+        )
+    elif table_name == "papers":
+        write_arrow_ipc_table(
+            pa.table(
+                {
+                    "paper_id": pa.array(["p1"], type=pa.string()),
+                    "title": pa.array(["Notes"], type=pa.string()),
+                    "venue": pa.array(["Proceedings"], type=pa.string()),
+                }
+            ),
+            papers_path,
+        )
+    elif table_name == "paper_authors":
+        write_arrow_ipc_table(
+            pa.table(
+                {
+                    "paper_id": pa.array(["p1"], type=pa.string()),
+                    "position": pa.array([0], type=pa.int64()),
+                }
+            ),
+            paper_authors_path,
+        )
+    elif table_name == "specter2":
+        write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), specter2_path)
+    else:
+        raise AssertionError(f"unexpected table_name: {table_name}")
+
+    with pytest.raises(KeyError, match=missing_column):
+        convert_to_arrow.validate_arrow_dataset_manifest(
+            {
+                "paths": {
+                    "signatures": str(signatures_path),
+                    "papers": str(papers_path),
+                    "paper_authors": str(paper_authors_path),
+                    "specter2": str(specter2_path),
+                }
+            },
+            require_embeddings=require_embeddings,
+            require_name_counts_index=False,
+        )
+
+
+@pytest.mark.parametrize(
     ("signature_id", "author_name", "message"),
     [
         (None, "Ada Lovelace", "signatures.signature_id contains null value"),
@@ -639,26 +748,9 @@ def test_validate_arrow_dataset_manifest_rejects_null_or_empty_required_strings(
     signatures_path = tmp_path / "signatures.arrow"
     papers_path = tmp_path / "papers.arrow"
     paper_authors_path = tmp_path / "paper_authors.arrow"
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "signature_id": pa.array([signature_id], type=pa.string()),
-                "paper_id": pa.array(["p1"], type=pa.string()),
-            }
-        ),
-        signatures_path,
-    )
-    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), papers_path)
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "paper_id": pa.array(["p1"], type=pa.string()),
-                "position": pa.array([0], type=pa.int64()),
-                "author_name": pa.array([author_name], type=pa.string()),
-            }
-        ),
-        paper_authors_path,
-    )
+    _write_signatures_table(pa, signatures_path, [signature_id], ["p1"])
+    _write_papers_table(pa, papers_path, ["p1"])
+    _write_paper_authors_table(pa, paper_authors_path, ["p1"], [author_name])
 
     with pytest.raises(ValueError, match=message):
         convert_to_arrow.validate_arrow_dataset_manifest(
@@ -681,26 +773,9 @@ def test_validate_manifest_can_require_complete_specter_rows(tmp_path: Path) -> 
     papers_path = tmp_path / "papers.arrow"
     paper_authors_path = tmp_path / "paper_authors.arrow"
     specter_path = tmp_path / "specter.arrow"
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "signature_id": pa.array(["s1", "s2"], type=pa.string()),
-                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
-            }
-        ),
-        signatures_path,
-    )
-    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1", "p2"], type=pa.string())}), papers_path)
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "paper_id": pa.array(["p1", "p2"], type=pa.string()),
-                "position": pa.array([0, 0], type=pa.int64()),
-                "author_name": pa.array(["Ada Lovelace", "Bob Smith"], type=pa.string()),
-            }
-        ),
-        paper_authors_path,
-    )
+    _write_signatures_table(pa, signatures_path, ["s1", "s2"], ["p1", "p2"])
+    _write_papers_table(pa, papers_path, ["p1", "p2"])
+    _write_paper_authors_table(pa, paper_authors_path, ["p1", "p2"], ["Ada Lovelace", "Bob Smith"])
     write_arrow_ipc_table(
         pa.table(
             {
@@ -817,21 +892,9 @@ def test_validate_arrow_dataset_manifest_rejects_incomplete_name_counts_index(tm
         json.dumps({"schema_version": "name_counts_index_v1", "files": {"first": {"path": "missing-first.bin"}}}),
         encoding="utf-8",
     )
-    write_arrow_ipc_table(
-        pa.table({"signature_id": pa.array(["s1"], type=pa.string()), "paper_id": pa.array(["p1"], type=pa.string())}),
-        signatures_path,
-    )
-    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), papers_path)
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "paper_id": pa.array(["p1"], type=pa.string()),
-                "position": pa.array([0], type=pa.int64()),
-                "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
-            }
-        ),
-        paper_authors_path,
-    )
+    _write_signatures_table(pa, signatures_path, ["s1"], ["p1"])
+    _write_papers_table(pa, papers_path, ["p1"])
+    _write_paper_authors_table(pa, paper_authors_path, ["p1"], ["Ada Lovelace"])
 
     with pytest.raises(ValueError, match="missing files.first.path target"):
         convert_to_arrow.validate_arrow_dataset_manifest(
@@ -893,26 +956,9 @@ def test_validate_arrow_dataset_manifest_requires_batch_index_sidecar(tmp_path: 
     signatures_path = tmp_path / "signatures.arrow"
     papers_path = tmp_path / "papers.arrow"
     paper_authors_path = tmp_path / "paper_authors.arrow"
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "signature_id": pa.array(["s1"], type=pa.string()),
-                "paper_id": pa.array(["p1"], type=pa.string()),
-            }
-        ),
-        signatures_path,
-    )
-    write_arrow_ipc_table(pa.table({"paper_id": pa.array(["p1"], type=pa.string())}), papers_path)
-    write_arrow_ipc_table(
-        pa.table(
-            {
-                "paper_id": pa.array(["p1"], type=pa.string()),
-                "position": pa.array([0], type=pa.int64()),
-                "author_name": pa.array(["Ada Lovelace"], type=pa.string()),
-            }
-        ),
-        paper_authors_path,
-    )
+    _write_signatures_table(pa, signatures_path, ["s1"], ["p1"])
+    _write_papers_table(pa, papers_path, ["p1"])
+    _write_paper_authors_table(pa, paper_authors_path, ["p1"], ["Ada Lovelace"])
     manifest = {
         "paths": {
             "signatures": str(signatures_path),

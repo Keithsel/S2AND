@@ -185,6 +185,7 @@ def test_detect_rust_runtime_capabilities_reads_from_dataset_paper_preprocess_ma
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
     assert capabilities.core_runtime_available is True
+    assert capabilities.from_dataset_available is True
     assert capabilities.from_dataset_paper_preprocess_available is True
 
 
@@ -213,6 +214,8 @@ def test_detect_rust_runtime_capabilities_does_not_require_json_ingest_markers()
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
 
     assert capabilities.core_runtime_available is True
+    assert capabilities.from_dataset_available is False
+    assert capabilities.from_dataset_paper_preprocess_available is False
     assert capabilities.reason == "rust_core_available"
 
 
@@ -342,7 +345,9 @@ def test_rust_get_build_info_contract():
     supported_kwargs = tuple(info.get("incremental_linking_pair_plan_supported_kwargs", ()))
     assert "query_candidate_component_keys_by_signature_id" in supported_kwargs
     if "raw_arrow_query_signature_planner_methods" not in info:
-        pytest.skip("installed local s2and_rust extension was built before raw-planner build-info markers")
+        raise pytest.skip.Exception(
+            "installed local s2and_rust extension was built before raw-planner build-info markers"
+        )
     raw_planner_methods = tuple(info.get("raw_arrow_query_signature_planner_methods", ()))
     assert "from_query_signatures" in raw_planner_methods
     assert "plan_query_signatures" in raw_planner_methods

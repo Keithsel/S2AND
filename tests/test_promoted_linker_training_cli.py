@@ -46,7 +46,7 @@ def test_promoted_training_defaults_to_arrow_rust_source() -> None:
         "s2and/data/production_model_v1.21/reproducibility/incremental_linker_training_target.json"
     )
     assert parser_defaults["feature_mode"] == "arrow-rust"
-    assert feature_mode_action.choices == ("arrow-rust", "minimal-raw-rust", "precomputed-promoted")
+    assert feature_mode_action.choices == ("arrow-rust", "precomputed-promoted")
     assert parser_defaults["arrow_name_counts_index_root"] is None
     assert parser_defaults["precomputed_feature_bundle_root"] is None
     assert parser_defaults["save_production_bundle_to"] is None
@@ -55,6 +55,27 @@ def test_promoted_training_defaults_to_arrow_rust_source() -> None:
     assert parser_defaults["hyperopt"] is False
     assert parser_defaults["hyperopt_evals"] is None
     assert parser_defaults["hyperopt_metric"] == "weighted_average_error"
+
+
+def test_minimal_raw_rust_is_not_public_feature_mode() -> None:
+    parser = promoted_train.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--feature-mode", "minimal-raw-rust"])
+
+
+def test_negative_limit_rows_is_rejected() -> None:
+    args = promoted_train.build_parser().parse_args(["--limit-rows", "-1"])
+
+    with pytest.raises(SystemExit, match="--limit-rows must be > 0"):
+        promoted_train.run(args)
+
+
+def test_selected_row_positions_rejects_non_positive_limit_rows() -> None:
+    labels = pd.DataFrame({"dataset": ["pubmed", "pubmed"]})
+
+    with pytest.raises(ValueError, match="limit_rows must be > 0"):
+        promoted_train._selected_row_positions(labels, datasets=None, limit_rows=-1)  # noqa: SLF001
 
 
 @pytest.mark.parametrize("retrieval_rank", [-1, 0, 65536])
@@ -192,7 +213,7 @@ def test_materialization_selects_source_tables_from_featureless_assets(
     )
     monkeypatch.setattr(
         promoted_train,
-        "_clean_minimal_raw_structural_rows",
+        "_clean_arrow_rust_structural_rows",
         lambda **kwargs: (kwargs["rows"], {"rows_before": len(kwargs["rows"]), "rows_after": len(kwargs["rows"])}),
     )
     monkeypatch.setattr(promoted_train, "_required_materialized_output_columns", lambda _labels, _features: ["dataset"])
@@ -201,8 +222,8 @@ def test_materialization_selects_source_tables_from_featureless_assets(
         "_selected_row_positions",
         lambda labels, _datasets, _limit_rows: __import__("numpy").arange(len(labels), dtype="int64"),
     )
-    monkeypatch.setattr(promoted_train, "_build_minimal_raw_dataset_context", lambda **_kwargs: object())
-    monkeypatch.setattr(promoted_train, "_release_minimal_raw_dataset_context", lambda _context: None)
+    monkeypatch.setattr(promoted_train, "_build_arrow_rust_dataset_context", lambda **_kwargs: object())
+    monkeypatch.setattr(promoted_train, "_release_arrow_rust_dataset_context", lambda _context: None)
 
     def fake_materialize_dataset_rows(**kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         rows = kwargs["rows"]
@@ -211,7 +232,7 @@ def test_materialization_selects_source_tables_from_featureless_assets(
             "rows": len(rows),
         }
 
-    monkeypatch.setattr(promoted_train, "_materialize_minimal_raw_dataset_rows", fake_materialize_dataset_rows)
+    monkeypatch.setattr(promoted_train, "_materialize_arrow_rust_dataset_rows", fake_materialize_dataset_rows)
 
     def fake_finalize(**kwargs: Any) -> promoted_train.OfficialBundle:
         captured["selected_keys"] = list(kwargs["selected_keys"])
@@ -666,7 +687,7 @@ def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(
     monkeypatch.setattr(
         promoted_train,
         "_materialize_minimal_raw_feature_bundle",
-        lambda **_kwargs: (bundle, [{"mode": "minimal-raw-rust"}]),
+        lambda **_kwargs: (bundle, [{"mode": "arrow-rust"}]),
     )
     monkeypatch.setattr(promoted_train, "_run_classic_hyperopt", fake_hyperopt)  # noqa: SLF001
     monkeypatch.setattr(promoted_train, "run_classic", fake_run_classic)
@@ -676,7 +697,7 @@ def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(
     args = promoted_train.build_parser().parse_args(
         [
             "--feature-mode",
-            "minimal-raw-rust",
+            "arrow-rust",
             "--run-full",
             "--hyperopt-evals",
             "2",

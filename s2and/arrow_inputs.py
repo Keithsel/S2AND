@@ -287,9 +287,13 @@ def validate_arrow_prediction_artifacts(
         invalid_paths.pop("specter", None)
         if "specter" in missing_keys:
             missing_keys.remove("specter")
+    if require_specter and "specter" in normalized:
+        invalid_paths.pop("specter2", None)
     if require_specter and "specter_batch_index" not in normalized and "specter2_batch_index" in normalized:
         normalized["specter_batch_index"] = normalized["specter2_batch_index"]
         invalid_paths.pop("specter_batch_index", None)
+    if require_specter and "specter_batch_index" in normalized:
+        invalid_paths.pop("specter2_batch_index", None)
     if not require_specter:
         normalized.pop("specter", None)
         normalized.pop("specter_batch_index", None)

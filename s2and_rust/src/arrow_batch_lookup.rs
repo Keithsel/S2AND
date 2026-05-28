@@ -5,7 +5,8 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Read;
 
-use crate::{arrow_error_to_py, fnv64, fnv64_update, io_error_to_py};
+use crate::raw_arrow::arrow_io::{arrow_error_to_py, io_error_to_py};
+use crate::{fnv64, fnv64_update};
 
 const ARROW_BATCH_LOOKUP_INDEX_MAGIC: &[u8; 8] = b"S2ABI001";
 const ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN: usize = 48;

@@ -1,6 +1,6 @@
 # Rust Ingest Source Policy Inventory
 
-Status date: 2026-05-27
+Status date: 2026-05-28
 
 This inventory documents the maintained Rust ingest sources after removing the
 legacy JSON constructor. The goal is to keep Arrow and `ANDData` ownership
@@ -62,3 +62,13 @@ Before any code deduplication, keep these focused tests in scope:
 - `tests/test_rust_from_dataset_contract.py`
 - `tests/test_raw_block_candidate_plan_arrow.py`
 - Rust unit tests in `s2and_rust/src/lib.rs`
+
+## Last Revalidation
+
+Status 2026-05-28: this policy inventory was rechecked against the current
+Arrow validation, Rust ingest, and `ANDData` compatibility code paths. The
+current lightweight regression command is:
+
+```powershell
+uv run pytest -q tests/test_rust_surface_contract.py tests/test_rust_capabilities.py tests/test_arrow_inputs.py
+```

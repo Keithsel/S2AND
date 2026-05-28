@@ -34,7 +34,6 @@ from s2and.incremental_linking.feature_block_arrow import (
     write_incremental_query_signatures_arrow,
     write_name_counts_arrow,
     write_name_counts_index,
-    write_name_pairs_arrow,
     write_raw_arrow_batch_lookup_indexes,
 )
 from s2and.incremental_linking.feature_block_contract import (
@@ -89,6 +88,5 @@ __all__ = [
     "write_incremental_query_signatures_arrow",
     "write_name_counts_arrow",
     "write_name_counts_index",
-    "write_name_pairs_arrow",
     "write_raw_arrow_batch_lookup_indexes",
 ]

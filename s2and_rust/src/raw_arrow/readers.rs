@@ -127,23 +127,29 @@ pub(crate) fn read_raw_arrow_signatures_from_batches(
         };
         for row in 0..batch.num_rows() {
             let signature_id_value = signature_id_values.required_value(row, "signature_id")?;
-            if keep_signature_ids.map_or(false, |keep| !keep.contains(signature_id_value.as_ref()))
-            {
-                continue;
-            }
             if signature_id_value.is_empty() {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "signatures Arrow cannot contain empty signature_id values",
                 ));
             }
+            // Detect duplicates regardless of the keep-filter so that an upstream
+            // corruption is caught symmetrically (a filtered scan must not be more
+            // permissive than a full scan).
+            if !seen_all_signature_ids.insert(signature_id_value.as_ref().to_string()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "signatures Arrow contains duplicate signature_id: {:?}",
+                    signature_id_value.as_ref()
+                )));
+            }
+            if keep_signature_ids.map_or(false, |keep| !keep.contains(signature_id_value.as_ref()))
+            {
+                continue;
+            }
             let signature_id = signature_id_value.into_owned();
             match out.entry(signature_id) {
-                Entry::Occupied(entry) => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "signatures Arrow contains duplicate signature_id: {:?}",
-                        entry.key()
-                    )));
-                }
+                Entry::Occupied(_) => unreachable!(
+                    "duplicate signature_id should be caught by the pre-filter check above"
+                ),
                 Entry::Vacant(entry) => {
                     let paper_id = paper_id_values
                         .required_value(row, "paper_id")?
@@ -300,16 +306,13 @@ pub(crate) fn read_raw_arrow_paper_authors_from_batches(
                 .push((position, author_name));
         }
     }
-    for (paper_id, authors) in out.iter_mut() {
+    // Duplicate (paper_id, position) rows are tolerated here to match the Python
+    // adapter at s2and/incremental_linking/query_adapter.py:_normalized_author_records,
+    // which sorts by (position, original-index) and lets downstream code treat the
+    // result as a set. Null positions remain rejected because the Arrow schema
+    // contract declares position required.
+    for (_paper_id, authors) in out.iter_mut() {
         authors.sort_by_key(|(position, _name)| *position);
-        for window in authors.windows(2) {
-            if window[0].0 == window[1].0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "paper_authors Arrow contains duplicate (paper_id, position): ({:?}, {})",
-                    paper_id, window[0].0
-                )));
-            }
-        }
     }
     Ok(out)
 }

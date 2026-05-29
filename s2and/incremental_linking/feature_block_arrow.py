@@ -44,13 +44,13 @@ ARROW_PHYSICAL_LAYOUT_SCHEMA_VERSION = "s2and_arrow_physical_v1"
 ARROW_BATCH_LOOKUP_INDEX_SCHEMA_VERSION = "arrow_batch_lookup_index"
 INCREMENTAL_QUERY_SIGNATURE_VIEWS = frozenset({"auto", "full", "initial_only"})
 _NAME_COUNTS_INDEX_MAGIC = b"S2NCI001"
-_ARROW_BATCH_LOOKUP_INDEX_MAGIC = b"S2ABI001"
+_ARROW_BATCH_LOOKUP_INDEX_MAGIC = b"S2ABI002"
 _NAME_COUNTS_INDEX_HASH_DOMAIN = b"s2and-name-counts-index-v1\x00"
 _ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN = b"s2and-arrow-batch-lookup-index-source\x00"
 _ARROW_BATCH_LOOKUP_INDEX_SOURCE_READ_BYTES = 1024 * 1024
 _NAME_COUNTS_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQ")
 _NAME_COUNTS_INDEX_RECORD_STRUCT = struct.Struct("<QQQIId")
-_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQQQ")
+_ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT = struct.Struct("<8sQQQQ")
 _ARROW_BATCH_LOOKUP_INDEX_RECORD_STRUCT = struct.Struct("<QII")
 _FNV64_OFFSET = 14695981039346656037
 _FNV64_PRIME = 1099511628211
@@ -529,7 +529,6 @@ def _decode_arrow_batch_lookup_index_header(index_path: Path, header: bytes) -> 
         _magic,
         record_count,
         source_size,
-        source_mtime_ns,
         key_column_hash,
         source_fingerprint,
     ) = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.unpack(header)
@@ -537,7 +536,6 @@ def _decode_arrow_batch_lookup_index_header(index_path: Path, header: bytes) -> 
         "magic": magic.decode("ascii"),
         "record_count": int(record_count),
         "source_size": int(source_size),
-        "source_mtime_ns": int(source_mtime_ns),
         "key_column_hash": int(key_column_hash),
         "source_fingerprint": int(source_fingerprint),
     }
@@ -698,7 +696,6 @@ def validate_arrow_batch_lookup_index(
         "magic": str(header["magic"]),
         "record_count": int(header["record_count"]),
         "source_size": int(header["source_size"]),
-        "source_mtime_ns": int(header["source_mtime_ns"]),
         "key_column_hash": int(header["key_column_hash"]),
         "source_fingerprint": int(header["source_fingerprint"]),
     }
@@ -843,7 +840,6 @@ def write_arrow_batch_lookup_index(
                     _ARROW_BATCH_LOOKUP_INDEX_MAGIC,
                     len(records),
                     source_snapshot.size,
-                    source_snapshot.mtime_ns,
                     key_column_hash,
                     source_snapshot.fingerprint,
                 )

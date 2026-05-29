@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::constraints::same_prefix_tokens;
 use crate::features::{compute_name_counts_data, word_ngrams_counter};
-use crate::name_counts::{NameCountsData, RawNameCountMaps};
+use crate::name_counts::{NameCountsData, NameCountsLastFirstInitialSemantics, RawNameCountMaps};
 use crate::orcid::normalize_orcid_owned;
 use crate::raw_arrow::readers::{
     RawArrowAuthorSignalData, RawArrowFeature, RawArrowNameCountRarityRow, RawArrowPaper,
@@ -46,6 +46,9 @@ pub(crate) fn build_raw_arrow_feature(
         &first,
         &signature.author_last,
         &last_normalized,
+        // Arrow datasets always use the current `<last> <first-initial>` lookup-key form;
+        // legacy `<last> <full-first-token>` semantics only apply to Python ANDData ingest.
+        NameCountsLastFirstInitialSemantics::InitialChar,
     );
     let middle_initials: HashSet<char> = middle
         .split_whitespace()
@@ -127,6 +130,16 @@ pub(crate) fn build_raw_arrow_feature(
         hashes.dedup();
         hashes
     };
+    // ORCID enablement has two equivalent control surfaces and they should always agree:
+    //   1. Per-request: `orcid_enabled` here, derived from `not clusterer.suppress_orcid`
+    //      in [s2and/incremental_linking/production.py] and threaded through the planner.
+    //   2. Per-ingest: Python `ANDData(use_orcid_id=False)` strips ORCIDs at signature
+    //      build time (see s2and/data.py author_info_orcid handling), used by offline
+    //      training data prep only.
+    // When `orcid_enabled=false`, the kernel suppresses ORCID at hash time so the
+    // signature.orcid value is irrelevant. When `orcid_enabled=true`, the kernel honors
+    // whatever the ingest layer produced — a None signature.orcid is "no ORCID for this
+    // signature", not an error.
     let orcid_hash = if orcid_enabled {
         signature
             .orcid

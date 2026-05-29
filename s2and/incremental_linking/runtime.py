@@ -53,6 +53,7 @@ from s2and.incremental_linking.retrieval import (
     RAW_CANDIDATE_PLAN_ROW_KEYS,
     LinkerRetrievalBatch,
     RawArrowPlanBundle,
+    _query_author_for_retrieval_row_signal,
     build_linker_retrieval_batch_from_raw_candidate_plan,
     build_linker_retrieval_batch_rust,
     validate_raw_candidate_plan_schema,
@@ -422,26 +423,17 @@ def _predict_incremental_link_or_abstain_compact(
         forced_constraint_rows = np.asarray([], dtype=np.int64)
         if constraint_requires is not None:
             forced_constraint_rows = group[constraint_requires[group]]
-        if len(forced_orcid_rows):
-            best_row = _best_row_for_group(
-                forced_orcid_rows,
-                probabilities=probabilities,
-                retrieval_ranks=candidate_batch.retrieval_ranks,
-                component_keys=component_keys,
-            )
-            # Margin is reported against the highest-scoring non-best candidate from the
-            # full query group, not just the forced subset, so a single ORCID-forced row
-            # still produces a meaningful "beats the alternatives" margin.
-            runner_up_score = _forced_runner_up_score(
-                group,
-                best_row=best_row,
-                probabilities=probabilities,
-                retrieval_ranks=candidate_batch.retrieval_ranks,
-                component_keys=component_keys,
-            )
-            margin = None if np.isnan(runner_up_score) else float(probabilities[best_row] - runner_up_score)
-            action: LinkAction = "link"
-        elif len(forced_constraint_rows):
+        # Runner-up score for forced (require/ORCID) branches is reported against the
+        # eligible (non-vetoed) subset of the query group, so a constraint-disallowed
+        # competitor cannot inflate or deflate the reported margin.
+        eligible_group = group
+        if constraint_vetoes is not None:
+            eligible_mask = ~constraint_vetoes[group]
+            if not bool(np.all(eligible_mask)):
+                eligible_group = group[eligible_mask]
+        if len(forced_constraint_rows):
+            # An explicit require constraint is the user's hard contract; it takes
+            # precedence over the ORCID heuristic and over the disallow veto branch.
             _validate_single_constraint_require_target(
                 forced_constraint_rows=forced_constraint_rows,
                 component_keys=component_keys,
@@ -454,7 +446,23 @@ def _predict_incremental_link_or_abstain_compact(
                 component_keys=component_keys,
             )
             runner_up_score = _forced_runner_up_score(
-                group,
+                eligible_group,
+                best_row=best_row,
+                probabilities=probabilities,
+                retrieval_ranks=candidate_batch.retrieval_ranks,
+                component_keys=component_keys,
+            )
+            margin = None if np.isnan(runner_up_score) else float(probabilities[best_row] - runner_up_score)
+            action: LinkAction = "link"
+        elif len(forced_orcid_rows):
+            best_row = _best_row_for_group(
+                forced_orcid_rows,
+                probabilities=probabilities,
+                retrieval_ranks=candidate_batch.retrieval_ranks,
+                component_keys=component_keys,
+            )
+            runner_up_score = _forced_runner_up_score(
+                eligible_group,
                 best_row=best_row,
                 probabilities=probabilities,
                 retrieval_ranks=candidate_batch.retrieval_ranks,
@@ -839,25 +847,7 @@ def _merge_row_signal_sources(*sources: Mapping[str, Any] | None) -> dict[str, A
     return row_signals
 
 
-def _query_author_for_gate(query: Any) -> str:
-    value = getattr(query, "query_author", None)
-    if value is not None and str(value).strip():
-        return str(value)
-
-    def first_present(*names: str) -> Any:
-        for name in names:
-            attr_value = getattr(query, name, None)
-            if attr_value is not None and str(attr_value).strip():
-                return attr_value
-        return None
-
-    parts = [
-        first_present("first", "author_info_first"),
-        first_present("middle", "author_info_middle"),
-        first_present("last", "author_info_last"),
-        first_present("suffix", "author_info_suffix"),
-    ]
-    return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
+_query_author_for_gate = _query_author_for_retrieval_row_signal
 
 
 def _production_query_author_row_signals(

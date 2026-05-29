@@ -7,9 +7,38 @@ Evaluate production S2AND models (SPECTER1 vs SPECTER2) on various datasets.
 In this script we try to answer the question: if we deploy SPECTER2, will S2AND care?
 Both with retraining and without retraining.
 
-This is done with s2and-mini. Ai2 employee, find it at s3://ai2-s2-research/s2and/s2and-mini/
+================================================================================
+Which bundle the numbers below refer to
+================================================================================
 
-With retraining (random seed 42):
+The expected B3 numbers in this docstring are all measured against the
+**s2and-mini** bundle (`--dataset mini`). Mini is a curated subset of the full
+S2AND benchmark; Ai2 employees can find it at
+`s3://ai2-s2-research/s2and/s2and-mini/`.
+
+The mini bundle shares signature content with the full benchmark bundle but
+re-keys signature ids (mini ids are the full ids prefixed with `<dataset>_`).
+For three datasets (arnetminer, pubmed, qian) the mini signature set is
+identical to the full signature set, so the docstring numbers also reproduce
+on `--dataset full`. For the other three (inspire, kisti, zbmath) mini is a
+strict subset of full, so `--dataset full` evaluates a different (larger,
+harder) signature set and reports different B3:
+
+    Dataset      mini sigs      full sigs    mini == full?
+    arnetminer       7,144          7,144    yes
+    pubmed           2,871          2,871    yes
+    qian             6,542          6,542    yes
+    inspire          9,305        536,564    no (mini is a 1.7% subset)
+    kisti           37,779         40,383    no (mini is a 94% subset)
+    zbmath           5,327         15,181    no (mini is a 35% subset)
+
+If you ran `--dataset full --use-arrow` and saw inspire/kisti/zbmath drift by
+~0.4-1.2 F1 from the numbers below, that is the bundle difference, not a
+regression. To reproduce the docstring numbers exactly, run `--dataset mini`.
+
+================================================================================
+With retraining (random seed 42, dataset=mini)
+================================================================================
 
 Performance with SPECTERv1 data, on arnetminer (B3): (0.922, 0.985, 0.952)
 Performance with SPECTERv2 data, on arnetminer (B3): (0.93, 0.988, 0.958)
@@ -29,9 +58,14 @@ Performance with SPECTERv2 data, on qian (B3): (0.95, 0.964, 0.957)
 Performance with SPECTERv1 data, on zbmath (B3): (0.966, 0.984, 0.975)
 Performance with SPECTERv2 data, on zbmath (B3): (0.975, 0.991, 0.983)
 
----
+================================================================================
+Without retraining (production model artifacts, random seed 42, dataset=mini)
+================================================================================
 
-Without retraining (production model artifacts, random seed 42, verified 2026-05-21):
+SPECTER2 numbers verified 2026-05-21 against the ANDData/Python backend; all
+six datasets reproduce bit-identically on 2026-05-28 via
+`S2AND_BACKEND=python --dataset mini --specter-suffixes _specter2.pkl --seed 42
+--no-arrow`.
 
 Performance with SPECTERv1 data, on arnetminer (B3): (0.988, 0.972, 0.98)
 Performance with SPECTERv2 data, on arnetminer (B3): (0.946, 0.982, 0.963)
@@ -51,19 +85,36 @@ Performance with SPECTERv2 data, on qian (B3): (0.978, 0.964, 0.971)
 Performance with SPECTERv1 data, on zbmath (B3): (0.966, 0.986, 0.975)
 Performance with SPECTERv2 data, on zbmath (B3): (0.961, 0.992, 0.976)
 
+================================================================================
+Full-bundle Arrow numbers (no retraining, SPECTER2, --dataset full --use-arrow)
+================================================================================
 
-Usage:
+For reference, when evaluating the full bundle through the Arrow + Rust
+production path (`--dataset full --use-arrow --specter-suffixes _specter2.pkl
+--seed 42`), measured 2026-05-28:
+
+Performance on arnetminer (B3): (0.946, 0.982, 0.963)    # matches mini
+Performance on inspire    (B3): (0.983, 0.932, 0.957)    # mini ⊂ full
+Performance on kisti      (B3): (0.942, 0.968, 0.955)    # mini ⊂ full
+Performance on pubmed     (B3): (1.0,   0.892, 0.943)    # matches mini
+Performance on qian       (B3): (0.978, 0.964, 0.971)    # matches mini
+Performance on zbmath     (B3): (0.945, 0.985, 0.964)    # mini ⊂ full
+
+================================================================================
+Usage
+================================================================================
+
     # Evaluate on inventors_s2and (default)
     uv run python scripts/eval_prod_models.py
 
     # Evaluate on inventors_s2and
     uv run python scripts/eval_prod_models.py --dataset inventors_s2and
 
-    # Evaluate on s2and_mini datasets
-    uv run python scripts/eval_prod_models.py --dataset mini
-    # Uses Arrow automatically when complete Arrow artifacts exist.
+    # Reproduce the docstring numbers above (mini bundle, ANDData backend)
+    S2AND_BACKEND=python uv run python scripts/eval_prod_models.py \
+        --dataset mini --no-arrow --seed 42
 
-    # Evaluate released benchmark Arrow bundles directly
+    # Evaluate the full released benchmark via Arrow + Rust production path
     uv run python scripts/eval_prod_models.py --dataset full --use-arrow
 
     # Retrain from scratch instead of using prod models

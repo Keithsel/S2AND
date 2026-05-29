@@ -235,13 +235,30 @@ impl RustFeaturizer {
 
         let specter_sim = if english_or_unknown_count == 2 {
             if let (Some(specter_a), Some(specter_b)) = (p1.specter.as_ref(), p2.specter.as_ref()) {
-                let score = match (p1.specter_norm, p2.specter_norm) {
-                    (Some(norm_a), Some(norm_b)) if specter_a.len() == specter_b.len() => {
-                        cosine_sim_with_norms(specter_a, norm_a, specter_b, norm_b)
-                    }
-                    _ => cosine_sim_vec_f32(specter_a, specter_b),
-                };
-                score + 1.0
+                // Match s2and.featurizer behavior at s2and/featurizer.py:1223,1227:
+                // all-zero SPECTER vectors are treated as missing, yielding NaN.
+                // The Arrow ingest path keeps all-zero rows as real vectors (per the
+                // Current Decisions table in docs/work_plan.md), so the missing-vector
+                // check has to live here instead of at the ingest boundary.
+                let a_zero = p1.specter_norm.map_or_else(
+                    || specter_a.iter().all(|v| *v == 0.0),
+                    |norm| norm == 0.0,
+                );
+                let b_zero = p2.specter_norm.map_or_else(
+                    || specter_b.iter().all(|v| *v == 0.0),
+                    |norm| norm == 0.0,
+                );
+                if a_zero || b_zero {
+                    f64::NAN
+                } else {
+                    let score = match (p1.specter_norm, p2.specter_norm) {
+                        (Some(norm_a), Some(norm_b)) if specter_a.len() == specter_b.len() => {
+                            cosine_sim_with_norms(specter_a, norm_a, specter_b, norm_b)
+                        }
+                        _ => cosine_sim_vec_f32(specter_a, specter_b),
+                    };
+                    score + 1.0
+                }
             } else {
                 f64::NAN
             }
@@ -695,6 +712,10 @@ impl RustFeaturizer {
         let compute_reference_features: bool =
             dataset.getattr("compute_reference_features")?.extract()?;
         let preprocess: bool = dataset.getattr("preprocess")?.extract()?;
+        // ANDData already populates `author_info_name_counts` with the correct
+        // `name_counts_last_first_initial_semantics` lookup (see s2and/data.py
+        // _compute_signature_name_counts); from_dataset reuses those precomputed
+        // values directly instead of recomputing name-count keys in Rust.
 
         let text_module = py.import("s2and.text")?;
         let stop_words = extract_required_string_set(&text_module.getattr("STOPWORDS")?)?;
@@ -1615,6 +1636,8 @@ impl RustFeaturizer {
                     &affiliation_stopwords,
                     &unidecode_char_map,
                     preprocess,
+                    // Arrow-ingest datasets always use the current initial-char semantics.
+                    NameCountsLastFirstInitialSemantics::InitialChar,
                 )
             };
             install_with_optional_rayon_pool(num_threads, compute)

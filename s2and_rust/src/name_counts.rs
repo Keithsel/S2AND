@@ -1,6 +1,7 @@
+use memmap2::Mmap;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use crate::{
@@ -29,6 +30,19 @@ pub(crate) enum RawNameCountKind {
     Last,
     FirstLast,
     LastFirstInitial,
+}
+
+/// Mirrors `s2and.data.NAME_COUNTS_LAST_FIRST_INITIAL_*`. Today only the Arrow
+/// raw-ingest path computes `last_first_initial` keys in Rust, and Arrow datasets
+/// always use `InitialChar`. `from_dataset` reuses `ANDData`-precomputed values,
+/// which respect the user-selected semantics on the Python side. The enum and
+/// `LegacyFullFirstToken` variant exist as a contract surface so any future
+/// Rust-side legacy-mode ingest can opt into the matching lookup-key form.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameCountsLastFirstInitialSemantics {
+    LegacyFullFirstToken,
+    InitialChar,
 }
 
 impl RawNameCountKind {
@@ -89,7 +103,11 @@ impl RawNameCountIndex {
 }
 
 struct RawNameCountIndexFile {
-    bytes: Box<[u8]>,
+    // Memory-mapped index file. Bulk of the file is the variable-length
+    // name blob (hundreds of MB per kind); mmap avoids reading or
+    // allocating that bulk up front. Lookups page-fault only the records
+    // section pages they touch plus the matched name range.
+    mmap: Mmap,
     record_count: usize,
     blob_offset: usize,
     blob_len: usize,
@@ -97,14 +115,24 @@ struct RawNameCountIndexFile {
 
 impl RawNameCountIndexFile {
     fn open(path: &Path, kind: RawNameCountKind) -> PyResult<Self> {
-        let bytes = fs::read(path).map_err(|err| {
+        let file = File::open(path).map_err(|err| {
             pyo3::exceptions::PyIOError::new_err(format!(
-                "failed to read name-count index file {}: {}",
+                "failed to open name-count index file {}: {}",
                 path.display(),
                 err
             ))
         })?;
-        let bytes = bytes.into_boxed_slice();
+        // SAFETY: the index files are produced by our own offline writer
+        // and remain immutable on disk during inference. Concurrent
+        // truncation is not part of the supported operating contract.
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|err| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "failed to mmap name-count index file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+        let bytes: &[u8] = &mmap;
         if bytes.len() < NAME_COUNTS_INDEX_HEADER_LEN {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "name-count index file {} is shorter than the header",
@@ -118,9 +146,9 @@ impl RawNameCountIndexFile {
                 kind.key(),
             )));
         }
-        let record_count = read_u64_usize(&bytes, 8, path, "record_count")?;
-        let blob_offset = read_u64_usize(&bytes, 16, path, "blob_offset")?;
-        let blob_len = read_u64_usize(&bytes, 24, path, "blob_len")?;
+        let record_count = read_u64_usize(bytes, 8, path, "record_count")?;
+        let blob_offset = read_u64_usize(bytes, 16, path, "blob_offset")?;
+        let blob_len = read_u64_usize(bytes, 24, path, "blob_len")?;
         let records_end = NAME_COUNTS_INDEX_HEADER_LEN
             .checked_add(
                 record_count
@@ -152,7 +180,7 @@ impl RawNameCountIndexFile {
         }
         for index in 0..record_count {
             let record_offset = NAME_COUNTS_INDEX_HEADER_LEN + index * NAME_COUNTS_INDEX_RECORD_LEN;
-            let name_offset_raw = read_u64_le_unchecked(&bytes, record_offset + 16);
+            let name_offset_raw = read_u64_le_unchecked(bytes, record_offset + 16);
             let name_offset = usize::try_from(name_offset_raw).map_err(|_| {
                 pyo3::exceptions::PyOverflowError::new_err(format!(
                     "name-count index file {} record {} for kind {} has name offset that overflows usize: {}",
@@ -162,7 +190,7 @@ impl RawNameCountIndexFile {
                     name_offset_raw
                 ))
             })?;
-            let name_len = read_u32_le_unchecked(&bytes, record_offset + 24) as usize;
+            let name_len = read_u32_le_unchecked(bytes, record_offset + 24) as usize;
             let name_end = name_offset.checked_add(name_len).ok_or_else(|| {
                 pyo3::exceptions::PyOverflowError::new_err(format!(
                     "name-count index file {} record {} for kind {} name range overflows",
@@ -187,8 +215,8 @@ impl RawNameCountIndexFile {
             let read_pair = |index: usize| {
                 let offset = NAME_COUNTS_INDEX_HEADER_LEN + index * NAME_COUNTS_INDEX_RECORD_LEN;
                 (
-                    read_u64_le_unchecked(&bytes, offset),
-                    read_u64_le_unchecked(&bytes, offset + 8),
+                    read_u64_le_unchecked(bytes, offset),
+                    read_u64_le_unchecked(bytes, offset + 8),
                 )
             };
             let mut previous_index = 0usize;
@@ -211,7 +239,7 @@ impl RawNameCountIndexFile {
             }
         }
         Ok(Self {
-            bytes,
+            mmap,
             record_count,
             blob_offset,
             blob_len,
@@ -225,8 +253,8 @@ impl RawNameCountIndexFile {
     fn record_hash_pair(&self, index: usize) -> (u64, u64) {
         let offset = self.record_offset(index);
         (
-            read_u64_le_unchecked(&self.bytes, offset),
-            read_u64_le_unchecked(&self.bytes, offset + 8),
+            read_u64_le_unchecked(&self.mmap, offset),
+            read_u64_le_unchecked(&self.mmap, offset + 8),
         )
     }
 
@@ -252,20 +280,20 @@ impl RawNameCountIndexFile {
                 break;
             }
             let offset = self.record_offset(index);
-            let name_offset = match usize::try_from(read_u64_le_unchecked(&self.bytes, offset + 16))
+            let name_offset = match usize::try_from(read_u64_le_unchecked(&self.mmap, offset + 16))
             {
                 Ok(value) => value,
                 Err(_) => break,
             };
-            let name_len = read_u32_le_unchecked(&self.bytes, offset + 24) as usize;
+            let name_len = read_u32_le_unchecked(&self.mmap, offset + 24) as usize;
             if name_offset
                 .checked_add(name_len)
                 .map_or(false, |end| end <= self.blob_len)
             {
                 let start = self.blob_offset + name_offset;
                 let end = start + name_len;
-                if &self.bytes[start..end] == name_bytes {
-                    return Some(read_f64_le_unchecked(&self.bytes, offset + 32));
+                if &self.mmap[start..end] == name_bytes {
+                    return Some(read_f64_le_unchecked(&self.mmap, offset + 32));
                 }
             }
             index += 1;

@@ -492,8 +492,13 @@ impl RustHybridCentroidRetriever {
         allow_global_orcid_override: bool,
     ) -> RetrievalCandidateSelection {
         if allow_global_orcid_override {
+            let global_candidates =
+                (0..self.summaries.len()).filter(|idx| match excluded_candidate_indices {
+                    Some(excluded) => !excluded.contains(idx),
+                    None => true,
+                });
             if let Some(selection) =
-                self.orcid_candidate_selection_for_query(query_data, 0..self.summaries.len())
+                self.orcid_candidate_selection_for_query(query_data, global_candidates)
             {
                 return selection;
             }

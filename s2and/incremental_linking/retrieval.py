@@ -117,6 +117,33 @@ REQUIRED_RUST_PAIR_PLAN_KEYS: tuple[str, ...] = (
 )
 
 
+def _query_author_for_retrieval_row_signal(query: Any) -> str:
+    """Resolve a display author string for a retrieval query.
+
+    Mirrors the gate-side helper in s2and.incremental_linking.runtime so that the
+    Rust retrieval path can populate `query_author` row signals directly, matching
+    the raw-Arrow retrieval path's row-signal contract.
+    """
+    value = getattr(query, "query_author", None)
+    if value is not None and str(value).strip():
+        return str(value)
+
+    def first_present(*names: str) -> Any:
+        for name in names:
+            attr_value = getattr(query, name, None)
+            if attr_value is not None and str(attr_value).strip():
+                return attr_value
+        return None
+
+    parts = [
+        first_present("first", "author_info_first"),
+        first_present("middle", "author_info_middle"),
+        first_present("last", "author_info_last"),
+        first_present("suffix", "author_info_suffix"),
+    ]
+    return " ".join(str(part).strip() for part in parts if part is not None and str(part).strip())
+
+
 @dataclass(frozen=True)
 class LinkerRetrievalBatch:
     """Retrieved candidate rows, flat pair plan, and compact row-level signals."""
@@ -592,11 +619,33 @@ def build_linker_retrieval_batch_rust(
             dtype=object,
         )
     query_first_tokens = np.asarray(plan["row_query_first_tokens"], dtype=object)
+    # Mirror the raw-Arrow path: broadcast per-query author strings onto each row so
+    # downstream gate features (top_meta_query_author_len) read query_author directly
+    # from row_signals instead of relying on a separate runtime patch-in.
+    row_query_signature_indices_arr = candidate_batch.row_query_signature_indices
+    if row_query_signature_indices_arr is None:
+        raise RuntimeError("Rust retrieval plan did not provide row_query_signature_indices")
+    per_query_authors = np.asarray(
+        [_query_author_for_retrieval_row_signal(query) for query in queries],
+        dtype=object,
+    )
+    query_index_to_offset = {
+        int(query_index): offset
+        for offset, query_index in enumerate(query_signature_indices_array)
+    }
+    query_authors_per_row = np.asarray(
+        [
+            per_query_authors[query_index_to_offset[int(query_index)]]
+            for query_index in row_query_signature_indices_arr
+        ],
+        dtype=object,
+    )
     row_signals: dict[str, Any] = {
         "retrieval_score": candidate_batch.retrieval_scores,
         "retrieval_rank": candidate_batch.retrieval_ranks,
         "candidate_component_key": np.asarray(candidate_batch.row_component_keys, dtype=object),
         "query_view": query_views,
+        "query_author": query_authors_per_row,
         "cluster_size": np.asarray(plan["row_component_sizes"], dtype=np.float32),
         "named_signature_count": np.asarray(plan["row_named_signature_counts"], dtype=np.float32),
         "dominant_first_name": np.asarray(plan["row_dominant_first_names"], dtype=object),

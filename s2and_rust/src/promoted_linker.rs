@@ -16,7 +16,10 @@ const LINKER_GENERIC_FAMILY_MIN_COUNT: f32 = 3.0;
 const LINKER_GENERIC_FAMILY_MIN_RATIO: f32 = 0.6;
 
 fn linker_round(value: f32, scale: f32) -> f32 {
-    (value * scale).round() / scale
+    // Use round-half-to-even (banker's rounding) to match np.round, which the
+    // Python reference at tests/linker_row_feature_reference.py applies to every
+    // value passed through linker_round.
+    (value * scale).round_ties_even() / scale
 }
 
 fn linker_clip01(value: f32) -> f32 {
@@ -296,8 +299,10 @@ fn linker_derive_group_features(
                 !dominant_first_alpha[*index].is_empty()
                     && dominant_first_alpha[*index] == dominant_first_alpha[best_top5],
             );
+            // Match the Python reference in tests/linker_row_feature_reference.py:
+            // retrieval_score is used raw inside the product; do not clip to [0,1].
             same_family_as_heuristic_choice[*index] = linker_round(
-                dominant_first_top1_match[*index] * linker_clip01(retrieval_score[*index])
+                dominant_first_top1_match[*index] * retrieval_score[*index]
                     + same_dominant_first_as_best_top5[*index] * (1.0 - top5_mean_distance[*index]),
                 1_000_000.0,
             );
@@ -325,7 +330,10 @@ fn linker_year_gap_features(
     let mut span = vec![0.0f32; query_year.len()];
     for index in 0..query_year.len() {
         if candidate_year_range_missing[index] == 0.0 {
-            span[index] = (candidate_year_max[index] - candidate_year_min[index]).max(0.0);
+            let raw_span = (candidate_year_max[index] - candidate_year_min[index]).max(0.0);
+            // Match the Python reference in tests/linker_row_feature_reference.py,
+            // which applies np.round(span, 6) at the end.
+            span[index] = linker_round(raw_span, 1_000_000.0);
         }
         if query_year_missing[index] != 0.0 || candidate_year_range_missing[index] != 0.0 {
             continue;

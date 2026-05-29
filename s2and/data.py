@@ -549,6 +549,13 @@ class ANDData:
                 author_info_affiliations_n_grams=None,
                 author_info_coauthor_n_grams=None,
                 author_info_email=signature["author_info"]["email"],
+                # use_orcid_id is an offline data-prep knob used by training data
+                # construction (incremental_linking_training.data_loading) to build
+                # datasets that strip ORCIDs entirely. Production callers leave the
+                # default True and let the per-request `Clusterer.suppress_orcid` flag
+                # drive ORCID enablement (which threads to Rust via `orcid_enabled` in
+                # raw_arrow_features). The two control surfaces are equivalent in
+                # effect; do not mix them.
                 author_info_orcid=(
                     (signature["author_info"].get("source_ids") or [None])[0]
                     if use_orcid_id

@@ -4758,6 +4758,11 @@ class Clusterer:
 
         if partial_supervision is None:
             partial_supervision = {}
+        if dists is not None and partial_supervision:
+            raise ValueError(
+                "partial_supervision cannot be used with precomputed dists because override pairs "
+                "would not be injected into the distance matrix"
+            )
         _apply_dataset_name_count_semantics_for_prediction(self, dataset)
 
         pred_clusters = defaultdict(list)
@@ -5463,7 +5468,7 @@ class Clusterer:
                 cluster_dists,
                 config=config,
             )
-            if best_cluster_id is not None and best_dist < self.cluster_model.eps:
+            if best_cluster_id is not None and best_dist <= self.cluster_model.eps:
                 linked_signature_to_cluster[unassigned_signature] = best_cluster_id
 
         return self._finish_incremental_with_seed_links(

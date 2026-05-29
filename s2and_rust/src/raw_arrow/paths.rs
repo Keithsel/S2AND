@@ -36,10 +36,10 @@ pub(crate) fn optional_path_from_py_dict(
     paths: &Bound<'_, PyDict>,
     key: &str,
 ) -> PyResult<Option<String>> {
-    paths
-        .get_item(key)?
-        .map(|value| value.extract())
-        .transpose()
+    match paths.get_item(key)? {
+        Some(value) if !value.is_none() => Ok(Some(value.extract::<String>()?)),
+        _ => Ok(None),
+    }
 }
 
 pub(crate) fn optional_name_counts_index_path_from_py_dict(

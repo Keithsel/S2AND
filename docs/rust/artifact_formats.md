@@ -15,7 +15,7 @@ It replaces the older artifact-divergence migration log.
 | Cluster seeds | `cluster_seeds.arrow` Arrow IPC table | Required for seeded/incremental Arrow prediction. Omit for unseeded full prediction. |
 | Cluster seed disallows | `cluster_seed_disallows.arrow` Arrow IPC table | Optional for seeded/incremental Arrow prediction. Include it when pairwise seed disallow constraints are present; omitted means no disallows. |
 | SPECTER | `specter.arrow` Arrow fixed-size-list `float32` table | Preferred direct-path embedding input. Include the embedding version required by the model. |
-| Raw-planner batch indexes | `<arrow-stem>.<path-key>.bin` S2AND binary sidecar | Optional derived indexes for large-block raw planning. Current writers emit `arrow_batch_lookup_index` with magic `S2ABI001`; regenerate from the final Arrow IPC files. |
+| Raw-planner batch indexes | `<arrow-stem>.<path-key>.bin` S2AND binary sidecar | Optional derived indexes for large-block raw planning. Current writers emit `arrow_batch_lookup_index` with magic `S2ABI002`; regenerate from the final Arrow IPC files. |
 | Name counts | `s2and/data/name_counts_index/` sorted binary sidecar | Preferred Rust hot-path lookup artifact for models that use name-count features. |
 | Name-count Arrow table | `name_counts.arrow` long-form Arrow table | Generation, inspection, and parity debugging only. It is not a request-time runtime fallback for `name_counts_index/`. |
 | Name aliases | Packaged filtered text file | Shared runtime default. Avoid per-dataset alias artifacts unless running an explicit experiment. |
@@ -76,7 +76,7 @@ manifests should use the `name_counts_index` key; do not emit the old
 
 `scripts/convert_to_arrow.py` is the reference deployable Arrow-bundle writer.
 It writes bounded Arrow IPC file-format tables, regenerates current raw-planner
-batch-index sidecars (`S2ABI001`), records physical-layout metrics, and writes
+batch-index sidecars (`S2ABI002`), records physical-layout metrics, and writes
 dataset manifests. `scripts/verification/compare_full_predict_arrow_parity.py`
 is the reference bounded parity writer and follows the same table and sidecar
 helpers for temporary verification artifacts.

@@ -2014,16 +2014,15 @@ pub(crate) struct SubblockMergeMetadata {
 pub(crate) fn subblock_merge_candidate_metadata(key: &str, size: usize) -> SubblockMergeMetadata {
     let key_parts: Vec<&str> = key.split('|').collect();
     let first_name = key_parts.first().copied().unwrap_or_default().to_string();
-    let middle_name = if key_parts.len() > 1 {
-        Some(
-            key_parts[1]
-                .split_once('=')
-                .map_or("", |(_left, right)| right)
-                .to_string(),
-        )
-    } else {
-        None
-    };
+    // Match s2and/subblocking.py:1543-1554: only emit a middle_name when the second
+    // segment explicitly carries a `key=value` token, mirroring Python's
+    // `if "=" in key_parts[1]` guard. Returning `Some("")` for an `=`-less segment
+    // would silently make the subblock eligible for merge fan-out against other
+    // empty-middle subblocks.
+    let middle_name = key_parts
+        .get(1)
+        .and_then(|part| part.split_once('='))
+        .map(|(_left, right)| right.to_string());
     let name_for_splits = if py_len(&first_name) > 1 {
         Some(first_name.clone())
     } else if py_len(&first_name) == 1 && middle_name.is_some() {

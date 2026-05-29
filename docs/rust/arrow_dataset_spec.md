@@ -233,7 +233,7 @@ index per file. At runtime, the selected embedding file is passed under the
 `<embedding-stem>.specter_batch_index.bin` sidecar when present.
 
 The batch-index format is S2AND-owned. Current writers and readers require
-`arrow_batch_lookup_index` / `S2ABI001`, which records the key-column hash and
+`arrow_batch_lookup_index` / `S2ABI002`, which records the key-column hash and
 full-file source fingerprint in addition to key-to-batch records. Each record maps a
 64-bit FNV-1a hash of the lookup key to an IPC record-batch index; the Rust
 reader verifies exact ids after loading the selected batches, so hash collisions

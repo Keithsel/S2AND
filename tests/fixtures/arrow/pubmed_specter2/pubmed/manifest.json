@@ -83,7 +83,7 @@
     "signatures_batch_index": {
       "reused": false,
       "schema_version": "arrow_batch_lookup_index",
-      "magic": "S2ABI001",
+      "magic": "S2ABI002",
       "row_count": 2871,
       "record_count": 2871,
       "key_column_hash": 607743565014278955,
@@ -96,7 +96,7 @@
     "papers_batch_index": {
       "reused": false,
       "schema_version": "arrow_batch_lookup_index",
-      "magic": "S2ABI001",
+      "magic": "S2ABI002",
       "row_count": 2871,
       "record_count": 2871,
       "key_column_hash": 17948583095397703583,
@@ -109,7 +109,7 @@
     "paper_authors_batch_index": {
       "reused": false,
       "schema_version": "arrow_batch_lookup_index",
-      "magic": "S2ABI001",
+      "magic": "S2ABI002",
       "row_count": 12361,
       "record_count": 12361,
       "key_column_hash": 17948583095397703583,
@@ -122,7 +122,7 @@
     "specter_batch_index": {
       "reused": false,
       "schema_version": "arrow_batch_lookup_index",
-      "magic": "S2ABI001",
+      "magic": "S2ABI002",
       "row_count": 2871,
       "record_count": 2871,
       "key_column_hash": 17948583095397703583,
@@ -135,7 +135,7 @@
     "specter2_batch_index": {
       "reused": false,
       "schema_version": "arrow_batch_lookup_index",
-      "magic": "S2ABI001",
+      "magic": "S2ABI002",
       "row_count": 2871,
       "record_count": 2871,
       "key_column_hash": 17948583095397703583,

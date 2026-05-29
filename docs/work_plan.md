@@ -1,6 +1,6 @@
 # Work Plan
 
-Status date: 2026-05-27
+Status date: 2026-05-28
 
 This is the active Rust/Arrow platform backlog. Stable architecture and artifact
 contracts live in:
@@ -51,294 +51,9 @@ The canonical surface owns:
 - Seed sidecars and request-local seed materialization.
 - Subblocking strictness, telemetry keys, and producer hints.
 
-## Active Sequence
-
-1. Keep the local canonical Arrow replay/profiling source at
-   `s2and/data/s2and_and_big_blocks_linker_dataset_20260525`.
-2. Treat release artifact validation for the current Arrow S3 prefix as
-   complete; keep future publication smokes explicit and network opt-in.
-3. Convert production-facing scripts to Arrow routes where that is a direct
-   replacement; relabel raw/reference parity scripts instead of expanding them.
-4. Preserve strict production routing through `s2and.arrow_inputs`; do not add
-   another strict/compatibility discovery layer.
-5. Delete or isolate remaining non-Arrow Rust loaders after their scripts/tests
-   are clearly labeled compatibility-only.
-6. Split oversized Rust and Arrow incremental runtime modules only after the
-   production boundary is locked and tested.
-
-## Cleanup Batch Exit Criteria
-
-| Area | Promotion criteria |
-|---|---|
-| Graph subblocking telemetry | Stats are passed explicitly; production code has no `_graph_subblocking_stats` read/mutation path. |
-| Rust pair-plan ABI | `get_build_info()` exposes supported pair-plan kwargs and row signals; Python no longer parses `__text_signature__` or runs a live zero-row probe. |
-| Arrow path authority | Production prediction reads only explicit dataset Arrow path mappings and validates them through `s2and.arrow_inputs`; sibling-bundle and optional-sidecar discovery remain compatibility-only. |
-| Arrow schema contract | `s2and/arrow_schema_contract.json` is checked by Rust/Python tests before any reader policy is centralized. |
-
 ## Open Work
 
-### 1. Production Artifact Generation
-
-Current state:
-
-- The current S3-synced public Arrow release under `s2and/data` has the
-  manifest-backed `name_counts_index/generations/<generation-id>/` layout.
-- The canonical local replay/profiling bundle is
-  `s2and/data/s2and_and_big_blocks_linker_dataset_20260525`.
-
-Remaining:
-
-- For the next full regeneration, rebuild durable Arrow bundles from the full
-  schema in [rust/arrow_dataset_spec.md](rust/arrow_dataset_spec.md) and run
-  `refresh-root-manifest` before publication.
-- Keep production-scale `name_counts_index/` in S3, not Git/LFS.
-- Keep `name_counts.arrow` for generation, inspection, and parity debugging,
-  not as the default request-time read.
-
-Done when:
-
-- A reproducible `uv run ...` conversion builds a local Arrow release root.
-- Every dataset manifest, required Arrow IPC file, batch lookup index, and
-  `name_counts_index/manifest.json` validates for the benchmark datasets and
-  canonical linker replay bundle.
-
-### 2. Arrow S3 Release
-
-Target prefix:
-`s3://ai2-s2-research-public/s2and-release-arrow`.
-
-Current state:
-
-- The prefix was published and no-auth spot-checked on 2026-05-25.
-- The refreshed root manifest and root helper files were uploaded on
-  2026-05-26 after default and size-only dry runs showed no changed large
-  Arrow objects. A final dry run returned no pending uploads.
-- A bounded public-release smoke on 2026-05-26 copied the root, `qian`, and
-  `name_counts_index` manifests with `--no-sign-request`, then ran
-  `scripts/eval_prod_models.py --dataset full --use-arrow --datasets qian
-  --specter-suffixes _specter2.pkl --seed 42 --n_jobs 2` against the
-  S3-converged local release root. The direct Arrow
-  `predict_from_arrow_paths(...)` route completed with qian B3
-  `(0.978, 0.964, 0.971)`.
-- Keep the canonical replay subbundle name
-  `s2and_and_big_blocks_linker_dataset_20260525/` for the current public Arrow
-  release.
-- The release is Arrow-native. Do not mirror `.feature_cache/`, raw JSON,
-  pickle embeddings, or precomputed `features_corrected/`.
-- Local release-manifest generation now records root-manifest checksums,
-  per-dataset audit counts, generator commit metadata, validation requirements,
-  and the exact validation commands.
-- `refresh-root-manifest` refreshes those checksums/audits/validation commands
-  in a local S3-synced checkout while preserving the logical S3 `output_root`
-  and nested replay-bundle metadata.
-- `scripts/verification/validate_local_arrow_release.py` provides the
-  non-network local release-root smoke: root helper files, root-manifest
-  checksum fields, dataset manifest references, required Arrow artifact paths,
-  raw-planner batch-index sidecars, replay-bundle manifests, and
-  `name_counts_index/manifest.json` targets.
-- The local tiny-fixture release-layout regression covers root manifest
-  checksums, dataset manifest references, readable Arrow IPC files, a
-  batch-index sidecar, production model manifest, and
-  `name_counts_index/manifest.json`.
-
-Remaining:
-
-- Keep S3/network validation as an explicit release smoke command, not default
-  pytest, until CI has a dedicated network-enabled release job.
-- For future publications, rerun the bounded public-release smoke after upload.
-
-Done when:
-
-- The public prefix has a root manifest with checksums.
-- Every dataset manifest references existing files.
-- A bounded smoke command can read the published files and run
-  `predict_from_arrow_paths(...)`.
-
-### 3. Strict Production Routing
-
-Already landed:
-
-- `Clusterer.predict_from_arrow_paths(...)` validates complete Arrow artifacts
-  and raises structured missing-artifact errors.
-- Rust `Clusterer.predict(...)` fails closed in production Rust mode when Arrow
-  artifacts are incomplete, including subblocked prediction.
-- Rust `Clusterer.predict_incremental(...)` requires base Arrow artifacts and a
-  seed source before entering promoted incremental scoring.
-- Arrow graph subblocking requires batch indexes and no longer falls back after
-  Arrow read/prepare/call failures on the Rust production path.
-- Rust Arrow subblocking is native-graph only. The legacy
-  `subblocking_fallback_mode` knob and the Rust `fallback_cluster_fn` callback
-  path were removed, so Rust no longer calls Python during Arrow subblocking.
-- Raw payload / Python `FeatureBlock` Rust scoring bridges were removed.
-- Bounded script-level smoke tests cover
-  `scripts/convert_to_arrow.py service-json`, the Arrow production tutorial,
-  Arrow production eval, and the Arrow rust-suite production benchmark
-  dispatch.
-- A canonical large-block fixture proves Arrow graph subblocking, Arrow
-  featurizer reuse, and promoted incremental completion run without `ANDData`
-  fallback.
-- `scripts/eval_prod_models.py --use-arrow` was run on the local mini Arrow
-  bundle for `pubmed`, `qian`, and `zbmath` with no `ANDData` construction:
-  B3 F1 was 0.943, 0.971, and 0.976 respectively.
-- The same Arrow eval smoke now runs against the S3-synced public release root
-  in `s2and/data`: `pubmed`, `qian`, and `zbmath` with SPECTER2 produced B3
-  F1 0.943, 0.971, and 0.959 respectively.
-- Existing-release feature parity was spot-checked on 2026-05-26 with
-  `scripts/verification/compare_existing_arrow_anddata_feature_parity.py`
-  against `s2and/data-backup` raw JSON/pickle and `s2and/data` Arrow bundles
-  for `pubmed`, `qian`, and `zbmath`. The bounded SPECTER2 run used 64
-  signatures and 128 sampled pairs per dataset, and all three had 39 feature
-  columns, zero NaN mismatches, and max absolute drift `0.0` at tolerance
-  `1e-5`.
-
-Remaining:
-
-- Keep future production call sites on `s2and.arrow_inputs`; do not duplicate
-  strict validation in scripts or model helpers.
-
-Done when:
-
-- Arrow full prediction, subblocked prediction, and promoted incremental smoke
-  tests run without `ANDData` fallback.
-- Compatibility routes still preserve legacy behavior for training, fixtures,
-  parity checks, and explicitly labeled legacy scripts.
-
-### 4. Compatibility And Python-Heavy Paths
-
-Remaining:
-
-- Prefer `Clusterer.predict_from_arrow_paths(...)` or Arrow-routed
-  `predict(...)` for production inference.
-- Use `scripts/verification/compare_graph_subblocking_arrow_quality.py` for
-  Python graph vs Rust graph subblocking checks. It no longer compares against
-  the old SPECTER fallback or any Rust-calls-Python callback path.
-- Keep the raw-Arrow incremental runtime split between planner-owned execution
-  and strict preplanned scoring. Query request fields should stay in typed
-  Arrow sidecars; production batch scoring should continue to call the
-  preplanned surface with a supplied raw candidate plan and Rust featurizer.
-- Keep `feature_block_from_arrow_paths(...)` implementation-only for
-  fixture/parity validation. Do not re-export it as public production API.
-- Keep `RustFeaturizer.from_dataset(...)` as the Python-reference,
-  training/eval, parity, and fixture surface.
-- Keep text `altered_cluster_signatures.txt` fallback only for training/legacy
-  fixtures until those fixtures migrate to Arrow sidecars.
-
-Done when:
-
-- Production docs and scripts recommend only Arrow-backed Rust inference.
-- Removed raw payload / `FeatureBlock` scoring bridges have no callers.
-- Remaining Python-object helpers are explicitly fixture, conversion, parity, or
-  training utilities.
-
-### 5. Rust Surface Cleanup
-
-Already landed:
-
-- Removed unused or duplicate public/debug APIs including
-  `RustHybridCentroidRetriever.summary_count(...)`,
-  `raw_block_query_candidate_plan_arrow(...)`,
-  the legacy list-of-tuples linker aggregate API,
-  the aggregate-only pair stats PyO3 method,
-  the string-pair constraint API, and direct retriever debug APIs.
-- Removed `RustFeaturizer.from_json_paths(...)` and the Python JSON-ingest
-  lifecycle from active constructors.
-- Removed direct Rust handling of tuple-shaped SPECTER pickle payloads from
-  `RustFeaturizer.from_dataset(...)`; Python `ANDData` owns pickle loading and
-  normalization before Rust feature generation.
-- Production pairwise training now defaults `S2AND_BACKEND=rust` before
-  importing `s2and`, so `ANDData` loading/preprocessing can delegate feature
-  generation to `RustFeaturizer.from_dataset(...)`.
-- Removed `RustFeaturizer.save(...)` and `RustFeaturizer.load(...)`; the
-  counter-data measurement helper now reports build-time RSS deltas instead of
-  depending on Rust featurizer serialization.
-- Removed the legacy `make_subblocks_with_telemetry_arrow(...)` PyO3 export and
-  its Python fallback callback. The Python wrapper now probes only
-  `make_subblocks_with_telemetry_arrow_native_graph(...)`.
-- Removed the `s2and.rust_capabilities` compatibility shim.
-- Extracted the promoted non-pairwise linker feature kernel into
-  `s2and_rust/src/promoted_linker.rs` with its focused Rust unit test and PyO3
-  registration helper.
-- Extracted manifest-backed name-count index loading and lookup into
-  `s2and_rust/src/name_counts.rs`, keeping `lib.rs` on the existing
-  `RawNameCountMaps` / `NameCountsData` contract.
-- Extracted Python-compatible text/name normalization helpers into
-  `s2and_rust/src/text_compat.rs`.
-- Extracted raw-planner Arrow batch lookup reading into
-  `s2and_rust/src/arrow_batch_lookup.rs`.
-- Relabeled remaining JSON-backed compatibility references; active Python
-  constructors reject `RustFeaturizer.from_json_paths(...)`.
-- Current inventory:
-  [rust/public_surface_inventory.md](rust/public_surface_inventory.md).
-
-Remaining:
-
-- Keep the indexed pairwise feature API as the Python Rust batching boundary.
-  The Python `featurize_pair_rust(...)` and string-pair matrix wrappers have
-  been removed; direct Rust `featurize_pair(...)`, `featurize_pairs(...)`, and
-  `featurize_pairs_matrix(...)` PyO3 debug methods have also been removed.
-- Split `s2and_rust/src/lib.rs` mechanically, one low-coupling module at a
-  time. Completed extractions: `promoted_linker`, `name_counts`,
-  `text_compat`, `arrow_batch_lookup`, `constraints`, `orcid`,
-  `pair_indexing`, `rayon_pool`, `language_detection`, `raw_arrow::arrow_io`,
-  `raw_arrow::readers`, `raw_arrow::paths`, `raw_arrow_features`,
-  `raw_candidate_planner`, `retrieval`, `ingest_dataset`, `features` helpers,
-  `subblocking`, and `rust_featurizer` including linker-distance helpers.
-  Candidate next modules: none identified for this cleanup pass; `lib.rs` now
-  keeps shared core data types, tests, build info, and PyO3 registration.
-- Move focused tests with extracted modules where that preserves private
-  visibility without unnecessary `pub(crate)` churn.
-
-Done when:
-
-- `lib.rs` is mostly PyO3 export wiring.
-- Extracted modules own focused tests.
-- Rust unit tests and focused Python/Rust integration tests pass after each
-  extraction.
-
-### 6. Rust Ingest Deduplication
-
-Current inventory:
-[rust/ingest_source_policy_inventory.md](rust/ingest_source_policy_inventory.md).
-
-Remaining:
-
-- Deduplicate Arrow/JSON/`ANDData` staging records only where source semantics
-  match: unidecode, language handling, name splitting, name-count telemetry,
-  paper-author handling, ORCID/source-id derivation, malformed positions,
-  reference features, `preprocess=false`, and filtering order.
-- Keep source-specific differences documented instead of hiding them behind a
-  broad shared helper.
-
-Done when:
-
-- Equivalent ingest semantics share staging helpers.
-- Source-specific behavior remains explicit.
-- Rust library tests and focused Python/Rust integration tests pass.
-- Bounded real-dataset Arrow-vs-`ANDData` feature parity is recorded for
-  datasets that have both original JSON inputs and generated Arrow bundles,
-  with feature matrix drift no larger than `1e-5` except for documented,
-  intentional source-policy differences.
-
-### 7. Incremental Helper Shim
-
-Current state:
-
-- The old `Clusterer._predict_incremental_helper(...)` shim was renamed to the
-  explicitly internal Python fallback path.
-- Focused tests no longer monkeypatch or reference
-  `_predict_incremental_helper(...)`; return-contract coverage goes through
-  `Clusterer.predict_incremental(...)`.
-
-Remaining:
-
-- None for this shim.
-
-Done when:
-
-- No tests monkeypatch or reference `_predict_incremental_helper(...)`, and
-  focused incremental tests pass.
-
-### 8. Performance Targets
+### 1. Performance Targets
 
 Current evidence:
 
@@ -346,17 +61,19 @@ Current evidence:
   runs on the canonical local `pubmed` `r agarwal` block with 25 synthetic seed
   clusters and 25 query signatures because the canonical replay bundle has no
   `clusters` artifact.
-- Result summary:
-  p50 predict wall time 11.15s, min 11.12s, max 11.63s, max RSS 3.72 GB,
-  625 candidate rows, 1 query batch, p50 final predicted peak delta
-  18,712,216 bytes.
-- The largest measured contributors in the Arrow telemetry were reusable
-  window featurizer work and manifest-backed name-count reads during window
-  planning. Treat these as the next optimization candidates only if a focused
-  before/after profile shows at least a 10% wall-time or allocation impact.
-- Evidence: [rust/profiling/2026-05-27-promoted-incremental-arrow.md](rust/profiling/2026-05-27-promoted-incremental-arrow.md).
-  This was a dirty-worktree/debug-assertions run, so it is operational
-  prioritization evidence rather than a release-grade performance claim.
+- Release-build baseline (debug_assertions=false): p50 predict wall 2.18s,
+  read_name_counts p50 0.775s (35.5% of wall), peak RSS 3.84 GB.
+- After replacing `fs::read` with `memmap2`-backed reads for the four
+  `name_counts_index/*.bin` files: p50 predict wall 2.01s, read_name_counts
+  p50 0.622s (-19.7%), peak RSS 3.02 GB (-21.4%). Wall-time gain is -7.9%,
+  below the 10% threshold for continued optimization, so no further work is
+  scheduled on this workload.
+- The 2026-05-27 reading of p50 ~11.15s was the debug-assertions cost; a
+  release rebuild alone explains ~5x of that.
+- Evidence: [rust/profiling/2026-05-28-promoted-incremental-arrow.md](rust/profiling/2026-05-28-promoted-incremental-arrow.md)
+  (release-grade refresh and mmap delta);
+  [rust/profiling/2026-05-27-promoted-incremental-arrow.md](rust/profiling/2026-05-27-promoted-incremental-arrow.md)
+  (prior debug-assertions snapshot).
 
 Next profiling target:
 
@@ -380,12 +97,17 @@ Act only when:
 - Stop optimizing once measured improvement falls below 10% for the selected
   workload.
 
-### 9. Feature-Space Parity And Correctness Bugs
+### 2. Feature-Space Parity And Correctness Bugs
 
 These bugs change the values produced by featurization for currently-valid
 inputs. Defer until they can be fixed together so feature-parity baselines and
 trained models can be re-established in a single pass. Source: 2026-05-27
-bug-validation pass (see commit log near this work plan edit).
+bug-validation pass.
+
+Status update (2026-05-28): Rust-side and pure-logic fixes have landed; the
+remaining open items are bugs that exist in Python (or in both Python and Rust)
+and would change Python feature values when fixed. See "Fixed in 2026-05-28
+correctness pass" below for what changed.
 
 Required when picking these up:
 
@@ -395,23 +117,7 @@ Required when picking these up:
 - Re-train production pairwise models if cumulative feature drift exceeds the
   current `1e-5` tolerance on any non-changed column.
 
-Open bugs:
-
-- **Rust ignores `name_counts_last_first_initial_semantics="legacy_full_first_token"`.**
-  Python branches at [s2and/data.py:890-894](../s2and/data.py#L890-L894); Rust
-  unconditionally uses the first initial at
-  [s2and_rust/src/ingest_dataset.rs:961-966](../s2and_rust/src/ingest_dataset.rs#L961-L966).
-  Datasets built in Python legacy mode silently disagree with Rust on
-  `last_first_initial` lookup keys. Add the semantic switch on the Rust side
-  and plumb the flag through `from_dataset(...)` / Arrow ingest.
-
-- **`query_author` missing from Rust retrieval `row_signals`.**
-  Raw-Arrow path at
-  [s2and/incremental_linking/retrieval.py:486-492](../s2and/incremental_linking/retrieval.py#L486-L492)
-  includes `query_author`; Rust path at
-  [s2and/incremental_linking/retrieval.py:595-611](../s2and/incremental_linking/retrieval.py#L595-L611)
-  omits it. Downstream features that read `query_author` (e.g.
-  `top_meta_query_author_len`) silently become zero only on the Rust path.
+Open bugs (Python feature changes deferred for the next re-baseline cycle):
 
 - **Sinonym overwrite leaves stale normalized fields when run outside `__init__`.**
   [s2and/data.py:2385-2389](../s2and/data.py#L2385-L2389) replaces only raw
@@ -421,14 +127,6 @@ Open bugs:
   canonical path is safe. Any call site that mutates signatures post-init
   produces stale `_normalized_*` / `name_counts`. Invalidate or re-derive in
   `apply_sinonym_overwrites` so the invariant is explicit.
-
-- **Strict vs lenient paper-author positions between Rust and Python.**
-  Rust at
-  [s2and_rust/src/raw_arrow/readers.rs:294,305-311](../s2and_rust/src/raw_arrow/readers.rs#L294)
-  errors on null position and duplicate `(paper_id, position)`. Python at
-  [s2and/incremental_linking/query_adapter.py:163-166](../s2and/incremental_linking/query_adapter.py#L163-L166)
-  silently falls back to enumeration index on type errors. Pick one policy and
-  document the divergence if intentional.
 
 - **Self-cite signal returns 1.0 when both signatures share a self-citing paper (parity bug).**
   Same bug exists in Python at
@@ -453,24 +151,41 @@ Open bugs:
   return 0. Split both sides on whitespace and compare initial sets when either
   side is a single character.
 
-- **Subblocking ORCID gating asymmetry between layers.**
-  Rust at
+- **Subblocking ORCID gating asymmetry between layers.** (Latent — outputs
+  match on the default code path.) Rust at
   [s2and_rust/src/raw_arrow_features.rs:120](../s2and_rust/src/raw_arrow_features.rs#L120)
   gates the ORCID hash on a per-call `orcid_enabled` flag; Python relies on
   `author_info_orcid` being `None` when `use_orcid_id=False` at
-  [s2and/data.py:554](../s2and/data.py#L554). End-to-end output matches on the
-  default code path; mismatched flag combinations between ingest and
-  subblocking would diverge. Align the gating surface so the same flag controls
-  both layers in both implementations.
+  [s2and/data.py:554](../s2and/data.py#L554). Mismatched flag combinations
+  between ingest and subblocking would diverge. Align the gating surface so the
+  same flag controls both layers in both implementations.
 
-- **Unicode `is_alphabetic` / `is_uppercase` divergence in the fastText 0.9 gate.**
-  Python at [s2and/text.py:360-365](../s2and/text.py#L360-L365) uses
-  `c.isalpha()` / `c.isupper()`; Rust at
-  [s2and_rust/src/language_detection.rs:80-86](../s2and_rust/src/language_detection.rs#L80-L86)
-  uses `ch.is_alphabetic()` / `ch.is_uppercase()`. Python's `isalpha` counts
-  modifier letters (category Lm); Rust's `is_alphabetic` does not. Modifier
-  letters and certain superscripts shift the uppercase ratio and can flip the
-  fastText preprocessing branch, producing different language labels.
+- **Arrow ingest hardcodes `NameCountsLastFirstInitialSemantics::InitialChar`.**
+  (Latent — correct by construction because Arrow datasets are contractually
+  canonical, but the assumption is not enforced.) Rust
+  [s2and_rust/src/raw_arrow_features.rs:49-51](../s2and_rust/src/raw_arrow_features.rs#L49-L51)
+  and
+  [s2and_rust/src/rust_featurizer.rs:1639-1640](../s2and_rust/src/rust_featurizer.rs#L1639-L1640)
+  pin the semantic to `InitialChar` with an inline comment. If a future Arrow
+  bundle were generated from a `legacy_full_first_token` ANDData, Rust would
+  silently use the wrong `last_first_initial` keys with no diagnostic. Cheap
+  defenses: (a) add `name_counts_last_first_initial_semantics` to the Arrow
+  dataset manifest (defaulting to `initial_char`) and pass it through to
+  `build_name_counts_data_from_artifact`, or (b) when the manifest is present,
+  assert it declares `initial_char` and fail fast otherwise.
+
+- **Unicode `is_alphabetic` / `is_uppercase` claim under review in the fastText
+  0.9 gate.** Original report claimed Python's `isalpha` counts category Lm
+  while Rust's `is_alphabetic` does not. Re-check on 2026-05-28: Python
+  `str.isalpha()` returns True for Lu/Ll/Lt/Lm/Lo, and Rust
+  `char::is_alphabetic()` is the Unicode `Alphabetic` property which also
+  includes Lm. The actual divergence is narrower (Rust's `Alphabetic` includes
+  `Other_Alphabetic` characters that Python's `isalpha` does not). If a real
+  fastText branch flip is reproducible, re-document the precise category set
+  and fix; otherwise close as a documentation correction.
+  Sites:
+  [s2and/text.py:360-365](../s2and/text.py#L360-L365);
+  [s2and_rust/src/language_detection.rs:80-86](../s2and_rust/src/language_detection.rs#L80-L86).
 
 - **`detect_language` reports `is_reliable=True` when only one detector responded.**
   [s2and/text.py:387-398](../s2and/text.py#L387-L398) treats `un_ft` or `un_2`
@@ -478,27 +193,176 @@ Open bugs:
   as two-detector agreement downstream. Decide whether single-detector should
   be reliable; if not, fix and propagate the new `is_reliable` semantics.
 
-## Blocked
+- **Query-vs-query `cluster_seed_disallows` pairs are unenforced.**
+  Telemetry counter only on the Python side at
+  [s2and/incremental_linking/runtime.py:1163-1164](../s2and/incremental_linking/runtime.py#L1163-L1164),
+  silently dropped on the Rust side at
+  [s2and_rust/src/raw_candidate_planner.rs:174-201](../s2and_rust/src/raw_candidate_planner.rs#L174-L201).
+  Rust and Python currently agree on the no-op behavior, but enforcement
+  requires post-link reconciliation across both implementations. Pick one
+  policy (raise, telemetry-only, or enforce) coordinated with model owners.
 
-### Normalization Canonicalization Migration
+### Second-pass bugs (2026-05-28)
 
-Blocked until canonical artifacts and retraining can move together. Full plan:
-[normalization_migration_blocked.md](normalization_migration_blocked.md). The
-ASCII/non-ASCII dash behavior, tuple probing fallbacks, ORCID prefix
-fallbacks, and block compaction workarounds are measured legacy-compatibility
-repairs, not the canonical target. Code TODO comments in
-[../s2and/data.py](../s2and/data.py) and the production count scripts point at
-this migration; do not schedule them as separate cleanup work before canonical
-artifacts exist.
+Found during a follow-up sweep that explicitly excluded the ten items above.
+Split into severity tiers. Tier A bugs change observable production behavior
+today; Tier B bugs are latent (currently masked, harmless, or only fire in
+labeled training paths) but worth fixing during the same re-baseline cycle.
 
-Verification gate (compatibility behavior stays stable):
+The remaining items below are Python-side feature changes that would require a
+re-baseline, or latent issues that are tracked but not actively fixed.
 
-```powershell
-uv run pytest -q tests/test_surname_hyphen_aware.py tests/test_subblocking_telemetry.py tests/test_text.py tests/test_rust_from_dataset_contract.py tests/test_cluster_incremental.py
-```
+#### Tier A — observable in production
+
+- **ORCID regex accepts Unicode digits in Python but Rust requires ASCII.**
+  Python `ORCID_PATTERN` at
+  [s2and/text.py:108-114](../s2and/text.py#L108-L114) uses bare `\d` (no
+  `re.ASCII`), so Unicode digit classes (Arabic-Indic `٠-٩`, etc.) match.
+  Rust `normalize_orcid_owned` at
+  [s2and_rust/src/orcid.rs:19,34](../s2and_rust/src/orcid.rs#L19) requires
+  `is_ascii_digit()`. Concrete divergence: a string like
+  `"https://orcid.org/٠٠٠٠-٠٠٠٢-١٨٢٥-009X"` returns a normalized ORCID under
+  Python and `None` under Rust. Fix the Python side to require ASCII digits
+  (add `re.ASCII` or `[0-9]`).
+
+- **Reader silently coerces NULL to `""` for schema-required string columns.**
+  [s2and_rust/src/raw_arrow/readers.rs:153-156](../s2and_rust/src/raw_arrow/readers.rs#L153-L156)
+  and
+  [s2and_rust/src/raw_arrow/readers.rs:242-248](../s2and_rust/src/raw_arrow/readers.rs#L242-L248)
+  call `optional_owned(row).unwrap_or_default()` on `signatures.author_first`,
+  `author_middle`, `author_last`, `author_suffix` and on `papers.title`,
+  `venue`, `journal_name`, all of which the schema contract at
+  [s2and/arrow_schema_contract.json:30-43](../s2and/arrow_schema_contract.json)
+  declares `required=true`. Compare `paper_authors.author_name` at
+  [s2and_rust/src/raw_arrow/readers.rs:295](../s2and_rust/src/raw_arrow/readers.rs#L295),
+  which correctly errors via `required_value`. The current behavior turns
+  upstream NULLs into empty-string name-count lookups (see [Bug 5 below](#empty-last-coalesces-to-1)),
+  empty-title term sets, etc. Fix: route the affected fields through
+  `required_value` and let `s2and.arrow_inputs` raise structured
+  `MissingArrowArtifactError`.
+
+- **SPECTER all-zero rows mean "missing" via Python dict ingest and "present" via Arrow ingest.**
+  Python-dict path
+  [s2and_rust/src/ingest_dataset.rs:701-738](../s2and_rust/src/ingest_dataset.rs#L701-L738)
+  drops all-zero embeddings as missing; Arrow path
+  [s2and_rust/src/raw_arrow/readers.rs:501-512](../s2and_rust/src/raw_arrow/readers.rs#L501-L512)
+  via
+  [s2and_rust/src/raw_arrow/arrow_io.rs:245-287](../s2and_rust/src/raw_arrow/arrow_io.rs#L245-L287)
+  keeps them as real centroids. The work plan already declares "Present rows
+  are real vectors, including all-zero rows" (Current Decisions table), so the
+  Arrow path matches the decision; the Python-dict path silently filters. Pick
+  one and align — the cleanest fix is to remove the zero-vector filter in the
+  Python-dict path so the two ingest modes share semantics.
+
+- **`compute_ref` drops self-citation and reference-Jaccard signal whenever `reference_details is None`.**
+  [s2and/featurizer.py:1175-1189](../s2and/featurizer.py#L1175-L1189)
+  gates the entire reference feature block on `compute_ref` AND both papers
+  having non-None `reference_details`. But `paper_id_2 in references_1` and
+  `jaccard(references_1, references_2)` only need `paper.references` (the raw
+  int list, always populated by the loader). On any non-canonical path with
+  `preprocess=False` and `compute_reference_features=True`, two computable
+  features become NaN. Fix: compute the two reference-list features
+  unconditionally when both `references` lists are present, and gate only the
+  four ngram-Counter features on `reference_details`.
+
+- <a id="empty-last-coalesces-to-1"></a>**`_compute_signature_name_counts` returns `last=1` for empty surnames (sentinel collision with genuinely once-seen surnames).**
+  [s2and/data.py:896-901](../s2and/data.py#L896-L901):
+  `last=self.last_dict.get(last_for_counts, 1)` returns the default `1` when
+  `last_for_counts == ""`, indistinguishable from a real corpus count of `1`.
+  Same for `last_first_initial` on line 900. `first` and `first_last` are
+  symmetric and correctly return `np.nan` (lines 897, 899). Together with the
+  reader bug above, a NULL `author_last` ends up as a rare-surname signal.
+  This is the same shape of bug as the documented "MISSING" email collision —
+  fix by returning `np.nan` (or an explicit None) when `last_for_counts == ""`.
+
+- **Same-signature row inflates `paper_author_list_*` features when the query is a member of its own cluster.**
+  [s2and/incremental_linking/query_adapter.py:578-611](../s2and/incremental_linking/query_adapter.py#L578-L611):
+  the `if same_signature: continue` guard at line 605 skips the local10
+  features but only after `best_author_jaccard`, `best_author_containment`,
+  `best_author_overlap`, and `best_author_count_log_absdiff` are already
+  updated with a perfect self-match (jaccard=1, containment=1, count_log_absdiff≈0).
+  Production incremental linking accidentally avoids this because
+  `unassigned_signature_ids` excludes seeds, but
+  [scripts/production/model/linker_train_calibrate_eval.py:2297](../scripts/production/model/linker_train_calibrate_eval.py#L2297)
+  uses the query as a member of its own cluster for positive-example
+  generation, polluting training data. Fix: move the `if same_signature:
+  continue` guard above the paper-author-list updates.
+
+- **Query-vs-query `cluster_seed_disallows` pairs silently dropped from raw planner exclusion.**
+  [s2and_rust/src/raw_candidate_planner.rs:174-201](../s2and_rust/src/raw_candidate_planner.rs#L174-L201)
+  only records exclusions when exactly one endpoint is a query; pairs where
+  both endpoints are residual queries write nothing.
+  [s2and/incremental_linking/runtime.py:1156-1160](../s2and/incremental_linking/runtime.py#L1156-L1160)
+  merely increments a counter for the same case. Two mutually-disallowed
+  residual queries can still be linked to the same predicted cluster within
+  one batch. Fix: enforce the constraint at batch reconciliation, or reject
+  query-vs-query disallows at validation time with a typed error.
+
+- **`get_text_ngrams` couples the short-token filter to `stopwords is not None`.**
+  [s2and/text.py:569-600](../s2and/text.py#L569-L600): the
+  `len(word) > 2` filter is only applied inside the `stopwords is not None`
+  branch. Reference-author ngrams built in
+  [s2and/data.py:2522](../s2and/data.py#L2522) pass `stopwords=None`,
+  accidentally disabling the short-token filter as well, so reference-author
+  ngrams include 1-2 char tokens (`"li"`, `"wu"`) that title/venue ngrams
+  drop. Decouple the two filters — either apply `len > 2` unconditionally or
+  add an explicit second argument.
+
+#### Tier B — latent, masked, or training-only
+
+- **`equal()` returns 1 (equal) for two whitespace-only first/middle/last inputs.**
+  [s2and/text.py:698-707](../s2and/text.py#L698-L707): the empty check uses
+  raw `len()` but the comparison uses `.lower().strip()`. `equal(" ", "  ")`
+  returns `1` (perfect match) instead of `default_val (NaN)`. Normalized
+  pipelines should not produce whitespace-only normalized names, but the
+  asymmetry between the raw-length guard and the post-strip comparison is a
+  latent foot-gun.
+
+- **Stale-index header reserves `indexed_source_mtime_ns` but freshness check ignores it.**
+  [s2and_rust/src/arrow_batch_lookup.rs:78-109](../s2and_rust/src/arrow_batch_lookup.rs#L78-L109):
+  the 8-byte field is read into `_indexed_source_mtime_ns` (underscore →
+  discarded) and only `(size, fingerprint)` are compared. The fingerprint
+  hashes full file contents so freshness is correct, but the field is dead
+  documentation in the on-disk format. Either remove from the header (and
+  bump the format version) or actually enforce.
+
+- **`FNV64` batch-lookup keys can collide; downstream filtering masks but telemetry double-counts.**
+  [s2and_rust/src/arrow_batch_lookup.rs:161-186](../s2and_rust/src/arrow_batch_lookup.rs#L161-L186):
+  `lower_bound` matches on 64-bit hash equality, not on raw key, so two
+  distinct keys hashing to the same value return both batches. The reader
+  re-filters by `keep_ids.contains(...)`, so output rows are correct, but
+  `rows_scanned` telemetry is inflated and any future consumer trusting
+  `batch_indices_for_keys` as exact would be wrong. Either store enough key
+  material to verify, or document the FNV-collision assumption loudly.
+
+- **Duplicate-id detection in Arrow readers depends on the `keep_ids` filter.**
+  [s2and_rust/src/raw_arrow/readers.rs:128-146,222-240,473-516](../s2and_rust/src/raw_arrow/readers.rs#L128-L516):
+  `seen_paper_ids`/`seen_signature_ids` is populated after the filter runs,
+  so an Arrow file with two rows sharing the same id is rejected only when
+  both copies survive the filter. Pre-filter detection would catch upstream
+  corruption symmetrically.
+
+- **`apply_orcid_subblocking` Rust binds duplicate signature IDs to the last subblock visited; Python to flat dict insertion order.**
+  [s2and_rust/src/subblocking.rs:2270-2280](../s2and_rust/src/subblocking.rs#L2270-L2280)
+  vs
+  [s2and/subblocking.py:1937-1941](../s2and/subblocking.py#L1937-L1941).
+  Currently a non-issue because upstream is supposed to partition signatures
+  across subblocks (the function does not defend against a duplicate). The
+  Python `assert` at
+  [s2and/subblocking.py:2031](../s2and/subblocking.py#L2031) only checks set
+  equality, not multiplicity, so any future invariant break would silently
+  produce different ORCID merge graphs on the two implementations.
+
+- **Disallow-veto coverage gap at `pair_count == 2 && disallow_count == 1`.**
+  [s2and/incremental_linking/runtime.py:254-258](../s2and/incremental_linking/runtime.py#L254-L258):
+  the three veto rules cover `pair_count <= 1` (`single_pair_disallow`),
+  `disallow_count >= pair_count` (`all_pairs_disallow`), and
+  `pair_count >= 3 && fraction >= 0.8` (`mostly_disallow`). The 2-pair
+  half-disallow case falls through the cracks while the 1-pair 100% disallow
+  case is honored. Confirm whether this is intentional product policy; if
+  not, add an explicit two-pair rule.
 
 ## Watchlist
-
 
 ### Compact Incremental Partial Supervision
 
@@ -522,6 +386,25 @@ uv run pytest -q tests/test_incremental_linking_runtime.py::test_private_retriev
 uv run pytest -q tests/test_model_pairwise_exceptions.py
 ```
 
+## Blocked
+
+### Normalization Canonicalization Migration
+
+Blocked until canonical artifacts and retraining can move together. Full plan:
+[normalization_migration_blocked.md](normalization_migration_blocked.md). The
+ASCII/non-ASCII dash behavior, tuple probing fallbacks, ORCID prefix
+fallbacks, and block compaction workarounds are measured legacy-compatibility
+repairs, not the canonical target. Code TODO comments in
+[../s2and/data.py](../s2and/data.py) and the production count scripts point at
+this migration; do not schedule them as separate cleanup work before canonical
+artifacts exist.
+
+Verification gate (compatibility behavior stays stable):
+
+```powershell
+uv run pytest -q tests/test_surname_hyphen_aware.py tests/test_subblocking_telemetry.py tests/test_text.py tests/test_rust_from_dataset_contract.py tests/test_cluster_incremental.py
+```
+
 ## Documentation Cleanup
 
 - If licensing policy is corrected, update [../README.md](../README.md),
@@ -538,6 +421,15 @@ These are not TODOs, but they should shape future work:
   or complete Arrow paths to `Clusterer.predict(...)`.
 - Keep full scans and compatibility fallbacks explicit test-only or
   parity-only options.
+- Prefer `Clusterer.predict_from_arrow_paths(...)` or Arrow-routed
+  `predict(...)` for production inference; keep
+  `feature_block_from_arrow_paths(...)` and `RustFeaturizer.from_dataset(...)`
+  as fixture/parity/training surfaces only.
+- Keep production-scale `name_counts_index/` in S3, not Git/LFS;
+  `name_counts.arrow` stays available for generation/inspection/parity, not
+  request-time reads.
+- Do not duplicate strict Arrow validation in scripts or model helpers;
+  always go through `s2and.arrow_inputs`.
 
 ## Non-Goals
 
@@ -545,4 +437,3 @@ These are not TODOs, but they should shape future work:
 - Do not add another strict/compatibility discovery layer beside
   `s2and.arrow_inputs`.
 - Do not run S3/network release smokes as default pytest.
-

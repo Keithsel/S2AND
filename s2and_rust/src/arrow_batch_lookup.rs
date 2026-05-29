@@ -8,8 +8,8 @@ use std::io::Read;
 use crate::raw_arrow::arrow_io::{arrow_error_to_py, io_error_to_py};
 use crate::{fnv64, fnv64_update};
 
-const ARROW_BATCH_LOOKUP_INDEX_MAGIC: &[u8; 8] = b"S2ABI001";
-const ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN: usize = 48;
+const ARROW_BATCH_LOOKUP_INDEX_MAGIC: &[u8; 8] = b"S2ABI002";
+const ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN: usize = 40;
 const ARROW_BATCH_LOOKUP_INDEX_RECORD_LEN: usize = 16;
 const ARROW_BATCH_LOOKUP_INDEX_SOURCE_HASH_DOMAIN: &[u8] =
     b"s2and-arrow-batch-lookup-index-source\0";
@@ -76,13 +76,8 @@ impl ArrowBatchLookupIndex {
                 .try_into()
                 .expect("indexed source-size slice has fixed length"),
         );
-        let _indexed_source_mtime_ns = u64::from_le_bytes(
-            bytes[24..32]
-                .try_into()
-                .expect("indexed source-mtime slice has fixed length"),
-        );
         let indexed_key_column_hash = u64::from_le_bytes(
-            bytes[32..40]
+            bytes[24..32]
                 .try_into()
                 .expect("indexed key-column hash slice has fixed length"),
         );
@@ -95,7 +90,7 @@ impl ArrowBatchLookupIndex {
             )));
         }
         let indexed_source_fingerprint = u64::from_le_bytes(
-            bytes[40..48]
+            bytes[32..40]
                 .try_into()
                 .expect("indexed source fingerprint slice has fixed length"),
         );
@@ -294,7 +289,6 @@ mod tests {
                 .copied()
                 .chain(0_u64.to_le_bytes())
                 .chain((source_bytes.len() as u64).to_le_bytes())
-                .chain(0_u64.to_le_bytes())
                 .chain(fnv64(b"signature_id").to_le_bytes())
                 .chain(source_fingerprint.to_le_bytes())
                 .collect::<Vec<u8>>(),

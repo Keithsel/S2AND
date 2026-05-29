@@ -568,6 +568,7 @@ pub(crate) fn preprocess_stage_signatures(
     affiliation_stopwords: &HashSet<String>,
     unidecode_char_map: &HashMap<char, String>,
     preprocess: bool,
+    name_counts_semantics: NameCountsLastFirstInitialSemantics,
 ) -> Vec<(String, SignatureData)> {
     signature_inputs
         .par_iter()
@@ -651,6 +652,7 @@ pub(crate) fn preprocess_stage_signatures(
                 &first_without_apostrophe,
                 &entry.raw_last,
                 &last_normalized,
+                name_counts_semantics,
             );
             (
                 entry.sig_id.clone(),
@@ -926,6 +928,7 @@ pub(crate) fn build_name_counts_data_from_artifact(
     first_without_apostrophe: &str,
     raw_last: &str,
     last_normalized: &str,
+    semantics: NameCountsLastFirstInitialSemantics,
 ) -> Option<NameCountsData> {
     if !has_name_counts_artifact(raw_name_counts) {
         return None;
@@ -944,14 +947,23 @@ pub(crate) fn build_name_counts_data_from_artifact(
     }
 
     let last_for_counts = canonical_last_for_counts(raw_last, last_normalized);
-    let first_initial = first_for_counts
-        .chars()
-        .next()
-        .map(|ch| ch.to_string())
-        .unwrap_or_default();
-    let last_first_initial_key = format!("{} {}", last_for_counts, first_initial)
-        .trim()
-        .to_string();
+    let last_first_initial_key = match semantics {
+        NameCountsLastFirstInitialSemantics::LegacyFullFirstToken => {
+            format!("{} {}", last_for_counts, first_for_counts)
+                .trim()
+                .to_string()
+        }
+        NameCountsLastFirstInitialSemantics::InitialChar => {
+            let first_initial = first_for_counts
+                .chars()
+                .next()
+                .map(|ch| ch.to_string())
+                .unwrap_or_default();
+            format!("{} {}", last_for_counts, first_initial)
+                .trim()
+                .to_string()
+        }
+    };
 
     let first = if py_len(&first_for_counts) > 1 {
         match raw_name_counts.get(RawNameCountKind::First, &first_for_counts) {

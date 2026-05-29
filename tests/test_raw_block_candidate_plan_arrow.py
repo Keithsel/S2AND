@@ -169,7 +169,7 @@ def _fnv64_bytes(value: bytes) -> int:
 def _append_batch_index_record(index_path: str, *, key: str, batch_index: int) -> None:
     path = Path(index_path)
     raw = path.read_bytes()
-    magic, record_count, source_size, source_mtime_ns, key_column_hash, source_fingerprint = (
+    magic, record_count, source_size, key_column_hash, source_fingerprint = (
         _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.unpack_from(raw, 0)
     )
     offset = _ARROW_BATCH_LOOKUP_INDEX_HEADER_STRUCT.size
@@ -185,7 +185,6 @@ def _append_batch_index_record(index_path: str, *, key: str, batch_index: int) -
             magic,
             len(records),
             source_size,
-            source_mtime_ns,
             key_column_hash,
             source_fingerprint,
         )
@@ -1249,7 +1248,7 @@ def test_raw_arrow_candidate_plan_orcid_override_returns_all_matches(tmp_path: P
     assert plan["row_orcid_match"].tolist() == [1, 1, 1]
 
 
-def test_raw_arrow_candidate_plan_orcid_override_is_exempt_from_seed_disallows(tmp_path: Path) -> None:
+def test_raw_arrow_candidate_plan_orcid_override_respects_seed_disallows(tmp_path: Path) -> None:
     signatures = pa.table(
         {
             "signature_id": pa.array(["q1", "s_good", "s_other"], type=pa.string()),
@@ -1312,10 +1311,13 @@ def test_raw_arrow_candidate_plan_orcid_override_is_exempt_from_seed_disallows(t
         num_threads=1,
     )
 
-    assert set(plan["row_component_keys"]) == {"c_good", "c_other"}
+    # ORCID override now respects `cluster_seed_disallows`: the disallow
+    # (q1, s_good) excludes the c_good component even when the query's ORCID
+    # matches a seed in that component. Only c_other survives.
+    assert set(plan["row_component_keys"]) == {"c_other"}
     assert set(plan["left_signature_ids"]) == {"q1"}
-    assert set(plan["right_signature_ids"]) == {"s_good", "s_other"}
-    assert plan["row_orcid_match"].tolist() == [1, 1]
+    assert set(plan["right_signature_ids"]) == {"s_other"}
+    assert plan["row_orcid_match"].tolist() == [1]
     assert plan["telemetry"]["cluster_seed_disallowed_candidate_count"] == 1
 
 

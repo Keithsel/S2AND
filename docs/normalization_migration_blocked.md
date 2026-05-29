@@ -11,6 +11,11 @@ Status
 - Rechecked on May 26, 2026 during Rust Arrow graph-subblocking work. The current production-quality subblocking
   behavior depends on a localized legacy-compatibility repair for dash-like given names; that repair is documented
   below as current compatibility behavior, not as the canonical target state.
+- Path-only audit on May 28, 2026: refreshed Rust code references for
+  `build_name_counts_data_from_artifact`, `canonical_last_for_counts`, and
+  `normalize_subblocking_signature_rows` after earlier module extractions out of `lib.rs`,
+  and noted that Rust now supports both `last_first_initial` semantics via
+  `NameCountsLastFirstInitialSemantics`. No policy or compatibility-shim changes.
 
 Scope
 - Unify name normalization for first/middle/last across data preparation, modeling, subblocking, and auxiliary datasets (name counts, name tuples, ORCID prefix counts).
@@ -128,8 +133,11 @@ Fix during the blocked canonical migration (real-data findings)
       `author_info_first_normalized_without_apostrophe`, and middle/last normalized fields.
   - Rust locations:
     - `s2and_rust/src/text_compat.rs::split_first_middle_hyphen_aware_compat`.
-    - `s2and_rust/src/lib.rs::build_name_counts_data_from_artifact`.
-    - `s2and_rust/src/lib.rs::canonical_last_for_counts`.
+    - `s2and_rust/src/ingest_dataset.rs::build_name_counts_data_from_artifact`.
+    - `s2and_rust/src/ingest_dataset.rs::canonical_last_for_counts`.
+    - `s2and_rust/src/name_counts.rs::NameCountsLastFirstInitialSemantics` (Rust now supports both
+      `legacy_full_first_token` and `initial_char` semantics; `InitialChar` is the default and matches
+      existing canonical artifacts).
     - Rust constraint/name-tuple helpers and pairwise/incremental feature extraction paths that consume normalized
       first/middle/last values.
   - Compatibility repairs inside `legacy_compat` may keep current behavior correct, but canonical-only semantics must
@@ -255,7 +263,7 @@ References in code (as of this migration doc)
 - Rust compatibility implementation: `s2and_rust/src/text_compat.rs::split_first_middle_hyphen_aware_compat`.
 - Subblocking legacy-compat first/middle key materialization:
   `s2and/subblocking.py::signature_name_parts_for_subblocking` and
-  `s2and_rust/src/lib.rs::normalize_subblocking_signature_rows`.
+  `s2and_rust/src/subblocking.rs::normalize_subblocking_signature_rows`.
 - Surname count shim: `_canonicalize_last_for_counts` in `s2and/data.py`.
 - Last-name constraint shim: `_lasts_equivalent_for_constraint` in `s2and/data.py`.
 - Constraint and incremental new-name tuple fallback logic (exact/joined/first-token forms):

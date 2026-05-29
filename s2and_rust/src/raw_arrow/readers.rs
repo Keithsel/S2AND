@@ -81,6 +81,7 @@ pub(crate) fn read_raw_arrow_signatures_from_batches(
     keep_signature_ids: Option<&HashSet<String>>,
 ) -> PyResult<HashMap<String, RawArrowSignature>> {
     let mut out = HashMap::new();
+    let mut seen_all_signature_ids: HashSet<String> = HashSet::new();
     for batch in batches {
         let signature_id_col = batch.column(arrow_column_index(&batch, "signature_id", path)?);
         let signature_id_values =

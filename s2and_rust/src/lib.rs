@@ -59,10 +59,9 @@ use raw_arrow_features::{
     build_raw_arrow_summary_signals, extract_specter_for_paper_id, mask_raw_arrow_query,
     raw_arrow_name_count_rarity_row, raw_arrow_paper_evidence_row, round_six,
 };
-use raw_candidate_planner::{
-    raw_arrow_labeled_candidate_plan, raw_arrow_summary_signals_for_members_cached,
-    RawBlockQueryCandidatePlanner,
-};
+use raw_candidate_planner::{raw_arrow_labeled_candidate_plan, RawBlockQueryCandidatePlanner};
+#[cfg(test)]
+use raw_candidate_planner::raw_arrow_summary_signals_for_members_cached;
 use rayon_pool::install_with_optional_rayon_pool;
 pub(crate) use retrieval::*;
 pub(crate) use rust_featurizer::RustFeaturizer;

@@ -297,7 +297,18 @@ def _iter_embedding_section(stream: JsonStream) -> Iterator[tuple[str, tuple[str
         vector_text = stream.read_json_value_text().strip()
         if not (vector_text.startswith("[") and vector_text.endswith("]")):
             raise ValueError(f"Expected embedding array for paper_id={key!r} in {stream.path}")
-        vector = np.fromstring(vector_text[1:-1], sep=",", dtype=np.float32)
+        # Parse the JSON array explicitly. `np.fromstring(sep=",")` is deprecated and
+        # silently truncates on the first unparseable token (e.g. NaN/Infinity text),
+        # which would corrupt the embedding without raising. json.loads fails loudly.
+        try:
+            values = json.loads(vector_text)
+        except json.JSONDecodeError as err:
+            raise ValueError(f"Malformed embedding array for paper_id={key!r} in {stream.path}: {err}") from err
+        vector = np.asarray(values, dtype=np.float32)
+        if vector.ndim != 1:
+            raise ValueError(
+                f"Expected 1-D embedding array for paper_id={key!r} in {stream.path}; got shape {vector.shape}"
+            )
         yield "paper_embedding", (key, vector)
         if not _consume_delimited_sequence_end(stream, separator=",", end="}"):
             return
@@ -327,7 +338,15 @@ def iter_monolith_records(path: Path, *, chunk_size: int | None = None) -> Itera
 
 
 def census_monolith(path: Path, *, limit_signatures: int | None = None) -> MonolithCensus:
-    """Scan the monolith once and collect counts for the selected subset."""
+    """Scan the monolith and collect counts for the selected subset.
+
+    Two passes are required so the paper/embedding membership tests use the
+    complete ``needed_paper_ids`` set. A single pass would be order-dependent:
+    if the ``papers``/``paper_embeddings`` sections precede ``signatures`` in the
+    JSON, ``needed_paper_ids`` would still be empty while those records stream,
+    silently undercounting (the write pass already resolves against the finished
+    census set, so only the census itself is at risk).
+    """
     signature_count = 0
     paper_count = 0
     embedding_count = 0
@@ -335,6 +354,7 @@ def census_monolith(path: Path, *, limit_signatures: int | None = None) -> Monol
     block_counts: Counter[str] = Counter()
     needed_paper_ids: set[str] = set()
 
+    # Pass 1: collect the signature subset and the set of papers it references.
     for record_type, payload in iter_monolith_records(path):
         if record_type == "signatures":
             if limit_signatures is not None and signature_count >= limit_signatures:
@@ -344,7 +364,10 @@ def census_monolith(path: Path, *, limit_signatures: int | None = None) -> Monol
             paper_id = str(signature["paper_id"])
             needed_paper_ids.add(paper_id)
             block_counts[str(signature["author_info"]["block"])] += 1
-        elif record_type == "papers":
+
+    # Pass 2: count papers/embeddings against the complete needed-paper set.
+    for record_type, payload in iter_monolith_records(path):
+        if record_type == "papers":
             paper = payload
             paper_id = str(paper["paper_id"])
             if paper_id in needed_paper_ids:

@@ -39,8 +39,10 @@ pub(crate) fn name_tuple_contains(
     a: &str,
     b: &str,
 ) -> bool {
+    // Directed lookup to match the Python reference, which tests `(a, b) in name_tuples`
+    // in argument order only (see `first_names_name_compatible` in s2and/text.py). The
+    // shipped tuples file lists both directions, so symmetric pairs still match.
     map.get(a).map_or(false, |vals| vals.contains(b))
-        || map.get(b).map_or(false, |vals| vals.contains(a))
 }
 
 fn first_name_forms(value: &str) -> (String, String, String) {

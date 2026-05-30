@@ -91,10 +91,13 @@ pub(crate) fn insert_name_tuple_alias(
     a: String,
     b: String,
 ) {
-    map.entry(a.clone())
-        .or_insert_with(HashSet::new)
-        .insert(b.clone());
-    map.entry(b).or_insert_with(HashSet::new).insert(a);
+    // Directed insert to match the Python reference, which stores name tuples as a
+    // `set[tuple[str, str]]` keyed on the curated (a, b) order (see
+    // `_load_name_tuples_from_file` in s2and/data.py). The shipped
+    // `s2and_name_tuples_filtered.txt` lists both directions explicitly for every
+    // pair, so directed insertion still yields both lookups while staying faithful
+    // to any asymmetric tuples a caller might supply.
+    map.entry(a).or_insert_with(HashSet::new).insert(b);
 }
 
 pub(crate) fn extract_name_tuples_map(

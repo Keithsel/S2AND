@@ -920,7 +920,6 @@ vladan,vlada
 vlada,vladan
 margaret,margo
 margo,margaret
-david,davis
 louise,louisa
 louisa,louise
 miguel,migue

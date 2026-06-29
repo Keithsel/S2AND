@@ -6,6 +6,11 @@ import pytest
 
 import s2and.runtime as rust_capabilities
 
+# A rust extension version that satisfies the current minimum. Derived from the
+# guard itself so these fixtures track the lockstep version bump instead of going
+# stale on every release (see MIN_SUPPORTED_RUST_EXTENSION_VERSION).
+_SUPPORTED_VERSION = rust_capabilities.min_supported_rust_extension_version_string()
+
 
 def _missing_module(name: str) -> ModuleNotFoundError:
     return ModuleNotFoundError(f"No module named {name!r}", name=name)
@@ -64,7 +69,7 @@ def test_load_s2and_rust_extension_prefers_versioned_candidate_on_tie(monkeypatc
     cast(Any, ShimModule).RustFeaturizer = RustFeaturizer
 
     class NativeModule:
-        __version__ = "0.51.0"
+        __version__ = _SUPPORTED_VERSION
 
     cast(Any, NativeModule).RustFeaturizer = RustFeaturizer
 
@@ -114,7 +119,7 @@ def test_load_s2and_rust_extension_reraises_nested_missing_dependency(monkeypatc
     RustFeaturizer = _make_core_rust_featurizer()
 
     class ShimModule:
-        __version__ = "0.51.0"
+        __version__ = _SUPPORTED_VERSION
 
     cast(Any, ShimModule).RustFeaturizer = RustFeaturizer
 
@@ -179,7 +184,7 @@ def test_detect_rust_runtime_capabilities_reads_from_dataset_paper_preprocess_ma
     RustFeaturizer = _make_core_rust_featurizer(supports_from_dataset_paper_preprocess=True)
 
     class Module:
-        __version__ = "0.51.0"
+        __version__ = _SUPPORTED_VERSION
 
     cast(Any, Module).RustFeaturizer = RustFeaturizer
 
@@ -208,7 +213,7 @@ def test_detect_rust_runtime_capabilities_does_not_require_json_ingest_markers()
             return 0
 
     class Module:
-        __version__ = "0.51.0"
+        __version__ = _SUPPORTED_VERSION
         RustFeaturizer = RustFeaturizerWithoutJsonCompat
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
@@ -240,7 +245,7 @@ def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():
             return None
 
     class Module:
-        __version__ = "0.51.0"
+        __version__ = _SUPPORTED_VERSION
         RustFeaturizer = NamedRustFeaturizer
         RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
         RawBlockQueryCandidatePlanner = NamedRawBlockQueryCandidatePlanner
@@ -265,7 +270,7 @@ def test_detect_rust_runtime_capabilities_rejects_stale_raw_query_signature_plan
             return None
 
     class Module:
-        __version__ = "0.51.0"
+        __version__ = _SUPPORTED_VERSION
         RustFeaturizer = _make_core_rust_featurizer()
         RawBlockQueryCandidatePlanner = NamedRawPlanner
 
@@ -289,7 +294,7 @@ def test_detect_rust_runtime_capabilities_rejects_stale_incremental_pair_plan_ab
             return None
 
     class Module:
-        __version__ = "0.51.0"
+        __version__ = _SUPPORTED_VERSION
         RustFeaturizer = NamedRustFeaturizer
         RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
 
@@ -314,7 +319,7 @@ def test_detect_rust_runtime_capabilities_requires_pair_plan_orcid_signal_marker
             return None
 
     class Module:
-        __version__ = "0.51.0"
+        __version__ = _SUPPORTED_VERSION
         RustFeaturizer = NamedRustFeaturizer
         RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
 

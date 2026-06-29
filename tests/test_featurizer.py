@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
@@ -66,7 +67,7 @@ class TestData(unittest.TestCase):
 
 
 def test_rust_prewarm_happens_before_rss_sampling(monkeypatch):
-    dataset = SimpleNamespace(name="dummy", mode="train", compute_reference_features=False)
+    dataset = cast(ANDData, SimpleNamespace(name="dummy", mode="train", compute_reference_features=False))
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff"])
     runtime_context = RuntimeContext(
         operation="featurization_run",
@@ -268,8 +269,8 @@ def test_rust_prewarm_happens_before_rss_sampling(monkeypatch):
             labels_single, labels_multi, "Labels don't match between single and multi-threaded"
         )
 
-    def test_global_dataset_initialization_in_workers(self):
-        """Test that global_dataset is properly initialized in worker processes"""
+    def test_bound_dataset_is_available_in_workers(self):
+        """Test that the bound dataset is available in worker processes."""
         test_pairs = [
             ("3", "0", 0),
             ("3", "1", 0),
@@ -287,10 +288,10 @@ def test_rust_prewarm_happens_before_rss_sampling(monkeypatch):
                 chunk_size=1,
                 nan_value=-1,
             )
-            # If we get here, global dataset was properly initialized
+            # If we get here, worker context was bound correctly.
             assert features.shape[0] == len(test_pairs)
         except (AttributeError, NameError) as e:
-            self.fail(f"Global dataset not properly initialized in worker processes: {e}")
+            self.fail(f"Dataset not available in worker processes: {e}")
 
     def test_multiprocessing_with_different_chunk_sizes(self):
         """Test that different chunk sizes don't affect results with multiprocessing"""
@@ -365,3 +366,34 @@ def test_signature_id_to_index_or_raise_reports_missing_signature_id():
 
     with pytest.raises(ValueError, match="999"):
         _signature_id_to_index_or_raise(signature_id_to_index, 999)
+
+
+def test_many_pairs_featurize_surfaces_rust_initialization_failure(monkeypatch):
+    dataset = cast(ANDData, SimpleNamespace(name="dummy", compute_reference_features=False))
+    featurizer_info = FeaturizationInfo(features_to_use=["year_diff"])
+    runtime_context = RuntimeContext(
+        operation="featurization_run",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="run-raises",
+        source="default",
+    )
+
+    monkeypatch.setattr(feature_port, "s2and_rust", object())
+
+    def fail_prewarm(*_args, **_kwargs):
+        raise RuntimeError("native init failed")
+
+    monkeypatch.setattr(feature_port, "_get_rust_featurizer", fail_prewarm)
+
+    with pytest.raises(RuntimeError, match="Rust featurizer init failed"):
+        many_pairs_featurize(
+            [],
+            dataset,
+            featurizer_info,
+            n_jobs=1,
+            use_cache=False,
+            chunk_size=1,
+            runtime_context=runtime_context,
+        )

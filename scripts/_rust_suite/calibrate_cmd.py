@@ -5,7 +5,7 @@ import json
 import math
 import platform
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,7 +15,7 @@ from s2and.memory_calibration import (
     effective_rust_batch_persistent_row_overhead_bytes,
     extract_phase_a_sample,
     extract_rust_batch_sample,
-    iter_log_records,
+    iter_memory_telemetry_records,
     percentile,
 )
 
@@ -51,8 +51,8 @@ class _CalibrationProfile:
         self,
         *,
         description: str,
-        record_matcher: str,
-        sample_extractor: Callable[[str], Any | None],
+        stage: str,
+        sample_extractor: Callable[[Mapping[str, Any]], Any | None],
         effective_fn: Callable[[Any], float | None],
         matched_record_key: str,
         recommended_key: str,
@@ -60,7 +60,7 @@ class _CalibrationProfile:
         print_title: str,
     ) -> None:
         self.description = description
-        self.record_matcher = record_matcher
+        self.stage = stage
         self.sample_extractor = sample_extractor
         self.effective_fn = effective_fn
         self.matched_record_key = matched_record_key
@@ -71,8 +71,8 @@ class _CalibrationProfile:
 
 _CALIBRATION_PROFILES: dict[str, _CalibrationProfile] = {
     "phase_a": _CalibrationProfile(
-        description="Calibrate Phase A accumulator entry bytes from telemetry logs.",
-        record_matcher="Telemetry: phase_split_phase_a",
+        description="Calibrate Phase A accumulator entry bytes from memory telemetry JSONL.",
+        stage="phase_a_seed_distances",
         sample_extractor=extract_phase_a_sample,
         effective_fn=effective_accumulator_entry_bytes,
         matched_record_key="matched_phase_a_records",
@@ -81,8 +81,8 @@ _CALIBRATION_PROFILES: dict[str, _CalibrationProfile] = {
         print_title="Phase A accumulator calibration",
     ),
     "rust_batch": _CalibrationProfile(
-        description="Calibrate Rust batch persistent row overhead bytes from telemetry logs.",
-        record_matcher="Telemetry: pair_featurization_memory",
+        description="Calibrate Rust batch persistent row overhead bytes from memory telemetry JSONL.",
+        stage="pair_featurization_rust_batch",
         sample_extractor=extract_rust_batch_sample,
         effective_fn=effective_rust_batch_persistent_row_overhead_bytes,
         matched_record_key="matched_rust_batch_records",
@@ -97,7 +97,7 @@ def run_calibration(argv: list[str], *, profile_key: str) -> int:
     profile = _CALIBRATION_PROFILES[profile_key]
 
     parser = argparse.ArgumentParser(description=profile.description)
-    parser.add_argument("logs", nargs="+", help="Log file(s) containing telemetry lines.")
+    parser.add_argument("logs", nargs="+", help="JSONL file(s) containing structured memory telemetry records.")
     parser.add_argument(
         "--write-json",
         type=str,
@@ -114,8 +114,8 @@ def run_calibration(argv: list[str], *, profile_key: str) -> int:
         if not path.exists():
             raise FileNotFoundError(str(path))
         with _open_text_log(path) as fh:
-            for record in iter_log_records(fh):
-                if profile.record_matcher not in record:
+            for record in iter_memory_telemetry_records(fh):
+                if record.get("stage") != profile.stage:
                     continue
                 matched_records += 1
                 sample = profile.sample_extractor(record)

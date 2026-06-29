@@ -1,9 +1,17 @@
 import unittest
+from typing import Any, cast
 
 import pandas as pd
 import pytest
 
 from s2and.data import ANDData, _parse_sinonym_name
+
+
+def test_maybe_load_list_empty_file_returns_empty_list(tmp_path):
+    empty_path = tmp_path / "empty.txt"
+    empty_path.write_text("", encoding="utf-8")
+
+    assert ANDData.maybe_load_list(str(empty_path)) == []
 
 
 class TestData(unittest.TestCase):
@@ -30,9 +38,7 @@ class TestData(unittest.TestCase):
 
     def test_split_pairs_within_blocks(self):
         # Test random sampling within blocks
-        self.qian_dataset.pair_sampling_block = True
-        self.qian_dataset.pair_sampling_balanced_classes = False
-        self.qian_dataset.pair_sampling_balanced_homonym_synonym = False
+        self.qian_dataset.pair_sampling_mode = "within_block_random"
         self.qian_dataset.train_pairs_size = 1000
         self.qian_dataset.val_pairs_size = 500
         self.qian_dataset.test_pairs_size = 500
@@ -54,9 +60,7 @@ class TestData(unittest.TestCase):
         )
 
         # Test balanced pos/neg sampling within blocks
-        self.qian_dataset.pair_sampling_block = True
-        self.qian_dataset.pair_sampling_balanced_classes = True
-        self.qian_dataset.pair_sampling_balanced_homonym_synonym = False
+        self.qian_dataset.pair_sampling_mode = "within_block_balanced_classes"
         train_pairs, val_pairs, test_pairs = self.qian_dataset.split_pairs(
             train_block_dict, val_block_dict, test_block_dict
         )
@@ -69,9 +73,7 @@ class TestData(unittest.TestCase):
         )
 
         # Test balanced pos/neg and homonym/synonym sampling within blocks
-        self.qian_dataset.pair_sampling_block = True
-        self.qian_dataset.pair_sampling_balanced_classes = True
-        self.qian_dataset.pair_sampling_balanced_homonym_synonym = True
+        self.qian_dataset.pair_sampling_mode = "within_block_balanced_homonym_synonym"
         train_pairs, val_pairs, test_pairs = self.qian_dataset.split_pairs(
             train_block_dict, val_block_dict, test_block_dict
         )
@@ -88,7 +90,9 @@ class TestData(unittest.TestCase):
         train_pairs, val_pairs, test_pairs = self.qian_dataset.split_pairs(
             train_block_dict, val_block_dict, test_block_dict
         )
-        assert len(train_pairs) == 1000, len(val_pairs) == 500 and len(test_pairs) == 7244
+        assert len(train_pairs) == 1000
+        assert len(val_pairs) == 500
+        assert len(test_pairs) == 7244
 
     def test_blocks(self):
         original_blocks = self.dummy_dataset.get_original_blocks()
@@ -126,7 +130,7 @@ class TestData(unittest.TestCase):
                 name="",
                 mode="train",
                 unit_of_data_split="blocks",
-                pair_sampling_block=False,
+                pair_sampling_mode="global_balanced_classes",
                 load_name_counts=False,
                 preprocess=False,
             )
@@ -138,7 +142,7 @@ class TestData(unittest.TestCase):
                 name="",
                 mode="train",
                 clusters={},
-                train_pairs=[],
+                train_pairs=cast(Any, []),
                 load_name_counts=False,
                 preprocess=False,
             )
@@ -163,7 +167,7 @@ class TestData(unittest.TestCase):
                 name="",
                 mode="train",
                 train_blocks=[],
-                train_pairs=[],
+                train_pairs=cast(Any, []),
                 load_name_counts=False,
                 preprocess=False,
             )
@@ -279,25 +283,129 @@ def test_compute_signature_name_counts_uses_single_character_initial():
     assert counts.last_first_initial == 17
 
 
-def test_pair_sampling_invalid_configuration_raises_value_error():
+def test_empty_altered_cluster_signatures_file_loads_as_empty_list(tmp_path):
+    altered_path = tmp_path / "altered_cluster_signatures.txt"
+    altered_path.write_text("", encoding="utf-8")
+
     dataset = ANDData(
         signatures={},
         papers={},
-        name="invalid_pair_sampling_configuration",
+        name="empty_altered",
         mode="inference",
+        cluster_seeds={"1": {"2": "require"}},
+        altered_cluster_signatures=str(altered_path),
         load_name_counts=False,
         preprocess=False,
     )
-    dataset.pair_sampling_block = False
-    dataset.pair_sampling_balanced_classes = False
-    dataset.pair_sampling_balanced_homonym_synonym = False
 
-    with pytest.raises(ValueError, match="not a valid combination"):
-        dataset.pair_sampling(
-            sample_size=10,
-            signature_ids=[],
-            blocks={},
-            all_pairs=False,
+    assert dataset.altered_cluster_signatures == []
+
+
+def test_pair_sampling_invalid_mode_raises_value_error():
+    with pytest.raises(ValueError, match="Unknown pair_sampling_mode"):
+        ANDData(
+            signatures={},
+            papers={},
+            clusters={},
+            name="invalid_pair_sampling_mode",
+            mode="train",
+            pair_sampling_mode="global_unbalanced",  # type: ignore[arg-type]
+            load_name_counts=False,
+            preprocess=False,
+        )
+
+
+def test_pair_sampling_legacy_flags_map_to_canonical_modes():
+    dataset = ANDData(
+        signatures={},
+        papers={},
+        clusters={},
+        name="legacy_pair_sampling_flags",
+        mode="train",
+        unit_of_data_split="signatures",
+        pair_sampling_block=False,
+        pair_sampling_balanced_classes=True,
+        load_name_counts=False,
+        preprocess=False,
+    )
+
+    assert dataset.pair_sampling_mode == "global_balanced_classes"
+    assert not dataset.pair_sampling_block
+    assert dataset.pair_sampling_balanced_classes
+    assert not dataset.pair_sampling_balanced_homonym_synonym
+
+    dataset = ANDData(
+        signatures={},
+        papers={},
+        clusters={},
+        name="legacy_pair_sampling_homonym",
+        mode="train",
+        pair_sampling_balanced_homonym_synonym=True,
+        load_name_counts=False,
+        preprocess=False,
+    )
+
+    assert dataset.pair_sampling_mode == "within_block_balanced_homonym_synonym"
+    assert dataset.pair_sampling_block
+    assert dataset.pair_sampling_balanced_classes
+    assert dataset.pair_sampling_balanced_homonym_synonym
+
+
+def test_pair_sampling_preserves_legacy_positional_random_seed():
+    dataset = ANDData(
+        {},
+        {},
+        "legacy_positional_pair_sampling_args",
+        "train",
+        {},
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "s2",
+        "signatures",
+        1,
+        0.8,
+        0.1,
+        0.1,
+        30000,
+        5000,
+        5000,
+        False,
+        True,
+        False,
+        True,
+        4242,
+        False,
+        1,
+        False,
+    )
+
+    assert dataset.pair_sampling_mode == "global_balanced_classes"
+    assert dataset.all_test_pairs_flag is True
+    assert dataset.random_seed == 4242
+
+
+def test_pair_sampling_rejects_mixed_canonical_and_legacy_flags():
+    with pytest.raises(ValueError, match="Set either pair_sampling_mode or legacy"):
+        ANDData(
+            signatures={},
+            papers={},
+            clusters={},
+            name="mixed_pair_sampling",
+            mode="train",
+            pair_sampling_mode="within_block_random",
+            pair_sampling_block=True,
+            load_name_counts=False,
+            preprocess=False,
         )
 
 
@@ -366,6 +474,9 @@ def test_fixed_pairs_does_not_mutate_source_dataframes():
         preprocess=False,
     )
 
+    assert dataset.train_pairs is not None
+    assert dataset.val_pairs is not None
+    assert dataset.test_pairs is not None
     train_before = dataset.train_pairs.copy(deep=True)
     val_before = dataset.val_pairs.copy(deep=True)
     test_before = dataset.test_pairs.copy(deep=True)
@@ -373,7 +484,7 @@ def test_fixed_pairs_does_not_mutate_source_dataframes():
     train_pairs, val_pairs, test_pairs = dataset.fixed_pairs()
 
     assert dataset.train_pairs.equals(train_before)
-    assert dataset.val_pairs is not None and dataset.val_pairs.equals(val_before)
+    assert dataset.val_pairs.equals(val_before)
     assert dataset.test_pairs.equals(test_before)
 
     all_labels = [int(pair[2]) for pair in train_pairs + val_pairs + test_pairs]

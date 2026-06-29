@@ -8,8 +8,9 @@ import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from functools import partial, reduce
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, cast
 
 import numpy as np
 import pandas as pd
@@ -42,17 +43,18 @@ from s2and.text import (
     VENUE_STOP_WORDS,
     compute_block,
     detect_language,
+    first_names_name_compatible,
     get_text_ngrams,
     get_text_ngrams_words,
     normalize_text,
-    same_prefix_tokens,
     split_first_middle_hyphen_aware,
 )
+from s2and.thread_config import resolve_n_jobs
 
 logger = logging.getLogger("s2and")
 
 # Lazy-initialized global for Sinonym detector within worker processes
-_SINONYM_DETECTOR = None  # type: ignore
+_SINONYM_DETECTOR = None
 _SINONYM_DETECTOR_LOCK = threading.Lock()
 CHUNK_SIZE = 1000  # for multiprocessing imap chunks
 _PAIR_LABEL_MAP: dict[str | int, int] = {"NO": 0, "YES": 1, "0": 0, 0: 0, "1": 1, 1: 1}
@@ -67,6 +69,73 @@ NameCountsLastFirstInitialSemantics = Literal[
     "legacy_full_first_token",
     "initial_char",
 ]
+PairSamplingMode = Literal[
+    "within_block_random",
+    "within_block_balanced_classes",
+    "within_block_balanced_homonym_synonym",
+    "global_balanced_classes",
+]
+_PAIR_SAMPLING_MODES: frozenset[str] = frozenset(
+    {
+        "within_block_random",
+        "within_block_balanced_classes",
+        "within_block_balanced_homonym_synonym",
+        "global_balanced_classes",
+    }
+)
+
+
+def _validate_pair_sampling_mode(mode: str) -> PairSamplingMode:
+    """Return a validated pair sampling mode."""
+
+    if mode not in _PAIR_SAMPLING_MODES:
+        raise ValueError(f"Unknown pair_sampling_mode: {mode!r}")
+    return cast(PairSamplingMode, mode)
+
+
+def _pair_sampling_uses_blocks(mode: PairSamplingMode) -> bool:
+    """Return whether a pair sampling mode samples within blocks."""
+
+    return mode != "global_balanced_classes"
+
+
+def _resolve_pair_sampling_mode(
+    *,
+    pair_sampling_mode: PairSamplingMode | str | None,
+    pair_sampling_block: bool | None,
+    pair_sampling_balanced_classes: bool | None,
+    pair_sampling_balanced_homonym_synonym: bool | None,
+) -> PairSamplingMode:
+    """Resolve canonical pair-sampling mode from current or legacy constructor args."""
+
+    legacy_values = (
+        pair_sampling_block,
+        pair_sampling_balanced_classes,
+        pair_sampling_balanced_homonym_synonym,
+    )
+    if pair_sampling_mode is not None:
+        if any(value is not None for value in legacy_values):
+            raise ValueError("Set either pair_sampling_mode or legacy pair_sampling_* flags, not both")
+        return _validate_pair_sampling_mode(str(pair_sampling_mode))
+
+    block = True if pair_sampling_block is None else bool(pair_sampling_block)
+    balanced_classes = False if pair_sampling_balanced_classes is None else bool(pair_sampling_balanced_classes)
+    balanced_homonym_synonym = (
+        False if pair_sampling_balanced_homonym_synonym is None else bool(pair_sampling_balanced_homonym_synonym)
+    )
+
+    if balanced_homonym_synonym:
+        if not block:
+            raise ValueError("pair_sampling_balanced_homonym_synonym requires pair_sampling_block=True")
+        return "within_block_balanced_homonym_synonym"
+    if balanced_classes:
+        return "within_block_balanced_classes" if block else "global_balanced_classes"
+    if block:
+        return "within_block_random"
+    raise ValueError(
+        "Legacy pair_sampling_block=False with pair_sampling_balanced_classes=False is unsupported; "
+        "pass pair_sampling_mode='global_balanced_classes' or use within-block sampling."
+    )
 
 
 # ------------------------ Local helpers (backcompat shims) ------------------------
@@ -77,8 +146,8 @@ def _lasts_equivalent_for_constraint(l1: str, l2: str) -> bool:
 
     Examples: "ou yang" == "ouyang"; strictly unequal strings otherwise.
 
-    TODO(s2and): Remove when canonicalization is unified end-to-end and constraints
-    operate on canonical forms only.
+    TODO(s2and): Remove only after the canonical-artifact rollout gate in
+    docs/normalization_migration_blocked.md is satisfied.
     """
     if l1 == l2:
         return True
@@ -91,7 +160,8 @@ def _canonicalize_last_for_counts(raw_last: str | None, normalized_last: str) ->
     Join internal spaces for hyphen/compound surnames so historical single-token
     count keys still match (e.g., "ou yang" -> "ouyang").
 
-    TODO(s2and): Remove once name count tables are regenerated with hyphen-aware surnames.
+    TODO(s2and): Remove only after the canonical-artifact rollout gate in
+    docs/normalization_migration_blocked.md is satisfied.
     """
     if (raw_last is not None and "-" in raw_last) or (" " in normalized_last):
         return (normalized_last or "").replace(" ", "")
@@ -105,13 +175,13 @@ def _load_name_counts_cached() -> tuple[dict[str, int], dict[str, int], dict[str
     """
     global _NAME_COUNTS_CACHE
     if _NAME_COUNTS_CACHE is not None:
-        return _NAME_COUNTS_CACHE  # type: ignore[return-value]
+        return _NAME_COUNTS_CACHE
     with _NAME_COUNTS_CACHE_LOCK:
         # Double-check after acquiring lock (another thread may have loaded).
         if _NAME_COUNTS_CACHE is None:
             with open(cached_path(NAME_COUNTS_PATH), "rb") as f:
                 _NAME_COUNTS_CACHE = pickle.load(f)
-    return _NAME_COUNTS_CACHE  # type: ignore[return-value]
+    return cast(tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]], _NAME_COUNTS_CACHE)
 
 
 def _load_name_tuples_from_file(filename: str) -> set[tuple[str, str]]:
@@ -137,7 +207,7 @@ def _resolve_name_counts_last_first_initial_semantics(
         NAME_COUNTS_LAST_FIRST_INITIAL_LEGACY,
         NAME_COUNTS_LAST_FIRST_INITIAL_INITIAL_CHAR,
     }:
-        return normalized  # type: ignore[return-value]
+        return cast(NameCountsLastFirstInitialSemantics, normalized)
     if strict:
         raise ValueError(
             "name_counts_last_first_initial_semantics must be one of "
@@ -178,7 +248,12 @@ def _ordered_coauthors_for_signature(signature: "Signature", papers: dict[str, "
             signature.paper_id,
         )
         return []
-    return [author.author_name for author in paper.authors if author.position != signature.author_info_position]
+    # Rust JSON ingest can skip Python paper preprocessing, so `paper.authors` may still hold raw names here.
+    return [
+        normalize_text(author.author_name)
+        for author in paper.authors
+        if author.position != signature.author_info_position
+    ]
 
 
 def _python_signature_ngrams_batch(
@@ -318,9 +393,9 @@ class ANDData:
         train_pairs_size: number of training pairs for learning the linkage function
         val_pairs_size: number of validation pairs for fine-tuning the linkage function parameters
         test_pairs_size: number of test pairs for evaluating the linkage function
-        pair_sampling_block: sample pairs from only within blocks?,
-        pair_sampling_balanced_classes: sample a balanced number of positive and negative pairs?,
-        pair_sampling_balanced_homonym_synonym: sample a balanced number of homonymous and synonymous pairs?,
+        pair_sampling_mode: strategy for sampling training/eval pairs. Legacy
+            pair_sampling_block/pair_sampling_balanced_classes/pair_sampling_balanced_homonym_synonym
+            flags are still accepted when pair_sampling_mode is not provided.
         all_test_pairs_flag: With blocking, for the linkage function evaluation task, should the test
             contain all possible pairs from test blocks, or the given number of pairs (test_pairs_size)
         random_seed: random seed
@@ -377,9 +452,9 @@ class ANDData:
         train_pairs_size: int = 30000,
         val_pairs_size: int = 5000,
         test_pairs_size: int = 5000,
-        pair_sampling_block: bool = True,
-        pair_sampling_balanced_classes: bool = False,
-        pair_sampling_balanced_homonym_synonym: bool = False,
+        pair_sampling_block: bool | None = None,
+        pair_sampling_balanced_classes: bool | None = None,
+        pair_sampling_balanced_homonym_synonym: bool | None = None,
         all_test_pairs_flag: bool = False,
         random_seed: int = 1111,
         load_name_counts: bool | dict = True,
@@ -391,6 +466,8 @@ class ANDData:
         name_counts_last_first_initial_semantics: NameCountsLastFirstInitialSemantics | None = None,
         sinonym_overwrite_min_ratio: float | None = 3.0,
         compute_reference_features: bool = False,
+        compute_block_fn: Callable[[str], str] = compute_block,
+        pair_sampling_mode: PairSamplingMode | None = None,
     ):
         init_start = time.perf_counter()
         self.runtime_context = build_runtime_context("dataset_build")
@@ -405,6 +482,7 @@ class ANDData:
         self.clusters_path = clusters if isinstance(clusters, str) else None
         self.cluster_seeds_path = cluster_seeds if isinstance(cluster_seeds, str) else None
         self.specter_embeddings_path = specter_embeddings if isinstance(specter_embeddings, str) else None
+        self.compute_block_fn = compute_block_fn
         rust_capabilities = detect_rust_runtime_capabilities()
         self.rust_lifecycle_policy = build_rust_lifecycle_policy(
             backend=self.runtime_context.resolved_backend,
@@ -418,12 +496,18 @@ class ANDData:
             use_sinonym_overwrite=use_sinonym_overwrite,
         )
         defer_rust_json_ingest_write_for_sinonym = self.rust_lifecycle_policy.defer_rust_json_ingest_write_for_sinonym
+        pair_sampling_mode = _resolve_pair_sampling_mode(
+            pair_sampling_mode=pair_sampling_mode,
+            pair_sampling_block=pair_sampling_block,
+            pair_sampling_balanced_classes=pair_sampling_balanced_classes,
+            pair_sampling_balanced_homonym_synonym=pair_sampling_balanced_homonym_synonym,
+        )
 
         if mode == "train":
             if train_blocks is not None and block_type != "original":
                 logger.warning("If you are passing in training/val/test blocks, then you may want original blocks.")
 
-            if unit_of_data_split == "blocks" and not pair_sampling_block:
+            if unit_of_data_split == "blocks" and not _pair_sampling_uses_blocks(pair_sampling_mode):
                 raise ValueError("Block-based cluster splits are not compatible with sampling strategies 0 and 1.")
 
             if (clusters is not None and train_pairs is not None) or (
@@ -605,16 +689,16 @@ class ANDData:
         self.specter_embeddings = self.maybe_load_specter(specter_embeddings)
         # prevents errors during testing where we have no specter embeddings
         if self.specter_embeddings is None:
-            self.specter_embeddings = {}  # type: ignore
+            self.specter_embeddings = {}
         else:
             # Only keep embeddings for papers we retained
             needed_keys = set(self.papers.keys())
-            self.specter_embeddings = {k: v for k, v in self.specter_embeddings.items() if str(k) in needed_keys}  # type: ignore
+            self.specter_embeddings = {k: v for k, v in self.specter_embeddings.items() if str(k) in needed_keys}
         logger.info("loaded specter, loading cluster seeds")
         cluster_seeds_dict = self.maybe_load_json(cluster_seeds)
         self.altered_cluster_signatures = self.maybe_load_list(altered_cluster_signatures)
         self.cluster_seeds_disallow = set()
-        self.cluster_seeds_require = {}  # type: ignore
+        self.cluster_seeds_require = {}
         self.max_seed_cluster_id = None
         if cluster_seeds_dict is not None:
             cluster_num = 0
@@ -663,9 +747,7 @@ class ANDData:
         self.train_pairs_size = train_pairs_size
         self.val_pairs_size = val_pairs_size
         self.test_pairs_size = test_pairs_size
-        self.pair_sampling_block = pair_sampling_block
-        self.pair_sampling_balanced_classes = pair_sampling_balanced_classes
-        self.pair_sampling_balanced_homonym_synonym = pair_sampling_balanced_homonym_synonym
+        self.pair_sampling_mode = pair_sampling_mode
         self.all_test_pairs_flag = all_test_pairs_flag
         self.random_seed = random_seed
         self.signature_to_cluster_id = None
@@ -680,9 +762,7 @@ class ANDData:
                 logger.info("made signature to cluster id")
         elif self.mode == "inference":
             # sampling within blocks and exhaustive flag is turned on
-            self.pair_sampling_block = True
-            self.pair_sampling_balanced_classes = False
-            self.pair_sampling_balanced_homonym_synonym = False
+            self.pair_sampling_mode = "within_block_random"
             self.all_test_pairs_flag = True
             self.block_type = "s2"  # pure inference is for S2 probably?
         else:
@@ -711,7 +791,7 @@ class ANDData:
             logger.info("loaded name counts")
         self.name_counts_loaded = bool(name_counts_loaded)
 
-        self.n_jobs = n_jobs
+        self.n_jobs = resolve_n_jobs(n_jobs)
         self.compute_reference_features = compute_reference_features
         self.signature_to_block = self.get_signatures_to_block()
         papers_from_signatures = {str(signature.paper_id) for signature in self.signatures.values()}
@@ -741,6 +821,7 @@ class ANDData:
                 self.n_jobs,
                 self.preprocess,
                 compute_reference_features=self.compute_reference_features,
+                compute_block_fn=self.compute_block_fn,
             )
             logger.info("preprocessed papers")
         logger.debug(
@@ -762,6 +843,28 @@ class ANDData:
             "Telemetry stage: stage=anddata_total_init seconds=%.3f",
             time.perf_counter() - init_start,
         )
+
+    @property
+    def pair_sampling_block(self) -> bool:
+        """Return whether pair sampling uses blocks."""
+
+        return _pair_sampling_uses_blocks(self.pair_sampling_mode)
+
+    @property
+    def pair_sampling_balanced_classes(self) -> bool:
+        """Return whether pair sampling balances positive and negative labels."""
+
+        return self.pair_sampling_mode in {
+            "within_block_balanced_classes",
+            "within_block_balanced_homonym_synonym",
+            "global_balanced_classes",
+        }
+
+    @property
+    def pair_sampling_balanced_homonym_synonym(self) -> bool:
+        """Return whether pair sampling also balances homonym/synonym cases."""
+
+        return self.pair_sampling_mode == "within_block_balanced_homonym_synonym"
 
     def _sync_in_memory_names_to_rust_json_payload(
         self,
@@ -846,7 +949,8 @@ class ANDData:
         #   for hyphenated Chinese given names (e.g., "qi xin"). For counts only, we heuristically
         #   join internal spaces to form a single token ("qixin") IF the raw first contained a hyphen.
         # - This preserves old behavior for most names while improving lookups for hyphenated cases.
-        # TODO: revisit once we re-extract name_counts using Sinonym-aware canonicalization.
+        # TODO(s2and): revisit after the canonical-artifact rollout gate in
+        # docs/normalization_migration_blocked.md is satisfied.
         counts_first_without_apostrophe = first_without_apostrophe
         counts_last_normalized = last_normalized
         if counts_first_without_apostrophe is None or counts_last_normalized is None:
@@ -866,7 +970,8 @@ class ANDData:
         # - Historically, last names were single tokens; normalization turns hyphens into spaces
         #   (e.g., "ou-yang" -> "ou yang"). For counts only, treat space/hyphen variants as the
         #   same token by joining internal spaces ("ouyang").
-        # TODO(s2and): remove this once name_counts are regenerated with hyphen-aware surnames.
+        # TODO(s2and): remove after the canonical-artifact rollout gate in
+        # docs/normalization_migration_blocked.md is satisfied.
         last_for_counts = _canonicalize_last_for_counts(signature.author_info_last, counts_last_normalized)
 
         first_last_for_count = (first_for_counts + " " + last_for_counts).strip()
@@ -877,11 +982,9 @@ class ANDData:
             last_first_initial_for_count = (last_for_counts + " " + first_initial).strip()
 
         return NameCounts(
-            first=(self.first_dict.get(first_for_counts, 1) if len(first_for_counts) > 1 else np.nan),  # type: ignore
+            first=(self.first_dict.get(first_for_counts, 1) if len(first_for_counts) > 1 else np.nan),
             last=self.last_dict.get(last_for_counts, 1),
-            first_last=(
-                self.first_last_dict.get(first_last_for_count, 1) if len(first_for_counts) > 1 else np.nan  # type: ignore
-            ),
+            first_last=(self.first_last_dict.get(first_last_for_count, 1) if len(first_for_counts) > 1 else np.nan),
             last_first_initial=self.last_first_initial_dict.get(last_first_initial_for_count, 1),
         )
 
@@ -947,7 +1050,7 @@ class ANDData:
 
                     coauthor_set = set(coauthors) if coauthors is not None else None
                     coauthor_blocks = (
-                        set(compute_block(author) for author in coauthors) if coauthors is not None else None
+                        set(self.compute_block_fn(author) for author in coauthors) if coauthors is not None else None
                     )
 
                     affiliations: list[str] = signature.author_info_affiliations
@@ -983,9 +1086,9 @@ class ANDData:
                             #   given names together).
                             # - Surname: for downstream lookups/constraints we also treat hyphen/space variants
                             #   equivalently.
-                            # TODO(s2and): Once name_counts/name_tuples are regenerated with Sinonym-aware
-                            #              canonicalization, remove the backward-compat shims added below for
-                            #              last-name counts/constraints.
+                            # TODO(s2and): Remove the backward-compat shims added below for last-name
+                            #              counts/constraints after the canonical-artifact rollout gate in
+                            #              docs/normalization_migration_blocked.md is satisfied.
                             # Default normalization (keeps legacy behavior for counts/lookups)
                             first_normalized = normalize_text(first_raw)
                             middle_normalized = normalize_text(middle_raw)
@@ -1266,7 +1369,10 @@ class ANDData:
         """
         if isinstance(path_or_list, str):
             with open(path_or_list) as f:
-                return f.read().strip().split("\n")
+                contents = f.read().strip()
+                if not contents:
+                    return []
+                return contents.splitlines()
         else:
             return path_or_list
 
@@ -1373,21 +1479,24 @@ class ANDData:
         high_value: float | int = LARGE_DISTANCE,
         dont_merge_cluster_seeds: bool = True,
         incremental_dont_use_cluster_seeds: bool = False,
+        suppress_orcid: bool = False,
     ) -> float | None:
-        """Applies cluster_seeds and generates the default
-        constraints which are:
+        """Apply pairwise hard constraints for a signature pair.
 
-        First we apply the passed-in cluster_seeds, then:
+        Precedence:
+        1) Apply passed-in cluster seed constraints first (`disallow`/`require`).
+        2) Optionally disallow merging signatures that belong to different
+           required-seed groups when `dont_merge_cluster_seeds` is enabled.
+        3) If both ORCIDs are present and equal and `suppress_orcid` is false, return `low_value`.
+        4) Return `high_value` for deterministic conflicts:
+           - normalized last names disagree (hyphen/space-insensitive)
+           - first initials disagree
+           - first names are neither compatible prefixes nor known aliases
+             from `self.name_tuples`
+           - middle-name evidence is mutually conflicting (initials or full
+             middle tokens)
 
-        (1) if not a.prefix(b) or b.prefix(a) and (a, b) not in self.name_tuples:
-            distance(a, b) = high_value
-
-        (2) if len(a_middle) > 0 and len(b_middle) > 0 and
-            intersection(a_middle_chars, b_middle_chars) == 0:
-            distance(a, b) = high_value
-
-        There is currently no rule to assign low_value but it would be good
-        to potentially add an ORCID rule to use low_value
+        If no hard rule applies, return `None`.
 
         Parameters
         ----------
@@ -1403,7 +1512,11 @@ class ANDData:
             this flag controls whether to use cluster seeds to enforce "dont merge"
             as well as "must merge" constraints
         incremental_dont_use_cluster_seeds: bool
-            Are we clustering in incremental mode? If so, don't use the cluster seeds that came with the dataset
+            If true, ignore cluster-seed require groups, including the derived
+            cross-group disallow rule. Explicit `cluster_seeds_disallow` pairs
+            still apply as hard negatives.
+        suppress_orcid: bool
+            If true, do not use same-ORCID equality as a must-link constraint.
 
         Returns
         -------
@@ -1435,13 +1548,11 @@ class ANDData:
         first_2, middle_2_text = _materialize_constraint_name_parts(signature_2)
         middle_1 = middle_1_text.split()
 
-        paper_1 = self.papers[str(signature_1.paper_id)]
-        paper_2 = self.papers[str(signature_2.paper_id)]
-
         orcid_1 = signature_1.author_info_orcid
         orcid_2 = signature_2.author_info_orcid
 
-        # cluster seeds have precedence
+        # Explicit disallow pairs are hard negatives; the incremental flag only
+        # suppresses seed-cluster require groups and derived cross-group disallows.
         if (signature_id_1, signature_id_2) in self.cluster_seeds_disallow or (
             signature_id_2,
             signature_id_1,
@@ -1453,16 +1564,18 @@ class ANDData:
             return CLUSTER_SEEDS_LOOKUP["require"]
         elif (
             dont_merge_cluster_seeds
+            and (not incremental_dont_use_cluster_seeds)
             and (signature_id_1 in self.cluster_seeds_require and signature_id_2 in self.cluster_seeds_require)
             and (self.cluster_seeds_require[signature_id_1] != self.cluster_seeds_require[signature_id_2])
         ):
             return CLUSTER_SEEDS_LOOKUP["disallow"]
         # orcid is a very reliable indicator: if 2 orcids are present and equal, then they are the same person
         # but if they are not equal, we can't say much
-        elif orcid_1 is not None and orcid_2 is not None and orcid_1 == orcid_2:
+        elif not suppress_orcid and orcid_1 is not None and orcid_2 is not None and orcid_1 == orcid_2:
             return low_value
         # just-in-case last name constraint: if last names are different (hyphen/space-insensitive), then disallow
-        # TODO(s2and): remove hyphen/space-insensitive shim once canonicalization is unified end-to-end
+        # TODO(s2and): remove after the canonical-artifact rollout gate in
+        # docs/normalization_migration_blocked.md is satisfied.
         elif not _lasts_equivalent_for_constraint(
             _materialize_constraint_last_normalized(signature_1),
             _materialize_constraint_last_normalized(signature_2),
@@ -1471,11 +1584,6 @@ class ANDData:
         # just-in-case first initial constraint: if first initials are different, then disallow
         elif len(first_1) > 0 and len(first_2) > 0 and first_1[0] != first_2[0]:
             return high_value
-        # and then language constraints
-        elif (paper_1.is_reliable and paper_2.is_reliable) and (
-            paper_1.predicted_language != paper_2.predicted_language
-        ):
-            return high_value
         # and then name based constraints
         else:
             # either a known alias or a prefix of the other
@@ -1483,20 +1591,9 @@ class ANDData:
             # Backward-compatibility: `first_1`/`first_2` can now be multi-token (Sinonym output).
             # Legacy name_tuples were curated over single-token first names. To remain compatible,
             # try multiple forms for alias membership: exact, joined-without-spaces, and first-token only.
-            # TODO: revisit once we re-extract name_tuples aligned with Sinonym canonicalization.
-            first_1_parts = first_1.split()
-            first_2_parts = first_2.split()
-            f1_join = "".join(first_1_parts)
-            f2_join = "".join(first_2_parts)
-            f1_tok = first_1_parts[0] if first_1_parts else first_1
-            f2_tok = first_2_parts[0] if first_2_parts else first_2
-            known_alias = (
-                (first_1, first_2) in self.name_tuples
-                or (f1_join, f2_join) in self.name_tuples
-                or (f1_tok, f2_tok) in self.name_tuples
-            )
-            prefix = same_prefix_tokens(first_1, first_2)
-            if not prefix and not known_alias:
+            # TODO(s2and): remove after the canonical-artifact rollout gate in
+            # docs/normalization_migration_blocked.md is satisfied.
+            if not first_names_name_compatible(first_1, first_2, self.name_tuples):
                 return high_value
             # dont cluster together if there is no intersection between the sets of middle initials
             # and both sets are not empty
@@ -1655,7 +1752,7 @@ class ANDData:
                     signature_to_year[signature_id] = 0
                 else:
                     # mypy: year is Optional[int] on Paper; guarded above, so cast to int here
-                    signature_to_year[signature_id] = int(self.papers[paper_id].year)  # type: ignore[arg-type]
+                    signature_to_year[signature_id] = int(self.papers[paper_id].year)
 
             train_size = int(len(signature_to_year) * self.train_ratio)
             val_size = int(len(signature_to_year) * self.val_ratio)
@@ -1714,9 +1811,9 @@ class ANDData:
 
         logger.info(f"shuffled train/val/test {len(train_block_dict), len(val_block_dict), len(test_block_dict)}")
 
-        train_set = set(reduce(lambda x, y: x + y, train_block_dict.values()))  # type: ignore
-        val_set = set(reduce(lambda x, y: x + y, val_block_dict.values()))  # type: ignore
-        test_set = set(reduce(lambda x, y: x + y, test_block_dict.values()))  # type: ignore
+        train_set = set(reduce(lambda x, y: x + y, train_block_dict.values()))
+        val_set = set(reduce(lambda x, y: x + y, val_block_dict.values()))
+        test_set = set(reduce(lambda x, y: x + y, test_block_dict.values()))
         intersection_1 = train_set.intersection(test_set)
         intersection_2 = train_set.intersection(val_set)
         intersection_3 = val_set.intersection(test_set)
@@ -1942,23 +2039,7 @@ class ANDData:
         -------
         list: list of signature pairs
         """
-        valid_configuration = (
-            (not self.pair_sampling_block and self.pair_sampling_balanced_classes)
-            or (self.pair_sampling_block and self.pair_sampling_balanced_classes)
-            or (
-                self.pair_sampling_block
-                and not self.pair_sampling_balanced_homonym_synonym
-                and not self.pair_sampling_balanced_classes
-            )
-        )
-        if not valid_configuration:
-            raise ValueError(
-                f"You chose sample within blocks? {self.pair_sampling_block}, sample balanced pos/neg?\
-                 {self.pair_sampling_balanced_classes}, sample balanced homonym/synonym?\
-                  {self.pair_sampling_balanced_homonym_synonym}. This is not a valid combination.\
-                   Not using blocks and not doing balancing is not supported, and homonym/synonym\
-                    balancing without pos/neg balancing is not supported"
-            )
+        pair_sampling_mode = _validate_pair_sampling_mode(str(self.pair_sampling_mode))
 
         same_name_different_cluster: list[tuple[str, str, int | float]] = []
         same_name_same_cluster: list[tuple[str, str, int | float]] = []
@@ -1966,7 +2047,7 @@ class ANDData:
         different_name_different_cluster: list[tuple[str, str, int | float]] = []
         possible: list[tuple[str, str, int | float]] = []
 
-        if not self.pair_sampling_block:
+        if pair_sampling_mode == "global_balanced_classes":
             if self.signature_to_cluster_id is None:
                 raise ValueError("signature_to_cluster_id is required for non-block pair sampling")
             signature_to_cluster_id = self.signature_to_cluster_id
@@ -1986,7 +2067,7 @@ class ANDData:
                             same_name_different_cluster.append((s1, s2, 0))
                         else:
                             different_name_different_cluster.append((s1, s2, 0))
-        elif not self.pair_sampling_balanced_homonym_synonym and not self.pair_sampling_balanced_classes:
+        elif pair_sampling_mode == "within_block_random":
             for _, signatures in blocks.items():
                 for i, s1 in enumerate(signatures):
                     for s2 in signatures[i + 1 :]:
@@ -2022,11 +2103,7 @@ class ANDData:
                                 different_name_different_cluster.append((s1, s2, 0))
 
         if all_pairs:
-            if (
-                self.pair_sampling_balanced_homonym_synonym
-                or self.pair_sampling_balanced_classes
-                or not self.pair_sampling_block
-            ):
+            if pair_sampling_mode != "within_block_random":
                 all_pairs_output: list[tuple[str, str, int | float]] = (
                     same_name_different_cluster
                     + same_name_same_cluster
@@ -2037,29 +2114,27 @@ class ANDData:
             else:
                 return possible
         else:
-            if self.pair_sampling_balanced_classes:
+            if pair_sampling_mode in {
+                "within_block_balanced_classes",
+                "within_block_balanced_homonym_synonym",
+                "global_balanced_classes",
+            }:
                 pairs = sampling(
                     same_name_different_cluster,
                     different_name_same_cluster,
                     same_name_same_cluster,
                     different_name_different_cluster,
                     sample_size,
-                    self.pair_sampling_balanced_homonym_synonym,
+                    pair_sampling_mode == "within_block_balanced_homonym_synonym",
                     self.random_seed,
                 )
-            elif (
-                self.pair_sampling_block
-                and not self.pair_sampling_balanced_classes
-                and not self.pair_sampling_balanced_homonym_synonym
-            ):
+            elif pair_sampling_mode == "within_block_random":
                 sample_size = min(len(possible), sample_size)
                 pairs = random_sampling(possible, sample_size, self.random_seed)
             else:
                 raise ValueError(
                     "Unsupported pair sampling configuration for non-exhaustive sampling "
-                    f"(pair_sampling_block={self.pair_sampling_block}, "
-                    f"pair_sampling_balanced_classes={self.pair_sampling_balanced_classes}, "
-                    f"pair_sampling_balanced_homonym_synonym={self.pair_sampling_balanced_homonym_synonym})"
+                    f"(pair_sampling_mode={pair_sampling_mode})"
                 )
             return pairs
 
@@ -2069,13 +2144,13 @@ class ANDData:
 
 def _ensure_sinonym_detector():
     """Lazily import and initialize a process-level default detector."""
-    global _SINONYM_DETECTOR  # type: ignore
+    global _SINONYM_DETECTOR
     if _SINONYM_DETECTOR is not None:
         return _SINONYM_DETECTOR
     with _SINONYM_DETECTOR_LOCK:
         if _SINONYM_DETECTOR is None:
             try:
-                from sinonym.detector import ChineseNameDetector  # type: ignore
+                from sinonym.detector import ChineseNameDetector
             except Exception as e:  # pragma: no cover - optional dependency
                 raise ImportError(
                     "Sinonym is not installed or failed to import. Install 'sinonym' to enable this feature."
@@ -2247,7 +2322,7 @@ def sinonym_preprocess_papers_parallel(papers_dict: dict[str, Paper], n_jobs: in
     if n_jobs > 1:
         # Explicit platform policy to avoid implicit UniversalPool defaults at call sites.
         use_threads = platform.system() in ("Windows", "Darwin")
-        with UniversalPool(processes=n_jobs, use_threads=use_threads) as p:  # type: ignore
+        with UniversalPool(processes=n_jobs, use_threads=use_threads) as p:
             _max = len(papers_dict)
             with tqdm(total=_max, desc="Sinonym: analyzing author batches") as pbar:
                 # Build a lightweight iterable to minimize serialization overhead
@@ -2300,7 +2375,7 @@ def _sinonym_preprocess_paper_light(item: tuple[str, list[tuple[int, str]]]) -> 
         return key, {}
 
     detector = _ensure_sinonym_detector()
-    results = detector.process_name_batch(names)  # type: ignore[attr-defined]
+    results = detector.process_name_batch(names)
 
     pos_to_norm: dict[int, Any] = {}
 
@@ -2353,8 +2428,8 @@ def apply_sinonym_overwrites(
         signatures: signature_id -> Signature
         per_paper_results: paper_id(str) -> { position -> parsed_struct }
         overwrite_blocks: if True, also overwrite author_info_block with the new
-            block derived from normalized first/last. Use only in inference to
-            avoid changing dataset splits.
+            S2AND block derived from normalized first initial and normalized last.
+            Use only in inference to avoid changing dataset splits.
 
     Returns:
         Number of signatures updated.
@@ -2375,24 +2450,9 @@ def apply_sinonym_overwrites(
                 allowed = allow_overwrite_pos.get(paper_id_str, set())
                 if sig.author_info_position not in allowed:
                     continue
-            # Build the new block only when BOTH first and last are present.
-            # Otherwise, do not change the existing block value.
             new_block = None
-            try:
-                if first and last:
-                    # Match standard block computation: first-initial + last, then normalize.
-                    # TODO(s2and): When blocks are recomputed everywhere from Sinonym-aware
-                    # canonical forms, remove compatibility handling in this overwrite path.
-                    new_block = normalize_text(f"{first[:1]} {last}")
-            except Exception:
-                # Log any unexpected formatting issues; keep prior block on error
-                logger.exception(
-                    "Error computing new block for signature_id=%s (paper_id=%s, position=%s)",
-                    sig_id,
-                    sig.paper_id,
-                    sig.author_info_position,
-                )
-                new_block = None
+            if first and last:
+                new_block = normalize_text(f"{first[:1]} {last}")
 
             # Always update first/middle/last; conditionally update block in inference
             new_sig = sig._replace(
@@ -2497,7 +2557,11 @@ def preprocess_paper_1(item: tuple[str, Paper], *, preprocess: bool = True) -> t
     return (key, paper)
 
 
-def preprocess_paper_2(item: tuple[str, Paper, list[MiniPaper]]) -> tuple[str, Paper]:
+def preprocess_paper_2(
+    item: tuple[str, Paper, list[MiniPaper]],
+    *,
+    compute_block_fn: Callable[[str], str] = compute_block,
+) -> tuple[str, Paper]:
     """
     helper function to perform preprocessing of the reference details for a paper.
     Note: this happens after the main paper preprocessing has occurred.
@@ -2523,7 +2587,7 @@ def preprocess_paper_2(item: tuple[str, Paper, list[MiniPaper]]) -> tuple[str, P
             [author.strip() for paper in reference_papers for author in paper.authors],
         )
     )
-    blocks = [compute_block(author) for author in authors]
+    blocks = [compute_block_fn(author) for author in authors]
     names = " ".join(authors)
     reference_details = (
         get_text_ngrams(names.strip(), use_bigrams=True, stopwords=None),
@@ -2544,6 +2608,7 @@ def preprocess_papers_parallel(
     preprocess: bool,
     *,
     compute_reference_features: bool = False,
+    compute_block_fn: Callable[[str], str] = compute_block,
 ) -> dict:
     """
     helper function to preprocess papers
@@ -2565,7 +2630,7 @@ def preprocess_papers_parallel(
     use_pool_stage_1 = n_jobs > 1 and platform.system() == "Linux"
     if use_pool_stage_1:
         # Linux/WSL2: force process workers for CPU-bound paper 1 preprocessing.
-        with UniversalPool(processes=n_jobs, use_threads=False) as p:  # type: ignore
+        with UniversalPool(processes=n_jobs, use_threads=False) as p:
             _max = len(papers_dict)
             with tqdm(total=_max, desc="Preprocessing papers 1/2") as pbar:
                 func = partial(preprocess_paper_1, preprocess=preprocess)
@@ -2597,7 +2662,7 @@ def preprocess_papers_parallel(
             for key, value in output.items()
         ]
         for item in tqdm(input_2, total=len(input_2), desc="Preprocessing papers 2/2"):
-            k, v = preprocess_paper_2(item)
+            k, v = preprocess_paper_2(item, compute_block_fn=compute_block_fn)
             output[k] = v
     elif preprocess and not compute_reference_features:
         # Ensure reference_details exists as empty counters to keep downstream code safe

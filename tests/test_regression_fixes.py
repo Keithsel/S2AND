@@ -1,8 +1,5 @@
-import importlib.util
-import json
-import math
-from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
@@ -10,21 +7,16 @@ import pytest
 import s2and.eval as eval_module
 import s2and.model as model_module
 import s2and.subblocking as subblocking_module
+from s2and.data import ANDData
 from s2and.eval import incremental_cluster_eval
 from s2and.featurizer import FeaturizationInfo
 from s2and.model import Clusterer
 from s2and.runtime import RuntimeContext
 from s2and.sampling import sampling
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
-
-def _load_script_module(relative_path: str, module_name: str):
-    spec = importlib.util.spec_from_file_location(module_name, REPO_ROOT / relative_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _as_anddata(dataset: object) -> ANDData:
+    return cast(ANDData, dataset)
 
 
 def _subblocking_signature(first_name: str, *, middle_name: str = "", orcid: str | None = None):
@@ -35,6 +27,22 @@ def _subblocking_signature(first_name: str, *, middle_name: str = "", orcid: str
         author_info_middle=middle_name,
         author_info_orcid=orcid,
     )
+
+
+def test_model_predict_class0_does_not_require_num_threads_keyword_support():
+    class RejectsNumThreads:
+        def predict_proba(self, features):
+            return np.column_stack((np.zeros(len(features)), np.ones(len(features))))
+
+    predictions, seconds, backend = model_module._predict_class0_with_runtime(
+        RejectsNumThreads(),
+        np.zeros((2, 1), dtype=np.float64),
+        num_threads=2,
+    )
+
+    assert np.array_equal(predictions, np.zeros(2, dtype=np.float64))
+    assert seconds >= 0.0
+    assert backend == "python"
 
 
 def _run_make_subblocks_with_fixed_first_pass(monkeypatch, signatures, first_pass_output, *, maximum_size: int):
@@ -117,7 +125,7 @@ def test_incremental_cluster_eval_val_uses_val_block_for_pairwise_metrics(monkey
 
     dataset = DummyDataset()
     clusterer = DummyClusterer()
-    incremental_cluster_eval(dataset, clusterer, split="val")
+    incremental_cluster_eval(cast(ANDData, dataset), cast(Clusterer, clusterer), split="val")
 
     assert len(captured_test_blocks) == 2
     assert captured_test_blocks[0] == {"b": ["s_val"]}
@@ -232,91 +240,25 @@ def test_make_subblocks_merges_orcid_when_target_has_capacity(monkeypatch):
     assert all(len(signature_ids) <= 4 for signature_ids in output.values())
 
 
-def test_transform_signature_file_handles_empty_email_field(tmp_path):
-    transform_module = _load_script_module(
-        "scripts/archive/transform_all_datasets.py",
-        "transform_all_datasets_regression",
-    )
-
-    signatures = {
-        "1": {
-            "paperid": 1,
-            "authorinfo": {
-                "position": 0,
-                "block": "a smith",
-                "first": "A",
-                "middle": "",
-                "last": "Smith",
-                "suffix": "",
-                "emails": "{}",
-                "affiliations": "",
-                "given-block": "",
-                "ethnicity": "",
-                "gender": "",
-            },
-            "actual_name": "",
-        }
-    }
-    input_path = tmp_path / "signatures.json"
-    with open(input_path, "w") as input_file:
-        json.dump(signatures, input_file)
-
-    transformed = transform_module.transform_signature_file(str(input_path))
-    assert transformed["1"]["author_info"]["email"] is None
-
-
-@pytest.mark.parametrize(
-    ("script_path", "module_name"),
-    [
-        ("scripts/transfer_experiment_seed_paper.py", "transfer_seed_regression"),
-        ("scripts/archive/transfer_experiment_internal.py", "transfer_internal_regression"),
-    ],
-)
-def test_transfer_script_facet_helpers_handle_empty_groups(script_path, module_name):
-    module = _load_script_module(script_path, module_name)
-
-    disparity_scores = module.disparity_analysis({"group": []}, {"group": []})
-    assert math.isnan(disparity_scores["S2AND std"])
-    assert disparity_scores["S2AND max-perf-group"] is None
-
-    empty_feature = ([], [])
-    s2and_scores, s2_scores = module.summary_features_analysis(
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-        empty_feature,
-    )
-    assert math.isnan(s2and_scores["first_name_diff"])
-    assert math.isnan(s2_scores["first_name_diff"])
-
-
 def test_clusterer_predict_uses_minimum_one_for_incremental_batch_threshold(monkeypatch):
     class Signature:
         def __init__(self, first_name):
             self.author_info_first_normalized_without_apostrophe = first_name
 
-    dataset = SimpleNamespace(
-        signatures={
-            "m1": Signature("alex"),
-            "m2": Signature("alex"),
-            "m3": Signature("alex"),
-            "m4": Signature("alex"),
-            "m5": Signature("alex"),
-            "m6": Signature("alex"),
-            "s1": Signature("a"),
-            "s2": Signature("a"),
-        },
-        cluster_seeds_require={},
+    dataset = _as_anddata(
+        SimpleNamespace(
+            signatures={
+                "m1": Signature("alex"),
+                "m2": Signature("alex"),
+                "m3": Signature("alex"),
+                "m4": Signature("alex"),
+                "m5": Signature("alex"),
+                "m6": Signature("alex"),
+                "s1": Signature("a"),
+                "s2": Signature("a"),
+            },
+            cluster_seeds_require={},
+        )
     )
 
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
@@ -325,7 +267,7 @@ def test_clusterer_predict_uses_minimum_one_for_incremental_batch_threshold(monk
     monkeypatch.setattr(
         model_module,
         "_sync_rust_cluster_seeds",
-        lambda _dataset, runtime_context=None, use_cache=False: None,
+        lambda _dataset, runtime_context=None: None,
     )
     monkeypatch.setattr(
         model_module,
@@ -368,163 +310,123 @@ def test_clusterer_predict_uses_minimum_one_for_incremental_batch_threshold(monk
     assert captured["batching_threshold"] == 1
 
 
-def test_distance_matrix_helper_uses_indexed_constraint_api(monkeypatch):
-    dataset = SimpleNamespace()
-    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
-    clusterer = Clusterer(
-        featurizer_info=featurizer_info,
-        classifier=None,
-        n_jobs=1,
-        use_cache=False,
-        use_default_constraints_as_supervision=True,
+@pytest.mark.parametrize(
+    ("restore_rust_cluster_seeds_on_exit", "expected_sync_calls", "expected_evict_calls"),
+    [
+        (True, 3, 0),
+        (False, 2, 1),
+    ],
+)
+def test_clusterer_predict_optionally_skips_final_rust_seed_restore(
+    monkeypatch,
+    restore_rust_cluster_seeds_on_exit,
+    expected_sync_calls,
+    expected_evict_calls,
+):
+    class Signature:
+        def __init__(self, first_name):
+            self.author_info_first_normalized_without_apostrophe = first_name
+
+    original_cluster_seeds = {"orig_seed": "orig_cluster"}
+    dataset = _as_anddata(
+        SimpleNamespace(
+            signatures={
+                "m1": Signature("alex"),
+                "m2": Signature("alex"),
+                "s1": Signature("a"),
+                "s2": Signature("a"),
+            },
+            cluster_seeds_require=dict(original_cluster_seeds),
+            cluster_seeds_disallow=set(),
+        )
     )
 
-    class _FakeFeaturizer:
-        def signature_ids(self):
-            return ["s1", "s2"]
+    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
+    clusterer = Clusterer(featurizer_info=featurizer_info, classifier=None, n_jobs=1, use_cache=False)
 
-        def get_constraints_matrix_indexed(self, *_args, **_kwargs):
-            return [None]
+    sync_snapshots: list[dict[str, str]] = []
+    evict_snapshots: list[dict[str, str]] = []
 
-    captured = {
-        "featurizer_use_cache": None,
-        "batch_use_cache": None,
-        "batch_calls": 0,
-        "fallback_calls": 0,
-    }
-
-    monkeypatch.setattr(model_module, "_use_rust_constraints", lambda runtime_context=None: True)
     monkeypatch.setattr(
         model_module,
-        "_get_rust_featurizer",
-        lambda _dataset, runtime_context=None, use_cache=False: captured.__setitem__("featurizer_use_cache", use_cache)
-        or _FakeFeaturizer(),
-    )
-
-    def fake_get_constraints_matrix_indexed_rust(*args, use_cache=False, **kwargs):
-        del args, kwargs
-        captured["batch_calls"] += 1
-        captured["batch_use_cache"] = use_cache
-        return [0.0]
-
-    def fake_get_constraint_rust(*args, **kwargs):
-        del args, kwargs
-        captured["fallback_calls"] += 1
-        return None
-
-    monkeypatch.setattr(model_module, "get_constraints_matrix_indexed_rust", fake_get_constraints_matrix_indexed_rust)
-    monkeypatch.setattr(model_module, "get_constraint_rust", fake_get_constraint_rust)
-
-    helper = clusterer.distance_matrix_helper({"b": ["s1", "s2"]}, dataset, partial_supervision={})
-    next(helper)
-
-    assert captured["featurizer_use_cache"] is False
-    assert captured["batch_use_cache"] is False
-    assert captured["batch_calls"] == 1
-    assert captured["fallback_calls"] == 0
-
-
-def test_make_distance_matrices_rust_blockwise_uses_indexed_constraint_api(monkeypatch):
-    from s2and import feature_port
-
-    if not feature_port.rust_featurizer_available():
-        pytest.skip("s2and_rust extension is unavailable")
-
-    monkeypatch.setenv("S2AND_BACKEND", "rust")
-    dataset = SimpleNamespace(cluster_seeds_require={}, cluster_seeds_disallow=set())
-    featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
-    clusterer = Clusterer(
-        featurizer_info=featurizer_info,
-        classifier=None,
-        n_jobs=1,
-        use_cache=False,
-        use_default_constraints_as_supervision=True,
-        batch_size=2,
-    )
-
-    class _FakeFeaturizer:
-        def signature_ids(self):
-            return ["s1", "s2"]
-
-        def get_constraints_matrix_indexed(self, *_args, **_kwargs):
-            return [None]
-
-    captured = {
-        "featurizer_use_cache": None,
-        "batch_use_cache": None,
-        "batch_calls": 0,
-        "fallback_calls": 0,
-    }
-
-    monkeypatch.setattr(model_module, "_use_rust_constraints", lambda runtime_context=None: True)
-    monkeypatch.setattr(model_module, "_sync_rust_cluster_seeds", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        model_module.Clusterer,
-        "distance_matrix_helper",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy helper path should not be called")),
+        "_sync_rust_cluster_seeds",
+        lambda dataset_arg, runtime_context=None: sync_snapshots.append(
+            dict(dataset_arg.cluster_seeds_require)
+        ),
     )
     monkeypatch.setattr(
         model_module,
-        "_get_rust_featurizer",
-        lambda _dataset, runtime_context=None, use_cache=False: captured.__setitem__("featurizer_use_cache", use_cache)
-        or _FakeFeaturizer(),
+        "evict_rust_featurizer",
+        lambda dataset_arg: evict_snapshots.append(dict(dataset_arg.cluster_seeds_require)) or True,
+    )
+    monkeypatch.setattr(
+        model_module,
+        "make_subblocks",
+        lambda block_signatures, _dataset, maximum_size: {
+            "multi_1": ["m1", "m2"],
+            "single_1": ["s1", "s2"],
+        },
     )
 
-    def fake_get_constraints_matrix_indexed_rust(*args, use_cache=False, **kwargs):
-        del args, kwargs
-        captured["batch_calls"] += 1
-        captured["batch_use_cache"] = use_cache
-        return [0.0]
+    def fake_predict_helper(self, block_dict, _dataset, *args, **kwargs):
+        del self, _dataset, args, kwargs
+        block_key = next(iter(block_dict))
+        return {"cluster_multi": list(block_dict[block_key])}, None
 
-    def fake_get_constraint_rust(*args, **kwargs):
-        del args, kwargs
-        captured["fallback_calls"] += 1
-        return None
+    def fake_predict_incremental(self, block_signatures, dataset_arg, *args, **kwargs):
+        del self, args, kwargs
+        return {
+            "clusters": {"merged": list(dataset_arg.cluster_seeds_require.keys()) + list(block_signatures)},
+            "phase_b_mode": "exact",
+            "phase_b_budget_bytes": 0,
+            "phase_b_required_bytes": 0,
+        }
 
-    def fake_many_pairs_featurize(signature_pairs, *_args, **_kwargs):
-        labels = np.asarray([float(pair[2]) for pair in signature_pairs], dtype=np.float64)
-        features = np.zeros((len(signature_pairs), 1), dtype=np.float64)
-        return features, labels, None
+    monkeypatch.setattr(Clusterer, "predict_helper", fake_predict_helper)
+    monkeypatch.setattr(Clusterer, "predict_incremental", fake_predict_incremental)
 
-    def fake_predict_and_combine(
-        _classifier,
-        _nameless_classifier,
-        _features,
-        labels,
-        _nameless_features,
-        _batch_label,
-        runtime_context=None,
-        **_kwargs,
-    ):
-        del runtime_context, _kwargs
-        return np.asarray(labels + model_module.LARGE_INTEGER, dtype=np.float64), 0.0
+    pred_clusters, _ = clusterer.predict(
+        {"block": ["m1", "m2", "s1", "s2"]},
+        dataset,
+        batching_threshold=2,
+        restore_rust_cluster_seeds_on_exit=restore_rust_cluster_seeds_on_exit,
+    )
 
-    monkeypatch.setattr(model_module, "get_constraints_matrix_indexed_rust", fake_get_constraints_matrix_indexed_rust)
-    monkeypatch.setattr(model_module, "get_constraint_rust", fake_get_constraint_rust)
-    monkeypatch.setattr(model_module, "many_pairs_featurize", fake_many_pairs_featurize)
-    monkeypatch.setattr(model_module, "_predict_and_combine", fake_predict_and_combine)
+    assert pred_clusters == {"merged": ["m1", "m2", "s1", "s2"]}
+    assert sync_snapshots[:2] == [
+        {"m1": "cluster_multi", "m2": "cluster_multi"},
+        {"m1": "merged", "m2": "merged", "s1": "merged", "s2": "merged"},
+    ]
+    assert len(sync_snapshots) == expected_sync_calls
+    assert len(evict_snapshots) == expected_evict_calls
+    assert dict(dataset.cluster_seeds_require) == original_cluster_seeds
 
-    output = clusterer.make_distance_matrices({"b": ["s1", "s2"]}, dataset, partial_supervision={})
-    assert float(output["b"][0]) == pytest.approx(0.0, abs=0.0)
-    assert captured["featurizer_use_cache"] is False
-    assert captured["batch_use_cache"] is False
-    assert captured["batch_calls"] == 1
-    assert captured["fallback_calls"] == 0
+    if restore_rust_cluster_seeds_on_exit:
+        assert sync_snapshots[-1] == original_cluster_seeds
+        assert evict_snapshots == []
+    else:
+        assert evict_snapshots == [original_cluster_seeds]
+
+    version_before_mutation = int(dataset._cluster_seeds_version)
+    dataset.cluster_seeds_require["new_seed"] = "new_cluster"
+    assert int(dataset._cluster_seeds_version) == version_before_mutation + 1
 
 
 def test_sync_rust_cluster_seeds_skips_when_unchanged(monkeypatch):
     calls = {"count": 0}
 
-    def fake_update(_dataset, runtime_context=None, use_cache=False):
-        del runtime_context, use_cache
+    def fake_update(_dataset, runtime_context=None):
+        del runtime_context
         calls["count"] += 1
 
     monkeypatch.setattr(model_module, "update_rust_cluster_seeds", fake_update)
 
-    dataset = SimpleNamespace(
-        cluster_seeds_require={},
-        cluster_seeds_disallow=set(),
-        _cluster_seeds_version=1,
+    dataset = _as_anddata(
+        SimpleNamespace(
+            cluster_seeds_require={},
+            cluster_seeds_disallow=set(),
+            _cluster_seeds_version=1,
+        )
     )
     runtime_context = RuntimeContext(
         operation="constraints",
@@ -535,8 +437,8 @@ def test_sync_rust_cluster_seeds_skips_when_unchanged(monkeypatch):
         source="default",
     )
 
-    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context, use_cache=False)
-    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context, use_cache=False)
+    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context)
+    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context)
     assert calls["count"] == 1
     assert int(getattr(dataset, "_rust_cluster_seeds_sync_calls", 0)) == 2
     assert int(getattr(dataset, "_rust_cluster_seeds_sync_attempted", 0)) == 1
@@ -546,7 +448,7 @@ def test_sync_rust_cluster_seeds_skips_when_unchanged(monkeypatch):
     assert float(getattr(dataset, "_rust_cluster_seeds_sync_seconds_max", 0.0)) >= 0.0
 
     dataset._cluster_seeds_version += 1
-    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context, use_cache=False)
+    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context)
     assert calls["count"] == 2
     assert int(getattr(dataset, "_rust_cluster_seeds_sync_calls", 0)) == 3
     assert int(getattr(dataset, "_rust_cluster_seeds_sync_attempted", 0)) == 2
@@ -557,16 +459,18 @@ def test_sync_rust_cluster_seeds_skips_when_unchanged(monkeypatch):
 def test_sync_rust_cluster_seeds_detects_in_place_seed_mutation(monkeypatch):
     calls = {"count": 0}
 
-    def fake_update(_dataset, runtime_context=None, use_cache=False):
-        del runtime_context, use_cache
+    def fake_update(_dataset, runtime_context=None):
+        del runtime_context
         calls["count"] += 1
 
     monkeypatch.setattr(model_module, "update_rust_cluster_seeds", fake_update)
 
-    dataset = SimpleNamespace(
-        cluster_seeds_require={"s1": "c1", "s2": "c1"},
-        cluster_seeds_disallow={("s1", "s3")},
-        _cluster_seeds_version=1,
+    dataset = _as_anddata(
+        SimpleNamespace(
+            cluster_seeds_require={"s1": "c1", "s2": "c1"},
+            cluster_seeds_disallow={("s1", "s3")},
+            _cluster_seeds_version=1,
+        )
     )
     runtime_context = RuntimeContext(
         operation="constraints",
@@ -577,16 +481,16 @@ def test_sync_rust_cluster_seeds_detects_in_place_seed_mutation(monkeypatch):
         source="default",
     )
 
-    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context, use_cache=False)
+    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context)
     assert calls["count"] == 1
 
     dataset.cluster_seeds_require["s2"] = "c2"
-    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context, use_cache=False)
+    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context)
     assert calls["count"] == 2
 
     dataset.cluster_seeds_disallow.remove(("s1", "s3"))
     dataset.cluster_seeds_disallow.add(("s2", "s3"))
-    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context, use_cache=False)
+    model_module._sync_rust_cluster_seeds(dataset, runtime_context=runtime_context)
     assert calls["count"] == 3
     assert int(getattr(dataset, "_rust_cluster_seeds_sync_calls", 0)) == 3
     assert int(getattr(dataset, "_rust_cluster_seeds_sync_attempted", 0)) == 3
@@ -595,7 +499,7 @@ def test_sync_rust_cluster_seeds_detects_in_place_seed_mutation(monkeypatch):
 
 
 def test_make_distance_matrices_fastcluster_cross_batch_preserves_per_block_order(monkeypatch):
-    dataset = SimpleNamespace(cluster_seeds_require={}, cluster_seeds_disallow=set())
+    dataset = _as_anddata(SimpleNamespace(cluster_seeds_require={}, cluster_seeds_disallow=set()))
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff", "misc_features"])
     clusterer = Clusterer(
         featurizer_info=featurizer_info,

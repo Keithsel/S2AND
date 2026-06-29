@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from s2and import feature_port, runtime
+from s2and import feature_port, runtime, rust_calls
 from s2and.featurizer import FeaturizationInfo, many_pairs_featurize
 from tests.helpers import build_dummy_dataset
 
@@ -67,8 +67,21 @@ def test_resolve_backend_explicit_rust_raises_when_runtime_unavailable(monkeypat
         "detect_rust_runtime_capabilities",
         lambda: _runtime_capabilities(core_available=False, reason="rust_extension_unavailable"),
     )
-    with pytest.raises(RuntimeError, match="reason=rust_extension_unavailable"):
+    with pytest.raises(RuntimeError) as exc_info:
         runtime.resolve_backend(emit_startup_warning=False)
+    message = str(exc_info.value)
+    assert "reason=rust_extension_unavailable" in message
+    assert f"s2and_rust (>= {runtime.min_supported_rust_extension_version_string()})" in message
+
+
+def test_load_s2and_rust_extension_propagates_native_import_errors() -> None:
+    def importer(name: str):
+        if name == "s2and_rust":
+            raise ImportError("GLIBC version mismatch")
+        raise AssertionError(f"unexpected import: {name}")
+
+    with pytest.raises(ImportError, match="GLIBC version mismatch"):
+        runtime.load_s2and_rust_extension(import_module=importer)
 
 
 def test_resolve_backend_explicit_rust_uses_capability_probe(monkeypatch: pytest.MonkeyPatch):
@@ -83,6 +96,20 @@ def test_resolve_backend_explicit_rust_uses_capability_probe(monkeypatch: pytest
     assert resolution.requested_backend == "rust"
     assert resolution.resolved_backend == "rust"
     assert resolution.capability_reason == "rust_core_available"
+
+
+def test_rust_calls_missing_matrix_reports_runtime_minimum() -> None:
+    class MissingMatrixFeaturizer:
+        pass
+
+    with pytest.raises(RuntimeError) as exc_info:
+        rust_calls.get_constraints_matrix_rust(
+            dataset=object(),
+            pairs=[],
+            featurizer=MissingMatrixFeaturizer(),
+        )
+
+    assert f"s2and-rust>={runtime.min_supported_rust_extension_version_string()}" in str(exc_info.value)
 
 
 def test_resolve_backend_auto_env_uses_capability_probe(monkeypatch: pytest.MonkeyPatch):
@@ -153,7 +180,7 @@ def test_python_backend_pair_featurization_makes_zero_rust_calls(monkeypatch):
 
 def test_rust_backend_pair_featurization_fails_fast_on_rust_error(monkeypatch):
     if not feature_port.rust_featurizer_available():
-        pytest.skip("s2and_rust extension is unavailable")
+        raise pytest.skip.Exception("s2and_rust extension is unavailable")
 
     monkeypatch.setenv("S2AND_BACKEND", "rust")
     monkeypatch.setattr(

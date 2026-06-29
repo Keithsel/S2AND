@@ -20,14 +20,29 @@ import time
 from collections import Counter
 from pathlib import Path
 
-import ijson
 import numpy as np
 from sklearn.model_selection import train_test_split
+
+try:
+    import ijson  # type: ignore
+except ModuleNotFoundError:
+    ijson = None  # type: ignore[assignment]
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SIGNATURE_LOG_INTERVAL = 500_000
 CLUSTER_LOG_INTERVAL = 250_000
 PAPER_LOG_INTERVAL = 500_000
+
+
+def require_ijson():
+    """Return the optional streaming JSON parser or raise with install guidance."""
+
+    if ijson is None:
+        raise ModuleNotFoundError(
+            "ijson is required for inventors subset streaming. "
+            "Run this script with `uv run --with ijson scripts/make_inventors_s2and_subset.py ...`."
+        )
+    return ijson
 
 
 def parse_args() -> argparse.Namespace:
@@ -166,8 +181,9 @@ def stratified_train_val_split(
 def count_signatures_per_block(signatures_path: Path, limit_signatures: int | None = None) -> Counter[str]:
     block_counts: Counter[str] = Counter()
     count = 0
+    ijson_module = require_ijson()
     with signatures_path.open("rb") as infile:
-        for prefix, event, value in ijson.parse(infile):
+        for prefix, event, value in ijson_module.parse(infile):
             if event == "string" and prefix.endswith(".author_info.block"):
                 block_counts[value] += 1
                 count += 1
@@ -181,8 +197,9 @@ def collect_signature_ids_for_blocks(
 ) -> set[str]:
     selected: set[str] = set()
     scanned = 0
+    ijson_module = require_ijson()
     with signatures_path.open("rb") as infile:
-        for signature_id, signature in ijson.kvitems(infile, ""):
+        for signature_id, signature in ijson_module.kvitems(infile, ""):
             scanned += 1
             if signature["author_info"]["block"] in block_set:
                 selected.add(signature_id)
@@ -201,8 +218,9 @@ def collect_signature_blocks_for_ids(
     scanned = 0
     found = 0
     target = len(signature_ids)
+    ijson_module = require_ijson()
     with signatures_path.open("rb") as infile:
-        for signature_id, signature in ijson.kvitems(infile, ""):
+        for signature_id, signature in ijson_module.kvitems(infile, ""):
             scanned += 1
             if needed(signature_id):
                 blocks.add(signature["author_info"]["block"])
@@ -223,8 +241,9 @@ def expand_signatures_via_clusters(
     expanded: set[str] = set()
     touched_clusters = 0
     scanned = 0
+    ijson_module = require_ijson()
     with clusters_path.open("rb") as infile:
-        for _cluster_id, cluster in ijson.kvitems(infile, ""):
+        for _cluster_id, cluster in ijson_module.kvitems(infile, ""):
             scanned += 1
             sig_ids = cluster.get("signature_ids", [])
             hit = False
@@ -268,6 +287,7 @@ class DSU:
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    ijson_module = require_ijson()
 
     signatures_path = args.input_dir / "signatures.json"
     clusters_path = args.input_dir / "clusters.json"
@@ -348,7 +368,7 @@ def main() -> None:
     scanned_sigs = 0
     keep_sig = final_signature_ids.__contains__
     with signatures_path.open("rb") as infile:
-        for signature_id, signature in ijson.kvitems(infile, ""):
+        for signature_id, signature in ijson_module.kvitems(infile, ""):
             scanned_sigs += 1
             if keep_sig(signature_id):
                 final_signature_records[signature_id] = signature
@@ -376,7 +396,7 @@ def main() -> None:
         out.write("{")
         first = True
         with clusters_path.open("rb") as infile:
-            for cluster_id, cluster in ijson.kvitems(infile, ""):
+            for cluster_id, cluster in ijson_module.kvitems(infile, ""):
                 scanned_clusters += 1
                 sig_ids = cluster.get("signature_ids", [])
                 selected_sig_ids: list[str] = []
@@ -456,7 +476,7 @@ def main() -> None:
         out.write("{")
         first = True
         with papers_path.open("rb") as infile:
-            for paper_id, paper in ijson.kvitems(infile, ""):
+            for paper_id, paper in ijson_module.kvitems(infile, ""):
                 scanned_papers += 1
                 if keep_paper(str(paper_id)):
                     if not first:

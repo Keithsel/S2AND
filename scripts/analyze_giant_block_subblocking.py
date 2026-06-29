@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from s2and.data import ANDData, Signature
-from s2and.subblocking import _signature_name_parts_for_subblocking, make_subblocks_with_telemetry
+from s2and.subblocking import make_subblocks_with_telemetry, signature_name_parts_for_subblocking
 from s2and.text import ORCID_PATTERN
 
 
@@ -93,7 +93,7 @@ def _single_letter_first_name_ids(signatures: dict[str, Signature]) -> set[str]:
     return {
         str(signature_id)
         for signature_id, signature in signatures.items()
-        if len(_signature_name_parts_for_subblocking(signature)[0]) <= 1
+        if len(signature_name_parts_for_subblocking(signature)[0]) <= 1
     }
 
 

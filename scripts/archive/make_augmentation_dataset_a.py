@@ -4,6 +4,7 @@ import json
 import json as json_module
 import os
 import pickle
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -158,12 +159,12 @@ for dataset_paper_id, title in all_titles_dict.items():
     papers.append({"paper_id": dataset_paper_id, "title": title, "abstract": ""})
 
 if os.path.exists(os.path.join(AUGMENTATION_DIR, "title_only_specters.pickle")):
-    with open(os.path.join(AUGMENTATION_DIR, "title_only_specters.pickle"), "rb") as f:  # type: ignore
-        embeddings = pickle.load(f)  # type: ignore
+    with open(os.path.join(AUGMENTATION_DIR, "title_only_specters.pickle"), "rb") as f:
+        embeddings = pickle.load(f)
 
     embeddings, _ = embed(papers, embeddings)
 else:
     embeddings, _ = embed(papers)
 
-with open(os.path.join(AUGMENTATION_DIR, "title_only_specters.pickle"), "wb") as f:  # type: ignore
-    pickle.dump(embeddings, f)  # type: ignore
+with open(os.path.join(AUGMENTATION_DIR, "title_only_specters.pickle"), "wb") as f:
+    pickle.dump(embeddings, f)

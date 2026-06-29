@@ -66,7 +66,8 @@ Current State (post-Sinonym hyphen pass)
   - Constraints: last-name disallow uses space-insensitive comparison (`ou yang` == `ouyang`).
     - Helper: `_lasts_equivalent_for_constraint(...)`.
   - Subblocking: ORCID prefix map lookup has a first-token fallback for multi-token first names.
-  - Name tuples in constraints: alias logic probes exact, joined, and first-token forms for compatibility with legacy tuples.
+  - Name tuples in constraints and incremental new-name guarding: shared helper
+    `first_names_name_compatible(...)` probes exact, joined, and first-token forms for compatibility with legacy tuples.
   - Sinonym overwrite block recomputation compacts surnames for blocking (`q ouyang`) when overwriting blocks.
 
 Target End State
@@ -100,7 +101,8 @@ Migration Plan (phased, verifiable)
 4) Cut over and remove compatibility code
    - Remove `_canonicalize_last_for_counts`.
    - Remove `_lasts_equivalent_for_constraint`.
-   - Remove name-tuple compatibility probing (joined/first-token fallback) in constraints.
+   - Remove name-tuple compatibility probing (joined/first-token fallback) from
+     `first_names_name_compatible(...)`.
    - Remove subblocking first-token ORCID count probe.
    - Remove inference-only block compaction workaround once blocks are canonical everywhere.
 
@@ -146,13 +148,19 @@ References in code (as of this migration doc)
 - Given-name canonicalization: `s2and.text.split_first_middle_hyphen_aware`.
 - Surname count shim: `_canonicalize_last_for_counts` in `s2and/data.py`.
 - Last-name constraint shim: `_lasts_equivalent_for_constraint` in `s2and/data.py`.
-- Constraint tuple fallback logic (exact/joined/first-token forms): `ANDData.get_constraint` in `s2and/data.py`.
+- Constraint and incremental new-name tuple fallback logic (exact/joined/first-token forms):
+  `first_names_name_compatible(...)` in `s2and/text.py`, consumed by `ANDData.get_constraint`
+  and incremental clustering guards.
 - ORCID prefix fallback in subblocking: lookup path in `s2and/subblocking.py` during merge-pair scoring.
 - Sinonym overwrite gating/application: `compute_sinonym_overwrite_allowlist`, `apply_sinonym_overwrites` in `s2and/data.py`.
 
 Tests (current)
 - `tests/test_surname_hyphen_aware.py`
-  - Transitional regression coverage for surname count canonicalization, last-name constraint equivalence, and block compaction behavior under Sinonym overwrites.
+  - Transitional regression coverage for surname count canonicalization, last-name constraint equivalence,
+    name-tuple compatibility forms, and block compaction behavior under Sinonym overwrites.
+- `tests/test_cluster_incremental.py`
+  - Transitional regression coverage that incremental new-name guarding accepts the same legacy
+    name-tuple compatibility forms as constraints.
 
 Tests (required for end state)
 - Canonical first-name equivalence cases from the frozen example table.

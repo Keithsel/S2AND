@@ -28,7 +28,7 @@ with open(os.path.join(_PACKAGE_DATA_DIR, "first_k_letter_counts_from_orcid.json
     FIRST_K_LETTER_COUNTS = json.load(f)
 
 
-def _signature_affiliation_feature_keys(signature) -> list[str]:
+def signature_affiliation_feature_keys(signature) -> list[str]:
     if signature.author_info_affiliations_n_grams is not None:
         return list(signature.author_info_affiliations_n_grams.keys())
     affiliations = list(signature.author_info_affiliations or [])
@@ -41,7 +41,7 @@ def _signature_affiliation_feature_keys(signature) -> list[str]:
     return list(ngrams.keys())
 
 
-def _signature_name_parts_for_subblocking(signature) -> tuple[str, str]:
+def signature_name_parts_for_subblocking(signature) -> tuple[str, str]:
     first = signature.author_info_first_normalized_without_apostrophe
     middle = signature.author_info_middle_normalized_without_apostrophe
     if first is not None and middle is not None:
@@ -50,7 +50,7 @@ def _signature_name_parts_for_subblocking(signature) -> tuple[str, str]:
     return split_first_middle_hyphen_aware(signature.author_info_first, signature.author_info_middle)
 
 
-def _signature_coauthor_blocks_for_specter(signature, anddata) -> list[str]:
+def _signature_coauthor_blocks_for_specter(signature, anddata, compute_block_fn=compute_block) -> list[str]:
     coauthor_blocks = signature.author_info_coauthor_blocks
     if coauthor_blocks is not None:
         return list(coauthor_blocks)
@@ -63,10 +63,10 @@ def _signature_coauthor_blocks_for_specter(signature, anddata) -> list[str]:
         coauthors = [
             author.author_name for author in paper.authors if author.position != signature.author_info_position
         ]
-    return [compute_block(author) for author in coauthors]
+    return [compute_block_fn(author) for author in coauthors]
 
 
-def cluster_with_specter(signature_ids, anddata, target_subblock_size=10000):
+def cluster_with_specter(signature_ids, anddata, target_subblock_size=10000, compute_block_fn=compute_block):
     """Helper function to cluster signature ids into subblocks using specter embeddings.
     Also tries to add simple embeddings of co-author blocks and affiliation n-grams.
 
@@ -96,13 +96,16 @@ def cluster_with_specter(signature_ids, anddata, target_subblock_size=10000):
     try:
         # same for the co-author blocks
         X = MultiLabelBinarizer(sparse_output=True).fit_transform(
-            [_signature_coauthor_blocks_for_specter(anddata.signatures[i], anddata) for i in signature_ids]
+            [
+                _signature_coauthor_blocks_for_specter(anddata.signatures[i], anddata, compute_block_fn)
+                for i in signature_ids
+            ]
         )
         X_svd = TruncatedSVD(n_components=SPECTER_DIM).fit_transform(X)
 
         # same for affiliations
         X = TfidfVectorizer(preprocessor=None, analyzer=lambda x: x).fit_transform(
-            [_signature_affiliation_feature_keys(anddata.signatures[i]) for i in signature_ids]
+            [signature_affiliation_feature_keys(anddata.signatures[i]) for i in signature_ids]
         )
         X_svd2 = TruncatedSVD(n_components=SPECTER_DIM).fit_transform(X)
 
@@ -229,6 +232,7 @@ def make_subblocks_with_telemetry(
     anddata,
     maximum_size=15000,
     first_k_letter_counts_sorted=FIRST_K_LETTER_COUNTS,
+    compute_block_fn=compute_block,
 ):
     """Split signature IDs into subblocks and report how the partition was built.
 
@@ -255,7 +259,7 @@ def make_subblocks_with_telemetry(
     """
     logger.info("Beginning subblocking...")
     signature_ids = np.array(signature_ids)
-    first_middle_names = [_signature_name_parts_for_subblocking(anddata.signatures[i]) for i in signature_ids]
+    first_middle_names = [signature_name_parts_for_subblocking(anddata.signatures[i]) for i in signature_ids]
     first_names = np.array([name_parts[0] for name_parts in first_middle_names])
     middle_names = np.array([name_parts[1] for name_parts in first_middle_names])
 
@@ -307,7 +311,7 @@ def make_subblocks_with_telemetry(
     output_for_specter = {}
     for key, sig_ids_loop in output_cant_subdivide.items():
         middle_names_loop = np.array(
-            [_signature_name_parts_for_subblocking(anddata.signatures[i])[1] for i in sig_ids_loop]
+            [signature_name_parts_for_subblocking(anddata.signatures[i])[1] for i in sig_ids_loop]
         )
         output_loop, output_cant_subdivide_loop = subdivide_helper(
             middle_names_loop, sig_ids_loop, maximum_size, starting_k=1
@@ -367,7 +371,12 @@ def make_subblocks_with_telemetry(
         else:
             telemetry["specter_invocation_count"] += 1
             telemetry["specter_input_signature_count"] += int(len(sig_ids_loop))
-            specter_clustering = cluster_with_specter(sig_ids_loop, anddata, target_subblock_size=maximum_size)
+            specter_clustering = cluster_with_specter(
+                sig_ids_loop,
+                anddata,
+                target_subblock_size=maximum_size,
+                compute_block_fn=compute_block_fn,
+            )
             # prepend the key to the specter_clustering keys
             for key_loop in list(specter_clustering.keys()):
                 output_loop[key + "|specter=" + str(key_loop)] = specter_clustering.pop(key_loop)
@@ -632,7 +641,13 @@ def make_subblocks_with_telemetry(
     return output, telemetry
 
 
-def make_subblocks(signature_ids, anddata, maximum_size=15000, first_k_letter_counts_sorted=FIRST_K_LETTER_COUNTS):
+def make_subblocks(
+    signature_ids,
+    anddata,
+    maximum_size=15000,
+    first_k_letter_counts_sorted=FIRST_K_LETTER_COUNTS,
+    compute_block_fn=compute_block,
+):
     """Split signature IDs into subblocks based on name attributes.
 
     This is the existing production-facing wrapper around
@@ -652,5 +667,6 @@ def make_subblocks(signature_ids, anddata, maximum_size=15000, first_k_letter_co
         anddata,
         maximum_size=maximum_size,
         first_k_letter_counts_sorted=first_k_letter_counts_sorted,
+        compute_block_fn=compute_block_fn,
     )
     return output

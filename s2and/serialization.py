@@ -18,14 +18,6 @@ _LEGACY_NAME_COUNT_SEMANTICS = "legacy_full_first_token"
 _INITIAL_NAME_COUNT_SEMANTICS = "initial_char"
 
 
-def _resolve_name_count_semantics_from_featurizer_version(featurizer_version: Any) -> str | None:
-    if not isinstance(featurizer_version, int):
-        return None
-    if featurizer_version <= 2:
-        return _LEGACY_NAME_COUNT_SEMANTICS
-    return _INITIAL_NAME_COUNT_SEMANTICS
-
-
 def _attach_feature_contract_metadata(loaded: Any) -> None:
     clusterer = loaded.get("clusterer") if isinstance(loaded, dict) else None
     if clusterer is None:
@@ -37,9 +29,10 @@ def _attach_feature_contract_metadata(loaded: Any) -> None:
     if semantics not in {_LEGACY_NAME_COUNT_SEMANTICS, _INITIAL_NAME_COUNT_SEMANTICS}:
         featurizer_info = getattr(clusterer, "featurizer_info", None)
         featurizer_version = getattr(featurizer_info, "featurizer_version", None)
-        inferred = _resolve_name_count_semantics_from_featurizer_version(featurizer_version)
-        if inferred is not None:
-            contract["name_counts_last_first_initial_semantics"] = inferred
+        if isinstance(featurizer_version, int):
+            # Packaged v1.1/v1.2 pickles predate feature_contract metadata,
+            # but their name-count artifact is keyed by last + first initial.
+            contract["name_counts_last_first_initial_semantics"] = _INITIAL_NAME_COUNT_SEMANTICS
     clusterer.feature_contract = contract
 
 

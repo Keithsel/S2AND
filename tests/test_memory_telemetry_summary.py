@@ -19,14 +19,28 @@ def _load_rust_suite_module():
 
 def test_summarize_memory_telemetry_writes_json(tmp_path):
     module = _load_rust_suite_module()
-    log_path = tmp_path / "run.log"
+    log_path = tmp_path / "memory_telemetry.jsonl"
     log_path.write_text(
         "\n".join(
             [
-                "2026-02-27 00:00:00,000 - s2and - INFO - Telemetry: phase_split_phase_a "
-                "prediction_error_ratio=1.250 underpredicted=True",
-                "2026-02-27 00:00:01,000 - s2and - INFO - Telemetry: pair_featurization_memory "
-                "stage=pair_featurization_rust_batch prediction_error_ratio=0.900 underpredicted=False",
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "event": "memory_telemetry",
+                        "stage": "phase_a_seed_distances",
+                        "prediction_error_ratio": 1.25,
+                        "underpredicted": True,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "event": "memory_telemetry",
+                        "stage": "pair_featurization_rust_batch",
+                        "prediction_error_ratio": 0.9,
+                        "underpredicted": False,
+                    }
+                ),
             ]
         )
         + "\n",
@@ -40,6 +54,7 @@ def test_summarize_memory_telemetry_writes_json(tmp_path):
     assert int(blob["schema_version"]) == 1
 
     phase_a = blob["stages"]["phase_a_seed_distances"]
+    assert phase_a["stage"] == "phase_a_seed_distances"
     assert int(phase_a["matched_records"]) == 1
     assert int(phase_a["samples"]) == 1
     assert int(phase_a["underpredicted_count"]) == 1
@@ -47,6 +62,7 @@ def test_summarize_memory_telemetry_writes_json(tmp_path):
     assert float(phase_a["ratio_summary"]["p95"]) == 1.25
 
     rust_batch = blob["stages"]["pair_featurization_rust_batch"]
+    assert rust_batch["stage"] == "pair_featurization_rust_batch"
     assert int(rust_batch["matched_records"]) == 1
     assert int(rust_batch["samples"]) == 1
     assert int(rust_batch["underpredicted_count"]) == 0
@@ -56,15 +72,9 @@ def test_summarize_memory_telemetry_writes_json(tmp_path):
 
 def test_summarize_memory_telemetry_returns_nonzero_when_no_samples(tmp_path):
     module = _load_rust_suite_module()
-    log_path = tmp_path / "empty.log"
+    log_path = tmp_path / "empty.jsonl"
     log_path.write_text(
-        "\n".join(
-            [
-                "2026-02-27 00:00:00,000 - s2and - INFO - not a telemetry line",
-                "some continuation line",
-            ]
-        )
-        + "\n",
+        json.dumps({"schema_version": 1, "event": "memory_telemetry", "stage": "unrelated"}) + "\n",
         encoding="utf-8",
     )
     output_path = tmp_path / "summary.json"

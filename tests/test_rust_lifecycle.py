@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pytest
 
 from s2and.rust_lifecycle import (
@@ -90,6 +92,7 @@ def test_rust_training_from_dataset_skips_python_paper_preprocess_when_capabilit
         use_rust=True,
         from_dataset_paper_preprocess_available=True,
     )
+    assert policy.mode == "rust_training_skip_preprocess"
     assert policy.rust_build_path == "from_dataset"
     assert policy.skip_python_paper_preprocess is True
 
@@ -105,6 +108,7 @@ def test_rust_training_from_dataset_does_not_skip_with_reference_features():
         use_rust=True,
         from_dataset_paper_preprocess_available=True,
     )
+    assert policy.mode == "rust_training_from_dataset"
     assert policy.rust_build_path == "from_dataset"
     assert policy.skip_python_paper_preprocess is False
 
@@ -134,6 +138,7 @@ def test_rust_inference_with_sinonym_overwrite_keeps_from_json_paths():
         use_rust=True,
         use_sinonym_overwrite=True,
     )
+    assert policy.mode == "rust_inference_json_sinonym"
     assert policy.rust_build_path == "from_json_paths"
     assert policy.skip_python_paper_preprocess is True
     assert policy.defer_rust_json_ingest_write_for_sinonym is True
@@ -158,7 +163,7 @@ def test_rust_inference_without_sinonym_overwrite_does_not_defer_json_ingest_wri
 def test_defer_signature_ngrams_requires_preprocess_and_rust(preprocess: bool, use_rust: bool):
     backend = "rust" if use_rust else "python"
     policy = build_rust_lifecycle_policy(
-        backend=backend,  # type: ignore[arg-type]
+        backend=backend,
         mode="train",
         has_signatures_path=True,
         has_papers_path=True,
@@ -176,7 +181,7 @@ def test_defer_signature_fields_requires_rust_and_non_inference(
 ):
     backend = "rust" if use_rust else "python"
     policy = build_rust_lifecycle_policy(
-        backend=backend,  # type: ignore[arg-type]
+        backend=backend,
         mode=mode,
         has_signatures_path=True,
         has_papers_path=True,
@@ -218,3 +223,7 @@ def test_policy_representative_combinations(
     assert isinstance(policy, RustLifecyclePolicy)
     if backend == "python":
         assert policy == PYTHON_ONLY_POLICY
+
+
+def test_lifecycle_policy_stores_only_canonical_mode():
+    assert [field.name for field in fields(RustLifecyclePolicy)] == ["mode"]

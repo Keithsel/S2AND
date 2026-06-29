@@ -1,6 +1,6 @@
 # Environment Variables
 
-Centralized reference for all S2AND environment variables.
+Centralized reference for supported S2AND environment variables.
 
 ---
 
@@ -16,8 +16,9 @@ Centralized reference for all S2AND environment variables.
 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
-| `S2AND_CACHE` | `<path>` | `~/.s2and` | Cache root directory (only used when `use_cache=True`). |
-| `S2AND_RUST_FEATURIZER_MAX_INMEM` | `<int>` | unbounded | Cap in-memory Rust featurizer entries (`0` = unbounded). Use `1` for single-dataset-per-process workloads; `2-3` if alternating among a few datasets. Only matters when `use_cache=True`. |
+| `S2AND_CACHE` | `<path>` | `~/.s2and` | Cache root directory for the pair-feature cache and artifact downloads. |
+
+See [caching.md](caching.md) for cache semantics and on-disk layout.
 
 ---
 
@@ -25,6 +26,7 @@ Centralized reference for all S2AND environment variables.
 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
+| `S2AND_PATH_CONFIG` | `<path>` | `s2and/data/path_config.json` | Path to the JSON data-path config. Use when data lives outside the package default path. |
 | `S2AND_RUST_NAME_COUNTS_JSON` | `<path>` | none | Artifact-backed name-count lookups for Rust JSON ingest (`from_json_paths`). Used when dataset signature-level name counts are not available. |
 
 ---
@@ -34,15 +36,18 @@ Centralized reference for all S2AND environment variables.
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
 | `S2AND_NORMALIZATION_VERSION` | `<string>` | `legacy_compat` | Normalization version expected by artifact-backed name-count ingest. |
-| `S2AND_ALLOW_NORMALIZATION_VERSION_MISMATCH` | `0`, `1` | `0` | Allow artifact-backed name-count ingest with missing/mismatched normalization metadata. |
+
+Missing or mismatched artifact normalization metadata is fail-fast by default. Use an explicit API/CLI option only for
+audited legacy artifacts, for example `allow_normalization_version_mismatch=True` in the Rust featurizer path or
+`--allow-normalization-version-mismatch` in `scripts/production/model/linker_train_calibrate_eval.py`.
 
 ---
 
-## Testing & Benchmarking
+## Testing & Benchmarking Only
 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
-| `S2AND_SKIP_FASTTEXT` | `0`, `1` | `0` | Skip FastText loading (useful for tests/benchmarks that don't need language detection). |
+| `S2AND_SKIP_FASTTEXT` | `0`, `1` | `0` | Test/benchmark-only knob to skip FastText loading when language-detection fidelity is not under test. Do not use it for production runs. |
 
 ---
 
@@ -75,3 +80,4 @@ See `docs/threading.md` for detailed guidance on avoiding nested parallelism and
 - **Rust batch mode** uses Rayon internally for parallelism; Python process pools are not used when Rust is enabled.
 - **Thread env vars** (OMP, MKL, etc.) are typically read at library load time. Setting them after importing `lightgbm` or similar is unreliable.
 - **Windows memory budgeting** uses `GlobalMemoryStatusEx` for total RAM and `GetProcessMemoryInfo` for RSS when `psutil` is unavailable.
+- **Import path policy**: avoid using `PYTHONPATH` for normal repo scripts because it can shadow an installed package or compiled extension. CI/test commands may set it only when intentionally testing the checkout source tree.

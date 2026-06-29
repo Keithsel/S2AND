@@ -47,7 +47,7 @@ pruning, predicate pushdown) do not apply.
 | `lid.176.bin` (FastText) | FastText binary | FastText binary (Rust crate) | keep as-is | Yes |
 | `name_tuples` txt | plain text | plain text (`fs::read_to_string`) | keep as-is | Yes |
 | Trained model (LightGBM) | pickle (Clusterer) | not loaded by Rust | LightGBM native text | Ready for multi-language |
-| `RustFeaturizer` disk cache | bincode via PyO3 | bincode (native) | keep as-is | Rust-only by design |
+| `RustFeaturizer` same-process cache | Python object reference | native Rust object behind PyO3 | keep as-is | Process-local by design |
 | Train/val/test pairs | CSV | not used by Rust | CSV (keep as-is) | Python-only |
 
 ---
@@ -69,7 +69,7 @@ After format migration milestones:
 
 1. **`name_counts`**: collapse into one canonical format used by both paths.
    Target: `name_counts.msgpack` replaces `name_counts.pickle` and `name_counts_rust.json`.
-   Then delete `scripts/export_name_counts_for_rust.py` and the `_rust_name_counts_artifact_path()` /
+   Then delete `scripts/production/counts/export_name_counts_for_rust.py` and the `_rust_name_counts_artifact_path()` /
    dual-path logic in `feature_port.py`.
 
 2. **`name_tuples`**: collapse to one default variant.

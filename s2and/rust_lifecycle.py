@@ -6,6 +6,54 @@ from typing import Any, Literal
 from s2and.runtime import Backend
 
 RustBuildPath = Literal["from_dataset", "from_json_paths"]
+RustLifecycleMode = Literal[
+    "python_only",
+    "rust_from_dataset_no_preprocess",
+    "rust_inference_from_dataset",
+    "rust_inference_json_raw",
+    "rust_inference_json_raw_sinonym",
+    "rust_inference_json",
+    "rust_inference_json_sinonym",
+    "rust_training_from_dataset",
+    "rust_training_skip_preprocess",
+]
+
+_RUST_JSON_PATH_MODES: frozenset[RustLifecycleMode] = frozenset(
+    {
+        "rust_inference_json_raw",
+        "rust_inference_json_raw_sinonym",
+        "rust_inference_json",
+        "rust_inference_json_sinonym",
+    }
+)
+_SKIP_PYTHON_PAPER_PREPROCESS_MODES: frozenset[RustLifecycleMode] = frozenset(
+    {
+        "rust_inference_json",
+        "rust_inference_json_sinonym",
+        "rust_training_skip_preprocess",
+    }
+)
+_DEFER_SIGNATURE_NGRAM_MODES: frozenset[RustLifecycleMode] = frozenset(
+    {
+        "rust_inference_from_dataset",
+        "rust_inference_json",
+        "rust_inference_json_sinonym",
+        "rust_training_from_dataset",
+        "rust_training_skip_preprocess",
+    }
+)
+_DEFER_SIGNATURE_FIELD_MODES: frozenset[RustLifecycleMode] = frozenset(
+    {
+        "rust_training_from_dataset",
+        "rust_training_skip_preprocess",
+    }
+)
+_DEFER_RUST_JSON_INGEST_WRITE_MODES: frozenset[RustLifecycleMode] = frozenset(
+    {
+        "rust_inference_json_raw_sinonym",
+        "rust_inference_json_sinonym",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -26,23 +74,6 @@ class RustJsonIngestContract:
     num_threads: int
     expected_normalization_version: str | None = None
     allow_normalization_version_mismatch: bool = False
-
-    def as_from_json_paths_args(self) -> tuple[Any, ...]:
-        return (
-            self.signatures_path,
-            self.papers_path,
-            self.cluster_seeds_path,
-            self.specter_embeddings,
-            self.name_tuples_path,
-            self.name_counts_path,
-            self.preprocess,
-            self.compute_reference_features,
-            self.cluster_seed_require_value,
-            self.cluster_seed_disallow_value,
-            self.num_threads,
-            self.expected_normalization_version,
-            self.allow_normalization_version_mismatch,
-        )
 
 
 def build_rust_json_ingest_contract(
@@ -82,22 +113,42 @@ def build_rust_json_ingest_contract(
 
 @dataclass(frozen=True)
 class RustLifecyclePolicy:
-    """Frozen snapshot of Rust lifecycle decisions for a dataset."""
+    """Frozen canonical Rust lifecycle decision for a dataset."""
 
-    rust_build_path: RustBuildPath
-    skip_python_paper_preprocess: bool
-    defer_signature_ngrams_to_rust: bool
-    defer_signature_fields_to_rust: bool
-    defer_rust_json_ingest_write_for_sinonym: bool
+    mode: RustLifecycleMode
+
+    @property
+    def rust_build_path(self) -> RustBuildPath:
+        """Return the Rust featurizer build path implied by this mode."""
+
+        return "from_json_paths" if self.mode in _RUST_JSON_PATH_MODES else "from_dataset"
+
+    @property
+    def skip_python_paper_preprocess(self) -> bool:
+        """Return whether Python paper preprocessing is deferred to Rust."""
+
+        return self.mode in _SKIP_PYTHON_PAPER_PREPROCESS_MODES
+
+    @property
+    def defer_signature_ngrams_to_rust(self) -> bool:
+        """Return whether signature n-gram computation is deferred to Rust."""
+
+        return self.mode in _DEFER_SIGNATURE_NGRAM_MODES
+
+    @property
+    def defer_signature_fields_to_rust(self) -> bool:
+        """Return whether normalized signature fields are deferred to Rust."""
+
+        return self.mode in _DEFER_SIGNATURE_FIELD_MODES
+
+    @property
+    def defer_rust_json_ingest_write_for_sinonym(self) -> bool:
+        """Return whether Sinonym-overwritten JSON payload writing is deferred."""
+
+        return self.mode in _DEFER_RUST_JSON_INGEST_WRITE_MODES
 
 
-PYTHON_ONLY_POLICY = RustLifecyclePolicy(
-    rust_build_path="from_dataset",
-    skip_python_paper_preprocess=False,
-    defer_signature_ngrams_to_rust=False,
-    defer_signature_fields_to_rust=False,
-    defer_rust_json_ingest_write_for_sinonym=False,
-)
+PYTHON_ONLY_POLICY = RustLifecyclePolicy(mode="python_only")
 
 
 def _is_inference_mode(mode: str) -> bool:
@@ -128,37 +179,22 @@ def build_rust_lifecycle_policy(
 
     is_inference = _is_inference_mode(mode)
 
-    rust_build_path: RustBuildPath = (
-        "from_json_paths" if is_inference and has_signatures_path and has_papers_path else "from_dataset"
-    )
+    has_json_paths = has_signatures_path and has_papers_path
+    if is_inference and has_json_paths:
+        if use_sinonym_overwrite:
+            return RustLifecyclePolicy(
+                mode="rust_inference_json_sinonym" if preprocess else "rust_inference_json_raw_sinonym"
+            )
+        return RustLifecyclePolicy(mode="rust_inference_json" if preprocess else "rust_inference_json_raw")
 
-    training_from_dataset_can_skip_python_paper_preprocess = bool(
-        preprocess
-        and use_rust
-        and not is_inference
-        and rust_build_path == "from_dataset"
-        and from_dataset_paper_preprocess_available
-        and not compute_reference_features
-    )
-    skip_python_paper_preprocess = bool(
-        preprocess
-        and use_rust
-        and (rust_build_path == "from_json_paths" or training_from_dataset_can_skip_python_paper_preprocess)
-    )
-    defer_signature_ngrams_to_rust = bool(preprocess and use_rust)
-    defer_signature_fields_to_rust = bool(preprocess and use_rust and not is_inference)
-    defer_rust_json_ingest_write_for_sinonym = bool(
-        use_sinonym_overwrite
-        and is_inference
-        and rust_build_path == "from_json_paths"
-        and has_signatures_path
-        and has_papers_path
-    )
+    if is_inference:
+        return RustLifecyclePolicy(
+            mode="rust_inference_from_dataset" if preprocess else "rust_from_dataset_no_preprocess"
+        )
 
-    return RustLifecyclePolicy(
-        rust_build_path=rust_build_path,
-        skip_python_paper_preprocess=skip_python_paper_preprocess,
-        defer_signature_ngrams_to_rust=defer_signature_ngrams_to_rust,
-        defer_signature_fields_to_rust=defer_signature_fields_to_rust,
-        defer_rust_json_ingest_write_for_sinonym=defer_rust_json_ingest_write_for_sinonym,
-    )
+    if not preprocess:
+        return RustLifecyclePolicy(mode="rust_from_dataset_no_preprocess")
+
+    if from_dataset_paper_preprocess_available and not compute_reference_features:
+        return RustLifecyclePolicy(mode="rust_training_skip_preprocess")
+    return RustLifecyclePolicy(mode="rust_training_from_dataset")

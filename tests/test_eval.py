@@ -4,9 +4,12 @@ import unittest
 import warnings
 
 import numpy as np
+import pytest
 
 import s2and.shap_utils as shap_utils
 from s2and.eval import (
+    _shap_values_for_tree_model_preserving_booster_params,
+    _write_claims_eval_shap_plots,
     b3_precision_recall_fscore,
     claims_eval,
     f1_score,
@@ -227,13 +230,13 @@ class TestShapIntegration(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(td, "wrapped_shap.png")))
 
     def test_pairwise_eval_suppresses_feature_name_warning(self):
-        import lightgbm as lgb
         import pandas as pd
+        from lightgbm import LGBMClassifier
 
         rng = np.random.default_rng(7)
         X_train = pd.DataFrame(rng.random((20, 3)), columns=["f0", "f1", "f2"])
         y_train = rng.integers(0, 2, size=20)
-        classifier = lgb.LGBMClassifier(n_estimators=8, random_state=7, verbosity=-1)
+        classifier = LGBMClassifier(n_estimators=8, random_state=7, verbosity=-1)
         classifier.fit(X_train, y_train)
 
         X = rng.random((4, 3))
@@ -455,6 +458,56 @@ def test_claims_eval_writes_distance_dump_when_available():
         assert os.path.exists(os.path.join(td, "preds_unit.json"))
         assert os.path.exists(os.path.join(td, "dists_unit.pkl"))
         assert output["total"] == 1
+
+
+def test_shap_values_restore_lightgbm_booster_params(monkeypatch):
+    class DummyBooster:
+        def __init__(self):
+            self.params = {"keep": "value"}
+
+    class DummyClassifier:
+        def __init__(self):
+            self.booster_ = DummyBooster()
+
+    classifier = DummyClassifier()
+
+    def mutate_booster_params(model, features, class_index):
+        del class_index
+        model.booster_.params["temporary"] = "shap"
+        return np.zeros_like(features)
+
+    monkeypatch.setattr(shap_utils, "_shap_values_for_tree_model", mutate_booster_params)
+
+    values = _shap_values_for_tree_model_preserving_booster_params(classifier, np.ones((2, 3)))
+
+    np.testing.assert_array_equal(values, np.zeros((2, 3)))
+    assert classifier.booster_.params == {"keep": "value"}
+
+
+def test_write_claims_eval_shap_plots_requires_nameless_features(monkeypatch):
+    class DummyFeatureInfo:
+        def get_feature_names(self):
+            return ["feature"]
+
+    class DummyClusterer:
+        classifier = object()
+        nameless_classifier = object()
+        featurizer_info = DummyFeatureInfo()
+        nameless_featurizer_info = None
+
+    def fake_many_pairs_featurize(*_args, **_kwargs):
+        return np.ones((1, 1)), np.array([1]), None
+
+    monkeypatch.setattr("s2and.eval.many_pairs_featurize", fake_many_pairs_featurize)
+
+    with pytest.raises(ValueError, match="output_shap=True requires clusterer.nameless_featurizer_info"):
+        _write_claims_eval_shap_plots(
+            id1="p1___0",
+            id2="p2___0",
+            dataset=object(),
+            clusterer=DummyClusterer(),
+            directory_for_caching=".",
+        )
 
 
 if __name__ == "__main__":

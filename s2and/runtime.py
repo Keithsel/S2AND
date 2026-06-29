@@ -19,10 +19,11 @@ RuntimeSource = Literal["S2AND_BACKEND", "default"]
 _STARTUP_WARNING_EMITTED = False
 _STARTUP_WARNING_LOCK = threading.Lock()
 
-MIN_SUPPORTED_RUST_EXTENSION_VERSION = (0, 40, 0)
+MIN_SUPPORTED_RUST_EXTENSION_VERSION = (0, 50, 0)
 _CORE_REQUIRED_FEATURIZER_MARKERS = (
     "from_dataset",
     "from_json_paths",
+    "json_ingest_telemetry",
     "signature_ids",
     "get_constraint",
     "get_constraints_matrix",
@@ -37,11 +38,17 @@ _FEATURIZER_API_SCORE_MARKERS = tuple(
     in {
         "from_dataset",
         "from_json_paths",
+        "json_ingest_telemetry",
         "signature_ids",
         "featurize_pairs_matrix_indexed",
         "update_signature_name_counts",
     }
 )
+RUST_CAPABILITY_HYBRID_CENTROID_RETRIEVER_V1 = "hybrid_centroid_retriever_v1"
+RUST_CAPABILITY_INDEXED_PAIR_ARRAY_FEATURIZATION_V1 = "indexed_pair_array_featurization_v1"
+RUST_CAPABILITY_INCREMENTAL_LINKING_PAIR_PLAN_V1 = "incremental_linking_pair_plan_v1"
+RUST_CAPABILITY_INCREMENTAL_LINKING_CONSTRAINT_ARRAYS_V1 = "incremental_linking_constraint_arrays_v1"
+_REQUIRED_INCREMENTAL_PAIR_PLAN_ROW_SIGNALS = ("row_orcid_match",)
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,7 @@ class RustRuntimeCapabilities:
     core_runtime_available: bool
     from_dataset_paper_preprocess_available: bool
     reason: str
+    named_capabilities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,12 @@ def _version_tuple_to_string(version: tuple[int, int, int]) -> str:
     return ".".join(str(part) for part in version)
 
 
+def min_supported_rust_extension_version_string() -> str:
+    """Return the minimum supported Rust extension version as a semver string."""
+
+    return _version_tuple_to_string(MIN_SUPPORTED_RUST_EXTENSION_VERSION)
+
+
 def _rust_featurizer_api_score(module: Any) -> int:
     rust_featurizer_cls = getattr(module, "RustFeaturizer", None)
     if rust_featurizer_cls is None:
@@ -97,11 +111,94 @@ def _rust_featurizer_api_score(module: Any) -> int:
     return sum(1 for marker in _FEATURIZER_API_SCORE_MARKERS if hasattr(rust_featurizer_cls, marker))
 
 
+def _callable_signature_mentions(method: Any, parameter_name: str) -> bool:
+    if not callable(method):
+        return False
+    text_signature = str(getattr(method, "__text_signature__", "") or "")
+    return parameter_name in text_signature
+
+
+def _module_sequence_contains_all(module: Any, attr_name: str, required: tuple[str, ...]) -> bool:
+    values = getattr(module, attr_name, None)
+    if values is None:
+        return False
+    if isinstance(values, str):
+        available = {values}
+    else:
+        try:
+            available = {str(value) for value in values}
+        except TypeError:
+            return False
+    return all(value in available for value in required)
+
+
+def _pair_plan_output_probe_has_required_keys(rust_retriever_cls: Any, required: tuple[str, ...]) -> bool:
+    try:
+        import numpy as np
+
+        retriever = rust_retriever_cls([], include_exemplars=True)
+        plan = retriever.top_k_hybrid_centroid_pair_plan(
+            [],
+            np.asarray([], dtype=np.uint32),
+            {},
+            1,
+            1,
+        )
+    except Exception:
+        return False
+    return all(key in plan for key in required)
+
+
+def _has_current_incremental_pair_plan_abi(module: Any, rust_retriever_cls: Any) -> bool:
+    method = getattr(rust_retriever_cls, "top_k_hybrid_centroid_pair_plan", None)
+    if not _callable_signature_mentions(method, "query_candidate_component_keys_by_signature_id"):
+        return False
+    if _module_sequence_contains_all(
+        module,
+        "INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS",
+        _REQUIRED_INCREMENTAL_PAIR_PLAN_ROW_SIGNALS,
+    ):
+        return True
+    return _pair_plan_output_probe_has_required_keys(rust_retriever_cls, _REQUIRED_INCREMENTAL_PAIR_PLAN_ROW_SIGNALS)
+
+
+def _detect_named_rust_capabilities(module: Any) -> tuple[str, ...]:
+    capabilities: list[str] = []
+    rust_featurizer_cls = getattr(module, "RustFeaturizer", None)
+    rust_retriever_cls = getattr(module, "RustHybridCentroidRetriever", None)
+    if rust_retriever_cls is not None and callable(getattr(rust_retriever_cls, "top_k_hybrid_centroid", None)):
+        capabilities.append(RUST_CAPABILITY_HYBRID_CENTROID_RETRIEVER_V1)
+    if rust_featurizer_cls is not None and callable(
+        getattr(rust_featurizer_cls, "linker_pair_index_arrays_aggregate_stats", None)
+    ):
+        capabilities.append(RUST_CAPABILITY_INDEXED_PAIR_ARRAY_FEATURIZATION_V1)
+    if rust_retriever_cls is not None and _has_current_incremental_pair_plan_abi(module, rust_retriever_cls):
+        capabilities.append(RUST_CAPABILITY_INCREMENTAL_LINKING_PAIR_PLAN_V1)
+    if (
+        rust_featurizer_cls is not None
+        and callable(getattr(rust_featurizer_cls, "linker_pair_index_arrays_constraint_labels", None))
+        and callable(getattr(rust_featurizer_cls, "linker_pair_distance_accumulators", None))
+    ):
+        capabilities.append(RUST_CAPABILITY_INCREMENTAL_LINKING_CONSTRAINT_ARRAYS_V1)
+    return tuple(capabilities)
+
+
+def _is_missing_s2and_rust_native_module(exc: ModuleNotFoundError) -> bool:
+    """Return whether an import failure means the optional Rust extension is absent."""
+
+    missing_name = exc.name or ""
+    return missing_name == "s2and_rust" or (
+        missing_name.startswith("s2and_rust.") and missing_name.endswith("._s2and_rust")
+    )
+
+
 def load_s2and_rust_extension(*, import_module: Callable[[str], Any] | None = None) -> Any | None:
     importer = import_module or importlib.import_module
     try:
         module = importer("s2and_rust")
-    except Exception:
+    except ModuleNotFoundError as exc:
+        if not _is_missing_s2and_rust_native_module(exc):
+            raise
         return None
 
     shim_score = _rust_featurizer_api_score(module)
@@ -111,7 +208,9 @@ def load_s2and_rust_extension(*, import_module: Callable[[str], Any] | None = No
     candidate_module: Any | None = None
     try:
         candidate_module = importer("s2and_rust._s2and_rust")
-    except Exception:
+    except ModuleNotFoundError as exc:
+        if not _is_missing_s2and_rust_native_module(exc):
+            raise
         candidate_module = None
 
     candidate_score = _rust_featurizer_api_score(candidate_module) if candidate_module is not None else -1
@@ -145,6 +244,7 @@ def detect_rust_runtime_capabilities(
             core_runtime_available=False,
             from_dataset_paper_preprocess_available=False,
             reason="rust_extension_unavailable",
+            named_capabilities=(),
         )
 
     rust_featurizer_cls = getattr(module, "RustFeaturizer", None)
@@ -154,6 +254,7 @@ def detect_rust_runtime_capabilities(
             core_runtime_available=False,
             from_dataset_paper_preprocess_available=False,
             reason="rust_featurizer_missing",
+            named_capabilities=_detect_named_rust_capabilities(module),
         )
 
     missing_markers = [
@@ -192,6 +293,7 @@ def detect_rust_runtime_capabilities(
         core_runtime_available=core_runtime_available,
         from_dataset_paper_preprocess_available=from_dataset_paper_preprocess_available,
         reason=reason,
+        named_capabilities=_detect_named_rust_capabilities(module),
     )
 
 
@@ -238,7 +340,7 @@ def _resolve_auto_backend(
 def _resolve_explicit_rust_backend(*, source: RuntimeSource) -> BackendResolution:
     capabilities = detect_rust_runtime_capabilities()
     if not capabilities.core_runtime_available:
-        min_version = _version_tuple_to_string(MIN_SUPPORTED_RUST_EXTENSION_VERSION)
+        min_version = min_supported_rust_extension_version_string()
         raise RuntimeError(
             "S2AND_BACKEND='rust' requested but Rust runtime is unavailable or unsupported "
             f"(reason={capabilities.reason}). Install/upgrade s2and_rust (>= {min_version}) "

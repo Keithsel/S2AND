@@ -31,7 +31,6 @@ RESULT_MARKERS: dict[str, tuple[str, str]] = {
 DEFAULT_ENV_KEYS = (
     "S2AND_BACKEND",
     "S2AND_SKIP_FASTTEXT",
-    "S2AND_RUST_FEATURIZER_MAX_INMEM",
     "S2AND_NORMALIZATION_VERSION",
     "S2AND_RUST_NAME_COUNTS_JSON",
     "PYTHONHASHSEED",
@@ -267,7 +266,11 @@ class _BaseRSSMonitor:
         try:
             import resource
 
-            ru_maxrss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            getrusage = getattr(resource, "getrusage", None)
+            rusage_self = getattr(resource, "RUSAGE_SELF", None)
+            if getrusage is None or rusage_self is None:
+                return 0
+            ru_maxrss = int(getrusage(rusage_self).ru_maxrss)
             # Linux reports KB, macOS reports bytes.
             if sys.platform.startswith("darwin"):
                 return ru_maxrss

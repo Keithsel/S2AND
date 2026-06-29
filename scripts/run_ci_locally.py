@@ -5,6 +5,7 @@ Run local CI with close parity to `.github/workflows/main.yaml`.
 Execution order:
   1) lint job:
      - uv sync --extra dev [--frozen if uv.lock exists]
+     - version sync check
      - ruff check / format checks
   2) typecheck-and-test matrix:
      - py-only lane
@@ -28,7 +29,7 @@ def uv_exe() -> list[str]:
     if uv_path:
         return [uv_path]
     try:
-        import uv  # noqa: F401
+        import uv  # type: ignore  # noqa: F401
     except Exception:
         print("ERROR: 'uv' not found. Install uv first.", file=sys.stderr)
         sys.exit(2)
@@ -46,11 +47,17 @@ def repo_root() -> Path:
 REPO = repo_root()
 LANES = ["py-only", "rust-enabled"]
 RUST_PARITY_TESTS = [
+    "tests/test_incremental_linking_default_artifact.py",
     "tests/test_feature_port_parity.py",
     "tests/test_rust_signature_preprocess.py",
     "tests/test_rust_batch_chunking.py",
     "tests/test_rust_from_json_paths.py",
 ]
+PYTEST_REPORT_FLAGS = ["-ra"]
+PY_ONLY_EXPECTED_SKIP_NOTE = (
+    "Rust-only tests are expected to report skips in the py-only lane; "
+    "the rust-enabled lane builds s2and_rust and must exercise them."
+)
 TY_PYTHON_VERSION = "3.11"
 TY_PYTHON_PLATFORM = os.environ.get("S2AND_CI_TY_PLATFORM", "linux")
 TY_BASE_IGNORES = [
@@ -74,6 +81,15 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
 
 def run_uv(args: list[str], *, env: dict[str, str] | None = None) -> None:
     run(uv_exe() + args, env=env)
+
+
+def pytest_args(*args: str, quiet: bool = False) -> list[str]:
+    cmd = ["run", "pytest"]
+    if quiet:
+        cmd.append("-q")
+    cmd.extend(PYTEST_REPORT_FLAGS)
+    cmd.extend(args)
+    return cmd
 
 
 def ensure_rust_on_path() -> None:
@@ -140,12 +156,15 @@ def sync_deps(*, lock_present: bool, lane: str) -> None:
         args.extend(["--extra", "rust"])
     if lock_present:
         args.append("--frozen")
+    if lane == "rust-enabled":
+        args.extend(["--no-install-package", "s2and-rust"])
     run_uv(args)
 
 
 def run_lint_job(*, lock_present: bool) -> None:
     print("\n=== lint ===")
     sync_deps(lock_present=lock_present, lane="py-only")
+    run_uv(["run", "python", "scripts/sync_version.py", "--check"])
     run_uv(["run", "ruff", "check", "s2and", "scripts", "tests"])
     run_uv(["run", "ruff", "format", "--check", "s2and"])
     script_files = top_level_script_files()
@@ -200,24 +219,22 @@ def run_typecheck_and_test_lane(*, lane: str, lock_present: bool) -> None:
         ensure_rust_on_path()
         run_maturin_develop_with_retries()
         for parity_test in RUST_PARITY_TESTS:
-            run_uv(["run", "pytest", "-q", parity_test])
+            run_uv(pytest_args(parity_test, quiet=True))
 
     run_ty_checks()
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(REPO)
     if lane == "py-only":
         env["S2AND_BACKEND"] = "python"
+        print(f"[{lane}] {PY_ONLY_EXPECTED_SKIP_NOTE}")
 
     run_uv(
-        [
-            "run",
-            "pytest",
+        pytest_args(
             "tests/",
             "--cov=s2and",
             "--cov-report=term-missing",
             "--cov-fail-under=40",
-        ],
+        ),
         env=env,
     )
 

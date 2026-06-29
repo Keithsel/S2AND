@@ -41,13 +41,16 @@ Build first (develop mode is slower, so use release mode for gates):
 uv run maturin develop -m s2and_rust/Cargo.toml --release
 ```
 
-Capture a log for every gate run (stdout + stderr):
-- PowerShell: append `*> scratch/baselines_YYYYMMDD/<run>_YYYYMMDD.log`
-- bash/zsh: append `> scratch/baselines_YYYYMMDD/<run>_YYYYMMDD.log 2>&1`
-
-Optional: summarize memory prediction telemetry from a run log:
+Capture run logs and structured memory telemetry with rust-suite global options
+(these must appear before the command name):
 ```
-uv run python scripts/rust_suite.py summarize-memory-telemetry scratch/baselines_YYYYMMDD/<run>_YYYYMMDD.log --write-json scratch/baselines_YYYYMMDD/<run>_memory_telemetry_YYYYMMDD.json
+--log-file scratch/baselines_YYYYMMDD/<run>_YYYYMMDD.log
+--memory-telemetry-jsonl scratch/baselines_YYYYMMDD/<run>_memory_telemetry_YYYYMMDD.jsonl
+```
+
+Optional: summarize memory prediction telemetry from the JSONL artifact:
+```
+uv run python scripts/rust_suite.py summarize-memory-telemetry scratch/baselines_YYYYMMDD/<run>_memory_telemetry_YYYYMMDD.jsonl --write-json scratch/baselines_YYYYMMDD/<run>_memory_telemetry_YYYYMMDD.json
 ```
 
 **1. Inference comparator**

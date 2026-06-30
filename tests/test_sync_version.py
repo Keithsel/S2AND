@@ -117,8 +117,8 @@ def test_sync_version_updates_rust_manifests_runtime_guard_and_lockfiles(tmp_pat
     assert "echo 0.50.0 > VERSION" in (tmp_path / "README.md").read_text(encoding="utf-8")
     assert "echo 0.50.0 > VERSION" in (tmp_path / "docs" / "development.md").read_text(encoding="utf-8")
     release_notes = (tmp_path / "docs" / "release_notes.md").read_text(encoding="utf-8")
-    assert "## 0.50.0" in release_notes
-    assert "package as `0.50.0` and pins optional Rust installs to `s2and-rust==0.50.0`" in release_notes
+    assert "## 0.49.0" in release_notes
+    assert "package as `0.49.0` and pins optional Rust installs to `s2and-rust==0.49.0`" in release_notes
     assert "This checkout is `0.50.0`" in (tmp_path / "s2and_rust" / "README.md").read_text(encoding="utf-8")
     assert 'version = "0.50.0"' in (tmp_path / "s2and_rust" / "Cargo.lock").read_text(encoding="utf-8")
     assert 'version = "0.50.0"' in (tmp_path / "uv.lock").read_text(encoding="utf-8")
@@ -146,3 +146,4 @@ def test_pre_commit_stages_sync_version_targets() -> None:
 
     for target in sync_version.version_targets():
         assert target.relative_path.as_posix() in hook_text
+    assert "docs/release_notes.md" not in hook_text

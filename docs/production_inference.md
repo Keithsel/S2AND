@@ -485,7 +485,7 @@ result = clusterer.predict_incremental_from_arrow_paths(
     },
     batching_threshold=5000,
     total_ram_bytes=32 * 1024**3,
-    name_tuples=filtered,
+    name_tuples="filtered",
 )
 
 clusters = result["clusters"]

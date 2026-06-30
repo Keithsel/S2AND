@@ -12,7 +12,7 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any, Literal, Self, TypeAlias, TypeVar, cast
 
@@ -35,6 +35,7 @@ from s2and.data import (
     NAME_COUNTS_LAST_FIRST_INITIAL_INITIAL_CHAR,
     NAME_COUNTS_LAST_FIRST_INITIAL_LEGACY,
     ANDData,
+    _load_name_tuples_from_file,
 )
 from s2and.eval import b3_precision_recall_fscore
 from s2and.feature_port import (
@@ -1374,6 +1375,21 @@ def _guard_predict_block_matrix_allocation(
 
 def _signature_first_for_rules(signature: Any) -> str:
     return signature.author_info_first_normalized_without_apostrophe or signature.author_info_first or ""
+
+
+@lru_cache(maxsize=2)
+def _load_name_tuples_for_incremental_rules(name_tuples: str | None) -> set[tuple[str, str]]:
+    if name_tuples == "filtered":
+        return _load_name_tuples_from_file("s2and_name_tuples_filtered.txt")
+    if name_tuples is None:
+        return _load_name_tuples_from_file("s2and_name_tuples.txt")
+    raise ValueError("name_tuples must be None, 'filtered', or a set of (first_a, first_b) tuples")
+
+
+def _name_tuples_for_incremental_rules(name_tuples: set[tuple[str, str]] | str | None) -> set[tuple[str, str]]:
+    if isinstance(name_tuples, set):
+        return name_tuples
+    return _load_name_tuples_for_incremental_rules(name_tuples)
 
 
 def _signature_first_initials_for_rules(first: str) -> frozenset[str]:
@@ -5476,9 +5492,10 @@ class Clusterer:
                     # if all existing first names are single characters, there is nothing else to check
                     if len(all_firsts) > 0:
                         first_unassigned = _signature_first_for_rules(dataset.signatures[unassigned_signature])
+                        name_tuples = _name_tuples_for_incremental_rules(dataset.name_tuples)
                         match_found = False
                         for first_assigned in all_firsts:
-                            if first_names_name_compatible(first_assigned, first_unassigned, dataset.name_tuples):
+                            if first_names_name_compatible(first_assigned, first_unassigned, name_tuples):
                                 match_found = True
                                 break
                         # if the candidate name is a prefix or a name alias for any existing name,

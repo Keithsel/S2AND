@@ -67,20 +67,6 @@ def version_targets() -> tuple[VersionTarget, ...]:
             pattern=rf"(?m)^(?P<prefix>echo )(?P<version>{SEMVER_PATTERN})(?P<suffix> > VERSION\s*)$",
         ),
         VersionTarget(
-            name="release_notes_heading",
-            relative_path=Path("docs") / "release_notes.md",
-            pattern=rf"(?m)^(?P<prefix>## )(?P<version>{SEMVER_PATTERN})(?P<suffix>\s*)$",
-        ),
-        VersionTarget(
-            name="release_notes_package_pin",
-            relative_path=Path("docs") / "release_notes.md",
-            pattern=(
-                rf"(?m)^(?P<prefix>- Ships the package as `)(?P<version>{SEMVER_PATTERN})"
-                rf"(?P<middle>` and pins optional Rust installs to `s2and-rust==)"
-                rf"(?P<version_2>{SEMVER_PATTERN})(?P<suffix>`\.\s*)$"
-            ),
-        ),
-        VersionTarget(
             name="rust_readme_checkout_version",
             relative_path=Path("s2and_rust") / "README.md",
             pattern=(

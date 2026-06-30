@@ -179,6 +179,47 @@ def test_finish_incremental_uses_split_inverse_for_altered_incompatibility_check
     assert clusters == {"0": ["seed_david", "seed_initial", "new_donald"]}
 
 
+def test_finish_incremental_lazily_resolves_filtered_name_tuples_for_direct_arrow_dataset() -> None:
+    """Direct Arrow's default name_tuples token should not crash compatibility checks."""
+
+    def signature(first: str) -> SimpleNamespace:
+        normalized = first.lower()
+        return SimpleNamespace(
+            author_info_first=first,
+            author_info_first_normalized_without_apostrophe=normalized,
+            author_info_last="Jones",
+            paper_id=f"p-{normalized}",
+        )
+
+    dataset = SimpleNamespace(
+        signatures={
+            "seed_xavier": signature("Xavier"),
+            "new_zelda": signature("Zelda"),
+        },
+        name_tuples="filtered",
+        max_seed_cluster_id=0,
+    )
+    clusterer = SimpleNamespace(
+        use_default_constraints_as_supervision=True,
+        suppress_orcid=False,
+    )
+
+    clusters = Clusterer._finish_incremental_with_seed_links(
+        cast(Any, clusterer),
+        ["new_zelda"],
+        cast(Any, dataset),
+        {"new_zelda": "0_0"},
+        {"0_0": "0"},
+        {"0": ["seed_xavier"]},
+        prevent_new_incompatibilities=True,
+        partial_supervision={},
+        runtime_context=cast(Any, SimpleNamespace()),
+        split_cluster_seeds_require_inverse={"0_0": ["seed_xavier"]},
+    )
+
+    assert clusters == {"0": ["seed_xavier"], "1": ["new_zelda"]}
+
+
 def test_subblocked_altered_presplit_failure_refreshes_telemetry(monkeypatch) -> None:
     clusterer = Clusterer(
         featurizer_info=FeaturizationInfo(features_to_use=[]),

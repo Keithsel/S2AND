@@ -172,7 +172,7 @@ def _validate_incremental_linker_metadata(linker_dir: Path) -> None:
         raise FileNotFoundError(f"Incremental linker booster is missing: {booster_path}")
     metadata = _read_json(metadata_path)
     validate_artifact_contract_metadata(metadata)
-    load_incremental_linking_artifact(linker_dir)
+    load_incremental_linking_artifact(linker_dir, require_rust_capabilities=False)
 
 
 def _load_bundle_clusterer(bundle_dir: Path, *, require_incremental_linker: bool = True) -> Clusterer:

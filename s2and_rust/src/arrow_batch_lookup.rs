@@ -219,6 +219,14 @@ impl ArrowBatchLookupIndex {
     }
 }
 
+pub(crate) fn validate_arrow_batch_lookup_index(
+    path: &str,
+    source_arrow_path: &str,
+    key_column: &str,
+) -> PyResult<()> {
+    ArrowBatchLookupIndex::open(path, source_arrow_path, key_column).map(|_| ())
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct IndexedArrowReadStats {
     pub(crate) batches_read: usize,

@@ -49,6 +49,9 @@ Load this directory once with `load_production_model(...)`. The returned object
 is still a normal mutable `Clusterer`, so callers can set `clusterer.n_jobs`,
 `clusterer.use_cache`, or `clusterer.cluster_model.eps` just as they did with
 the old pickle-loaded clusterer.
+For v1.2-derived production artifacts, including `production_model_v1.2.pickle`
+and `production_model_v1.21/`, the loader applies the published runtime
+FastCluster threshold `eps=0.65` before returning the clusterer.
 
 The `pairwise/*.lgb` files are native LightGBM models, so Python can load them
 without pickle and Rust/other runtimes can consume the same format directly.

@@ -8,6 +8,7 @@ import pytest
 
 import s2and.feature_port as feature_port
 import s2and.model as model_module
+import s2and.runtime as runtime
 from s2and.arrow_inputs import MissingArrowArtifactError
 from s2and.featurizer import FeaturizationInfo
 from s2and.model import Clusterer
@@ -39,7 +40,7 @@ class ArrowOnlyRustFeaturizer:
 
 
 class ArrowOnlyRustModule:
-    __version__ = "0.51.0"
+    __version__ = runtime.min_supported_rust_extension_version_string()
     RustFeaturizer = ArrowOnlyRustFeaturizer
 
 

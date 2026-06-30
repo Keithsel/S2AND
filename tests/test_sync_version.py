@@ -50,6 +50,31 @@ def _write_version_fixture(root: Path) -> None:
     )
     (root / "README.md").write_text("echo 0.49.0 > VERSION\n", encoding="utf-8")
     (root / "docs" / "development.md").write_text("echo 0.40.0 > VERSION\n", encoding="utf-8")
+    (root / "docs" / "release_notes.md").write_text(
+        "\n".join(
+            [
+                "# Release Notes",
+                "",
+                "## 0.49.0",
+                "",
+                "- Ships the package as `0.49.0` and pins optional Rust installs to `s2and-rust==0.49.0`.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (root / "s2and_rust" / "README.md").write_text(
+        "\n".join(
+            [
+                "# s2and-rust",
+                "",
+                "This checkout is `0.49.0`, so use a local build when working from this tree",
+                "until the matching packages are published.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     (root / "s2and_rust" / "Cargo.lock").write_text(
         "\n".join(
             [
@@ -91,6 +116,10 @@ def test_sync_version_updates_rust_manifests_runtime_guard_and_lockfiles(tmp_pat
     )
     assert "echo 0.50.0 > VERSION" in (tmp_path / "README.md").read_text(encoding="utf-8")
     assert "echo 0.50.0 > VERSION" in (tmp_path / "docs" / "development.md").read_text(encoding="utf-8")
+    release_notes = (tmp_path / "docs" / "release_notes.md").read_text(encoding="utf-8")
+    assert "## 0.50.0" in release_notes
+    assert "package as `0.50.0` and pins optional Rust installs to `s2and-rust==0.50.0`" in release_notes
+    assert "This checkout is `0.50.0`" in (tmp_path / "s2and_rust" / "README.md").read_text(encoding="utf-8")
     assert 'version = "0.50.0"' in (tmp_path / "s2and_rust" / "Cargo.lock").read_text(encoding="utf-8")
     assert 'version = "0.50.0"' in (tmp_path / "uv.lock").read_text(encoding="utf-8")
 

@@ -240,14 +240,12 @@ impl RustFeaturizer {
                 // The Arrow ingest path keeps all-zero rows as real vectors (per the
                 // Current Decisions table in docs/work_plan.md), so the missing-vector
                 // check has to live here instead of at the ingest boundary.
-                let a_zero = p1.specter_norm.map_or_else(
-                    || specter_a.iter().all(|v| *v == 0.0),
-                    |norm| norm == 0.0,
-                );
-                let b_zero = p2.specter_norm.map_or_else(
-                    || specter_b.iter().all(|v| *v == 0.0),
-                    |norm| norm == 0.0,
-                );
+                let a_zero = p1
+                    .specter_norm
+                    .map_or_else(|| specter_a.iter().all(|v| *v == 0.0), |norm| norm == 0.0);
+                let b_zero = p2
+                    .specter_norm
+                    .map_or_else(|| specter_b.iter().all(|v| *v == 0.0), |norm| norm == 0.0);
                 if a_zero || b_zero {
                     f64::NAN
                 } else {

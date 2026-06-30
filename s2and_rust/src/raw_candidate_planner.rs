@@ -486,7 +486,8 @@ impl RawBlockQueryCandidatePlanner {
                         existing.push(component_key.clone());
                     } else {
                         let owned_id = signature_id.clone();
-                        component_keys_by_member.insert(owned_id.clone(), vec![component_key.clone()]);
+                        component_keys_by_member
+                            .insert(owned_id.clone(), vec![component_key.clone()]);
                         seed_signature_ids.push(owned_id);
                     }
                 }

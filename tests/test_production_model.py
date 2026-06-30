@@ -12,7 +12,12 @@ from s2and.arrow_inputs import MissingArrowArtifactError
 from s2and.data import ANDData
 from s2and.model import _ensure_lightgbm_fitted, _selected_feature_indices
 from s2and.production_bundle import finalize_production_bundle, write_pairwise_production_bundle
-from s2and.production_model import NativeLightGBMBinaryClassifier, _config_choice, load_production_model
+from s2and.production_model import (
+    NativeLightGBMBinaryClassifier,
+    _config_choice,
+    _production_runtime_cluster_eps,
+    load_production_model,
+)
 from s2and.serialization import load_pickle_with_verified_label_encoder_compat
 from tests.helpers import import_s2and_rust, tiny_name_counts
 
@@ -151,10 +156,12 @@ def test_native_clusterer_predict_rust_requires_arrow_paths(monkeypatch: pytest.
 def test_native_clusterer_runtime_config_matches_v12_pickle() -> None:
     native_clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
     legacy_clusterer = load_pickle_with_verified_label_encoder_compat(_LEGACY_PICKLE_PATH)["clusterer"]
+    legacy_loader_clusterer = load_production_model(_LEGACY_PICKLE_PATH)
 
     assert type(native_clusterer.cluster_model) is type(legacy_clusterer.cluster_model)
     assert native_clusterer.cluster_model.linkage == legacy_clusterer.cluster_model.linkage
     assert native_clusterer.cluster_model.eps == 0.65
+    assert legacy_loader_clusterer.cluster_model.eps == 0.65
     assert native_clusterer.featurizer_info.features_to_use == legacy_clusterer.featurizer_info.features_to_use
     assert native_clusterer.featurizer_info.featurizer_version == legacy_clusterer.featurizer_info.featurizer_version
     assert native_clusterer.nameless_featurizer_info is not None
@@ -168,6 +175,7 @@ def test_native_clusterer_runtime_config_matches_v12_pickle() -> None:
         == legacy_clusterer.nameless_featurizer_info.featurizer_version
     )
     assert native_clusterer.best_params == {**legacy_clusterer.best_params, "eps": 0.65}
+    assert legacy_loader_clusterer.best_params == {**legacy_clusterer.best_params, "eps": 0.65}
     assert native_clusterer.batch_size == legacy_clusterer.batch_size
     assert native_clusterer.dont_merge_cluster_seeds == legacy_clusterer.dont_merge_cluster_seeds
     assert (
@@ -180,6 +188,27 @@ def test_native_clusterer_runtime_config_matches_v12_pickle() -> None:
 
     assert getattr(native_clusterer, "suppress_orcid", False) == getattr(legacy_clusterer, "suppress_orcid", False)
     assert native_clusterer._incremental_experiment_config() == legacy_clusterer._incremental_experiment_config()
+
+
+def test_production_runtime_cluster_eps_policy_is_version_scoped(tmp_path: Path) -> None:
+    assert _production_runtime_cluster_eps(tmp_path / "production_model_v1.2.pickle") == 0.65
+    assert _production_runtime_cluster_eps(tmp_path / "production_model_v1.21") == 0.65
+    assert (
+        _production_runtime_cluster_eps(
+            tmp_path / "production_model_v9.9",
+            manifest={"bundle_version": "9.9", "pairwise_model_version": "1.2"},
+            clusterer_config={"bundle_version": "9.9", "source_model_version": "9.9"},
+        )
+        == 0.65
+    )
+    assert (
+        _production_runtime_cluster_eps(
+            tmp_path / "production_model_v9.9",
+            manifest={"bundle_version": "9.9", "pairwise_model_version": "9.9"},
+            clusterer_config={"bundle_version": "9.9", "source_model_version": "9.9"},
+        )
+        is None
+    )
 
 
 def test_pairwise_stage_finalizes_into_loadable_production_bundle(tmp_path: Path) -> None:

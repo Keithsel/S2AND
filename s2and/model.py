@@ -123,7 +123,7 @@ for _export in (FastCluster, PairwiseModeler, VotingClassifier, intify):
 class _ArrowIncrementalSignatureInfo:
     """Signature fields needed by Arrow-only incremental completion."""
 
-    paper_id: str
+    paper_id: str | None
     author_info_first: str | None
     author_info_last: str | None
     author_info_first_normalized_without_apostrophe: str | None
@@ -862,7 +862,7 @@ def _load_arrow_incremental_signature_info(
                 middle = _optional_arrow_string(row.get("author_middle"))
                 first_without_apostrophe, _middle_without_apostrophe = split_first_middle_hyphen_aware(first, middle)
                 signatures[signature_id] = _ArrowIncrementalSignatureInfo(
-                    paper_id=str(row["paper_id"]),
+                    paper_id=_optional_arrow_string(row.get("paper_id")),
                     author_info_first=first,
                     author_info_last=_optional_arrow_string(row.get("author_last")),
                     author_info_first_normalized_without_apostrophe=first_without_apostrophe or None,
@@ -871,6 +871,62 @@ def _load_arrow_incremental_signature_info(
     missing_signature_ids = [signature_id for signature_id in requested_signature_ids if signature_id not in signatures]
     if missing_signature_ids:
         raise ValueError(f"Arrow signatures are missing incremental signature ids: {missing_signature_ids[:10]}")
+    return signatures
+
+
+def _load_arrow_incremental_orcid_signature_info(
+    arrow_paths: Mapping[str, Any],
+    signature_ids: Iterable[Any],
+) -> dict[str, _ArrowIncrementalSignatureInfo]:
+    """Load ORCID-only signature metadata for promoted incremental budget sizing."""
+
+    requested_signature_ids = tuple(dict.fromkeys(str(signature_id) for signature_id in signature_ids))
+    if not requested_signature_ids:
+        return {}
+    requested_signature_id_set = set(requested_signature_ids)
+    signatures_path = Path(str(arrow_paths["signatures"]))
+    required_columns = {"signature_id", "author_orcid"}
+    import pyarrow as pa
+
+    pc: Any = __import__("pyarrow.compute").compute
+
+    value_set = pa.array(requested_signature_ids, type=pa.string())
+    required_column_names = sorted(required_columns)
+    signatures: dict[str, _ArrowIncrementalSignatureInfo] = {}
+    with pa.memory_map(str(signatures_path), "r") as source:
+        reader = pa.ipc.open_file(source)
+        missing_columns = sorted(required_columns.difference(reader.schema.names))
+        if missing_columns:
+            raise ValueError(
+                "signatures Arrow is missing required columns for incremental ORCID metadata: " f"{missing_columns}"
+            )
+        signature_id_column_index = reader.schema.get_field_index("signature_id")
+        for batch_index in range(reader.num_record_batches):
+            batch = reader.get_batch(batch_index)
+            signature_id_column = batch.column(signature_id_column_index)
+            mask = pc.is_in(signature_id_column, value_set=value_set)
+            if not bool(pc.any(mask).as_py()):
+                continue
+            filtered = pa.Table.from_batches([batch], schema=reader.schema).select(required_column_names).filter(mask)
+            for row in filtered.to_pylist():
+                signature_id_value = row.get("signature_id")
+                if signature_id_value is None:
+                    raise ValueError("signatures Arrow cannot contain null signature_id values")
+                signature_id = str(signature_id_value)
+                if signature_id not in requested_signature_id_set:
+                    continue
+                if signature_id in signatures:
+                    raise ValueError(f"signatures Arrow contains duplicate signature_id: {signature_id!r}")
+                signatures[signature_id] = _ArrowIncrementalSignatureInfo(
+                    paper_id=None,
+                    author_info_first=None,
+                    author_info_last=None,
+                    author_info_first_normalized_without_apostrophe=None,
+                    author_info_orcid=_optional_arrow_string(row.get("author_orcid")),
+                )
+    missing_signature_ids = [signature_id for signature_id in requested_signature_ids if signature_id not in signatures]
+    if missing_signature_ids:
+        raise ValueError(f"Arrow signatures are missing incremental ORCID signature ids: {missing_signature_ids[:10]}")
     return signatures
 
 
@@ -5773,6 +5829,21 @@ class Clusterer:
         ]
         metadata_signature_ids = (*unassigned_signature_ids, *altered_seed_signature_ids)
         signatures = _load_arrow_incremental_signature_info(arrow_path_payload, metadata_signature_ids)
+        if not bool(getattr(self, "suppress_orcid", False)) and any(
+            (signature_info := signatures.get(signature_id)) is not None
+            and signature_info.author_info_orcid is not None
+            and signature_info.author_info_orcid.strip()
+            for signature_id in unassigned_signature_ids
+        ):
+            seed_orcid_signature_ids = [
+                signature_id for signature_id in seed_signature_to_cluster if signature_id not in signatures
+            ]
+            signatures.update(
+                _load_arrow_incremental_orcid_signature_info(
+                    arrow_path_payload,
+                    seed_orcid_signature_ids,
+                )
+            )
         request_dataset = _ArrowIncrementalPredictionDataset(
             arrow_paths=arrow_path_payload,
             name_tuples=name_tuples,

@@ -680,6 +680,69 @@ def test_predict_incremental_from_arrow_paths_loads_altered_seed_metadata(
     assert set(captured["dataset"].signatures) == {"3", "4", "5"}
 
 
+def test_predict_incremental_from_arrow_paths_loads_seed_orcids_for_budget_floor(
+    clusterer_dataset_factory,
+    monkeypatch,
+    tmp_path,
+):
+    clusterer, _dataset = clusterer_dataset_factory(name="dummy_incremental_direct_arrow_orcid_floor")
+    arrow_paths = _minimal_arrow_paths(tmp_path)
+    captured: dict[str, Any] = {}
+
+    def fake_load_signature_info(_paths: Mapping[str, Any], signature_ids: Any) -> dict[str, Any]:
+        captured["metadata_signature_ids"] = tuple(signature_ids)
+        return {
+            str(signature_id): model_module._ArrowIncrementalSignatureInfo(
+                paper_id=f"p{signature_id}",
+                author_info_first="Alex",
+                author_info_last="Smith",
+                author_info_first_normalized_without_apostrophe="alex",
+                author_info_orcid="0000-0000-0000-0001" if str(signature_id) == "5" else None,
+            )
+            for signature_id in signature_ids
+        }
+
+    def fake_load_orcid_info(_paths: Mapping[str, Any], signature_ids: Any) -> dict[str, Any]:
+        captured["orcid_signature_ids"] = tuple(signature_ids)
+        return {
+            str(signature_id): model_module._ArrowIncrementalSignatureInfo(
+                paper_id=None,
+                author_info_first=None,
+                author_info_last=None,
+                author_info_first_normalized_without_apostrophe=None,
+                author_info_orcid="0000-0000-0000-0001" if str(signature_id) == "8" else None,
+            )
+            for signature_id in signature_ids
+        }
+
+    def fake_promoted_linker(_clusterer: Any, _block_signatures: list[str], dataset_arg: Any, **_kwargs: Any):
+        captured["fanout"] = production_module.promoted_incremental_orcid_fanout_by_query(
+            dataset_arg,
+            ["5"],
+            dataset_arg.cluster_seeds_require,
+            orcid_enabled=True,
+        )
+        return {"clusters": {"0": ["3", "4"], "1": ["8", "5"]}}
+
+    monkeypatch.setattr(model_module, "_load_arrow_incremental_signature_info", fake_load_signature_info)
+    monkeypatch.setattr(model_module, "_load_arrow_incremental_orcid_signature_info", fake_load_orcid_info)
+    monkeypatch.setattr(
+        model_module,
+        "predict_incremental_promoted_linker_from_arrow_paths",
+        fake_promoted_linker,
+    )
+
+    clusterer.predict_incremental_from_arrow_paths(
+        ["3", "4", "5", "8"],
+        arrow_paths,
+        cluster_seeds_require={"3": "0", "4": "0", "8": "1"},
+    )
+
+    assert captured["metadata_signature_ids"] == ("5",)
+    assert captured["orcid_signature_ids"] == ("3", "4", "8")
+    assert captured["fanout"] == {"5": (1, 1)}
+
+
 def test_load_arrow_incremental_signature_info_scans_signatures_without_index(tmp_path: Path) -> None:
     import pyarrow as pa
 
@@ -708,12 +771,12 @@ def test_load_arrow_incremental_signature_info_scans_signatures_without_index(tm
         ),
         pa.record_batch(
             [
-                pa.array(["s2"], type=pa.string()),
-                pa.array(["p2"], type=pa.string()),
-                pa.array(["Anne-Marie"], type=pa.string()),
-                pa.array([""], type=pa.string()),
-                pa.array(["Ng"], type=pa.string()),
-                pa.array(["0000-0002"], type=pa.string()),
+                pa.array(["s2", "s3"], type=pa.string()),
+                pa.array(["p2", None], type=pa.string()),
+                pa.array(["Anne-Marie", "Null"], type=pa.string()),
+                pa.array(["", ""], type=pa.string()),
+                pa.array(["Ng", "Paper"], type=pa.string()),
+                pa.array(["0000-0002", None], type=pa.string()),
             ],
             schema=schema,
         ),
@@ -725,14 +788,24 @@ def test_load_arrow_incremental_signature_info_scans_signatures_without_index(tm
 
     signatures = model_module._load_arrow_incremental_signature_info(
         {"signatures": str(signatures_path)},
-        ["s2"],
+        ["s2", "s3"],
     )
 
-    assert set(signatures) == {"s2"}
+    assert set(signatures) == {"s2", "s3"}
     assert signatures["s2"].paper_id == "p2"
     assert signatures["s2"].author_info_first == "Anne-Marie"
     assert signatures["s2"].author_info_last == "Ng"
     assert signatures["s2"].author_info_orcid == "0000-0002"
+    assert signatures["s3"].paper_id is None
+
+    orcid_signatures = model_module._load_arrow_incremental_orcid_signature_info(
+        {"signatures": str(signatures_path)},
+        ["s2"],
+    )
+    assert set(orcid_signatures) == {"s2"}
+    assert orcid_signatures["s2"].paper_id is None
+    assert orcid_signatures["s2"].author_info_first is None
+    assert orcid_signatures["s2"].author_info_orcid == "0000-0002"
 
 
 def test_predict_incremental_arrow_promoted_linker_cleans_up_temp_seed_context_on_failure(

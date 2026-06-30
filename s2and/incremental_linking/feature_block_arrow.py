@@ -594,21 +594,26 @@ def _raise_arrow_source_changed(path: Path, *, context: str) -> NoReturn:
     raise ValueError(f"Arrow IPC file changed while {context}: {path!s}")
 
 
-def read_arrow_batch_lookup_index_batch_indices(
+def _read_arrow_batch_lookup_index_batch_indices(
     arrow_path: str | Path,
     index_path: str | Path,
     *,
     key_column: str,
     values: Iterable[Any],
+    validate_source_fingerprint: bool,
+    context: str,
 ) -> set[int]:
-    """Return Arrow record-batch indices that may contain the requested key values."""
-
     keep_hashes = {_fnv64_bytes(str(value).encode("utf-8")) for value in values}
     if not keep_hashes:
         return set()
     arrow_path_obj = Path(arrow_path)
     index_path_obj = Path(index_path)
-    source_snapshot = _stable_source_file_snapshot(arrow_path_obj, context="reading batch lookup index")
+    source_stat_before = arrow_path_obj.stat()
+    source_size = int(source_stat_before.st_size)
+    source_snapshot: _ArrowSourceSnapshot | None = None
+    if validate_source_fingerprint:
+        source_snapshot = _stable_source_file_snapshot(arrow_path_obj, context=context)
+        source_size = source_snapshot.size
     expected_key_column_hash = _fnv64_bytes(str(key_column).encode("utf-8"))
     with index_path_obj.open("rb") as infile:
         with mmap.mmap(infile.fileno(), 0, access=mmap.ACCESS_READ) as index_mmap:
@@ -622,15 +627,23 @@ def read_arrow_batch_lookup_index_batch_indices(
                     f"indexed hash={int(header['key_column_hash'])} expected hash={expected_key_column_hash} "
                     f"key_column={key_column!r}"
                 )
-            source_mismatch = _batch_lookup_index_source_mismatch(
-                header,
-                source_size=source_snapshot.size,
-                source_fingerprint=source_snapshot.fingerprint,
-            )
-            if source_mismatch is not None:
+            if validate_source_fingerprint:
+                if source_snapshot is None:
+                    raise AssertionError("source snapshot must be populated")
+                source_mismatch = _batch_lookup_index_source_mismatch(
+                    header,
+                    source_size=source_snapshot.size,
+                    source_fingerprint=source_snapshot.fingerprint,
+                )
+                if source_mismatch is not None:
+                    raise ValueError(
+                        f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': "
+                        f"{source_mismatch}"
+                    )
+            elif int(header["source_size"]) != source_size:
                 raise ValueError(
                     f"Arrow batch lookup index '{index_path_obj!s}' is stale for '{arrow_path_obj!s}': "
-                    f"{source_mismatch}"
+                    f"indexed size={int(header['source_size'])} current size={source_size}"
                 )
             record_count = int(header["record_count"])
             expected_len = (
@@ -651,9 +664,60 @@ def read_arrow_batch_lookup_index_batch_indices(
                 ):
                     batch_indices.add(_arrow_batch_lookup_record_batch_index(index_mmap, record_index))
                     record_index += 1
-    if not _source_snapshot_matches_stat(source_snapshot, arrow_path_obj.stat()):
-        _raise_arrow_source_changed(arrow_path_obj, context="reading batch lookup index")
+    source_stat_after = arrow_path_obj.stat()
+    if validate_source_fingerprint:
+        if source_snapshot is None:
+            raise AssertionError("source snapshot must be populated")
+        if not _source_snapshot_matches_stat(source_snapshot, source_stat_after):
+            _raise_arrow_source_changed(arrow_path_obj, context=context)
+    elif int(source_stat_before.st_size) != int(source_stat_after.st_size) or int(
+        source_stat_before.st_mtime_ns
+    ) != int(source_stat_after.st_mtime_ns):
+        _raise_arrow_source_changed(arrow_path_obj, context=context)
     return batch_indices
+
+
+def read_arrow_batch_lookup_index_batch_indices(
+    arrow_path: str | Path,
+    index_path: str | Path,
+    *,
+    key_column: str,
+    values: Iterable[Any],
+) -> set[int]:
+    """Return Arrow record-batch indices with strict source fingerprint validation."""
+
+    return _read_arrow_batch_lookup_index_batch_indices(
+        arrow_path,
+        index_path,
+        key_column=key_column,
+        values=values,
+        validate_source_fingerprint=True,
+        context="reading batch lookup index",
+    )
+
+
+def read_arrow_batch_lookup_index_batch_indices_for_request(
+    arrow_path: str | Path,
+    index_path: str | Path,
+    *,
+    key_column: str,
+    values: Iterable[Any],
+) -> set[int]:
+    """Return Arrow record-batch indices for request-time filtered reads.
+
+    This keeps sidecar magic/key/length/source-size checks but intentionally
+    avoids hashing the whole Arrow IPC file on every prediction request. Use
+    `validate_arrow_batch_lookup_index` for offline strict fingerprint checks.
+    """
+
+    return _read_arrow_batch_lookup_index_batch_indices(
+        arrow_path,
+        index_path,
+        key_column=key_column,
+        values=values,
+        validate_source_fingerprint=False,
+        context="reading request-time batch lookup index",
+    )
 
 
 def validate_arrow_batch_lookup_index(

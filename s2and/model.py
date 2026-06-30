@@ -88,7 +88,7 @@ from s2and.subblocking import (
     make_subblocks,
     rust_arrow_subblocking_available,
 )
-from s2and.text import first_names_name_compatible, normalize_orcid_compact
+from s2and.text import first_names_name_compatible, normalize_orcid_compact, split_first_middle_hyphen_aware
 from s2and.thread_config import resolve_n_jobs
 from s2and.warnings_utils import suppress_sklearn_feature_name_warnings
 
@@ -117,6 +117,54 @@ _CLUSTER_SEEDS_ARROW_CACHE_LOCK = threading.Lock()
 # Keep canonical pickle import paths stable after splitting module internals.
 for _export in (FastCluster, PairwiseModeler, VotingClassifier, intify):
     _export.__module__ = __name__
+
+
+@dataclass(frozen=True)
+class _ArrowIncrementalSignatureInfo:
+    """Signature fields needed by Arrow-only incremental completion."""
+
+    paper_id: str
+    author_info_first: str | None
+    author_info_last: str | None
+    author_info_first_normalized_without_apostrophe: str | None
+    author_info_orcid: str | None
+
+
+class _ArrowIncrementalPredictionDataset:
+    """Request-state adapter for direct Arrow incremental prediction."""
+
+    def __init__(
+        self,
+        *,
+        arrow_paths: Mapping[str, Any],
+        name_tuples: set[tuple[str, str]] | str | None,
+        cluster_seeds_require: Mapping[Any, Any] | None,
+        cluster_seeds_disallow: Iterable[tuple[Any, Any]] | None,
+        altered_cluster_signatures: Sequence[Any] | None,
+        max_seed_cluster_id: int,
+        signatures: Mapping[str, _ArrowIncrementalSignatureInfo],
+    ) -> None:
+        self.arrow_paths = dict(arrow_paths)
+        self.name_tuples = name_tuples
+        self.cluster_seeds_require = _normalize_cluster_seeds_require(cluster_seeds_require or {})
+        self.cluster_seeds_disallow = (
+            normalize_cluster_seed_disallow_pairs(cluster_seeds_disallow)
+            if cluster_seeds_disallow is not None
+            else set()
+        )
+        self.altered_cluster_signatures = (
+            [str(signature_id) for signature_id in altered_cluster_signatures]
+            if altered_cluster_signatures is not None
+            else None
+        )
+        self.max_seed_cluster_id = int(max_seed_cluster_id)
+        self.name_counts_last_first_initial_semantics: str | None = None
+        self.signatures = dict(signatures)
+
+    def set_name_counts_last_first_initial_semantics(self, semantics: str) -> None:
+        """Record the name-count semantics expected by the loaded model."""
+
+        self.name_counts_last_first_initial_semantics = str(semantics)
 
 
 def _is_recoverable_graph_subblocking_error(exc: Exception) -> bool:
@@ -742,6 +790,90 @@ def _cluster_seeds_require_from_arrow_paths(arrow_paths: Mapping[str, Any] | Non
     return _read_cluster_seeds_arrow(path)
 
 
+def _max_seed_cluster_id_from_seed_map(cluster_seeds_require: Mapping[Any, Any]) -> int:
+    """Return the next numeric cluster id after the supplied seed components."""
+
+    max_cluster_id = -1
+    for cluster_id in cluster_seeds_require.values():
+        try:
+            max_cluster_id = max(max_cluster_id, int(cluster_id))
+        except (TypeError, ValueError):
+            continue
+    return max_cluster_id + 1 if max_cluster_id >= 0 else 0
+
+
+def _optional_arrow_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _load_arrow_incremental_signature_info(
+    arrow_paths: Mapping[str, Any],
+    signature_ids: Iterable[Any],
+) -> dict[str, _ArrowIncrementalSignatureInfo]:
+    """Load request-local signature metadata from `signatures.arrow`."""
+
+    requested_signature_ids = tuple(dict.fromkeys(str(signature_id) for signature_id in signature_ids))
+    if not requested_signature_ids:
+        return {}
+    requested_signature_id_set = set(requested_signature_ids)
+    signatures_path = Path(str(arrow_paths["signatures"]))
+    required_columns = {
+        "signature_id",
+        "paper_id",
+        "author_first",
+        "author_middle",
+        "author_last",
+        "author_orcid",
+    }
+    import pyarrow as pa
+
+    pc: Any = __import__("pyarrow.compute").compute
+
+    value_set = pa.array(requested_signature_ids, type=pa.string())
+    required_column_names = sorted(required_columns)
+    signatures: dict[str, _ArrowIncrementalSignatureInfo] = {}
+    with pa.memory_map(str(signatures_path), "r") as source:
+        reader = pa.ipc.open_file(source)
+        missing_columns = sorted(required_columns.difference(reader.schema.names))
+        if missing_columns:
+            raise ValueError(
+                "signatures Arrow is missing required columns for incremental metadata: " f"{missing_columns}"
+            )
+        signature_id_column_index = reader.schema.get_field_index("signature_id")
+        for batch_index in range(reader.num_record_batches):
+            batch = reader.get_batch(batch_index)
+            signature_id_column = batch.column(signature_id_column_index)
+            mask = pc.is_in(signature_id_column, value_set=value_set)
+            if not bool(pc.any(mask).as_py()):
+                continue
+            filtered = pa.Table.from_batches([batch], schema=reader.schema).select(required_column_names).filter(mask)
+            for row in filtered.to_pylist():
+                signature_id_value = row.get("signature_id")
+                if signature_id_value is None:
+                    raise ValueError("signatures Arrow cannot contain null signature_id values")
+                signature_id = str(signature_id_value)
+                if signature_id not in requested_signature_id_set:
+                    continue
+                if signature_id in signatures:
+                    raise ValueError(f"signatures Arrow contains duplicate signature_id: {signature_id!r}")
+                first = _optional_arrow_string(row.get("author_first"))
+                middle = _optional_arrow_string(row.get("author_middle"))
+                first_without_apostrophe, _middle_without_apostrophe = split_first_middle_hyphen_aware(first, middle)
+                signatures[signature_id] = _ArrowIncrementalSignatureInfo(
+                    paper_id=str(row["paper_id"]),
+                    author_info_first=first,
+                    author_info_last=_optional_arrow_string(row.get("author_last")),
+                    author_info_first_normalized_without_apostrophe=first_without_apostrophe or None,
+                    author_info_orcid=_optional_arrow_string(row.get("author_orcid")),
+                )
+    missing_signature_ids = [signature_id for signature_id in requested_signature_ids if signature_id not in signatures]
+    if missing_signature_ids:
+        raise ValueError(f"Arrow signatures are missing incremental signature ids: {missing_signature_ids[:10]}")
+    return signatures
+
+
 def _cluster_seeds_arrow_path_exists(arrow_paths: Mapping[str, Any] | None) -> bool:
     if arrow_paths is None:
         return False
@@ -1038,7 +1170,16 @@ def _dataset_altered_cluster_signatures(
     dataset: Any,
     arrow_paths: Mapping[str, Any] | None = None,
 ) -> list[str]:
-    values = getattr(dataset, "altered_cluster_signatures", None)
+    return _altered_cluster_signatures_from_values_or_arrow(
+        getattr(dataset, "altered_cluster_signatures", None),
+        arrow_paths,
+    )
+
+
+def _altered_cluster_signatures_from_values_or_arrow(
+    values: Sequence[Any] | None,
+    arrow_paths: Mapping[str, Any] | None = None,
+) -> list[str]:
     if values is not None:
         return [str(value) for value in values]
     if arrow_paths is not None:
@@ -5541,6 +5682,126 @@ class Clusterer:
             resolve_total_ram_bytes=_resolve_total_ram_bytes_for_incremental,
             build_incremental_result=_build_incremental_result,
         )
+
+    def predict_incremental_from_arrow_paths(
+        self,
+        block_signatures: list[str],
+        arrow_paths: Mapping[str, Any],
+        *,
+        prevent_new_incompatibilities: bool = True,
+        batching_threshold: int | None = None,
+        partial_supervision: dict[tuple[str, str], int | float] | None = None,
+        runtime_context: RuntimeContext | None = None,
+        total_ram_bytes: int | None = None,
+        return_clusters_only: bool = False,
+        name_tuples: set[tuple[str, str]] | str | None = "filtered",
+        cluster_seeds_require: Mapping[Any, Any] | None = None,
+        cluster_seeds_disallow: Iterable[tuple[Any, Any]] | None = None,
+        altered_cluster_signatures: Sequence[Any] | None = None,
+    ) -> dict[str, Any] | dict[str, list[str]]:
+        """Predict incremental clustering directly from Arrow IPC inputs through Rust.
+
+        This is the direct Arrow public API for promoted incremental prediction.
+        It does not require callers to construct an `ANDData`-shaped dataset
+        object. Seed assignments may be supplied by `cluster_seeds_require` or
+        by `arrow_paths["cluster_seeds"]`.
+        """
+
+        if _uses_reference_features(self.featurizer_info) or _uses_reference_features(self.nameless_featurizer_info):
+            raise ValueError(
+                "Clusterer.predict_incremental_from_arrow_paths does not support reference_features; "
+                "use the ANDData predict_incremental path until Arrow reference-feature artifacts are available."
+            )
+        if runtime_context is None:
+            runtime_context = build_runtime_context("cluster_predict_incremental_from_arrow_paths")
+        if partial_supervision is None:
+            partial_supervision = {}
+        require_name_counts_index = clusterer_uses_name_count_features(self)
+        arrow_path_payload = validate_arrow_prediction_artifacts(
+            arrow_paths,
+            require_specter=clusterer_uses_embedding_features(self),
+            require_name_counts_index=require_name_counts_index,
+            require_batch_indexes=True,
+            context="Clusterer.predict_incremental_from_arrow_paths",
+            producer_hint=(
+                "provide signatures, papers, paper_authors, model-required specter, model-required "
+                "name_counts_index, raw-planner batch indexes, and a seed source through "
+                "cluster_seeds_require or cluster_seeds.arrow"
+            ),
+        )
+        _require_arrow_name_counts_index_for_clusterer(self, arrow_path_payload, context="Arrow incremental prediction")
+
+        explicit_cluster_seeds_require = _normalize_cluster_seeds_require(cluster_seeds_require or {})
+        if explicit_cluster_seeds_require:
+            seed_signature_to_cluster = explicit_cluster_seeds_require
+        else:
+            seed_signature_to_cluster = _cluster_seeds_require_from_arrow_paths(arrow_path_payload)
+        if not seed_signature_to_cluster and not _cluster_seeds_arrow_path_exists(arrow_path_payload):
+            _require_incremental_seed_source(
+                _ArrowIncrementalPredictionDataset(
+                    arrow_paths=arrow_path_payload,
+                    name_tuples=name_tuples,
+                    cluster_seeds_require=explicit_cluster_seeds_require,
+                    cluster_seeds_disallow=cluster_seeds_disallow,
+                    altered_cluster_signatures=altered_cluster_signatures,
+                    max_seed_cluster_id=0,
+                    signatures={},
+                ),
+                arrow_path_payload,
+                context="Clusterer.predict_incremental_from_arrow_paths",
+            )
+        if not seed_signature_to_cluster:
+            raise ValueError("Promoted incremental linker mode requires at least one seed cluster")
+
+        block_signature_ids = [str(signature_id) for signature_id in block_signatures]
+        unassigned_signature_ids = [
+            signature_id for signature_id in block_signature_ids if signature_id not in seed_signature_to_cluster
+        ]
+        altered_signature_ids = _altered_cluster_signatures_from_values_or_arrow(
+            altered_cluster_signatures,
+            arrow_path_payload,
+        )
+        altered_cluster_ids = {
+            str(seed_signature_to_cluster[signature_id])
+            for signature_id in altered_signature_ids
+            if signature_id in seed_signature_to_cluster
+        }
+        altered_seed_signature_ids = [
+            signature_id
+            for signature_id, cluster_id in seed_signature_to_cluster.items()
+            if str(cluster_id) in altered_cluster_ids
+        ]
+        metadata_signature_ids = (*unassigned_signature_ids, *altered_seed_signature_ids)
+        signatures = _load_arrow_incremental_signature_info(arrow_path_payload, metadata_signature_ids)
+        request_dataset = _ArrowIncrementalPredictionDataset(
+            arrow_paths=arrow_path_payload,
+            name_tuples=name_tuples,
+            cluster_seeds_require=explicit_cluster_seeds_require,
+            cluster_seeds_disallow=cluster_seeds_disallow,
+            altered_cluster_signatures=altered_cluster_signatures,
+            max_seed_cluster_id=_max_seed_cluster_id_from_seed_map(seed_signature_to_cluster),
+            signatures=signatures,
+        )
+        if require_name_counts_index:
+            _apply_dataset_name_count_semantics_for_prediction(self, cast(ANDData, request_dataset))
+        logger.info("Running direct Arrow promoted incremental prediction")
+        incremental_result = predict_incremental_promoted_linker_from_arrow_paths(
+            self,
+            block_signature_ids,
+            cast(ANDData, request_dataset),
+            arrow_paths=arrow_path_payload,
+            artifact_dir=Path(
+                getattr(self, "incremental_linker_artifact_dir", None) or DEFAULT_INCREMENTAL_LINKER_ARTIFACT_DIR
+            ),
+            prevent_new_incompatibilities=prevent_new_incompatibilities,
+            partial_supervision=partial_supervision,
+            runtime_context=runtime_context,
+            total_ram_bytes=total_ram_bytes,
+            batching_threshold=batching_threshold,
+            resolve_total_ram_bytes=_resolve_total_ram_bytes_for_incremental,
+            build_incremental_result=_build_incremental_result,
+        )
+        return dict(incremental_result["clusters"]) if return_clusters_only else incremental_result
 
     def predict_incremental(
         self,

@@ -60,10 +60,12 @@ filtered-read bypass and the single-pair Rust constraint API must not reappear.
 ## Compatibility And Python-Heavy Paths
 
 Production Rust inference uses `Clusterer.predict_from_arrow_paths(...)`,
-Arrow-routed `Clusterer.predict(...)`, or promoted
-`Clusterer.predict_incremental(...)` with complete base Arrow artifacts. The
-paths below remain useful, but they are compatibility, training, parity, or test
-surfaces rather than production inference APIs.
+Arrow-routed `Clusterer.predict(...)`, promoted
+`Clusterer.predict_incremental(...)` with complete base Arrow artifacts, or
+`Clusterer.predict_incremental_from_arrow_paths(...)` when callers have Arrow
+artifacts and request seed state but do not have an `ANDData`-shaped dataset
+object. The paths below remain useful, but they are compatibility, training,
+parity, or test surfaces rather than production inference APIs.
 
 Removed bridge surfaces: `RustFeaturizer.from_feature_block(...)` and raw
 payload scoring wrappers are no longer Rust inference APIs. They built or

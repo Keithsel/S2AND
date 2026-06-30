@@ -509,6 +509,232 @@ def test_predict_incremental_explicit_rust_backend_uses_promoted_linker_by_defau
     assert captured["arrow_paths"] == arrow_paths
 
 
+def test_predict_incremental_from_arrow_paths_uses_promoted_linker_without_dataset(
+    clusterer_dataset_factory,
+    monkeypatch,
+    tmp_path,
+):
+    clusterer, _dataset = clusterer_dataset_factory(name="dummy_incremental_direct_arrow")
+    arrow_paths = _minimal_arrow_paths(tmp_path)
+    cluster_seeds_path = tmp_path / "cluster_seeds.arrow"
+    write_cluster_seeds_arrow(cluster_seeds_path, {"3": "0", "4": "0"})
+    arrow_paths["cluster_seeds"] = str(cluster_seeds_path)
+    block = ["3", "4", "5", "6"]
+    runtime_context = cast(Any, SimpleNamespace(run_id="test-direct-arrow"))
+    captured: dict[str, Any] = {}
+    payload = {
+        "clusters": {"0": ["3", "4", "5"], "1": ["6"]},
+        "phase_b_mode": "exact",
+        "phase_b_budget_bytes": 0,
+        "phase_b_required_bytes": 0,
+    }
+
+    def fake_load_signature_info(paths: Mapping[str, Any], signature_ids: Any) -> dict[str, Any]:
+        captured["metadata_paths"] = dict(paths)
+        captured["metadata_signature_ids"] = tuple(signature_ids)
+        return {
+            str(signature_id): model_module._ArrowIncrementalSignatureInfo(
+                paper_id=f"p{signature_id}",
+                author_info_first="Alex",
+                author_info_last="Smith",
+                author_info_first_normalized_without_apostrophe="alex",
+                author_info_orcid=None,
+            )
+            for signature_id in signature_ids
+        }
+
+    def fake_promoted_linker(clusterer_arg: Any, block_signatures_arg: list[str], dataset_arg: Any, **kwargs: Any):
+        captured["clusterer"] = clusterer_arg
+        captured["block_signatures"] = list(block_signatures_arg)
+        captured["dataset"] = dataset_arg
+        captured.update(kwargs)
+        return dict(payload)
+
+    monkeypatch.setattr(model_module, "_load_arrow_incremental_signature_info", fake_load_signature_info)
+    monkeypatch.setattr(
+        model_module,
+        "predict_incremental_promoted_linker_from_arrow_paths",
+        fake_promoted_linker,
+    )
+
+    result = clusterer.predict_incremental_from_arrow_paths(
+        block,
+        arrow_paths,
+        batching_threshold=2,
+        total_ram_bytes=100_000,
+        runtime_context=runtime_context,
+        name_tuples={("alex", "al")},
+    )
+
+    assert result == payload
+    assert captured["clusterer"] is clusterer
+    assert captured["block_signatures"] == block
+    assert not isinstance(captured["dataset"], ANDData)
+    assert captured["dataset"].cluster_seeds_require == {}
+    assert captured["dataset"].name_tuples == {("alex", "al")}
+    assert captured["dataset"].arrow_paths["cluster_seeds"] == str(cluster_seeds_path)
+    assert captured["arrow_paths"]["cluster_seeds"] == str(cluster_seeds_path)
+    assert captured["runtime_context"] is runtime_context
+    assert captured["batching_threshold"] == 2
+    assert captured["total_ram_bytes"] == 100_000
+    assert captured["metadata_signature_ids"] == ("5", "6")
+    assert set(captured["dataset"].signatures) == {"5", "6"}
+
+
+def test_predict_incremental_from_arrow_paths_accepts_explicit_seed_mapping(
+    clusterer_dataset_factory,
+    monkeypatch,
+    tmp_path,
+):
+    clusterer, _dataset = clusterer_dataset_factory(name="dummy_incremental_direct_arrow_seed_mapping")
+    arrow_paths = _minimal_arrow_paths(tmp_path)
+    captured: dict[str, Any] = {}
+
+    def fake_load_signature_info(_paths: Mapping[str, Any], signature_ids: Any) -> dict[str, Any]:
+        captured["metadata_signature_ids"] = tuple(signature_ids)
+        return {}
+
+    def fake_promoted_linker(_clusterer: Any, _block_signatures: list[str], dataset_arg: Any, **_kwargs: Any):
+        captured["dataset"] = dataset_arg
+        return {"clusters": {"0": ["3", "4", "5"]}}
+
+    monkeypatch.setattr(model_module, "_load_arrow_incremental_signature_info", fake_load_signature_info)
+    monkeypatch.setattr(
+        model_module,
+        "predict_incremental_promoted_linker_from_arrow_paths",
+        fake_promoted_linker,
+    )
+
+    result = clusterer.predict_incremental_from_arrow_paths(
+        ["3", "4", "5"],
+        arrow_paths,
+        cluster_seeds_require={"3": 0, "4": 0},
+        return_clusters_only=True,
+    )
+
+    assert result == {"0": ["3", "4", "5"]}
+    assert captured["dataset"].cluster_seeds_require == {"3": "0", "4": "0"}
+    assert captured["metadata_signature_ids"] == ("5",)
+
+
+def test_predict_incremental_from_arrow_paths_requires_seed_source(
+    clusterer_dataset_factory,
+    monkeypatch,
+    tmp_path,
+):
+    clusterer, _dataset = clusterer_dataset_factory(name="dummy_incremental_direct_arrow_no_seeds")
+    arrow_paths = _minimal_arrow_paths(tmp_path)
+    monkeypatch.setattr(
+        model_module,
+        "predict_incremental_promoted_linker_from_arrow_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("promoted linker should not run")),
+    )
+
+    with pytest.raises(model_module.MissingArrowArtifactError, match="cluster_seeds_source"):
+        clusterer.predict_incremental_from_arrow_paths(["3", "4", "5"], arrow_paths)
+
+
+def test_predict_incremental_from_arrow_paths_loads_altered_seed_metadata(
+    clusterer_dataset_factory,
+    monkeypatch,
+    tmp_path,
+):
+    clusterer, _dataset = clusterer_dataset_factory(name="dummy_incremental_direct_arrow_altered")
+    arrow_paths = _minimal_arrow_paths(tmp_path)
+    cluster_seeds_path = tmp_path / "cluster_seeds.arrow"
+    altered_path = tmp_path / "altered_cluster_signatures.arrow"
+    write_cluster_seeds_arrow(cluster_seeds_path, {"3": "0", "4": "0", "8": "1"})
+    write_altered_cluster_signatures_arrow(altered_path, ["3"])
+    arrow_paths["cluster_seeds"] = str(cluster_seeds_path)
+    arrow_paths["altered_cluster_signatures"] = str(altered_path)
+    captured: dict[str, Any] = {}
+
+    def fake_load_signature_info(_paths: Mapping[str, Any], signature_ids: Any) -> dict[str, Any]:
+        captured["metadata_signature_ids"] = tuple(signature_ids)
+        return {
+            str(signature_id): model_module._ArrowIncrementalSignatureInfo(
+                paper_id=f"p{signature_id}",
+                author_info_first="Alex",
+                author_info_last="Smith",
+                author_info_first_normalized_without_apostrophe="alex",
+                author_info_orcid=None,
+            )
+            for signature_id in signature_ids
+        }
+
+    def fake_promoted_linker(_clusterer: Any, _block_signatures: list[str], dataset_arg: Any, **_kwargs: Any):
+        captured["dataset"] = dataset_arg
+        return {"clusters": {"0": ["3", "4", "5"]}}
+
+    monkeypatch.setattr(model_module, "_load_arrow_incremental_signature_info", fake_load_signature_info)
+    monkeypatch.setattr(
+        model_module,
+        "predict_incremental_promoted_linker_from_arrow_paths",
+        fake_promoted_linker,
+    )
+
+    clusterer.predict_incremental_from_arrow_paths(["3", "4", "5"], arrow_paths)
+
+    assert set(captured["metadata_signature_ids"]) == {"3", "4", "5"}
+    assert captured["dataset"].altered_cluster_signatures is None
+    assert set(captured["dataset"].signatures) == {"3", "4", "5"}
+
+
+def test_load_arrow_incremental_signature_info_scans_signatures_without_index(tmp_path: Path) -> None:
+    import pyarrow as pa
+
+    signatures_path = tmp_path / "signatures.arrow"
+    schema = pa.schema(
+        [
+            ("signature_id", pa.string()),
+            ("paper_id", pa.string()),
+            ("author_first", pa.string()),
+            ("author_middle", pa.string()),
+            ("author_last", pa.string()),
+            ("author_orcid", pa.string()),
+        ]
+    )
+    batches = [
+        pa.record_batch(
+            [
+                pa.array(["s1"], type=pa.string()),
+                pa.array(["p1"], type=pa.string()),
+                pa.array(["Alice"], type=pa.string()),
+                pa.array([""], type=pa.string()),
+                pa.array(["Jones"], type=pa.string()),
+                pa.array([None], type=pa.string()),
+            ],
+            schema=schema,
+        ),
+        pa.record_batch(
+            [
+                pa.array(["s2"], type=pa.string()),
+                pa.array(["p2"], type=pa.string()),
+                pa.array(["Anne-Marie"], type=pa.string()),
+                pa.array([""], type=pa.string()),
+                pa.array(["Ng"], type=pa.string()),
+                pa.array(["0000-0002"], type=pa.string()),
+            ],
+            schema=schema,
+        ),
+    ]
+    with pa.OSFile(str(signatures_path), "wb") as sink:
+        with pa.ipc.new_file(sink, schema) as writer:
+            for batch in batches:
+                writer.write_batch(batch)
+
+    signatures = model_module._load_arrow_incremental_signature_info(
+        {"signatures": str(signatures_path)},
+        ["s2"],
+    )
+
+    assert set(signatures) == {"s2"}
+    assert signatures["s2"].paper_id == "p2"
+    assert signatures["s2"].author_info_first == "Anne-Marie"
+    assert signatures["s2"].author_info_last == "Ng"
+    assert signatures["s2"].author_info_orcid == "0000-0002"
+
+
 def test_predict_incremental_arrow_promoted_linker_cleans_up_temp_seed_context_on_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

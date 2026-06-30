@@ -452,6 +452,32 @@ result = clusterer.predict_incremental(
 clusters = result["clusters"]
 ```
 
+Incremental prediction directly from Arrow paths, without constructing an
+`ANDData`-shaped dataset object:
+
+```python
+result = clusterer.predict_incremental_from_arrow_paths(
+    block_signatures,
+    {
+        "signatures": ".../signatures.arrow",
+        "papers": ".../papers.arrow",
+        "paper_authors": ".../paper_authors.arrow",
+        "signatures_batch_index": ".../signatures.signatures_batch_index.bin",
+        "papers_batch_index": ".../papers.papers_batch_index.bin",
+        "paper_authors_batch_index": ".../paper_authors.paper_authors_batch_index.bin",
+        "specter": ".../specter2.arrow",
+        "specter_batch_index": ".../specter2.specter_batch_index.bin",
+        "name_counts_index": ".../name_counts_index",
+        "cluster_seeds": ".../cluster_seeds.arrow",
+    },
+    batching_threshold=5000,
+    total_ram_bytes=32 * 1024**3,
+    name_tuples=filtered,
+)
+
+clusters = result["clusters"]
+```
+
 ### Rust promoted incremental target
 
 The target behavior is that `Clusterer.predict_incremental(...)` uses the

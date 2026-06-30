@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import orjson
 from tqdm import tqdm
 
 from s2and import feature_port, memory_budget
@@ -100,7 +99,8 @@ def _ensure_python_pair_signature_ngrams(
 
     has_missing_ngrams, inspected_signature_count = _has_missing_signature_ngrams_for_pairs(dataset, signature_pairs)
     if not has_missing_ngrams:
-        dataset._s2and_python_pair_ngrams_ready = True
+        if inspected_signature_count == len(getattr(dataset, "signatures", {})):
+            dataset._s2and_python_pair_ngrams_ready = True
         return
 
     materialize_start = time.perf_counter()
@@ -161,7 +161,6 @@ def _maybe_calibrate_rust_batch_fixed_overhead_bytes(
     *,
     rust_featurizer: Any,
     pieces_of_work: list[tuple[tuple[str, str], int]],
-    use_indexed_pairs: bool,
     signature_id_to_index: dict[Any, int],
     rust_selected_indices: list[int] | None,
     selected_feature_count: int,
@@ -223,38 +222,22 @@ def _maybe_calibrate_rust_batch_fixed_overhead_bytes(
             rss_now_bytes, _ = memory_budget.current_rss_bytes_best_effort(total_ram_for_stage)
             rss_peak_bytes = max(rss_peak_bytes, int(rss_now_bytes))
 
-            if use_indexed_pairs:
-                probe_pairs_indexed = [
-                    (
-                        _signature_id_to_index_or_raise(signature_id_to_index, pair[0]),
-                        _signature_id_to_index_or_raise(signature_id_to_index, pair[1]),
-                    )
-                    for pair in probe_pairs
-                ]
-                probe_chunk = np.asarray(
-                    rust_featurizer.featurize_pairs_matrix_indexed(
-                        probe_pairs_indexed,
-                        rust_selected_indices,
-                        int(num_threads),
-                        np.nan,
-                    ),
-                    dtype=np.float64,
+            probe_pairs_indexed = [
+                (
+                    _signature_id_to_index_or_raise(signature_id_to_index, pair[0]),
+                    _signature_id_to_index_or_raise(signature_id_to_index, pair[1]),
                 )
-            elif hasattr(rust_featurizer, "featurize_pairs_matrix"):
-                probe_chunk = np.asarray(
-                    rust_featurizer.featurize_pairs_matrix(
-                        probe_pairs,
-                        rust_selected_indices,
-                        int(num_threads),
-                        np.nan,
-                    ),
-                    dtype=np.float64,
-                )
-            else:
-                probe_chunk = np.asarray(
-                    rust_featurizer.featurize_pairs(probe_pairs, num_threads=int(num_threads)),
-                    dtype=np.float64,
-                )
+                for pair in probe_pairs
+            ]
+            probe_chunk = np.asarray(
+                rust_featurizer.featurize_pairs_matrix_indexed(
+                    probe_pairs_indexed,
+                    rust_selected_indices,
+                    int(num_threads),
+                    np.nan,
+                ),
+                dtype=np.float64,
+            )
 
             rss_after_call_bytes, _ = memory_budget.current_rss_bytes_best_effort(total_ram_for_stage)
             rss_peak_bytes = max(rss_peak_bytes, int(rss_after_call_bytes))
@@ -817,24 +800,6 @@ class FeaturizationInfo:
         """
         return os.path.join(CACHE_ROOT, dataset_name, str(self.featurizer_version))
 
-    def cache_file_path(self, dataset_name: str) -> str:
-        """
-        returns the legacy JSON file path for the features cache
-
-        Parameters
-        ----------
-        dataset_name: string
-            the name of the dataset
-
-        Returns
-        -------
-        string: the full file path for the features cache file
-        """
-        return os.path.join(
-            self.cache_directory(dataset_name),
-            "all_features.json",
-        )
-
     def cache_db_path(self, dataset_name: str) -> str:
         """
         returns the SQLite database path for the features cache
@@ -905,28 +870,6 @@ class FeaturizationInfo:
             """
         )
 
-    def _load_legacy_json_cache(self, legacy_path: str) -> dict[str, Any]:
-        cached_features = self._fresh_cache_payload()
-        try:
-            with open(legacy_path, "rb") as cache_file:
-                payload = orjson.loads(cache_file.read())
-        except ValueError:
-            with open(legacy_path, encoding="utf-8") as cache_file:
-                payload = json.load(cache_file)
-
-        if not isinstance(payload, dict):
-            raise ValueError(f"Invalid legacy pair-feature cache at {legacy_path}: expected object payload")
-        features = payload.get("features")
-        if not isinstance(features, dict):
-            raise ValueError(f"Invalid legacy pair-feature cache at {legacy_path}: missing features object")
-        cached_features["features"] = features
-        stored_features_to_use = payload.get("features_to_use")
-        if isinstance(stored_features_to_use, list) and all(isinstance(value, str) for value in stored_features_to_use):
-            cached_features["features_to_use"] = list(stored_features_to_use)
-        cached_features["__cache_backend__"] = "legacy_json"
-        cached_features["__legacy_cache_path__"] = legacy_path
-        return cached_features
-
     def _load_sqlite_cache(self, db_path: str) -> dict[str, Any]:
         cached_features = self._fresh_cache_payload()
         with sqlite3.connect(db_path, timeout=PAIR_FEATURE_CACHE_BUSY_TIMEOUT_SECONDS) as connection:
@@ -959,11 +902,8 @@ class FeaturizationInfo:
     def load_cache(self, dataset_name: str) -> dict[str, Any]:
         """Load the persisted pair-feature cache for a dataset."""
         db_path = self.cache_db_path(dataset_name)
-        legacy_path = self.cache_file_path(dataset_name)
         if os.path.exists(db_path):
             return self._load_sqlite_cache(db_path)
-        if os.path.exists(legacy_path):
-            return self._load_legacy_json_cache(legacy_path)
         cached_features = self._fresh_cache_payload()
         cached_features["__cache_backend__"] = "empty"
         return cached_features
@@ -996,12 +936,8 @@ class FeaturizationInfo:
         if not isinstance(new_features, dict):
             raise ValueError("cached_features['__new_features__'] must be a dictionary")
 
-        migrating_legacy_cache = cached_features.get("__cache_backend__") == "legacy_json"
         replace_existing_rows = not incremental
-        if incremental:
-            features_to_persist = full_features if migrating_legacy_cache else new_features
-        else:
-            features_to_persist = full_features
+        features_to_persist = new_features if incremental else full_features
         if len(features_to_persist) <= 0:
             return
 
@@ -1106,24 +1042,6 @@ def _single_pair_featurize(
         raise RuntimeError("global_dataset is not initialized; call many_pairs_featurize first")
 
     features = []
-    if runtime_context is None:
-        runtime_context = global_runtime_context
-    if runtime_context is None:
-        runtime_context = build_runtime_context("pair_featurization", emit_startup_warning=False)
-    use_rust = _use_rust_featurizer(runtime_context)
-    if use_rust and feature_port.s2and_rust is not None:
-        try:
-            features = feature_port.featurize_pair_rust(
-                dataset,
-                work_input[0],
-                work_input[1],
-                runtime_context=runtime_context,
-            )
-            return features, index
-        except Exception as exc:
-            raise RuntimeError(
-                "Rust pair featurization failed " f"(run_id={runtime_context.run_id} pair={work_input} error={exc})"
-            ) from exc
 
     signature_1 = dataset.signatures[work_input[0]]
     signature_2 = dataset.signatures[work_input[1]]
@@ -1326,7 +1244,7 @@ def _single_pair_featurize(
     )
 
     # unifying feature type in features array
-    features = [float(val) if type(val) in [np.float32, np.float64, float] else int(val) for val in features]
+    features = [float(val) if isinstance(val, np.floating | float) else int(val) for val in features]
 
     return features, index
 
@@ -1480,20 +1398,20 @@ def _execute_rust_batch_featurization_phase(
         dataset,
         runtime_context=runtime_context,
     )
-    use_indexed_pairs = bool(
-        hasattr(rust_featurizer, "featurize_pairs_matrix_indexed") and hasattr(rust_featurizer, "signature_ids")
-    )
-    supports_matrix_api = bool(use_indexed_pairs or hasattr(rust_featurizer, "featurize_pairs_matrix"))
+    if not hasattr(rust_featurizer, "featurize_pairs_matrix_indexed") or not hasattr(rust_featurizer, "signature_ids"):
+        raise RuntimeError(
+            "Rust batch pair featurization requires featurize_pairs_matrix_indexed and signature_ids; "
+            "rebuild/install a supported s2and-rust extension."
+        )
     rust_selected_indices: list[int] | None = None
-    if supports_matrix_api and not cache_policy.requires_full_feature_rows and len(indices_needed_for_compute) > 0:
+    if not cache_policy.requires_full_feature_rows and len(indices_needed_for_compute) > 0:
         rust_selected_indices = indices_needed_for_compute
     signature_id_to_index: dict[Any, int] = {}
-    if use_indexed_pairs:
-        rust_signature_ids = rust_featurizer.signature_ids()
-        for idx, sig_id in enumerate(rust_signature_ids):
-            signature_id_to_index[sig_id] = int(idx)
-            signature_id_to_index[str(sig_id)] = int(idx)
-        logger.info("Rust indexed pair API enabled (signature_count=%d)", len(signature_id_to_index))
+    rust_signature_ids = rust_featurizer.signature_ids()
+    for idx, sig_id in enumerate(rust_signature_ids):
+        signature_id_to_index[sig_id] = int(idx)
+        signature_id_to_index[str(sig_id)] = int(idx)
+    logger.info("Rust indexed pair API enabled (signature_count=%d)", len(signature_id_to_index))
     rust_feature_count = NUM_FEATURES if rust_selected_indices is None else len(rust_selected_indices)
     rust_prediction_params = memory_budget.resolve_rust_batch_prediction_params()
     configured_fixed_overhead_bytes = int(rust_prediction_params["fixed_overhead_bytes"])
@@ -1502,7 +1420,6 @@ def _execute_rust_batch_featurization_phase(
         calibrated_fixed_overhead_bytes = _maybe_calibrate_rust_batch_fixed_overhead_bytes(
             rust_featurizer=rust_featurizer,
             pieces_of_work=pieces_of_work,
-            use_indexed_pairs=use_indexed_pairs,
             signature_id_to_index=signature_id_to_index,
             rust_selected_indices=rust_selected_indices,
             selected_feature_count=len(indices_to_use),
@@ -1601,44 +1518,22 @@ def _execute_rust_batch_featurization_phase(
             while start_index < len(pieces_of_work):
                 chunk_work = pieces_of_work[start_index : start_index + target_chunk_size]
                 rust_pairs_chunk = [pair for pair, _ in chunk_work]
-                if use_indexed_pairs:
-                    rust_pairs_chunk_indexed = [
-                        (
-                            _signature_id_to_index_or_raise(signature_id_to_index, pair[0]),
-                            _signature_id_to_index_or_raise(signature_id_to_index, pair[1]),
-                        )
-                        for pair in rust_pairs_chunk
-                    ]
-                    rust_features_chunk = np.asarray(
-                        rust_featurizer.featurize_pairs_matrix_indexed(
-                            rust_pairs_chunk_indexed,
-                            rust_selected_indices,
-                            num_threads,
-                            np.nan,
-                        ),
-                        dtype=np.float64,
+                rust_pairs_chunk_indexed = [
+                    (
+                        _signature_id_to_index_or_raise(signature_id_to_index, pair[0]),
+                        _signature_id_to_index_or_raise(signature_id_to_index, pair[1]),
                     )
-                elif hasattr(rust_featurizer, "featurize_pairs_matrix"):
-                    rust_features_chunk = np.asarray(
-                        rust_featurizer.featurize_pairs_matrix(
-                            rust_pairs_chunk,
-                            rust_selected_indices,
-                            num_threads,
-                            np.nan,
-                        ),
-                        dtype=np.float64,
-                    )
-                else:
-                    if rust_selected_indices is not None:
-                        raise RuntimeError(
-                            "Rust batch selected-indices requested but "
-                            "featurize_pairs_matrix APIs are unavailable "
-                            f"(run_id={runtime_context.run_id})"
-                        )
-                    rust_features_chunk = np.asarray(
-                        rust_featurizer.featurize_pairs(rust_pairs_chunk, num_threads=num_threads),
-                        dtype=np.float64,
-                    )
+                    for pair in rust_pairs_chunk
+                ]
+                rust_features_chunk = np.asarray(
+                    rust_featurizer.featurize_pairs_matrix_indexed(
+                        rust_pairs_chunk_indexed,
+                        rust_selected_indices,
+                        num_threads,
+                        np.nan,
+                    ),
+                    dtype=np.float64,
+                )
 
                 if rust_features_chunk.shape[0] != len(chunk_work):
                     raise RuntimeError(
@@ -1798,24 +1693,17 @@ def many_pairs_featurize(
     rust_batch_rss_baseline_locked = False
     rust_batch_adaptive_halvings = 0
 
+    rust_module_available = False
     if _use_rust_featurizer(runtime_context):
-        if feature_port.s2and_rust is None:
-            if stage_uses_rust(runtime_context):
-                raise RuntimeError(
-                    "Rust backend requested for pair_featurization but s2and_rust extension is unavailable "
-                    f"(run_id={runtime_context.run_id})"
-                )
-        else:
-            try:
-                # Prewarm so from_dataset build doesn't land inside the RSS measurement window.
-                feature_port._get_rust_featurizer(
-                    dataset,
-                    runtime_context=runtime_context,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Rust featurizer init failed " f"(run_id={runtime_context.run_id} error={exc})"
-                ) from exc
+        try:
+            # Prewarm so from_dataset build doesn't land inside the RSS measurement window.
+            feature_port._get_rust_featurizer(
+                dataset,
+                runtime_context=runtime_context,
+            )
+            rust_module_available = True
+        except Exception as exc:
+            raise RuntimeError("Rust featurizer init failed " f"(run_id={runtime_context.run_id} error={exc})") from exc
         try:
             rust_batch_total_ram_for_stage, _ = memory_budget.resolve_total_ram_bytes(total_ram_bytes)
             rust_batch_rss_before_bytes, rust_batch_rss_source = memory_budget.current_rss_bytes_best_effort(
@@ -1840,9 +1728,7 @@ def many_pairs_featurize(
         if not os.path.exists(featurizer_info.cache_directory(dataset.name)):
             os.makedirs(featurizer_info.cache_directory(dataset.name))
         cache_storage_key = featurizer_info.cache_storage_key(dataset.name)
-        if os.path.exists(featurizer_info.cache_db_path(dataset.name)) or os.path.exists(
-            featurizer_info.cache_file_path(dataset.name)
-        ):
+        if os.path.exists(featurizer_info.cache_db_path(dataset.name)):
             with _CACHED_FEATURES_LOCK:
                 in_memory = CACHED_FEATURES.get(cache_storage_key)
             if in_memory is not None:
@@ -1874,7 +1760,7 @@ def many_pairs_featurize(
     coauthor_similarity_index: int | None = None
     coauthor_similarity_values: np.ndarray | None = None
     if delete_training_data:
-        coauthor_similarity_index = featurizer_info.get_feature_names().index("coauthor_similarity")
+        coauthor_similarity_index = featurizer_info.feature_group_to_index["coauthor_similarity"][1]
         coauthor_similarity_values = np.full(len(signature_pairs), -float(LARGE_INTEGER), dtype=np.float64)
 
     indices_needed_for_compute: list[int] = sorted(
@@ -1940,7 +1826,6 @@ def many_pairs_featurize(
 
     if cache_changed:
         use_rust = _use_rust_featurizer(runtime_context)
-        rust_module_available = feature_port.s2and_rust is not None if use_rust else False
         if use_rust and not rust_module_available:
             raise RuntimeError(
                 "Rust backend requested for pair_featurization but s2and_rust extension is unavailable "

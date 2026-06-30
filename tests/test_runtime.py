@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from s2and import feature_port, runtime, rust_calls
+from s2and import feature_port, runtime
 from s2and.featurizer import FeaturizationInfo, many_pairs_featurize
 from tests.helpers import build_dummy_dataset
 
@@ -18,8 +18,19 @@ def _runtime_capabilities(*, core_available: bool, reason: str) -> runtime.RustR
     return runtime.RustRuntimeCapabilities(
         extension_importable=core_available,
         core_runtime_available=core_available,
+        from_dataset_available=core_available,
         from_dataset_paper_preprocess_available=core_available,
         reason=reason,
+    )
+
+
+def _arrow_only_runtime_capabilities() -> runtime.RustRuntimeCapabilities:
+    return runtime.RustRuntimeCapabilities(
+        extension_importable=True,
+        core_runtime_available=True,
+        from_dataset_available=False,
+        from_dataset_paper_preprocess_available=False,
+        reason="rust_core_available",
     )
 
 
@@ -59,6 +70,74 @@ def test_resolve_backend_prefers_explicit_s2and_backend(monkeypatch: pytest.Monk
     assert resolution.source == "S2AND_BACKEND"
 
 
+def test_resolve_backend_argument_overrides_env(monkeypatch: pytest.MonkeyPatch):
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("S2AND_BACKEND", "python")
+    monkeypatch.setattr(
+        runtime,
+        "detect_rust_runtime_capabilities",
+        lambda: _runtime_capabilities(core_available=True, reason="rust_core_available"),
+    )
+
+    resolution = runtime.resolve_backend_for_request(backend="rust", emit_startup_warning=False)
+
+    assert resolution.requested_backend == "rust"
+    assert resolution.resolved_backend == "rust"
+    assert resolution.source == "argument"
+
+
+def test_build_runtime_context_accepts_backend_argument(monkeypatch: pytest.MonkeyPatch):
+    _clear_runtime_env(monkeypatch)
+
+    context = runtime.build_runtime_context("unit_test", backend="python", emit_startup_warning=False)
+
+    assert context.requested_backend == "python"
+    assert context.resolved_backend == "python"
+    assert context.source == "argument"
+    assert context.use_rust is False
+
+
+def test_build_runtime_context_auto_uses_python_for_from_dataset_stage_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setattr(
+        runtime,
+        "_auto_backend_capability_probe",
+        lambda: (True, "rust_core_available"),
+    )
+    monkeypatch.setattr(runtime, "detect_rust_runtime_capabilities", _arrow_only_runtime_capabilities)
+
+    context = runtime.build_runtime_context("featurization_run", emit_startup_warning=False)
+
+    assert context.resolved_backend == "python"
+    assert context.use_rust is False
+    assert context.from_dataset_available is False
+
+
+def test_build_runtime_context_allows_arrow_production_when_from_dataset_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setattr(runtime, "detect_rust_runtime_capabilities", _arrow_only_runtime_capabilities)
+
+    context = runtime.build_runtime_context("cluster_predict", backend="rust", emit_startup_warning=False)
+
+    assert context.resolved_backend == "rust"
+    assert context.use_rust is True
+    assert context.from_dataset_available is False
+
+
+def test_build_runtime_context_explicit_rust_rejects_from_dataset_stage_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setattr(runtime, "detect_rust_runtime_capabilities", _arrow_only_runtime_capabilities)
+
+    with pytest.raises(RuntimeError, match="RustFeaturizer.from_dataset is unavailable"):
+        runtime.build_runtime_context("featurization_run", backend="rust", emit_startup_warning=False)
+
+
 def test_resolve_backend_explicit_rust_raises_when_runtime_unavailable(monkeypatch: pytest.MonkeyPatch):
     _clear_runtime_env(monkeypatch)
     monkeypatch.setenv("S2AND_BACKEND", "rust")
@@ -96,20 +175,6 @@ def test_resolve_backend_explicit_rust_uses_capability_probe(monkeypatch: pytest
     assert resolution.requested_backend == "rust"
     assert resolution.resolved_backend == "rust"
     assert resolution.capability_reason == "rust_core_available"
-
-
-def test_rust_calls_missing_matrix_reports_runtime_minimum() -> None:
-    class MissingMatrixFeaturizer:
-        pass
-
-    with pytest.raises(RuntimeError) as exc_info:
-        rust_calls.get_constraints_matrix_rust(
-            dataset=object(),
-            pairs=[],
-            featurizer=MissingMatrixFeaturizer(),
-        )
-
-    assert f"s2and-rust>={runtime.min_supported_rust_extension_version_string()}" in str(exc_info.value)
 
 
 def test_resolve_backend_auto_env_uses_capability_probe(monkeypatch: pytest.MonkeyPatch):
@@ -194,16 +259,9 @@ def test_rust_backend_pair_featurization_fails_fast_on_rust_error(monkeypatch):
 
     class FailingRustFeaturizer:
         def signature_ids(self):
-            return []
+            return sorted(dataset.signatures.keys())
 
         def featurize_pairs_matrix_indexed(self, _pairs, _indices, _threads, _nan):
-            raise RuntimeError("synthetic rust batch failure")
-
-        def featurize_pairs_matrix(self, *_args, **_kwargs):
-            raise RuntimeError("synthetic rust batch failure")
-
-        def featurize_pairs(self, _pairs, num_threads=None):
-            del num_threads
             raise RuntimeError("synthetic rust batch failure")
 
     monkeypatch.setattr(feature_port, "s2and_rust", object())

@@ -142,10 +142,6 @@ jobs:
         if: matrix.lane == 'rust-enabled'
         run: uv run pytest -q tests/test_rust_batch_chunking.py
 
-      - name: "Rust parity guardrail: JSON ingest parity"
-        if: matrix.lane == 'rust-enabled'
-        run: uv run pytest -q tests/test_rust_from_json_paths.py
-
       # Type checking (ty with tuned migration rules)
       - name: ty (s2and)
         run: |

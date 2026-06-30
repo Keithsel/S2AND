@@ -32,17 +32,37 @@ def test_resolve_total_ram_arg_overrides_autodetect():
     assert source == "arg"
 
 
-def test_emit_memory_telemetry_writes_jsonl(monkeypatch, tmp_path):
+def test_emit_memory_telemetry_writes_jsonl(tmp_path):
     output_path = tmp_path / "memory_telemetry.jsonl"
-    monkeypatch.setenv(memory_budget.MEMORY_TELEMETRY_JSONL_ENV, str(output_path))
-
-    memory_budget.emit_memory_telemetry({"stage": "test_stage", "value": 7})
+    previous_path = memory_budget.memory_telemetry_jsonl_path()
+    try:
+        memory_budget.configure_memory_telemetry_jsonl(output_path)
+        memory_budget.emit_memory_telemetry({"stage": "test_stage", "value": 7})
+    finally:
+        memory_budget.configure_memory_telemetry_jsonl(previous_path)
 
     record = json.loads(output_path.read_text(encoding="utf-8"))
     assert record["schema_version"] == 1
     assert record["event"] == "memory_telemetry"
     assert record["stage"] == "test_stage"
     assert record["value"] == 7
+
+
+def test_emit_memory_telemetry_uses_env_fallback(monkeypatch, tmp_path):
+    output_path = tmp_path / "memory_telemetry_env.jsonl"
+    previous_path = memory_budget.memory_telemetry_jsonl_path()
+    try:
+        memory_budget.configure_memory_telemetry_jsonl(None)
+        monkeypatch.setenv(memory_budget.MEMORY_TELEMETRY_JSONL_ENV, str(output_path))
+
+        memory_budget.emit_memory_telemetry({"stage": "env_stage", "value": 11})
+    finally:
+        memory_budget.configure_memory_telemetry_jsonl(previous_path)
+
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert record["event"] == "memory_telemetry"
+    assert record["stage"] == "env_stage"
+    assert record["value"] == 11
 
 
 def test_resolve_total_ram_cgroup_uses_safety_factor():
@@ -189,6 +209,25 @@ def test_compute_promoted_phase_a_limits_uses_top_k_largest_components():
     assert int(limits.predicted_pairs_per_batch) == 3500
     assert float(limits.observed_safety_multiplier) == pytest.approx(2.0)
     assert bool(limits.single_query_exceeds_budget) is False
+
+
+def test_compute_promoted_phase_a_limits_allows_zero_queries_with_default_batch_limit():
+    limits = memory_budget.compute_promoted_phase_a_limits(
+        query_count=0,
+        component_sizes=[100, 50],
+        retrieval_top_k=2,
+        total_ram_bytes=1_000_000_000,
+        stage_budget_fraction=0.50,
+        fixed_overhead_bytes=1024,
+        detect_cgroup_fn=lambda: (None, "unavailable"),
+        detect_total_fn=lambda: (None, "unavailable"),
+        current_rss_fn=lambda _total: (100_000_000, "rss:test"),
+    )
+
+    assert int(limits.query_batch_size) == 0
+    assert int(limits.max_query_batch_size) == 1
+    assert int(limits.predicted_candidate_rows_per_batch) == 0
+    assert int(limits.predicted_pairs_per_batch) == 0
 
 
 def test_compute_promoted_phase_a_limits_shrinks_query_batch_under_tight_budget():

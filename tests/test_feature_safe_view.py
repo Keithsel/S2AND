@@ -11,7 +11,6 @@ from s2and.data import ANDData
 from s2and.feature_port import (
     _get_rust_featurizer,
     clear_rust_featurizer_cache,
-    get_constraint_rust,
     get_constraints_matrix_indexed_rust,
 )
 from s2and.runtime import build_runtime_context
@@ -112,14 +111,21 @@ def test_get_constraint_suppress_orcid_rust_parity() -> None:
     _require_rust()
     dataset = _feature_safe_dataset()
     clear_rust_featurizer_cache()
+    rust_featurizer = _get_rust_featurizer(dataset)
+    signature_index = {str(sig_id): idx for idx, sig_id in enumerate(rust_featurizer.signature_ids())}
+    indexed_pairs = [(signature_index["same_a"], signature_index["same_b"])]
 
-    assert get_constraint_rust(dataset, "same_a", "same_b") == dataset.get_constraint("same_a", "same_b")
-    assert get_constraint_rust(
+    assert get_constraints_matrix_indexed_rust(
         dataset,
-        "same_a",
-        "same_b",
+        indexed_pairs,
+        featurizer=rust_featurizer,
+    ) == [dataset.get_constraint("same_a", "same_b")]
+    assert get_constraints_matrix_indexed_rust(
+        dataset,
+        indexed_pairs,
+        featurizer=rust_featurizer,
         suppress_orcid=True,
-    ) == dataset.get_constraint("same_a", "same_b", suppress_orcid=True)
+    ) == [dataset.get_constraint("same_a", "same_b", suppress_orcid=True)]
 
 
 def test_cached_rust_featurizer_respects_suppress_orcid_per_call() -> None:

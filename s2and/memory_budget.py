@@ -14,6 +14,7 @@ logger = logging.getLogger("s2and")
 
 MEMORY_TELEMETRY_JSONL_ENV = "S2AND_MEMORY_TELEMETRY_JSONL"
 _MEMORY_TELEMETRY_LOCK = threading.Lock()
+_MEMORY_TELEMETRY_JSONL_PATH: Path | None = None
 
 AUTODETECT_RAM_SAFETY_FACTOR = 0.8
 DEFAULT_SAFETY_MARGIN_FRACTION = 0.10
@@ -164,13 +165,30 @@ def _json_safe_value(value: Any) -> Any:
     return str(value)
 
 
-def emit_memory_telemetry(record: Mapping[str, Any]) -> None:
-    """Append one structured memory telemetry record when configured by env var."""
+def configure_memory_telemetry_jsonl(path: str | Path | None) -> None:
+    """Configure the optional JSONL sink for structured memory telemetry."""
 
-    output_path_raw = os.environ.get(MEMORY_TELEMETRY_JSONL_ENV)
-    if not output_path_raw:
+    global _MEMORY_TELEMETRY_JSONL_PATH
+    _MEMORY_TELEMETRY_JSONL_PATH = None if path is None else Path(path)
+
+
+def memory_telemetry_jsonl_path() -> Path | None:
+    """Return the configured structured memory telemetry sink, if any."""
+
+    if _MEMORY_TELEMETRY_JSONL_PATH is not None:
+        return _MEMORY_TELEMETRY_JSONL_PATH
+    env_path = os.environ.get(MEMORY_TELEMETRY_JSONL_ENV)
+    if env_path is None or not env_path.strip():
+        return None
+    return Path(env_path)
+
+
+def emit_memory_telemetry(record: Mapping[str, Any]) -> None:
+    """Append one structured memory telemetry record when a sink is configured."""
+
+    output_path = memory_telemetry_jsonl_path()
+    if output_path is None:
         return
-    output_path = Path(output_path_raw)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "schema_version": 1,
@@ -768,12 +786,12 @@ def compute_promoted_phase_a_limits(
         current_rss_fn=current_rss_fn,
     )
     stage_budget_bytes = compute_stage_budget_bytes(snapshot.available_bytes, stage_budget_fraction)
-    # An explicitly supplied batch size must be positive, regardless of query_count.
-    # A None threshold with query_count == 0 is valid: the planner short-circuits to a
-    # zero-size batch below (no queries to batch), so it must not be rejected here.
-    if max_query_batch_size is not None and int(max_query_batch_size) <= 0:
+    if max_query_batch_size is None:
+        max_batch = 1 if parsed_query_count == 0 else parsed_query_count
+    else:
+        max_batch = int(max_query_batch_size)
+    if max_batch <= 0:
         raise ValueError(f"max_query_batch_size must be positive, got {max_query_batch_size}")
-    max_batch = parsed_query_count if max_query_batch_size is None else int(max_query_batch_size)
     max_batch = max(1, min(parsed_query_count if parsed_query_count > 0 else 1, max_batch))
 
     row_state_bytes_per_row = (

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
 import pytest
 
@@ -15,7 +17,7 @@ def test_ranked_query_rows_groups_in_first_seen_order_without_repeated_scans() -
         np.asarray(["q2", "q1", "q2", "q1", "q3", "q2"], dtype=object),
         np.asarray([0.4, 0.9, 0.8, 0.7, 0.1, 0.8], dtype=np.float64),
         retrieval_ranks=np.asarray([2, 1, 1, 2, 1, 3], dtype=np.int64),
-        component_keys=np.asarray(["b", "a", "a", "b", "z", "c"], dtype=object),
+        component_keys=cast(Any, np.asarray(["b", "a", "a", "b", "z", "c"], dtype=object)),
     )
 
     assert [group.tolist() for group in query_rows.groups] == [[0, 2, 5], [1, 3], [4]]
@@ -82,7 +84,7 @@ def test_build_logistic_gate_matrix_covers_feature_families() -> None:
         probabilities=probabilities,
         feature_values=feature_values,
         retrieval_ranks=feature_values["retrieval_rank"],
-        component_keys=np.asarray(["b", "a", "a", "b", "z", "c"], dtype=object),
+        component_keys=cast(Any, np.asarray(["b", "a", "a", "b", "z", "c"], dtype=object)),
     )
 
     assert [group.tolist() for group in query_rows.ranked_groups] == [[2, 5, 0], [1, 3], [4]]

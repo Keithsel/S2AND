@@ -2,25 +2,37 @@
 """
 This script demonstrates how to use the checked-in production S2AND model bundle for clustering.
 
-Default examples use `s2and/data/s2and_mini/*`.
+The production-oriented path uses Arrow inputs and calls
+`Clusterer.predict_from_arrow_paths(...)`. JSON/ANDData input remains available
+for legacy fixtures and subblocking knob examples.
 You can also point `--data-root` to `tests` and run `--dataset qian`.
 
 Examples:
-  # Bundled fixture + Rust backend
-  uv run --no-project python scripts/tutorial_for_predicting_with_the_prod_model.py \
-      --use-rust 1 --dataset qian --data-root tests --load-name-counts 0
+  # Arrow release + Rust backend
+  uv run python scripts/tutorial_for_predicting_with_the_prod_model.py \
+      --input-format arrow --use-rust 1 --dataset qian --arrow-data-root s2and/data
+
+  # Bundled JSON fixture + Rust backend
+  uv run python scripts/tutorial_for_predicting_with_the_prod_model.py \
+      --input-format json --use-rust 1 --dataset qian --data-root tests --load-name-counts 0
 
   # Show subblocking + memory budget knobs (for large blocks)
-  uv run --no-project python scripts/tutorial_for_predicting_with_the_prod_model.py \
+  uv run python scripts/tutorial_for_predicting_with_the_prod_model.py \
       --use-rust 1 --dataset qian --batching-threshold 5000 --desired-memory-use 25000000
 
   # Warm Rust featurizer before prediction
-  uv run --no-project python scripts/tutorial_for_predicting_with_the_prod_model.py \
+  uv run python scripts/tutorial_for_predicting_with_the_prod_model.py \
       --use-rust 1 --dataset qian --warm-rust-featurizer-before-predict 1
 """
 
 import argparse
 import os
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 def _apply_backend_flag(use_rust: int | None) -> None:
@@ -43,6 +55,44 @@ def _resolve_dataset_file(data_root: str, dataset_name: str, preferred_name: str
     raise FileNotFoundError(
         f"Missing dataset file for '{dataset_name}'. Tried '{preferred_path}' and '{fallback_path}'."
     )
+
+
+def _select_input_route(
+    *,
+    requested_input_format: str,
+    dataset_name: str,
+    arrow_data_root: str,
+    specter_suffix: str,
+    batching_threshold: int | None,
+    desired_memory_use: int | None,
+    warm_rust_featurizer_before_predict: int,
+    resolve_arrow_dataset_paths,
+) -> tuple[str, dict[str, str] | None]:
+    """Resolve tutorial input routing without loading models or ANDData."""
+
+    input_format = requested_input_format
+    arrow_paths = None
+    if input_format in {"auto", "arrow"}:
+        try:
+            arrow_paths = resolve_arrow_dataset_paths(arrow_data_root, dataset_name, specter_suffix)
+        except FileNotFoundError:
+            if input_format == "arrow":
+                raise
+            input_format = "json"
+        else:
+            if input_format == "auto" and (batching_threshold is not None or desired_memory_use is not None):
+                input_format = "json"
+            else:
+                input_format = "arrow"
+
+    if input_format == "arrow":
+        if batching_threshold is not None or desired_memory_use is not None:
+            raise ValueError("--batching-threshold and --desired-memory-use are JSON/ANDData tutorial knobs")
+        if warm_rust_featurizer_before_predict:
+            raise ValueError("--warm-rust-featurizer-before-predict is only valid for JSON/ANDData input")
+        if arrow_paths is None:
+            raise RuntimeError("Arrow input selected without resolved Arrow paths")
+    return input_format, arrow_paths
 
 
 def _cluster_eval_with_predict_options(
@@ -128,6 +178,33 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--input-format",
+        choices=["auto", "arrow", "json"],
+        default="auto",
+        help=(
+            "Input route. auto uses Arrow when the requested dataset exists under --arrow-data-root, "
+            "unless JSON-only subblocking knobs are supplied."
+        ),
+    )
+    parser.add_argument(
+        "--arrow-data-root",
+        type=str,
+        default=os.path.join("s2and", "data"),
+        help="Arrow release root containing per-dataset manifests, relative to repo root or absolute.",
+    )
+    parser.add_argument(
+        "--specter-suffix",
+        choices=["_specter.pickle", "_specter2.pkl"],
+        default="_specter2.pkl",
+        help="Embedding/model suffix used to select the Arrow embedding file.",
+    )
+    parser.add_argument(
+        "--arrow-total-ram-bytes",
+        type=int,
+        default=1_000_000_000_000,
+        help="Memory budget passed to Clusterer.predict_from_arrow_paths.",
+    )
+    parser.add_argument(
         "--load-name-counts",
         type=int,
         choices=[0, 1],
@@ -145,7 +222,10 @@ def main() -> None:
         type=int,
         choices=[0, 1],
         default=0,
-        help="Set 1 to enable pair-feature/Rust featurizer cache during prediction.",
+        help=(
+            "Set 1 to enable the persistent pair-feature SQLite cache during cache-aware prediction paths. "
+            "Same-process Rust featurizer reuse is independent of this flag."
+        ),
     )
     parser.add_argument(
         "--warm-rust-featurizer-before-predict",
@@ -197,6 +277,7 @@ def main() -> None:
     from s2and.feature_port import warm_rust_featurizer
     from s2and.featurizer import FeaturizationInfo
     from s2and.production_model import load_production_model
+    from scripts.eval_prod_models import cluster_eval_arrow, resolve_arrow_dataset_paths
 
     n_jobs = args.n_jobs
     use_cache = bool(args.use_cache)
@@ -205,6 +286,7 @@ def main() -> None:
     os.environ["OMP_NUM_THREADS"] = f"{n_jobs}"
 
     data_original = _resolve_root(PROJECT_ROOT_PATH, args.data_root)
+    arrow_data_root = _resolve_root(PROJECT_ROOT_PATH, args.arrow_data_root)
 
     random_seed = 42
 
@@ -264,13 +346,42 @@ def main() -> None:
         f"warm_rust_featurizer={args.warm_rust_featurizer_before_predict}, "
         f"batching_threshold={args.batching_threshold}, "
         f"desired_memory_use={args.desired_memory_use}, "
-        f"load_name_counts={args.load_name_counts}"
+        f"load_name_counts={args.load_name_counts}, "
+        f"input_format={args.input_format}"
     )
     print(f"Model: {model_path}")
     print(f"Data root: {data_original}")
+    print(f"Arrow data root: {arrow_data_root}")
 
     cluster_metrics_all = []
     for dataset_name in datasets:
+        input_format, arrow_paths = _select_input_route(
+            requested_input_format=args.input_format,
+            dataset_name=dataset_name,
+            arrow_data_root=arrow_data_root,
+            specter_suffix=args.specter_suffix,
+            batching_threshold=args.batching_threshold,
+            desired_memory_use=args.desired_memory_use,
+            warm_rust_featurizer_before_predict=args.warm_rust_featurizer_before_predict,
+            resolve_arrow_dataset_paths=resolve_arrow_dataset_paths,
+        )
+
+        if input_format == "arrow":
+            if arrow_paths is None:
+                raise RuntimeError("Arrow input selected without resolved Arrow paths")
+            cluster_metrics, _b3_metrics_per_signature = cluster_eval_arrow(
+                arrow_paths,
+                clusterer,
+                random_seed=random_seed,
+                n_jobs=n_jobs,
+                split=args.split,
+                total_ram_bytes=int(args.arrow_total_ram_bytes),
+            )
+            print(f"[{dataset_name}] Arrow predict_from_arrow_paths")
+            print(cluster_metrics)
+            cluster_metrics_all.append(cluster_metrics)
+            continue
+
         signatures_path = _resolve_dataset_file(
             data_original, dataset_name, f"{dataset_name}_signatures.json", "signatures.json"
         )

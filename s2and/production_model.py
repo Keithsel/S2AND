@@ -12,6 +12,7 @@ import numpy as np
 
 from s2and.consts import _PACKAGE_DATA_DIR
 from s2and.featurizer import FeaturizationInfo
+from s2and.incremental_linking.artifact import load_incremental_linking_artifact
 from s2and.incremental_linking.contracts import validate_artifact_contract_metadata
 from s2and.model import Clusterer, FastCluster, IncrementalBroadcastMode, IncrementalSeedScoreMode
 from s2and.serialization import load_pickle_with_verified_label_encoder_compat
@@ -171,6 +172,7 @@ def _validate_incremental_linker_metadata(linker_dir: Path) -> None:
         raise FileNotFoundError(f"Incremental linker booster is missing: {booster_path}")
     metadata = _read_json(metadata_path)
     validate_artifact_contract_metadata(metadata)
+    load_incremental_linking_artifact(linker_dir, require_rust_capabilities=False)
 
 
 def _load_bundle_clusterer(bundle_dir: Path, *, require_incremental_linker: bool = True) -> Clusterer:

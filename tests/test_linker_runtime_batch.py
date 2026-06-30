@@ -18,6 +18,29 @@ from tests.linker_row_feature_reference import build_promoted_non_pairwise_row_f
 s2and_rust = pytest.importorskip("s2and_rust", reason="s2and_rust is unavailable")
 
 
+def test_rust_retrieval_public_exports_are_available() -> None:
+    assert s2and_rust.DEFAULT_HYBRID_EXEMPLAR_4_WEIGHTS == [0.40, 0.23, 0.12, 0.05, 0.07]
+    assert hasattr(s2and_rust, "RustHybridCentroidRetriever")
+    assert not hasattr(s2and_rust, "RustNameCompatibleSubblockSelector")
+
+
+def test_pair_plan_rejects_values_above_uint16_rank_limit() -> None:
+    query = build_query_features(first="alice")
+    retriever = s2and_rust.RustHybridCentroidRetriever(
+        [build_cluster_summary(component_key="c1", first_name_counts=Counter({"alice": 1}))],
+        include_exemplars=True,
+    )
+
+    with pytest.raises(ValueError, match="retrieval_ranks"):
+        retriever.top_k_hybrid_centroid_pair_plan(
+            [query],
+            np.asarray([0], dtype=np.uint32),
+            {"c1": np.asarray([1], dtype=np.uint32)},
+            int(np.iinfo(np.uint16).max) + 1,
+            1,
+        )
+
+
 def _base_row_signals(row_count: int) -> dict[str, object]:
     return {
         "candidate_component_key": np.asarray([f"c{index}" for index in range(row_count)], dtype=object),
@@ -56,7 +79,7 @@ def _base_row_signals(row_count: int) -> dict[str, object]:
 
 def test_rust_retrieval_batch_returns_flat_pair_plan() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     query = build_query_features(first="alice", has_coauthors=True, has_affiliations=True)
     summaries = [
         build_cluster_summary(
@@ -91,7 +114,7 @@ def test_rust_retrieval_batch_returns_flat_pair_plan() -> None:
 
 def test_rust_retrieval_batch_preserves_single_character_title_and_venue_terms() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     query = build_query_features(
         first="alice",
         title_terms=frozenset({"a", "m", "study"}),
@@ -124,9 +147,9 @@ def test_rust_retrieval_batch_preserves_single_character_title_and_venue_terms()
     np.testing.assert_allclose(batch.row_signals["venue_overlap"], [0.5], rtol=1e-6, atol=1e-6)
 
 
-def test_rust_retrieval_batch_matches_direct_top_k_order() -> None:
+def test_rust_retrieval_batch_has_stable_retrieval_order() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     queries = [
         build_query_features(first="alice", has_coauthors=True, has_affiliations=True),
         build_query_features(first="bob", has_coauthors=True, has_affiliations=True),
@@ -159,13 +182,6 @@ def test_rust_retrieval_batch_matches_direct_top_k_order() -> None:
     ]
     retriever = s2and_rust.RustHybridCentroidRetriever(summaries, include_exemplars=True)
 
-    direct_keys = []
-    direct_scores = []
-    for query in queries:
-        keys, scores = retriever.top_k_hybrid_centroid(query, 4, 2)
-        direct_keys.extend(str(key) for key in keys)
-        direct_scores.extend(float(score) for score in scores)
-
     batch = build_linker_retrieval_batch_rust(
         retriever=retriever,
         queries=queries,
@@ -181,8 +197,23 @@ def test_rust_retrieval_batch_matches_direct_top_k_order() -> None:
         n_jobs=2,
     )
 
-    assert list(batch.candidate_batch.row_component_keys) == direct_keys
-    np.testing.assert_allclose(batch.candidate_batch.retrieval_scores, direct_scores, rtol=1e-6, atol=1e-6)
+    row_component_keys = batch.candidate_batch.row_component_keys
+    retrieval_scores = batch.candidate_batch.retrieval_scores
+    assert row_component_keys is not None
+    assert retrieval_scores is not None
+    assert list(row_component_keys) == [
+        "c_alice",
+        "c_bob",
+        "c_tie_a",
+        "c_tie_b",
+        "c_alice",
+        "c_bob",
+        "c_tie_a",
+        "c_tie_b",
+    ]
+    assert float(retrieval_scores[0]) > 0.0
+    assert float(retrieval_scores[4]) == pytest.approx(float(retrieval_scores[0]))
+    np.testing.assert_allclose(retrieval_scores[[1, 2, 3, 5, 6, 7]], 0.0, rtol=1e-6, atol=1e-6)
 
 
 def test_rust_retrieval_batch_rejects_unknown_query_view_before_retrieval() -> None:
@@ -211,6 +242,24 @@ def test_rust_retrieval_batch_rejects_unknown_per_query_view_before_retrieval() 
         )
 
 
+def test_retrieval_batch_rejects_duplicate_query_signature_indices_for_per_query_views() -> None:
+    class RetrieverShouldNotRun:
+        def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):
+            del args, kwargs
+            raise AssertionError("duplicate query_signature_indices should be rejected before retrieval")
+
+    with pytest.raises(ValueError, match="query_signature_indices must be unique"):
+        build_linker_retrieval_batch_rust(
+            retriever=RetrieverShouldNotRun(),
+            queries=[object(), object()],
+            query_signature_indices=np.asarray([7, 7], dtype=np.uint32),
+            component_member_indices_by_key={},
+            top_k=1,
+            query_view=["full", "initial_only"],
+            n_jobs=1,
+        )
+
+
 def test_rust_retrieval_batch_rejects_stale_pair_plan_schema() -> None:
     class StaleRetriever:
         def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):
@@ -229,9 +278,57 @@ def test_rust_retrieval_batch_rejects_stale_pair_plan_schema() -> None:
         )
 
 
+def test_rust_retrieval_batch_rejects_missing_consumed_row_signal_key() -> None:
+    empty_plan = {
+        "row_count": 0,
+        "left_signature_indices": np.asarray([], dtype=np.uint32),
+        "right_signature_indices": np.asarray([], dtype=np.uint32),
+        "pair_row_indices": np.asarray([], dtype=np.uint32),
+        "row_query_signature_indices": np.asarray([], dtype=np.uint32),
+        "row_component_keys": [],
+        "retrieval_scores": np.asarray([], dtype=np.float32),
+        "retrieval_ranks": np.asarray([], dtype=np.uint16),
+        "row_query_first_tokens": [],
+        "row_component_sizes": np.asarray([], dtype=np.float32),
+        "row_named_signature_counts": np.asarray([], dtype=np.float32),
+        "row_dominant_first_names": [],
+        "row_candidate_year_min": np.asarray([], dtype=np.int32),
+        "row_candidate_year_max": np.asarray([], dtype=np.int32),
+        "row_candidate_year_range_missing": np.asarray([], dtype=np.uint8),
+        "row_query_years": np.asarray([], dtype=np.int32),
+        "row_query_year_missing": np.asarray([], dtype=np.uint8),
+        "row_query_has_affiliations": np.asarray([], dtype=np.uint8),
+        "row_query_has_coauthors": np.asarray([], dtype=np.uint8),
+        "row_orcid_match": np.asarray([], dtype=np.uint8),
+        "middle_initial_compatibility": np.asarray([], dtype=np.float32),
+        "affiliation_overlap": np.asarray([], dtype=np.float32),
+        "coauthor_overlap": np.asarray([], dtype=np.float32),
+        "venue_overlap": np.asarray([], dtype=np.float32),
+        "year_compatibility": np.asarray([], dtype=np.float32),
+        "title_overlap": np.asarray([], dtype=np.float32),
+        "specter_centroid_similarity": np.asarray([], dtype=np.float32),
+    }
+
+    class StaleRetriever:
+        def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):
+            del args, kwargs
+            return dict(empty_plan)
+
+    with pytest.raises(RuntimeError, match="stale pair-plan schema.*specter_exemplar_similarity"):
+        build_linker_retrieval_batch_rust(
+            retriever=StaleRetriever(),
+            queries=[],
+            query_signature_indices=np.asarray([], dtype=np.uint32),
+            component_member_indices_by_key={},
+            top_k=1,
+            query_view="initial_only",
+            n_jobs=1,
+        )
+
+
 def test_full_query_view_changes_same_initial_retrieval_order() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     base_query = build_query_features(first="alice", has_full_first=True)
     initial_query = mask_query_features(base_query, "initial_only")
     full_query = mask_query_features(base_query, "full")
@@ -241,8 +338,18 @@ def test_full_query_view_changes_same_initial_retrieval_order() -> None:
     ]
     retriever = s2and_rust.RustHybridCentroidRetriever(summaries, include_exemplars=True)
 
-    initial_keys, initial_scores = retriever.top_k_hybrid_centroid(initial_query, 2, 1)
-    assert initial_keys == ["c_adam", "c_alice"]
+    initial_batch = build_linker_retrieval_batch_rust(
+        retriever=retriever,
+        queries=[initial_query],
+        query_signature_indices=np.asarray([9], dtype=np.uint32),
+        component_member_indices_by_key={"c_adam": [1], "c_alice": [2]},
+        top_k=2,
+        query_view="initial_only",
+        n_jobs=1,
+    )
+    assert initial_batch.candidate_batch.row_component_keys == ("c_adam", "c_alice")
+    initial_scores = initial_batch.candidate_batch.retrieval_scores
+    assert initial_scores is not None
     np.testing.assert_allclose(initial_scores, [0.0, 0.0], rtol=1e-6, atol=1e-6)
 
     batch = build_linker_retrieval_batch_rust(
@@ -258,17 +365,19 @@ def test_full_query_view_changes_same_initial_retrieval_order() -> None:
     assert batch.candidate_batch.row_component_keys == ("c_alice", "c_adam")
     assert batch.row_signals["query_view"].tolist() == ["full", "full"]
     assert batch.row_signals["query_first_token"].tolist() == ["alice", "alice"]
-    assert float(batch.candidate_batch.retrieval_scores[0]) > float(batch.candidate_batch.retrieval_scores[1])
+    retrieval_scores = batch.candidate_batch.retrieval_scores
+    assert retrieval_scores is not None
+    assert float(retrieval_scores[0]) > float(retrieval_scores[1])
 
 
 def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_or_year_filters() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     query = build_query_features(
         first="alice",
         middle_initials=frozenset({"q"}),
         year=2024,
-        orcid="0000-0001",
+        orcid="0000-0001-2345-6789",
         has_full_first=True,
     )
     summaries = [
@@ -278,7 +387,7 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
             middle_initial_counts=Counter({"q": 1}),
             year_min=2024,
             year_max=2024,
-            orcid_values=frozenset({"0000-0001"}),
+            orcid_values=frozenset({"0000-0001-2345-6789"}),
         ),
         build_cluster_summary(
             component_key="orcid_middle_conflict",
@@ -286,7 +395,7 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
             middle_initial_counts=Counter({"z": 1}),
             year_min=2024,
             year_max=2024,
-            orcid_values=frozenset({"0000-0001"}),
+            orcid_values=frozenset({"0000-0001-2345-6789"}),
         ),
         build_cluster_summary(
             component_key="orcid_year_conflict",
@@ -294,7 +403,7 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
             middle_initial_counts=Counter({"q": 1}),
             year_min=1900,
             year_max=1900,
-            orcid_values=frozenset({"0000-0001"}),
+            orcid_values=frozenset({"0000-0001-2345-6789"}),
         ),
         build_cluster_summary(
             component_key="non_orcid_candidate",
@@ -306,7 +415,6 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
     ]
     retriever = s2and_rust.RustHybridCentroidRetriever(summaries, include_exemplars=True)
 
-    direct_keys, _direct_scores = retriever.top_k_hybrid_centroid(query, 1, 1)
     batch = build_linker_retrieval_batch_rust(
         retriever=retriever,
         queries=[query],
@@ -325,9 +433,10 @@ def test_rust_retrieval_batch_orcid_override_returns_all_matches_without_middle_
     )
 
     expected = {"orcid_match", "orcid_middle_conflict", "orcid_year_conflict"}
-    assert set(direct_keys) == expected
-    assert set(batch.candidate_batch.row_component_keys) == expected
-    assert "non_orcid_candidate" not in batch.candidate_batch.row_component_keys
+    row_component_keys = batch.candidate_batch.row_component_keys
+    assert row_component_keys is not None
+    assert set(row_component_keys) == expected
+    assert "non_orcid_candidate" not in row_component_keys
     assert batch.row_signals["orcid_match"].tolist() == [1.0, 1.0, 1.0]
 
 
@@ -366,7 +475,6 @@ def test_rust_experimental_retrieval_rescues_high_coverage_mega_candidates() -> 
         query,
         ["c_rescue", "c_nonmega", "c_partial"],
         top_k=3,
-        max_block_component_size=1,
         weights=[0.0, 1.0, 0.0, 0.0, 0.0],
         first_name_mode="prefix",
         specter_mode="centroid",
@@ -392,7 +500,6 @@ def test_rust_experimental_retrieval_rescues_high_coverage_mega_candidates() -> 
         query,
         ["c_rescue", "c_nonmega", "c_partial"],
         top_k=3,
-        max_block_component_size=1,
         weights=[0.0, 1.0, 0.0, 0.0, 0.0],
         first_name_mode="prefix",
         specter_mode="centroid",
@@ -418,7 +525,7 @@ def test_rust_experimental_retrieval_rescues_high_coverage_mega_candidates() -> 
 
 def test_rust_retrieval_batch_applies_name_compatible_full_first_window() -> None:
     if not hasattr(s2and_rust.RustHybridCentroidRetriever, "top_k_hybrid_centroid_pair_plan"):
-        pytest.skip("top_k_hybrid_centroid_pair_plan is unavailable")
+        raise pytest.skip.Exception("top_k_hybrid_centroid_pair_plan is unavailable")
     query = build_query_features(first="alice", has_full_first=True)
     summaries = [
         build_cluster_summary(component_key="c_same", size=1, first_name_counts=Counter({"alice": 1})),
@@ -460,8 +567,10 @@ def test_rust_retrieval_batch_applies_name_compatible_full_first_window() -> Non
         full_first_global_backfill_count=2,
     )
 
-    assert set(batch.candidate_batch.row_component_keys) == {"c_same", "c_name", "c_backfill"}
-    assert "c_other" not in batch.candidate_batch.row_component_keys
+    row_component_keys = batch.candidate_batch.row_component_keys
+    assert row_component_keys is not None
+    assert set(row_component_keys) == {"c_same", "c_name", "c_backfill"}
+    assert "c_other" not in row_component_keys
 
 
 def test_promoted_non_pairwise_row_features_derive_group_columns() -> None:
@@ -538,6 +647,8 @@ def test_rust_promoted_non_pairwise_row_features_match_python_reference() -> Non
     row_signals["retrieval_score"] = np.asarray([0.9, 0.8, 0.7], dtype=np.float32)
     row_signals["retrieval_rank"] = np.asarray([1, 2, 1], dtype=np.float32)
     row_signals["family_id"] = np.asarray(["alice", "alice", "alice"], dtype=object)
+    row_signals["query_first_token"] = np.asarray(["Él", "El", "Zoë"], dtype=object)
+    row_signals["dominant_first_name"] = np.asarray(["Élodie", "Elodie", "Zoe"], dtype=object)
 
     rust_features = build_promoted_non_pairwise_row_features(candidate_batch, row_signals)
     python_features = build_promoted_non_pairwise_row_features_python_reference(candidate_batch, row_signals)
@@ -586,3 +697,22 @@ def test_promoted_non_pairwise_row_features_reports_generated_family_ids() -> No
 
     assert telemetry["generated_family_id_count"] == 3
     assert telemetry["generic_family_override_count"] == 3
+
+
+def test_promoted_non_pairwise_row_features_treats_family_id_none_as_missing() -> None:
+    candidate_batch = LinkerCandidateBatch(
+        row_count=3,
+        left_signature_indices=np.asarray([10, 10, 11], dtype=np.uint32),
+        right_signature_indices=np.asarray([1, 2, 3], dtype=np.uint32),
+        pair_row_indices=np.asarray([0, 1, 2], dtype=np.uint32),
+        row_query_signature_indices=np.asarray([10, 10, 11], dtype=np.uint32),
+        row_component_keys=("c0", "c1", "c2"),
+    )
+    row_signals = _base_row_signals(3)
+    row_signals["retrieval_score"] = np.asarray([0.9, 0.8, 0.7], dtype=np.float32)
+    row_signals["retrieval_rank"] = np.asarray([1, 2, 1], dtype=np.float32)
+    row_signals["family_id"] = None
+
+    _features, telemetry = build_promoted_non_pairwise_row_features_with_telemetry(candidate_batch, row_signals)
+
+    assert telemetry["generated_family_id_count"] == 3

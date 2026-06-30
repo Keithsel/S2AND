@@ -128,7 +128,6 @@ class IncrementalLinkingArtifactMetadata:
         )
         validate_artifact_contract_metadata(metadata.to_json_dict())
         load_logistic_gate_config(metadata.gate_config)
-        validate_required_rust_capabilities(metadata.required_rust_capabilities)
         return metadata
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -265,8 +264,14 @@ def save_incremental_linking_artifact(
     return metadata
 
 
-def load_incremental_linking_artifact(artifact_dir: Path) -> IncrementalLinkingArtifact:
-    """Load and validate an incremental linker artifact."""
+def load_incremental_linking_artifact(
+    artifact_dir: Path, *, require_rust_capabilities: bool = True
+) -> IncrementalLinkingArtifact:
+    """Load and validate an incremental linker artifact.
+
+    Set ``require_rust_capabilities=False`` when loading for Python-only use (e.g.
+    bundle validation or non-Rust inference) where the Rust extension is not required.
+    """
 
     artifact_dir = Path(artifact_dir)
     metadata_payload = json.loads((artifact_dir / METADATA_FILENAME).read_text(encoding="utf-8"))
@@ -276,6 +281,8 @@ def load_incremental_linking_artifact(artifact_dir: Path) -> IncrementalLinkingA
         observed_booster_sha256 = _sha256_file(booster_path)
         if observed_booster_sha256 != metadata.booster_sha256:
             raise ValueError("Incremental linker artifact booster_sha256 mismatch")
+    if require_rust_capabilities:
+        validate_required_rust_capabilities(metadata.required_rust_capabilities)
     booster = lgb.Booster(model_file=str(booster_path))
     artifact = IncrementalLinkingArtifact(
         booster=booster,

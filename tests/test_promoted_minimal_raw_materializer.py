@@ -1,32 +1,40 @@
 from __future__ import annotations
 
 import json
-import os
 from collections import Counter
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 import pytest
 
 import s2and.incremental_linking.query_adapter as retrieval
+from s2and import text as s2and_text
+from s2and.incremental_linking.feature_block import write_name_counts_index
 from s2and.incremental_linking.linker_pairwise import LinkerCandidateBatch
 from s2and.incremental_linking_training.classic import OfficialBundle
 from s2and.incremental_linking_training.query_support import build_rust_hybrid_centroid_retriever
+from scripts.production.model import linker_train_calibrate_eval as promoted_train
 from scripts.production.model.linker_train_calibrate_eval import (
     _apply_row_nan_policy,
+    _arrow_paths_for_dataset,
+    _arrow_row_seed_bypass_mask,
     _clean_minimal_raw_structural_rows,
     _component_member_details_by_key,
     _enable_fasttext_language_detection,
     _has_query_seed_connection,
     _load_target,
     _query_first_token_for_prefix,
+    _resolve_arrow_rust_pair_labels,
     _resolve_candidate_batch_pair_labels,
     _row_allows_seed_constraint_bypass,
     _row_label_is_positive,
     _score_candidate_summaries_with_frozen_rust_policy,
     _write_minimal_raw_partial_frame,
 )
+from tests.helpers import patch_tiny_name_counts_loader
 
 
 class _ConstraintClusterer:
@@ -304,7 +312,7 @@ def test_minimal_raw_constraint_resolution_bypasses_seed_constraints_and_ignores
 
     labels, summary = _resolve_candidate_batch_pair_labels(
         clusterer=clusterer,
-        dataset=SimpleNamespace(),
+        dataset=cast(Any, SimpleNamespace()),
         batch=batch,
         index_to_signature_id={0: "q", 1: "a", 2: "b", 3: "c"},
         runtime_context=None,
@@ -344,23 +352,12 @@ def test_minimal_raw_component_members_default_to_block_local_component_keys(tmp
     details = _component_member_details_by_key(
         members_path,
         {"a": 0, "b": 1, "c": 2, "d": 3},
-        dataset=dataset,
+        dataset=cast(Any, dataset),
     )
 
     assert details["m muller::284283"].signature_ids == ("b", "c")
     assert details["m muller::284283"].signature_indices.tolist() == [1, 2]
     assert details["other::1"].signature_ids == ("d",)
-
-    frozen_details = _component_member_details_by_key(
-        members_path,
-        {"a": 0, "b": 1, "c": 2, "d": 3},
-        dataset=dataset,
-        component_scope="frozen",
-    )
-
-    assert frozen_details["m muller::284283"].signature_ids == ("a", "b", "c")
-    assert frozen_details["m muller::284283"].signature_indices.tolist() == [0, 1, 2]
-    assert frozen_details["other::1"].signature_ids == ("d",)
 
 
 def test_minimal_raw_structural_cleaning_drops_self_only_candidates(tmp_path) -> None:
@@ -459,12 +456,16 @@ def test_minimal_raw_positive_label_marks_training_disallow_ignore() -> None:
     assert not _row_label_is_positive(SimpleNamespace(label=np.nan))
 
 
-def test_minimal_raw_loader_enables_fasttext_language_detection(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+def test_minimal_raw_loader_enables_fasttext_language_detection() -> None:
+    previous_enabled = s2and_text.fasttext_loading_enabled()
+    s2and_text.set_fasttext_loading_enabled(False)
 
-    _enable_fasttext_language_detection()
+    try:
+        _enable_fasttext_language_detection()
 
-    assert os.environ["S2AND_SKIP_FASTTEXT"] == "0"
+        assert s2and_text.fasttext_loading_enabled() is True
+    finally:
+        s2and_text.set_fasttext_loading_enabled(previous_enabled)
 
 
 def test_minimal_raw_seed_bypass_detects_seeded_query_component() -> None:
@@ -484,12 +485,12 @@ def test_minimal_raw_seed_bypass_detects_seeded_query_component() -> None:
     )
 
     assert _row_allows_seed_constraint_bypass(
-        dataset,
+        cast(Any, dataset),
         row,
         seed_constraint_signature_ids=frozenset({"q", "m1", "other"}),
     )
-    assert _has_query_seed_connection(dataset, query_signature_id="q", candidate_signature_ids=["m1"])
-    assert not _has_query_seed_connection(dataset, query_signature_id="q", candidate_signature_ids=["other"])
+    assert _has_query_seed_connection(cast(Any, dataset), query_signature_id="q", candidate_signature_ids=["m1"])
+    assert not _has_query_seed_connection(cast(Any, dataset), query_signature_id="q", candidate_signature_ids=["other"])
 
 
 def test_minimal_raw_seed_bypass_keeps_loo_marker_without_query_seed_flag() -> None:
@@ -505,8 +506,247 @@ def test_minimal_raw_seed_bypass_keeps_loo_marker_without_query_seed_flag() -> N
         query_in_seed_before_holdout=0,
     )
 
-    assert _row_allows_seed_constraint_bypass(dataset, row, seed_constraint_signature_ids=frozenset({"q", "m1"}))
-    assert _has_query_seed_connection(dataset, query_signature_id="q", candidate_signature_ids=["m1"])
+    assert _row_allows_seed_constraint_bypass(
+        cast(Any, dataset), row, seed_constraint_signature_ids=frozenset({"q", "m1"})
+    )
+    assert _has_query_seed_connection(cast(Any, dataset), query_signature_id="q", candidate_signature_ids=["m1"])
+
+
+def test_arrow_rust_row_seed_bypass_uses_manifest_seed_constraints() -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "query_signature_id": "q",
+                "candidate_component_key": "c_match",
+                "split": "train",
+                "query_in_seed_before_holdout": 0,
+            },
+            {
+                "query_signature_id": "q",
+                "candidate_component_key": "c_other",
+                "split": "train",
+                "query_in_seed_before_holdout": 0,
+            },
+        ]
+    )
+
+    mask = _arrow_row_seed_bypass_mask(
+        rows,
+        {"c_match": ("q", "m1"), "c_other": ("other",)},
+        cluster_seeds_require={"q": "seed_cluster", "m1": "seed_cluster", "other": "different"},
+        cluster_seeds_disallow=frozenset(),
+        seed_constrained_signature_ids=frozenset({"q", "m1", "other"}),
+    )
+
+    np.testing.assert_array_equal(mask, np.asarray([True, False]))
+
+
+def test_arrow_rust_pair_label_resolution_applies_seed_bypass_and_disallow_ignore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_constraints(
+        _dataset: Any,
+        left: np.ndarray,
+        right: np.ndarray,
+        *,
+        dont_merge_cluster_seeds: bool,
+        incremental_dont_use_cluster_seeds: bool,
+        num_threads: int,
+        featurizer: Any,
+        runtime_context: Any,
+        suppress_orcid: bool,
+    ) -> np.ndarray:
+        assert dont_merge_cluster_seeds is True
+        assert num_threads == 2
+        assert featurizer == "featurizer"
+        assert runtime_context is None
+        assert suppress_orcid is True
+        calls.append(
+            {
+                "left": np.asarray(left).tolist(),
+                "right": np.asarray(right).tolist(),
+                "seed_bypass": bool(incremental_dont_use_cluster_seeds),
+            }
+        )
+        if incremental_dont_use_cluster_seeds:
+            return np.asarray([-90_000.0, -90_000.0], dtype=np.float64)
+        return np.asarray([np.nan, -100_000.0, -90_000.0], dtype=np.float64)
+
+    monkeypatch.setattr(promoted_train, "get_constraint_labels_index_arrays_rust", fake_constraints)
+    batch = LinkerCandidateBatch(
+        row_count=3,
+        left_signature_indices=np.asarray([0, 0, 0], dtype=np.uint32),
+        right_signature_indices=np.asarray([1, 2, 3], dtype=np.uint32),
+        pair_row_indices=np.asarray([0, 1, 2], dtype=np.uint32),
+        row_query_signature_indices=np.asarray([0, 0, 0], dtype=np.uint32),
+    )
+
+    labels, summary = _resolve_arrow_rust_pair_labels(
+        clusterer=SimpleNamespace(use_default_constraints_as_supervision=True),
+        batch=batch,
+        featurizer="featurizer",
+        n_jobs=2,
+        pair_seed_bypass=np.asarray([False, True, True]),
+        pair_ignore_disallow=np.asarray([False, True, False]),
+    )
+
+    assert calls == [
+        {"left": [0, 0, 0], "right": [1, 2, 3], "seed_bypass": False},
+        {"left": [0, 0], "right": [2, 3], "seed_bypass": True},
+    ]
+    np.testing.assert_array_equal(np.isnan(labels), np.asarray([True, True, False]))
+    assert labels[2] == pytest.approx(-90_000.0)
+    assert summary["constraint_seed_bypass_pair_count"] == 2
+    assert summary["constraint_seed_bypass_batch_calls"] == 1
+    assert summary["constraint_disallow_ignored_pair_count"] == 1
+
+
+def test_arrow_paths_use_manifest_name_counts_index_unless_explicit_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = tmp_path / "bundle"
+    dataset_dir = bundle_root / "datasets" / "toy"
+    dataset_dir.mkdir(parents=True)
+    for filename in (
+        "signatures.arrow",
+        "papers.arrow",
+        "paper_authors.arrow",
+        "specter.arrow",
+        "signatures.signatures_batch_index.bin",
+        "papers.papers_batch_index.bin",
+        "paper_authors.paper_authors_batch_index.bin",
+        "specter.specter_batch_index.bin",
+    ):
+        (dataset_dir / filename).write_bytes(b"placeholder")
+    patch_tiny_name_counts_loader(monkeypatch)
+    manifest_index, _metrics = write_name_counts_index(bundle_root)
+    manifest_path = dataset_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "paths": {
+                    "signatures": "signatures.arrow",
+                    "papers": "papers.arrow",
+                    "paper_authors": "paper_authors.arrow",
+                    "specter": "specter.arrow",
+                    "signatures_batch_index": "signatures.signatures_batch_index.bin",
+                    "papers_batch_index": "papers.papers_batch_index.bin",
+                    "paper_authors_batch_index": "paper_authors.paper_authors_batch_index.bin",
+                    "specter_batch_index": "specter.specter_batch_index.bin",
+                    "name_counts_index": "name_counts_index",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle = OfficialBundle(
+        root=bundle_root.resolve(),
+        bundle_name="toy_bundle",
+        assets={},
+        models={},
+        expected_metrics={},
+    )
+
+    paths = _arrow_paths_for_dataset(bundle, "toy")
+    assert paths["name_counts_index"] == str(Path(manifest_index).resolve())
+
+    override_index, _metrics = write_name_counts_index(tmp_path / "override")
+    paths = _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=Path(override_index))
+    assert paths["name_counts_index"] == str(Path(override_index).resolve())
+
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "paths": {
+                    "signatures": "signatures.arrow",
+                    "papers": "papers.arrow",
+                    "paper_authors": "paper_authors.arrow",
+                    "specter": "specter.arrow",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="signatures_batch_index"):
+        _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=Path(override_index))
+
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "paths": {
+                    "signatures": "signatures.arrow",
+                    "papers": "papers.arrow",
+                    "paper_authors": "paper_authors.arrow",
+                    "specter": "specter.arrow",
+                    "signatures_batch_index": "signatures.signatures_batch_index.bin",
+                    "papers_batch_index": "papers.papers_batch_index.bin",
+                    "paper_authors_batch_index": "paper_authors.paper_authors_batch_index.bin",
+                    "specter_batch_index": "specter.specter_batch_index.bin",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="name_counts_index"):
+        _arrow_paths_for_dataset(bundle, "toy")
+    paths = _arrow_paths_for_dataset(bundle, "toy", name_counts_index_root=Path(override_index))
+    assert paths["name_counts_index"] == str(Path(override_index).resolve())
+
+
+def test_arrow_paths_alias_specter2_manifest_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = tmp_path / "bundle"
+    dataset_dir = bundle_root / "datasets" / "toy"
+    dataset_dir.mkdir(parents=True)
+    for filename in (
+        "signatures.arrow",
+        "papers.arrow",
+        "paper_authors.arrow",
+        "specter2.arrow",
+        "signatures.signatures_batch_index.bin",
+        "papers.papers_batch_index.bin",
+        "paper_authors.paper_authors_batch_index.bin",
+        "specter2.specter_batch_index.bin",
+    ):
+        (dataset_dir / filename).write_bytes(b"placeholder")
+    patch_tiny_name_counts_loader(monkeypatch)
+    manifest_index, _metrics = write_name_counts_index(bundle_root)
+    (dataset_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "paths": {
+                    "signatures": "signatures.arrow",
+                    "papers": "papers.arrow",
+                    "paper_authors": "paper_authors.arrow",
+                    "specter2": "specter2.arrow",
+                    "signatures_batch_index": "signatures.signatures_batch_index.bin",
+                    "papers_batch_index": "papers.papers_batch_index.bin",
+                    "paper_authors_batch_index": "paper_authors.paper_authors_batch_index.bin",
+                    "specter2_batch_index": "specter2.specter_batch_index.bin",
+                    "name_counts_index": "name_counts_index",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle = OfficialBundle(
+        root=bundle_root.resolve(),
+        bundle_name="toy_bundle",
+        assets={},
+        models={},
+        expected_metrics={},
+    )
+
+    paths = _arrow_paths_for_dataset(bundle, "toy")
+
+    assert paths["specter"] == str((dataset_dir / "specter2.arrow").resolve())
+    assert paths["specter_batch_index"] == str((dataset_dir / "specter2.specter_batch_index.bin").resolve())
+    assert paths["name_counts_index"] == str(Path(manifest_index).resolve())
 
 
 def test_minimal_raw_query_first_prefix_uses_full_author_before_masked_view() -> None:
@@ -519,7 +759,7 @@ def test_minimal_raw_query_first_prefix_uses_full_author_before_masked_view() ->
         ]
     )
 
-    assert _query_first_token_for_prefix(group, SimpleNamespace(first="j")) == "jianping"
+    assert _query_first_token_for_prefix(group, cast(Any, SimpleNamespace(first="j"))) == "jianping"
 
 
 def test_minimal_raw_retrieval_score_uses_frozen_rust_policy() -> None:
@@ -567,7 +807,6 @@ def test_minimal_raw_retrieval_score_uses_frozen_rust_policy() -> None:
         query=query,
         summaries={"c1": summary},
         retriever=retriever,
-        max_block_component_size=1,
         n_jobs=1,
     )
 

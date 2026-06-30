@@ -40,6 +40,7 @@ from s2and.incremental_linking_training.query_support import (
 from s2and.thread_config import resolve_n_jobs
 
 DEFAULT_CLASSIC_N_JOBS = 20
+UNLABELED_SINGLETON_ORCID_SUPERVISION_TYPE = "unlabeled_singleton_orcid"
 
 # Shared training, calibration, and evaluation helpers for the official replay
 # target. CLI entrypoints should import this module instead of owning copies.
@@ -119,6 +120,49 @@ def _read_csv(path: Path, **kwargs: Any) -> pd.DataFrame:
     defaults.update(kwargs)
     read_csv = cast(Any, pd.read_csv)
     return read_csv(path, **defaults)
+
+
+def _drop_unlabeled_singleton_orcid_rows(
+    rows: pd.DataFrame,
+    *,
+    context: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Drop weak singleton-ORCID supervision rows from linker label tables."""
+
+    query_count = int(rows["query_group_id"].astype(str).nunique()) if "query_group_id" in rows.columns else None
+    summary: dict[str, Any] = {
+        "context": context,
+        "policy": f"drop_supervision_type:{UNLABELED_SINGLETON_ORCID_SUPERVISION_TYPE}",
+        "rows_before": int(len(rows)),
+        "rows_removed": 0,
+        "rows_after": int(len(rows)),
+        "queries_before": query_count,
+        "queries_removed": 0,
+        "queries_after": query_count,
+        "positive_rows_removed": 0,
+        "negative_rows_removed": 0,
+    }
+    if "supervision_type" not in rows.columns:
+        return rows.copy(), summary
+
+    drop_mask = rows["supervision_type"].astype(str).eq(UNLABELED_SINGLETON_ORCID_SUPERVISION_TYPE)
+    if not bool(drop_mask.any()):
+        return rows.copy(), summary
+
+    labels = (
+        pd.to_numeric(rows["label"], errors="coerce").fillna(0).astype(np.int8) if "label" in rows.columns else None
+    )
+    query_ids_before = set(rows["query_group_id"].astype(str)) if "query_group_id" in rows.columns else set()
+    cleaned = rows.loc[~drop_mask].reset_index(drop=True)
+    query_ids_after = set(cleaned["query_group_id"].astype(str)) if "query_group_id" in cleaned.columns else set()
+    summary["rows_removed"] = int(drop_mask.sum())
+    summary["rows_after"] = int(len(cleaned))
+    summary["queries_removed"] = int(len(query_ids_before - query_ids_after))
+    summary["queries_after"] = int(len(query_ids_after)) if "query_group_id" in rows.columns else None
+    if labels is not None:
+        summary["positive_rows_removed"] = int((drop_mask & (labels == 1)).sum())
+        summary["negative_rows_removed"] = int((drop_mask & (labels == 0)).sum())
+    return cleaned, summary
 
 
 def _resolve_path(bundle: OfficialBundle, path_like: str | Path) -> Path:
@@ -1322,6 +1366,10 @@ def _load_classic_stratified_eval_rows(
         else:
             rows["source_key"] = str(source_spec["source_key"])
         rows["source_kind"] = str(source_spec["source_kind"])
+        rows, _filter_summary = _drop_unlabeled_singleton_orcid_rows(
+            rows,
+            context=f"stratified_eval:{source_spec['source_key']}",
+        )
         source_frames.append(rows)
     all_rows = _drop_shadowed_calibration_source_rows(pd.concat(source_frames, ignore_index=True))
     assignment_columns = [
@@ -1657,6 +1705,10 @@ def run_classic(
     feature_columns = tuple(spec["feature_columns"])
     monotone_constraints = _resolve_classic_monotone_constraints(spec, feature_columns)
     train_df = _read_csv(_resolve_path(bundle, spec["train_path"]), compression="gzip")
+    train_df, unlabeled_singleton_filter_summary = _drop_unlabeled_singleton_orcid_rows(
+        train_df,
+        context="classic_train",
+    )
     train_df["retrieval_rank"] = pd.to_numeric(train_df["retrieval_rank"], errors="coerce")
     train_df = train_df[train_df["retrieval_rank"] <= 25].copy()
     train_df["label"] = pd.to_numeric(train_df["label"], errors="coerce").fillna(0).astype(np.int8)
@@ -1693,6 +1745,10 @@ def run_classic(
 
     gate_source_path = _resolve_path(bundle, spec.get("classic_gate_source_path", spec["hwang_eval_path"]))
     gate_source_eval = _read_csv(gate_source_path, compression="gzip")
+    gate_source_eval, _gate_source_filter_summary = _drop_unlabeled_singleton_orcid_rows(
+        gate_source_eval,
+        context="classic_gate_source",
+    )
     gate_source_probabilities = model.predict_proba(_classic_feature_matrix(gate_source_eval, feature_columns))[:, 1]
     calibration_limit = int(spec.get("classic_gate_calibration_retrieval_limit", 50))
     gate_source_query_choices = _score_eval_candidate_rows(
@@ -1836,6 +1892,7 @@ def run_classic(
             "gate_bucket_query_counts": training_gate_bucket_summary["query_counts"],
             "gate_bucket_row_counts": training_gate_bucket_summary["row_counts"],
             "elapsed_seconds": train_seconds,
+            "unlabeled_singleton_orcid_filter_summary": unlabeled_singleton_filter_summary,
             "train_holdout_filter_summary": train_holdout_filter_summary,
             "train_filter_summary": train_filter_summary,
         },

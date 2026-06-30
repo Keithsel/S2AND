@@ -17,6 +17,7 @@ _SCRIPT_PATHS = [
     "scripts/_rust_suite/largest_block_cmd.py",
     "scripts/_rust_suite/prod_inference_cmd.py",
     "scripts/_rust_suite/stress_rebuild_cmd.py",
+    "scripts/_rust_suite/summarize_memory_telemetry_cmd.py",
     "scripts/_rust_suite/transfer_mini_cmd.py",
 ]
 

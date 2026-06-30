@@ -1,6 +1,7 @@
-import unittest
+from __future__ import annotations
+
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -9,64 +10,148 @@ import s2and.feature_port as feature_port
 import s2and.memory_budget as memory_budget
 from s2and.consts import LARGE_INTEGER
 from s2and.data import ANDData
-from s2and.featurizer import FeaturizationInfo, _signature_id_to_index_or_raise, many_pairs_featurize
+from s2and.featurizer import (
+    NUM_FEATURES,
+    FeaturizationInfo,
+    _ensure_python_pair_signature_ngrams,
+    _signature_id_to_index_or_raise,
+    many_pairs_featurize,
+)
 from s2and.runtime import RuntimeContext
+from tests.helpers import tiny_name_counts
+
+_FULL_FEATURES = [
+    "name_similarity",
+    "affiliation_similarity",
+    "email_similarity",
+    "coauthor_similarity",
+    "venue_similarity",
+    "year_diff",
+    "title_similarity",
+    "reference_features",
+    "misc_features",
+    "name_counts",
+    "journal_similarity",
+    "advanced_name_similarity",
+]
 
 
-class TestData(unittest.TestCase):
-    def setUp(self):
-        super().setUp()
-        self.dummy_dataset = ANDData(
-            "tests/dummy/signatures.json",
-            "tests/dummy/papers.json",
-            clusters="tests/dummy/clusters.json",
-            name="dummy",
-            load_name_counts=True,
-            compute_reference_features=True,
-        )
-
-        features_to_use = [
-            "name_similarity",
-            "affiliation_similarity",
-            "email_similarity",
-            "coauthor_similarity",
-            "venue_similarity",
-            "year_diff",
-            "title_similarity",
-            "reference_features",
-            "misc_features",
-            "name_counts",
-            "journal_similarity",
-            "advanced_name_similarity",
-        ]
-        self.dummy_featurizer = FeaturizationInfo(features_to_use=features_to_use)
-
-    def check_features_array_equal(self, array_1, array_2):
-        assert len(array_1) == len(array_2)
-        for i in range(len(array_1)):
-            both_nan = np.isnan(array_1[i]) and np.isnan(array_2[i])
-            if not both_nan:
-                self.assertAlmostEqual(array_1[i], array_2[i], msg=i)
-
-    def test_default_features_are_instance_isolated(self):
-        first = FeaturizationInfo()
-        first.features_to_use.remove("name_similarity")
-
-        second = FeaturizationInfo()
-        assert "name_similarity" in second.features_to_use
-        assert first.features_to_use is not second.features_to_use
-
-    def test_featurizer(self):
-        test_pairs = [
-            ("3", "0", 0),
-            ("3", "1", 0),
-            ("3", "2", 0),
-            ("3", "2", -1),
-        ]
-        many_pairs_featurize(test_pairs, self.dummy_dataset, self.dummy_featurizer, 2, False, 1, nan_value=-1)
+def _dummy_dataset(
+    name: str,
+    *,
+    compute_reference_features: bool = True,
+    load_name_counts: bool = True,
+) -> ANDData:
+    return ANDData(
+        "tests/dummy/signatures.json",
+        "tests/dummy/papers.json",
+        clusters="tests/dummy/clusters.json",
+        name=name,
+        load_name_counts=tiny_name_counts() if load_name_counts else False,
+        compute_reference_features=compute_reference_features,
+    )
 
 
-def test_rust_prewarm_happens_before_rss_sampling(monkeypatch):
+def _assert_feature_arrays_equal(left: np.ndarray, right: np.ndarray) -> None:
+    assert left.shape == right.shape
+    np.testing.assert_allclose(left, right, rtol=1e-10, atol=1e-10, equal_nan=True)
+
+
+def test_default_features_are_instance_isolated() -> None:
+    first = FeaturizationInfo()
+    first.features_to_use.remove("name_similarity")
+
+    second = FeaturizationInfo()
+    assert "name_similarity" in second.features_to_use
+    assert first.features_to_use is not second.features_to_use
+
+
+def test_featurizer_computes_requested_pairs() -> None:
+    dataset = _dummy_dataset("dummy_featurizer")
+    featurizer = FeaturizationInfo(features_to_use=_FULL_FEATURES)
+    test_pairs = [
+        ("3", "0", 0),
+        ("3", "1", 0),
+        ("3", "2", 0),
+        ("3", "2", -1),
+    ]
+
+    features, labels, _ = many_pairs_featurize(test_pairs, dataset, featurizer, 2, False, 1, nan_value=-1)
+
+    expected_width = sum(len(featurizer.feature_group_to_index[name]) for name in _FULL_FEATURES)
+    assert features.shape == (len(test_pairs), expected_width)
+    np.testing.assert_array_equal(labels, np.asarray([0, 0, 0, -1]))
+    assert np.any(features != -LARGE_INTEGER)
+
+
+def test_empty_python_pair_featurization_does_not_mark_missing_ngrams_ready() -> None:
+    runtime_context = RuntimeContext(
+        operation="featurization_run",
+        requested_backend="python",
+        resolved_backend="python",
+        use_rust=False,
+        run_id="run-python-ngrams",
+        source="argument",
+    )
+    signature = SimpleNamespace(author_info_affiliations_n_grams=None, author_info_coauthor_n_grams=None)
+    state = {"materialized": 0}
+
+    def materialize_signature_ngrams_python() -> None:
+        state["materialized"] += 1
+        signature.author_info_affiliations_n_grams = {}
+        signature.author_info_coauthor_n_grams = {}
+
+    dataset = cast(
+        ANDData,
+        SimpleNamespace(
+            signatures={"a": signature},
+            materialize_signature_ngrams_python=materialize_signature_ngrams_python,
+        ),
+    )
+
+    _ensure_python_pair_signature_ngrams(dataset, [], runtime_context)
+    assert not getattr(dataset, "_s2and_python_pair_ngrams_ready", False)
+
+    _ensure_python_pair_signature_ngrams(dataset, [("a", "a", 1)], runtime_context)
+    assert state["materialized"] == 1
+    assert dataset._s2and_python_pair_ngrams_ready is True
+
+
+def test_delete_training_data_uses_global_coauthor_similarity_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    dataset = cast(ANDData, SimpleNamespace(name="delete_training_data", mode="train", signatures={}))
+    featurizer_info = FeaturizationInfo(features_to_use=["coauthor_similarity"])
+    runtime_context = RuntimeContext(
+        operation="featurization_run",
+        requested_backend="python",
+        resolved_backend="python",
+        use_rust=False,
+        run_id="run-delete-training-data",
+        source="argument",
+    )
+
+    def fake_single_pair_featurize(_pair: tuple[str, str], index: int) -> tuple[np.ndarray, int]:
+        row = np.zeros(NUM_FEATURES, dtype=np.float64)
+        row[featurizer_info.feature_group_to_index["coauthor_similarity"][1]] = 1.0
+        return row, index
+
+    monkeypatch.setattr("s2and.featurizer._single_pair_featurize", fake_single_pair_featurize)
+
+    features, labels, _nameless = many_pairs_featurize(
+        [("a", "b", 0), ("c", "d", 1)],
+        dataset,
+        featurizer_info,
+        n_jobs=1,
+        use_cache=False,
+        chunk_size=1,
+        delete_training_data=True,
+        runtime_context=runtime_context,
+    )
+
+    assert features.shape == (1, 3)
+    np.testing.assert_array_equal(labels, np.asarray([1.0]))
+
+
+def test_rust_prewarm_happens_before_rss_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
     dataset = cast(ANDData, SimpleNamespace(name="dummy", mode="train", compute_reference_features=False))
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff"])
     runtime_context = RuntimeContext(
@@ -80,14 +165,28 @@ def test_rust_prewarm_happens_before_rss_sampling(monkeypatch):
 
     state = {"prewarm_called": False, "rss_called": False}
 
-    def fake_get_rust_featurizer(*_args, **_kwargs):
-        state["prewarm_called"] = True
-        return object()
+    class FakeRustFeaturizer:
+        def signature_ids(self) -> list[str]:
+            return ["a", "b"]
 
-    def fake_resolve_total_ram_bytes(_total_ram_bytes):
+        def featurize_pairs_matrix_indexed(
+            self,
+            pairs: object,
+            selected_indices: object,
+            num_threads: object,
+            nan_value: object,
+        ) -> np.ndarray:
+            del selected_indices, num_threads, nan_value
+            return np.zeros((len(cast(Any, pairs)), NUM_FEATURES), dtype=np.float64)
+
+    def fake_get_rust_featurizer(*_args: object, **_kwargs: object) -> object:
+        state["prewarm_called"] = True
+        return FakeRustFeaturizer()
+
+    def fake_resolve_total_ram_bytes(_total_ram_bytes: object) -> tuple[int, str]:
         return 1024, "test"
 
-    def fake_current_rss(_total_ram_bytes):
+    def fake_current_rss(_total_ram_bytes: object) -> tuple[int, str]:
         state["rss_called"] = True
         assert state["prewarm_called"] is True
         return 128, "test"
@@ -110,265 +209,269 @@ def test_rust_prewarm_happens_before_rss_sampling(monkeypatch):
     assert state["prewarm_called"] is True
     assert state["rss_called"] is True
 
-    def test_featurizer_without_reference_features_raises(self):
-        # Build a dataset with reference features enabled (baseline) and disabled
-        dataset_ref = ANDData(
-            "tests/dummy/signatures.json",
-            "tests/dummy/papers.json",
-            clusters="tests/dummy/clusters.json",
-            name="dummy_ref",
-            load_name_counts=True,
-            compute_reference_features=True,
-        )
-        dataset_no_ref = ANDData(
-            "tests/dummy/signatures.json",
-            "tests/dummy/papers.json",
-            clusters="tests/dummy/clusters.json",
-            name="dummy_no_ref",
-            load_name_counts=True,
-            compute_reference_features=False,
-        )
 
-        features_to_use = [
-            "name_similarity",
-            "affiliation_similarity",
-            "email_similarity",
-            "coauthor_similarity",
-            "venue_similarity",
-            "year_diff",
-            "title_similarity",
-            "reference_features",
-            "misc_features",
-            "name_counts",
-            "journal_similarity",
-            "advanced_name_similarity",
-        ]
-        fi = FeaturizationInfo(features_to_use=features_to_use)
+def test_many_pairs_featurize_uses_lazy_rust_loader_before_unavailable_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = cast(ANDData, SimpleNamespace(name="dummy", mode="train", compute_reference_features=False))
+    featurizer_info = FeaturizationInfo(features_to_use=["year_diff"])
+    runtime_context = RuntimeContext(
+        operation="featurization_run",
+        requested_backend="rust",
+        resolved_backend="rust",
+        use_rust=True,
+        run_id="run-lazy-load",
+        source="default",
+    )
+    state = {"prewarm_called": False}
 
-        # Single pair is sufficient for checking NaN placement
-        test_pairs = [("3", "0", 0)]
-        feats_ref, _, _ = many_pairs_featurize(
-            test_pairs,
-            dataset_ref,
-            fi,
+    class FakeRustFeaturizer:
+        def signature_ids(self) -> list[str]:
+            return ["a", "b"]
+
+        def featurize_pairs_matrix_indexed(
+            self,
+            pairs: object,
+            selected_indices: object,
+            num_threads: object,
+            nan_value: object,
+        ) -> np.ndarray:
+            del selected_indices, num_threads, nan_value
+            return np.zeros((len(cast(Any, pairs)), NUM_FEATURES), dtype=np.float64)
+
+    def fake_get_rust_featurizer(*_args: object, **_kwargs: object) -> object:
+        state["prewarm_called"] = True
+        return FakeRustFeaturizer()
+
+    monkeypatch.setattr(feature_port, "s2and_rust", None)
+    monkeypatch.setattr(feature_port, "_get_rust_featurizer", fake_get_rust_featurizer)
+
+    many_pairs_featurize(
+        [("a", "b", -1)],
+        dataset,
+        featurizer_info,
+        n_jobs=1,
+        use_cache=False,
+        chunk_size=1,
+        runtime_context=runtime_context,
+    )
+
+    assert state["prewarm_called"] is True
+
+
+def test_featurizer_without_reference_features_raises() -> None:
+    dataset_no_ref = _dummy_dataset(
+        "dummy_no_ref",
+        compute_reference_features=False,
+    )
+    featurizer = FeaturizationInfo(features_to_use=_FULL_FEATURES)
+
+    with pytest.raises(ValueError):
+        many_pairs_featurize(
+            [("3", "0", 0)],
+            dataset_no_ref,
+            featurizer,
             n_jobs=1,
             use_cache=False,
             chunk_size=1,
             nan_value=np.nan,
         )
 
-        # When reference_features are requested but the dataset disabled them,
-        # the featurizer should raise a clear ValueError.
-        with pytest.raises(ValueError):
-            _ = many_pairs_featurize(
-                test_pairs,
-                dataset_no_ref,
-                fi,
-                n_jobs=1,
-                use_cache=False,
-                chunk_size=1,
-                nan_value=np.nan,
-            )
 
-    def test_featurizer_without_reference_group_ok(self):
-        """When compute_reference_features=False and 'reference_features' is NOT requested,
-        featurization should proceed normally with a reduced feature vector."""
-        dataset_no_ref = ANDData(
-            "tests/dummy/signatures.json",
-            "tests/dummy/papers.json",
-            clusters="tests/dummy/clusters.json",
-            name="dummy_no_ref_ok",
-            load_name_counts=True,
-            compute_reference_features=False,
-        )
+def test_featurizer_without_reference_group_ok() -> None:
+    dataset_no_ref = _dummy_dataset(
+        "dummy_no_ref_ok",
+        compute_reference_features=False,
+    )
+    features_to_use = [
+        "name_similarity",
+        "affiliation_similarity",
+        "email_similarity",
+        "coauthor_similarity",
+        "venue_similarity",
+        "year_diff",
+        "title_similarity",
+        "misc_features",
+        "name_counts",
+        "journal_similarity",
+        "advanced_name_similarity",
+    ]
+    featurizer = FeaturizationInfo(features_to_use=features_to_use)
+    test_pairs = [("3", "0", 0), ("3", "1", 0)]
 
-        features_to_use = [
-            "name_similarity",
-            "affiliation_similarity",
-            "email_similarity",
-            "coauthor_similarity",
-            "venue_similarity",
-            "year_diff",
-            "title_similarity",
-            # no "reference_features" here
-            "misc_features",
-            "name_counts",
-            "journal_similarity",
-            "advanced_name_similarity",
-        ]
-        fi = FeaturizationInfo(features_to_use=features_to_use)
+    features, labels, _ = many_pairs_featurize(
+        test_pairs,
+        dataset_no_ref,
+        featurizer,
+        n_jobs=1,
+        use_cache=False,
+        chunk_size=1,
+        nan_value=-1,
+    )
 
-        test_pairs = [("3", "0", 0), ("3", "1", 0)]
-        feats, labels, _ = many_pairs_featurize(
+    assert features.shape[0] == len(test_pairs)
+    assert features.shape[1] == sum(len(featurizer.feature_group_to_index[name]) for name in features_to_use)
+    assert labels.tolist() == [0, 0]
+    assert np.any(features != -LARGE_INTEGER)
+
+
+def test_get_constraint() -> None:
+    dataset = _dummy_dataset("dummy_constraints")
+
+    assert dataset.get_constraint("0", "8", high_value=100) == 100
+    assert dataset.get_constraint("6", "8", high_value=100) == 100
+    assert dataset.get_constraint("0", "1") is None
+
+
+def test_multiprocessing_featurization_consistency() -> None:
+    dataset = _dummy_dataset("dummy_mp_consistency")
+    featurizer = FeaturizationInfo(features_to_use=_FULL_FEATURES)
+    test_pairs = [
+        ("3", "0", 0),
+        ("3", "1", 0),
+        ("3", "2", 0),
+        ("0", "1", 1),
+    ]
+
+    features_single, labels_single, _ = many_pairs_featurize(
+        test_pairs,
+        dataset,
+        featurizer,
+        n_jobs=1,
+        use_cache=False,
+        chunk_size=1,
+        nan_value=-1,
+    )
+    features_multi, labels_multi, _ = many_pairs_featurize(
+        test_pairs,
+        dataset,
+        featurizer,
+        n_jobs=2,
+        use_cache=False,
+        chunk_size=1,
+        nan_value=-1,
+    )
+
+    _assert_feature_arrays_equal(features_single, features_multi)
+    np.testing.assert_array_equal(labels_single, labels_multi)
+
+
+def test_bound_dataset_is_available_in_workers() -> None:
+    dataset = _dummy_dataset("dummy_bound_workers")
+    featurizer = FeaturizationInfo(features_to_use=_FULL_FEATURES)
+    test_pairs = [
+        ("3", "0", 0),
+        ("3", "1", 0),
+    ]
+
+    try:
+        features, _labels, _ = many_pairs_featurize(
             test_pairs,
-            dataset_no_ref,
-            fi,
-            n_jobs=1,
+            dataset,
+            featurizer,
+            n_jobs=2,
             use_cache=False,
             chunk_size=1,
             nan_value=-1,
         )
+    except (AttributeError, NameError) as exc:
+        raise AssertionError(f"Dataset not available in worker processes: {exc}") from exc
 
-        # Shape checks
-        assert feats.shape[0] == len(test_pairs)
-        expected_len = sum(len(fi.feature_group_to_index[name]) for name in features_to_use)
-        assert feats.shape[1] == expected_len
-
-        # Sanity: not all sentinel values
-        assert np.any(feats != -LARGE_INTEGER)
-
-    def test_get_constraint(self):
-        first_constraint = self.dummy_dataset.get_constraint("0", "8", high_value=100)
-        assert first_constraint == 100
-        middle_constraint = self.dummy_dataset.get_constraint("6", "8", high_value=100)
-        assert middle_constraint == 100
-        no_constraint = self.dummy_dataset.get_constraint("0", "1")
-        assert no_constraint is None
-
-    def test_multiprocessing_featurization_consistency(self):
-        """Test that multiprocessing featurization produces identical results to single-threaded"""
-        test_pairs = [
-            ("3", "0", 0),
-            ("3", "1", 0),
-            ("3", "2", 0),
-            ("0", "1", 1),
-        ]
-
-        # Test single-threaded
-        features_single, labels_single, _ = many_pairs_featurize(
-            test_pairs, self.dummy_dataset, self.dummy_featurizer, n_jobs=1, use_cache=False, chunk_size=1, nan_value=-1
-        )
-
-        # Test multi-threaded
-        features_multi, labels_multi, _ = many_pairs_featurize(
-            test_pairs, self.dummy_dataset, self.dummy_featurizer, n_jobs=2, use_cache=False, chunk_size=1, nan_value=-1
-        )
-
-        # Verify identical results
-        assert features_single.shape == features_multi.shape, "Feature array shapes don't match"
-        assert labels_single.shape == labels_multi.shape, "Label array shapes don't match"
-
-        # Check that all features are identical
-        for i in range(features_single.shape[0]):
-            for j in range(features_single.shape[1]):
-                val_single = features_single[i, j]
-                val_multi = features_multi[i, j]
-
-                # Handle NaN comparisons
-                both_nan = np.isnan(val_single) and np.isnan(val_multi)
-                if not both_nan:
-                    self.assertAlmostEqual(
-                        val_single,
-                        val_multi,
-                        places=10,
-                        msg=f"Feature mismatch at position ({i}, {j}): {val_single} vs {val_multi}",
-                    )
-
-        # Check labels are identical
-        np.testing.assert_array_equal(
-            labels_single, labels_multi, "Labels don't match between single and multi-threaded"
-        )
-
-    def test_bound_dataset_is_available_in_workers(self):
-        """Test that the bound dataset is available in worker processes."""
-        test_pairs = [
-            ("3", "0", 0),
-            ("3", "1", 0),
-        ]
-
-        # This test verifies that worker processes can access the global dataset
-        # If _init_pool wasn't working, this would fail with AttributeError
-        try:
-            features, labels, _ = many_pairs_featurize(
-                test_pairs,
-                self.dummy_dataset,
-                self.dummy_featurizer,
-                n_jobs=2,
-                use_cache=False,
-                chunk_size=1,
-                nan_value=-1,
-            )
-            # If we get here, worker context was bound correctly.
-            assert features.shape[0] == len(test_pairs)
-        except (AttributeError, NameError) as e:
-            self.fail(f"Dataset not available in worker processes: {e}")
-
-    def test_multiprocessing_with_different_chunk_sizes(self):
-        """Test that different chunk sizes don't affect results with multiprocessing"""
-        test_pairs = [
-            ("3", "0", 0),
-            ("3", "1", 0),
-            ("3", "2", 0),
-            ("0", "1", 1),
-            ("0", "2", 0),
-            ("1", "2", 1),
-        ]
-
-        # Test with chunk_size=1
-        features_chunk1, labels_chunk1, _ = many_pairs_featurize(
-            test_pairs, self.dummy_dataset, self.dummy_featurizer, n_jobs=2, use_cache=False, chunk_size=1, nan_value=-1
-        )
-
-        # Test with chunk_size=3
-        features_chunk3, labels_chunk3, _ = many_pairs_featurize(
-            test_pairs, self.dummy_dataset, self.dummy_featurizer, n_jobs=2, use_cache=False, chunk_size=3, nan_value=-1
-        )
-
-        # Results should be identical regardless of chunk size
-        assert features_chunk1.shape == features_chunk3.shape
-        np.testing.assert_array_almost_equal(features_chunk1, features_chunk3, decimal=10)
-        np.testing.assert_array_equal(labels_chunk1, labels_chunk3)
-
-    def test_multiprocessing_fallback_to_single_thread(self):
-        """Test that multiprocessing gracefully falls back when work is too small"""
-        test_pairs = [("3", "0", 0)]  # Very small work load
-
-        # Should work even with n_jobs > 1 for small datasets
-        features, labels, _ = many_pairs_featurize(
-            test_pairs, self.dummy_dataset, self.dummy_featurizer, n_jobs=4, use_cache=False, chunk_size=1, nan_value=-1
-        )
-
-        assert features.shape[0] == 1
-        assert labels.shape[0] == 1
-
-    def test_spawn_context_compatibility(self):
-        """Test that the spawn multiprocessing context works correctly"""
-        test_pairs = [
-            ("3", "0", 0),
-            ("3", "1", 0),
-            ("0", "1", 1),
-        ]
-
-        # This specifically tests that our spawn context implementation works
-        # The spawn context should work consistently across platforms
-        features, labels, _ = many_pairs_featurize(
-            test_pairs, self.dummy_dataset, self.dummy_featurizer, n_jobs=2, use_cache=False, chunk_size=1, nan_value=-1
-        )
-
-        # Verify we got valid results
-        assert features.shape[0] == len(test_pairs)
-        assert not np.all(features == -LARGE_INTEGER), "Features were not computed (global dataset issue)"
-
-        # Verify feature values are reasonable (not all zeros or errors)
-        non_missing_features = features[features != -LARGE_INTEGER]
-        assert len(non_missing_features) > 0, "No valid features computed"
+    assert features.shape[0] == len(test_pairs)
 
 
-def test_signature_id_to_index_or_raise_accepts_non_string_pair_ids():
+def test_multiprocessing_with_different_chunk_sizes() -> None:
+    dataset = _dummy_dataset("dummy_mp_chunk_sizes")
+    featurizer = FeaturizationInfo(features_to_use=_FULL_FEATURES)
+    test_pairs = [
+        ("3", "0", 0),
+        ("3", "1", 0),
+        ("3", "2", 0),
+        ("0", "1", 1),
+        ("0", "2", 0),
+        ("1", "2", 1),
+    ]
+
+    features_chunk1, labels_chunk1, _ = many_pairs_featurize(
+        test_pairs,
+        dataset,
+        featurizer,
+        n_jobs=2,
+        use_cache=False,
+        chunk_size=1,
+        nan_value=-1,
+    )
+    features_chunk3, labels_chunk3, _ = many_pairs_featurize(
+        test_pairs,
+        dataset,
+        featurizer,
+        n_jobs=2,
+        use_cache=False,
+        chunk_size=3,
+        nan_value=-1,
+    )
+
+    _assert_feature_arrays_equal(features_chunk1, features_chunk3)
+    np.testing.assert_array_equal(labels_chunk1, labels_chunk3)
+
+
+def test_multiprocessing_fallback_to_single_thread() -> None:
+    dataset = _dummy_dataset("dummy_mp_small_work")
+    featurizer = FeaturizationInfo(features_to_use=_FULL_FEATURES)
+
+    features, labels, _ = many_pairs_featurize(
+        [("3", "0", 0)],
+        dataset,
+        featurizer,
+        n_jobs=4,
+        use_cache=False,
+        chunk_size=1,
+        nan_value=-1,
+    )
+
+    assert features.shape[0] == 1
+    assert labels.shape[0] == 1
+
+
+def test_spawn_context_compatibility() -> None:
+    dataset = _dummy_dataset("dummy_spawn_context")
+    featurizer = FeaturizationInfo(features_to_use=_FULL_FEATURES)
+    test_pairs = [
+        ("3", "0", 0),
+        ("3", "1", 0),
+        ("0", "1", 1),
+    ]
+
+    features, _labels, _ = many_pairs_featurize(
+        test_pairs,
+        dataset,
+        featurizer,
+        n_jobs=2,
+        use_cache=False,
+        chunk_size=1,
+        nan_value=-1,
+    )
+
+    assert features.shape[0] == len(test_pairs)
+    assert not np.all(features == -LARGE_INTEGER)
+    assert len(features[features != -LARGE_INTEGER]) > 0
+
+
+def test_signature_id_to_index_or_raise_accepts_non_string_pair_ids() -> None:
     signature_id_to_index = {"1": 10, "2": 20}
 
     assert _signature_id_to_index_or_raise(signature_id_to_index, 1) == 10
     assert _signature_id_to_index_or_raise(signature_id_to_index, 2) == 20
 
 
-def test_signature_id_to_index_or_raise_reports_missing_signature_id():
+def test_signature_id_to_index_or_raise_reports_missing_signature_id() -> None:
     signature_id_to_index = {"1": 10}
 
     with pytest.raises(ValueError, match="999"):
         _signature_id_to_index_or_raise(signature_id_to_index, 999)
 
 
-def test_many_pairs_featurize_surfaces_rust_initialization_failure(monkeypatch):
+def test_many_pairs_featurize_surfaces_rust_initialization_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     dataset = cast(ANDData, SimpleNamespace(name="dummy", compute_reference_features=False))
     featurizer_info = FeaturizationInfo(features_to_use=["year_diff"])
     runtime_context = RuntimeContext(
@@ -382,7 +485,7 @@ def test_many_pairs_featurize_surfaces_rust_initialization_failure(monkeypatch):
 
     monkeypatch.setattr(feature_port, "s2and_rust", object())
 
-    def fail_prewarm(*_args, **_kwargs):
+    def fail_prewarm(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("native init failed")
 
     monkeypatch.setattr(feature_port, "_get_rust_featurizer", fail_prewarm)

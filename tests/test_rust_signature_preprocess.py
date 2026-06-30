@@ -3,16 +3,16 @@ import random
 from contextlib import contextmanager
 from itertools import combinations
 
+import numpy as np
 import pytest
 
 from s2and import feature_port
 from s2and.featurizer import _single_pair_featurize
 from s2and.subblocking import make_subblocks
-from s2and.text import AFFILIATIONS_STOP_WORDS, get_text_ngrams, get_text_ngrams_words
 from tests.helpers import build_dummy_dataset, equalish
 
-if not feature_port.rust_signature_preprocess_available():
-    raise pytest.skip.Exception("s2and_rust signature preprocessing API is unavailable", allow_module_level=True)
+if not feature_port.rust_featurizer_available():
+    raise pytest.skip.Exception("s2and_rust featurizer API is unavailable", allow_module_level=True)
 
 
 @contextmanager
@@ -29,11 +29,6 @@ def _temporary_env(name: str, value: str | None):
             os.environ.pop(name, None)
         else:
             os.environ[name] = original
-
-
-def _prefilter_affiliation_text(text: str) -> str:
-    tokens = [word for word in text.split() if word not in AFFILIATIONS_STOP_WORDS and len(word) > 1]
-    return " ".join(tokens)
 
 
 def _signature_scalar_fields(signature) -> dict[str, object]:
@@ -57,36 +52,6 @@ def _sample_pairs(signature_ids: list[str], limit: int = 8) -> list[tuple[str, s
         if len(pairs) >= limit:
             break
     return pairs
-
-
-@pytest.mark.parametrize(
-    "coauthor_text,affiliation_text",
-    [
-        ("", ""),
-        ("Alice Smith Bob Jones", "University of Washington Seattle"),
-        ("Renaud Séguier Abdul Sattar", "Department of Computer Science"),
-        ("A.B. C-D", "A I lab"),
-        (
-            " ".join([f"Author{i}" for i in range(80)]),
-            " ".join([f"Institute{i}" for i in range(30)]),
-        ),
-    ],
-)
-def test_signature_ngrams_batch_rust_parity(coauthor_text: str, affiliation_text: str):
-    filtered_affiliation_text = _prefilter_affiliation_text(affiliation_text)
-    rust_coauthor, rust_affiliation = feature_port.signature_ngrams_batch_rust(
-        [coauthor_text],
-        [filtered_affiliation_text],
-        num_threads=1,
-    )
-    assert len(rust_coauthor) == 1
-    assert len(rust_affiliation) == 1
-
-    expected_coauthor = get_text_ngrams(coauthor_text, stopwords=None, use_bigrams=True)
-    expected_affiliation = get_text_ngrams_words(filtered_affiliation_text, stopwords=set())
-
-    assert rust_coauthor[0] == expected_coauthor
-    assert rust_affiliation[0] == expected_affiliation
 
 
 def test_signature_preprocess_dataset_rust_defers_signature_fields():
@@ -118,10 +83,22 @@ def test_signature_preprocess_pair_features_and_constraints_parity_with_deferred
     signature_ids = list(dataset_python.signatures.keys())
     pairs = _sample_pairs(signature_ids, limit=8)
     assert len(pairs) > 0
+    rust_featurizer = feature_port._get_rust_featurizer(dataset_rust)  # noqa: SLF001
+    rust_signature_id_to_index = {
+        str(signature_id): index for index, signature_id in enumerate(rust_featurizer.signature_ids())
+    }
 
     for s1, s2 in pairs:
         python_features, _ = _single_pair_featurize((s1, s2), dataset=dataset_python)
-        rust_features = feature_port.featurize_pair_rust(dataset_rust, s1, s2)
+        rust_features = np.asarray(
+            rust_featurizer.featurize_pairs_matrix_indexed(
+                [(rust_signature_id_to_index[str(s1)], rust_signature_id_to_index[str(s2)])],
+                None,
+                getattr(dataset_rust, "n_jobs", 1),
+                np.nan,
+            ),
+            dtype=np.float64,
+        )[0]
         assert len(python_features) == len(rust_features)
         for idx, (python_value, rust_value) in enumerate(zip(python_features, rust_features, strict=True)):
             assert equalish(python_value, rust_value), (
@@ -129,7 +106,11 @@ def test_signature_preprocess_pair_features_and_constraints_parity_with_deferred
             )
 
         python_constraint = dataset_python.get_constraint(s1, s2)
-        rust_constraint = feature_port.get_constraint_rust(dataset_rust, s1, s2)
+        rust_constraint = feature_port.get_constraints_matrix_indexed_rust(
+            dataset_rust,
+            [(rust_signature_id_to_index[str(s1)], rust_signature_id_to_index[str(s2)])],
+            featurizer=rust_featurizer,
+        )[0]
         if python_constraint is None or rust_constraint is None:
             assert python_constraint is None and rust_constraint is None
         else:
@@ -175,7 +156,7 @@ def test_subblocking_membership_parity_python_vs_rust():
     assert clusters_python == clusters_rust
 
 
-def test_rust_json_ingest_uses_minimal_python_paper_preprocess():
+def test_rust_inference_from_dataset_runs_python_paper_preprocess():
     with _temporary_env("S2AND_BACKEND", "rust"):
         dataset_train = build_dummy_dataset(
             "dummy_signature_preprocess_full_papers",
@@ -190,6 +171,6 @@ def test_rust_json_ingest_uses_minimal_python_paper_preprocess():
     inference_paper = dataset_inference.papers[paper_id]
 
     assert train_paper.title_ngrams_chars is not None
-    assert inference_paper.title_ngrams_chars is None
+    assert inference_paper.title_ngrams_chars is not None
     assert train_paper.title_ngrams_words is not None
-    assert inference_paper.title_ngrams_words is None
+    assert inference_paper.title_ngrams_words is not None

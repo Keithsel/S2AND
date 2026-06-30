@@ -51,7 +51,6 @@ RUST_PARITY_TESTS = [
     "tests/test_feature_port_parity.py",
     "tests/test_rust_signature_preprocess.py",
     "tests/test_rust_batch_chunking.py",
-    "tests/test_rust_from_json_paths.py",
 ]
 PYTEST_REPORT_FLAGS = ["-ra"]
 PY_ONLY_EXPECTED_SKIP_NOTE = (

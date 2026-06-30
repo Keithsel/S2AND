@@ -108,14 +108,16 @@ def _set_backend_env(
         raise ValueError(f"Unsupported backend: {backend}")
 
     os.environ["OMP_NUM_THREADS"] = str(max(1, n_jobs))
-    os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
     os.environ["S2AND_BACKEND"] = backend
+    from s2and.text import set_fasttext_loading_enabled
+
+    set_fasttext_loading_enabled(False)
 
 
 def _collect_rust_package_info(require_non_dev_rust: bool, require_rust_release: bool) -> dict[str, Any]:
     from s2and import feature_port
 
-    module = feature_port.s2and_rust
+    module = feature_port._ensure_s2and_rust_loaded()  # noqa: SLF001
     if module is None:
         raise RuntimeError("Rust run requested but s2and_rust extension is unavailable")
 
@@ -158,7 +160,7 @@ def _run_single(args: argparse.Namespace) -> dict[str, Any]:
             bool(args.require_rust_release),
         )
 
-    # Rust inference defaults to JSON ingest; keep path inputs even on limited fixtures.
+    # Rust comparison keeps file-backed inputs for compatibility baselines, even on limited fixtures.
     force_path_inputs = args.backend == "rust"
     signatures_input, papers_input, _tmpdir = _load_dataset_inputs(
         args.dataset,

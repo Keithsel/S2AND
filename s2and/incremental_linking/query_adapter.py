@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -14,8 +14,17 @@ from s2and.data import ANDData
 from s2and.incremental_linking.gate_buckets import QueryView, normalize_query_views
 from s2and.incremental_linking.retrieval import LinkerRetrievalBatch
 from s2and.subblocking import signature_affiliation_feature_keys, signature_name_parts_for_subblocking
-from s2and.text import compute_block, normalize_text, same_prefix_tokens
-from s2and.text import name_counts as pairwise_name_counts
+from s2and.text import (
+    compute_block,
+    normalize_text,
+    same_prefix_tokens,
+)
+from s2and.text import (
+    name_counts as pairwise_name_counts,
+)
+from s2and.text import (
+    normalize_orcid as normalize_orcid_text,
+)
 
 EMPTY_STRING_SET: frozenset[str] = frozenset()
 PAIRWISE_NAME_COUNT_FEATURE_NAMES: tuple[str, ...] = (
@@ -42,12 +51,9 @@ NAME_COUNT_RARITY_FEATURE_COLUMNS: tuple[str, ...] = (
 
 
 def normalize_orcid(value: Any) -> str | None:
-    """Return a non-empty stripped ORCID value, or None."""
+    """Return a canonical ORCID value, or None."""
 
-    if value is None:
-        return None
-    orcid = str(value).strip()
-    return orcid or None
+    return normalize_orcid_text(value)
 
 
 @dataclass(frozen=True)
@@ -203,12 +209,27 @@ def _signature_coauthor_blocks(signature: Any, dataset: ANDData) -> frozenset[st
 
     coauthors = signature.author_info_coauthors
     if coauthors is None:
+        author_position = _signature_author_position(signature)
+        if author_position is None:
+            return EMPTY_STRING_SET
         paper = dataset.papers.get(str(signature.paper_id))
         if paper is None:
             return EMPTY_STRING_SET
-        coauthors = [
-            author.author_name for author in paper.authors if author.position != signature.author_info_position
-        ]
+        coauthors = []
+        for author in paper.authors:
+            raw_position = author.get("position") if isinstance(author, Mapping) else getattr(author, "position", None)
+            if raw_position is None:
+                position = None
+            else:
+                try:
+                    position = int(raw_position)
+                except (TypeError, ValueError):
+                    position = None
+            if position != author_position:
+                raw_name = (
+                    author.get("author_name") if isinstance(author, Mapping) else getattr(author, "author_name", None)
+                )
+                coauthors.append(raw_name)
     return _nonempty_feature_values([_safe_compute_block(str(author or "")) for author in coauthors])
 
 
@@ -228,11 +249,11 @@ def _get_specter_vector(dataset: ANDData, paper_id: Any) -> np.ndarray | None:
 
 
 def _signature_query_author(signature: Any) -> str:
-    """Return the best available raw author text for query-level gate features."""
+    """Return raw author text for query-level gate features."""
 
     full_name = getattr(signature, "author_info_full_name", None)
-    if full_name:
-        return str(full_name)
+    if full_name is not None and str(full_name).strip():
+        return str(full_name).strip()
     parts = [
         getattr(signature, "author_info_first", None),
         getattr(signature, "author_info_middle", None),
@@ -315,7 +336,7 @@ def extract_query_features(
     return replace(features, orcid=None)
 
 
-def mask_query_features(base: QueryFeatures, view: str, *, orcid_enabled: bool = False) -> QueryFeatures:
+def mask_query_features(base: QueryFeatures, view: QueryView, *, orcid_enabled: bool = False) -> QueryFeatures:
     """Apply the promoted retrieval query-view policy."""
 
     if view == "full":
@@ -349,26 +370,6 @@ def mask_query_features(base: QueryFeatures, view: str, *, orcid_enabled: bool =
     )
     if view == "initial_only":
         return masked
-    if view == "initial_only_no_specter":
-        return replace(masked, specter=None, has_specter=False)
-    if view == "initial_only_sparse_metadata":
-        return replace(
-            masked,
-            coauthor_blocks=EMPTY_STRING_SET,
-            affiliation_terms=EMPTY_STRING_SET,
-            has_coauthors=False,
-            has_affiliations=False,
-        )
-    if view == "initial_only_nearly_empty":
-        return replace(
-            masked,
-            coauthor_blocks=EMPTY_STRING_SET,
-            affiliation_terms=EMPTY_STRING_SET,
-            specter=None,
-            has_specter=False,
-            has_coauthors=False,
-            has_affiliations=False,
-        )
     raise ValueError(f"Unknown query view: {view}")
 
 
@@ -426,19 +427,15 @@ def _select_exemplars(vectors: list[np.ndarray], max_exemplars: int) -> list[np.
     return [np.asarray(vectors[idx], dtype=np.float32) for idx in selected_indices]
 
 
-def build_cluster_summary(
-    dataset: ANDData,
+def _cluster_summary_from_feature_rows(
     *,
     cluster_id: str,
     component_key: str,
-    signature_ids: Sequence[str],
+    feature_rows: Iterable[tuple[str, QueryFeatures]],
     max_exemplars: int,
-    feature_cache: dict[str, QueryFeatures] | None = None,
-    paper_author_name_cache: dict[str, frozenset[str]] | None = None,
-    orcid_enabled: bool = False,
-    block_key: str = "incremental",
+    block_key: str,
 ) -> ClusterSummary:
-    """Build one seed-cluster summary for Rust retrieval."""
+    """Build one seed-cluster summary from pre-extracted member features."""
 
     first_name_counts: Counter[str] = Counter()
     middle_initial_counts: Counter[str] = Counter()
@@ -459,14 +456,7 @@ def build_cluster_summary(
     member_signature_ids: list[str] = []
     member_title_terms: list[frozenset[str]] = []
 
-    for signature_id in signature_ids:
-        features = extract_query_features(
-            dataset,
-            str(signature_id),
-            feature_cache=feature_cache,
-            paper_author_name_cache=paper_author_name_cache,
-            orcid_enabled=orcid_enabled,
-        )
+    for signature_id, features in feature_rows:
         if len(features.first) > 1:
             first_name_counts[features.first] += 1
         for initial in features.middle_initials:
@@ -505,7 +495,7 @@ def build_cluster_summary(
         component_key=component_key,
         cluster_id=cluster_id,
         block_key=str(block_key),
-        size=len(signature_ids),
+        size=len(member_signature_ids),
         first_name_counts=first_name_counts,
         middle_initial_counts=middle_initial_counts,
         coauthor_counts=coauthor_counts,
@@ -528,6 +518,42 @@ def build_cluster_summary(
         member_local10_author_names=tuple(member_local10_author_names),
         member_signature_ids=tuple(member_signature_ids),
         member_title_terms=tuple(member_title_terms),
+    )
+
+
+def build_cluster_summary(
+    dataset: ANDData,
+    *,
+    cluster_id: str,
+    component_key: str,
+    signature_ids: Sequence[str],
+    max_exemplars: int,
+    feature_cache: dict[str, QueryFeatures] | None = None,
+    paper_author_name_cache: dict[str, frozenset[str]] | None = None,
+    orcid_enabled: bool = False,
+    block_key: str = "incremental",
+) -> ClusterSummary:
+    """Build one seed-cluster summary for Rust retrieval."""
+
+    feature_rows = (
+        (
+            str(signature_id),
+            extract_query_features(
+                dataset,
+                str(signature_id),
+                feature_cache=feature_cache,
+                paper_author_name_cache=paper_author_name_cache,
+                orcid_enabled=orcid_enabled,
+            ),
+        )
+        for signature_id in signature_ids
+    )
+    return _cluster_summary_from_feature_rows(
+        cluster_id=cluster_id,
+        component_key=component_key,
+        feature_rows=feature_rows,
+        max_exemplars=max_exemplars,
+        block_key=block_key,
     )
 
 
@@ -571,17 +597,18 @@ def raw_paper_evidence_features(query: QueryFeatures, summary: ClusterSummary) -
         best_author_containment = max(best_author_containment, containment)
         best_author_overlap = max(best_author_overlap, float(intersection))
 
-        if not same_signature:
-            local10_intersection = len(query_local10_names & candidate_local10_names)
-            local10_union = len(query_local10_names | candidate_local10_names)
-            if local10_union:
-                best_local10_jaccard = max(best_local10_jaccard, float(local10_intersection / local10_union))
-            best_local10_overlap_count = max(best_local10_overlap_count, float(local10_intersection))
-
         count_delta = abs(math.log1p(query_author_count) - math.log1p(int(candidate_count)))
         best_author_count_log_absdiff = (
             count_delta if best_author_count_log_absdiff is None else min(best_author_count_log_absdiff, count_delta)
         )
+
+        if same_signature:
+            continue
+        local10_intersection = len(query_local10_names & candidate_local10_names)
+        local10_union = len(query_local10_names | candidate_local10_names)
+        if local10_union:
+            best_local10_jaccard = max(best_local10_jaccard, float(local10_intersection / local10_union))
+        best_local10_overlap_count = max(best_local10_overlap_count, float(local10_intersection))
 
     return {
         "paper_author_list_max_jaccard": round(best_author_jaccard, 6),

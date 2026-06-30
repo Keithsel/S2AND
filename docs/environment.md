@@ -8,7 +8,7 @@ Centralized reference for supported S2AND environment variables.
 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
-| `S2AND_BACKEND` | `python`, `rust`, `auto` | `auto` | Controls which backend is used for featurization and constraints. `auto` resolves to Rust when the extension is available and core-capable; otherwise Python. |
+| `S2AND_BACKEND` | `python`, `rust`, `auto` | `auto` | Controls the default runtime backend for featurization, constraints, promoted incremental linking, and indexed Arrow subblocking. `auto` resolves to Rust when the extension is available and core-capable; otherwise Python. |
 
 ---
 
@@ -27,27 +27,15 @@ See [caching.md](caching.md) for cache semantics and on-disk layout.
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
 | `S2AND_PATH_CONFIG` | `<path>` | `s2and/data/path_config.json` | Path to the JSON data-path config. Use when data lives outside the package default path. |
-| `S2AND_RUST_NAME_COUNTS_JSON` | `<path>` | none | Artifact-backed name-count lookups for Rust JSON ingest (`from_json_paths`). Used when dataset signature-level name counts are not available. |
+| `S2AND_NORMALIZATION_VERSION` | `<version>` | code default | Expected normalization contract for Rust feature-port inputs. Use only when validating regenerated normalization-sensitive artifacts. |
 
 ---
 
-## Normalization Compatibility
+## Import & Model Loading
 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
-| `S2AND_NORMALIZATION_VERSION` | `<string>` | `legacy_compat` | Normalization version expected by artifact-backed name-count ingest. |
-
-Missing or mismatched artifact normalization metadata is fail-fast by default. Use an explicit API/CLI option only for
-audited legacy artifacts, for example `allow_normalization_version_mismatch=True` in the Rust featurizer path or
-`--allow-normalization-version-mismatch` in `scripts/production/model/linker_train_calibrate_eval.py`.
-
----
-
-## Testing & Benchmarking Only
-
-| Variable | Values | Default | Description |
-|----------|--------|---------|-------------|
-| `S2AND_SKIP_FASTTEXT` | `0`, `1` | `0` | Test/benchmark-only knob to skip FastText loading when language-detection fidelity is not under test. Do not use it for production runs. |
+| `S2AND_SKIP_FASTTEXT` | `1`, `true`, `yes` to skip | unset | Disables fastText model loading for scripts/tests that do not need language detection. Set before importing `s2and.text`. |
 
 ---
 

@@ -13,6 +13,7 @@ from s2and.data import ANDData
 from s2and.incremental_linking_training.name_counts import LoadNameCountsMode, resolve_load_name_counts
 from s2and.model import _ensure_lightgbm_fitted
 from s2and.production_model import load_production_model
+from s2and.text import fasttext_loading_enabled, set_fasttext_loading_enabled
 from s2and.thread_config import resolve_n_jobs
 
 
@@ -151,37 +152,49 @@ def load_giant_block_dataset(
     filtered_cluster_seeds = _filter_cluster_seeds(cluster_seeds, set(selected_signature_ids))
     filtered_altered = _filter_altered_signatures(altered_cluster_signatures, set(selected_signature_ids))
 
-    os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
-    os.environ["S2AND_BACKEND"] = "rust"
-    thread_count = str(resolve_n_jobs(n_jobs))
-    os.environ["OMP_NUM_THREADS"] = thread_count
-    os.environ["RAYON_NUM_THREADS"] = thread_count
+    previous_fasttext_loading_enabled = fasttext_loading_enabled()
+    env_keys = ("S2AND_SKIP_FASTTEXT", "S2AND_BACKEND", "OMP_NUM_THREADS", "RAYON_NUM_THREADS")
+    previous_env = {key: os.environ.get(key) for key in env_keys}
+    set_fasttext_loading_enabled(False)
+    try:
+        os.environ.setdefault("S2AND_SKIP_FASTTEXT", "1")
+        os.environ["S2AND_BACKEND"] = "rust"
+        thread_count = str(resolve_n_jobs(n_jobs))
+        os.environ["OMP_NUM_THREADS"] = thread_count
+        os.environ["RAYON_NUM_THREADS"] = thread_count
 
-    dataset = ANDData(
-        signatures=selected_signature_payloads,
-        papers=selected_paper_payloads,
-        name=f"{data_dir.name}_giant_block",
-        mode="inference",
-        specter_embeddings=selected_specter_embeddings,
-        clusters=None,
-        cluster_seeds=filtered_cluster_seeds,
-        altered_cluster_signatures=filtered_altered,
-        block_type="s2",
-        train_pairs=None,
-        val_pairs=None,
-        test_pairs=None,
-        train_pairs_size=1000,
-        val_pairs_size=1000,
-        test_pairs_size=1000,
-        n_jobs=int(n_jobs),
-        load_name_counts=resolve_load_name_counts(load_name_counts=load_name_counts, clusterer=clusterer),
-        preprocess=True,
-        random_seed=int(meta.get("random_seed", 0) if isinstance(meta, dict) else 0),
-        name_tuples="filtered",
-        use_orcid_id=False,
-        use_sinonym_overwrite=False,
-        compute_reference_features=False,
-    )
+        dataset = ANDData(
+            signatures=selected_signature_payloads,
+            papers=selected_paper_payloads,
+            name=f"{data_dir.name}_giant_block",
+            mode="inference",
+            specter_embeddings=selected_specter_embeddings,
+            clusters=None,
+            cluster_seeds=filtered_cluster_seeds,
+            altered_cluster_signatures=filtered_altered,
+            block_type="s2",
+            train_pairs=None,
+            val_pairs=None,
+            test_pairs=None,
+            train_pairs_size=1000,
+            val_pairs_size=1000,
+            test_pairs_size=1000,
+            n_jobs=int(n_jobs),
+            load_name_counts=resolve_load_name_counts(load_name_counts=load_name_counts, clusterer=clusterer),
+            preprocess=True,
+            random_seed=int(meta.get("random_seed", 0) if isinstance(meta, dict) else 0),
+            name_tuples="filtered",
+            use_orcid_id=False,
+            use_sinonym_overwrite=False,
+            compute_reference_features=False,
+        )
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        set_fasttext_loading_enabled(previous_fasttext_loading_enabled)
 
     load_info = {
         "target_block": resolved_block_key,

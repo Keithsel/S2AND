@@ -1,6 +1,6 @@
 # Rust Operational Baselines
 
-Status date: 2026-03-02 (latest snapshot: [`profiling/2026-03-02.md`](profiling/2026-03-02.md))
+Status date: 2026-05-27 (latest snapshot: [`profiling/2026-05-27-promoted-incremental-arrow.md`](profiling/2026-05-27-promoted-incremental-arrow.md))
 
 This doc is the operator guide for rerunning Rust promotion gates.
 The JSON artifacts under `scratch/` are the source of truth; avoid copying full metric tables into Markdown.
@@ -30,6 +30,8 @@ When refreshing gates:
 
 | Date | Highlights |
 |---|---|
+| [2026-05-27](profiling/2026-05-27-promoted-incremental-arrow.md) | Arrow-only promoted incremental profile on the canonical replay bundle; operational evidence from a dirty/debug worktree. |
+| [2026-05-25](profiling/2026-05-25-promoted-incremental-preflight.md) | Arrow promoted-incremental tiny preflight and canonical profiler setup. |
 | [2026-03-02](profiling/2026-03-02.md) | Gate rerun refresh snapshot (commands + artifact paths). |
 
 ---
@@ -53,7 +55,20 @@ Optional: summarize memory prediction telemetry from the JSONL artifact:
 uv run python scripts/rust_suite.py summarize-memory-telemetry scratch/baselines_YYYYMMDD/<run>_memory_telemetry_YYYYMMDD.jsonl --write-json scratch/baselines_YYYYMMDD/<run>_memory_telemetry_YYYYMMDD.json
 ```
 
-**1. Inference comparator**
+**1. Promoted incremental Arrow profile**
+```
+uv run python scripts/rust_suite.py promoted-incremental-arrow-profile \
+  --dataset pubmed --query-limit 25 --max-seed-clusters 25 --runs 5 \
+  --synthetic-seeds-when-clusters-missing \
+  --output-dir scratch/promoted_incremental_arrow_profile \
+  --write-json scratch/promoted_incremental_arrow_profile/pubmed.json
+```
+
+This is the current production-inference performance target. Build the Rust
+extension in release mode and use a clean worktree before treating the numbers
+as release-grade.
+
+**2. Inference comparator**
 ```
 uv run --no-project python scripts/rust_suite.py compare \
   --dataset inspire --limit 5000 --pair-count 5000 --n-jobs 4 \
@@ -61,7 +76,7 @@ uv run --no-project python scripts/rust_suite.py compare \
   --write-json scratch/baselines_YYYYMMDD/compare_inspire_5k_YYYYMMDD.json
 ```
 
-**2. Transfer-mini full**
+**3. Transfer-mini full**
 ```
 uv run --with psutil python scripts/rust_suite.py transfer-mini \
   --mode compare --preset full --target kisti \
@@ -69,10 +84,13 @@ uv run --with psutil python scripts/rust_suite.py transfer-mini \
   --write-json scratch/baselines_YYYYMMDD/profile_transfer_mini_full_YYYYMMDD.json
 ```
 
-**3. Stress rebuild (6x)**
+**4. Stress rebuild (6x)**
 ```
 uv run --with psutil python scripts/rust_suite.py stress-rebuild \
-  --dataset aminer --build-path from_json_paths \
+  --dataset aminer --build-path from_arrow_paths \
   --repeats 6 --num-threads 1 --rss-sample-ms 50 --require-rust-release 1 \
-  --write-json scratch/baselines_YYYYMMDD/stress_rust_from_json_paths_aminer_6x_YYYYMMDD.json
+  --write-json scratch/baselines_YYYYMMDD/stress_rust_from_arrow_paths_aminer_6x_YYYYMMDD.json
 ```
+
+Use `--build-path from_dataset` only for explicit classic `ANDData` lifecycle
+comparisons against the Arrow constructor.

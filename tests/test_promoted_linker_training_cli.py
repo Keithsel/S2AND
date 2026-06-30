@@ -37,28 +37,230 @@ def test_incremental_linking_runtime_imports_stay_runtime_safe() -> None:
     assert model_imports == []
 
 
-def test_promoted_training_defaults_to_minimal_raw_specter_source() -> None:
+def test_promoted_training_defaults_to_arrow_rust_source() -> None:
     parser = promoted_train.build_parser()
     parser_defaults = vars(parser.parse_args([]))
     feature_mode_action = next(action for action in parser._actions if action.dest == "feature_mode")  # noqa: SLF001
 
-    assert promoted_train.DEFAULT_SOURCE_BUNDLE_ROOT.name == "s2and_and_big_blocks_linker_dataset_20260513"
     assert promoted_train.DEFAULT_TARGET_JSON.relative_to(promoted_train.REPO_ROOT) == Path(
         "s2and/data/production_model_v1.21/reproducibility/incremental_linker_training_target.json"
     )
-    assert parser_defaults["feature_mode"] == "minimal-raw-rust"
-    assert feature_mode_action.choices == ("minimal-raw-rust", "precomputed-promoted")
+    assert parser_defaults["feature_mode"] == "arrow-rust"
+    assert feature_mode_action.choices == ("arrow-rust", "precomputed-promoted")
+    assert parser_defaults["arrow_name_counts_index_root"] is None
     assert parser_defaults["precomputed_feature_bundle_root"] is None
     assert parser_defaults["save_production_bundle_to"] is None
     assert parser_defaults["production_bundle_version"] is None
-    assert "promoted_feature_bundle_root" not in parser_defaults
     assert parser_defaults["prod_holdout_importance_weight"] == 10.0
     assert parser_defaults["hyperopt"] is False
     assert parser_defaults["hyperopt_evals"] is None
     assert parser_defaults["hyperopt_metric"] == "weighted_average_error"
-    assert parser_defaults["allow_normalization_version_mismatch"] is False
-    assert "minimal_raw_component_scope" not in parser_defaults
-    assert "minimal_raw_compare_pw_scopes" not in parser_defaults
+
+
+def test_minimal_raw_rust_is_not_public_feature_mode() -> None:
+    parser = promoted_train.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--feature-mode", "minimal-raw-rust"])
+
+
+def test_negative_limit_rows_is_rejected() -> None:
+    args = promoted_train.build_parser().parse_args(["--limit-rows", "-1"])
+
+    with pytest.raises(SystemExit, match="--limit-rows must be > 0"):
+        promoted_train.run(args)
+
+
+def test_selected_row_positions_rejects_non_positive_limit_rows() -> None:
+    labels = pd.DataFrame({"dataset": ["pubmed", "pubmed"]})
+
+    with pytest.raises(ValueError, match="limit_rows must be > 0"):
+        promoted_train._selected_row_positions(labels, datasets=None, limit_rows=-1)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("retrieval_rank", [-1, 0, 65536])
+def test_arrow_rust_materialization_rejects_invalid_retrieval_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    retrieval_rank: int,
+) -> None:
+    class RustModule:
+        @staticmethod
+        def raw_arrow_labeled_candidate_plan(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("rank validation should run before Rust planning")
+
+    monkeypatch.setattr(promoted_train.feature_port, "_require_rust_runtime", lambda: RustModule)
+    context = promoted_train.ArrowRustDatasetContext(
+        dataset_name="dummy",
+        row_component_scope="block-local",
+        pairwise_component_scope="block-local",
+        runtime_context=SimpleNamespace(),
+        arrow_paths={},
+        component_members={},
+        cluster_seeds_require={},
+        cluster_seeds_disallow=frozenset(),
+        seed_constrained_signature_ids=frozenset(),
+        max_block_component_size=1,
+    )
+    rows = pd.DataFrame(
+        [
+            {
+                "query_signature_id": "q1",
+                "query_view": "full",
+                "query_group_id": "g1",
+                "candidate_component_key": "c1",
+                "retrieval_rank": retrieval_rank,
+                "label": 0,
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="retrieval_rank"):
+        promoted_train._materialize_arrow_rust_dataset_rows(  # noqa: SLF001
+            context=context,
+            rows=rows,
+            target_features=[],
+            clusterer=SimpleNamespace(),
+            n_jobs=1,
+            total_ram_bytes=1,
+            max_exemplars=1,
+            pairwise_model_nan_value=0.0,
+            pairwise_aggregate_nan_value=0.0,
+            row_nan_policy="zero",
+        )
+
+
+def test_finalized_arrow_materialization_bundle_creates_corrected_feature_asset_group(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "output"
+    labels_path = source_root / "labels" / "train.parquet"
+    labels_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"query_group_id": "q1", "retrieval_rank": 1, "label": 1}]).to_parquet(labels_path, index=False)
+    payload = {
+        "bundle_name": "arrow_source",
+        "assets": {
+            "featureless_rows": {
+                "root": "labels",
+                "files": {
+                    "train_path": "labels/train.parquet",
+                },
+            },
+        },
+        "models": {
+            "classic": {
+                "feature_columns": [],
+                "best_params": {},
+            },
+        },
+        "expected_metrics": {},
+    }
+    source_root.mkdir(parents=True, exist_ok=True)
+    (source_root / "bundle.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "bundle.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    bundle = promoted_train._finalize_minimal_raw_bundle_metadata(  # noqa: SLF001
+        source_bundle=promoted_train.load_bundle(source_root),
+        output_bundle_root=output_root,
+        target={"feature_count": 1, "features": ["f0"], "params": {"n_estimators": 10}, "metrics": {}},
+        selected_keys=["train_path"],
+        stamp_precomputed_metadata=False,
+        source_mode="arrow-rust",
+    )
+
+    assert bundle.assets["corrected_feature_rows"]["root"] == "features_corrected"
+    feature_path = str(Path("features_corrected") / "train.parquet")
+    assert bundle.assets["corrected_feature_rows"]["files"] == {"train_path": feature_path}
+    assert bundle.models["classic"]["train_path"] == feature_path
+
+
+def test_materialization_selects_source_tables_from_featureless_assets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "source"
+    labels_dir = source_root / "labels"
+    labels_dir.mkdir(parents=True)
+    label_row = {
+        "dataset": "pubmed",
+        "query_group_id": "q1",
+        "candidate_component_key": "c1",
+        "retrieval_rank": 1,
+        "label": 1,
+    }
+    for filename in ("train.parquet", "hwang_eval.parquet"):
+        pd.DataFrame([label_row]).to_parquet(labels_dir / filename, index=False)
+
+    source_bundle = promoted_train.OfficialBundle(
+        root=source_root,
+        bundle_name="arrow_source",
+        assets={
+            "featureless_rows": {
+                "files": {
+                    "train_path": "labels/train.parquet",
+                    "hwang_eval_path": "labels/hwang_eval.parquet",
+                }
+            }
+        },
+        models={"classic": {}},
+        expected_metrics={},
+    )
+    captured: dict[str, list[str]] = {}
+
+    monkeypatch.setattr(promoted_train, "_copy_bundle_support_files", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        promoted_train,
+        "_asset_file",
+        lambda bundle, _group, key: bundle.root / bundle.assets["featureless_rows"]["files"][key],
+    )
+    monkeypatch.setattr(
+        promoted_train,
+        "_clean_arrow_rust_structural_rows",
+        lambda **kwargs: (kwargs["rows"], {"rows_before": len(kwargs["rows"]), "rows_after": len(kwargs["rows"])}),
+    )
+    monkeypatch.setattr(promoted_train, "_required_materialized_output_columns", lambda _labels, _features: ["dataset"])
+    monkeypatch.setattr(
+        promoted_train,
+        "_selected_row_positions",
+        lambda labels, _datasets, _limit_rows: __import__("numpy").arange(len(labels), dtype="int64"),
+    )
+    monkeypatch.setattr(promoted_train, "_build_arrow_rust_dataset_context", lambda **_kwargs: object())
+    monkeypatch.setattr(promoted_train, "_release_arrow_rust_dataset_context", lambda _context: None)
+
+    def fake_materialize_dataset_rows(**kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        rows = kwargs["rows"]
+        return {"f0": __import__("numpy").zeros(len(rows), dtype="float32")}, {
+            "dataset": "pubmed",
+            "rows": len(rows),
+        }
+
+    monkeypatch.setattr(promoted_train, "_materialize_arrow_rust_dataset_rows", fake_materialize_dataset_rows)
+
+    def fake_finalize(**kwargs: Any) -> promoted_train.OfficialBundle:
+        captured["selected_keys"] = list(kwargs["selected_keys"])
+        return kwargs["source_bundle"]
+
+    monkeypatch.setattr(promoted_train, "_finalize_minimal_raw_bundle_metadata", fake_finalize)
+
+    promoted_train._materialize_minimal_raw_feature_bundle(
+        source_bundle=source_bundle,
+        output_bundle_root=tmp_path / "output",
+        target={"features": ["f0"]},
+        clusterer=None,
+        n_jobs=1,
+        total_ram_bytes=1_000_000,
+        table_keys=None,
+        datasets=None,
+        limit_rows=None,
+        pair_batch_size=100,
+        query_batch_pair_limit=100,
+        max_exemplars=1,
+        max_top_k=1,
+        reuse_existing_features=False,
+        pairwise_model_nan_value=float("nan"),
+        pairwise_aggregate_nan_value=0.0,
+        row_nan_policy="finite",
+    )
+
+    assert captured["selected_keys"] == ["train_path", "hwang_eval_path"]
 
 
 def _write_precomputed_promoted_bundle(root: Path, target: dict[str, Any]) -> Path:
@@ -285,6 +487,17 @@ def test_prepare_prod_training_data_weights_calibration_rows_and_leaves_test_for
                 "label": 1,
                 "f0": 0.3,
             },
+            {
+                "query_group_id": "q_unlabeled",
+                "base_group_id": "b_unlabeled",
+                "candidate_component_key": "c_unlabeled",
+                "dataset": "unit",
+                "query_view": "full",
+                "retrieval_rank": 1,
+                "label": 0,
+                "supervision_type": "unlabeled_singleton_orcid",
+                "f0": 0.9,
+            },
         ],
     )
     _write_candidate_rows(
@@ -402,6 +615,7 @@ def test_prepare_prod_training_data_weights_calibration_rows_and_leaves_test_for
     assert summaries["stratified_calibration_calibration_fit"]["splits"] == ["calibration_fit"]
     assert summaries["stratified_calibration_calibration_fit"]["source_keys"] == ["s2and_eval"]
     assert prod_data.train_holdout_filter_summary["rows_removed"] == 1
+    assert "q_unlabeled" not in set(prod_data.rows["query_group_id"].astype(str))
 
 
 def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(
@@ -473,7 +687,7 @@ def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(
     monkeypatch.setattr(
         promoted_train,
         "_materialize_minimal_raw_feature_bundle",
-        lambda **_kwargs: (bundle, [{"mode": "minimal-raw-rust"}]),
+        lambda **_kwargs: (bundle, [{"mode": "arrow-rust"}]),
     )
     monkeypatch.setattr(promoted_train, "_run_classic_hyperopt", fake_hyperopt)  # noqa: SLF001
     monkeypatch.setattr(promoted_train, "run_classic", fake_run_classic)
@@ -483,7 +697,7 @@ def test_run_uses_hyperopt_params_and_saves_only_final_prod_artifact(
     args = promoted_train.build_parser().parse_args(
         [
             "--feature-mode",
-            "minimal-raw-rust",
+            "arrow-rust",
             "--run-full",
             "--hyperopt-evals",
             "2",

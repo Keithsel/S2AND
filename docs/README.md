@@ -26,19 +26,21 @@ This directory holds both user-facing guides and internal engineering notes.
 - Environment variables: [environment.md](environment.md)
 - Cache semantics and layout: [caching.md](caching.md)
 - Threading and parallelism: [threading.md](threading.md)
-- Subblocking for large blocks: [subclustering.md](subclustering.md)
+- Subblocking for large blocks: [subblocking.md](subblocking.md)
 - Rust promotion baselines and gate commands: [rust/baselines.md](rust/baselines.md)
-- Rust-only raw block candidate-plan shortcut: [rust/raw_block_query_candidate_plan.md](rust/raw_block_query_candidate_plan.md)
+- Rust inference architecture: [rust/inference_architecture.md](rust/inference_architecture.md)
+- Rust artifact formats: [rust/artifact_formats.md](rust/artifact_formats.md)
+- Direct Rust Arrow dataset schema: [rust/arrow_dataset_spec.md](rust/arrow_dataset_spec.md)
 - Historical profiling snapshots: [rust/profiling/README.md](rust/profiling/README.md)
 
 ## Deep dives and engineering notes
 
 - Stage-wise memory telemetry notes: [stage_memory_estimates.md](stage_memory_estimates.md)
+- Release notes: [release_notes.md](release_notes.md)
 
 ## Planning and migration docs
 
 - Rust and platform backlog: [work_plan.md](work_plan.md)
-- Rust artifact divergence and migration plan: [rust/artifact_divergence.md](rust/artifact_divergence.md)
 - Normalization migration plan [blocked]: [normalization_migration_blocked.md](normalization_migration_blocked.md)
 
 ## Scope notes

@@ -1,12 +1,10 @@
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from s2and.data import NameCounts
-
+import logging
+import os
 import re
 import threading
 import warnings
 from collections import Counter
+from typing import TYPE_CHECKING, Any
 
 import fasttext
 import jellyfish
@@ -20,29 +18,72 @@ from text_unidecode import unidecode
 from s2and.consts import FASTTEXT_PATH, NUMPY_NAN
 from s2and.file_cache import cached_path
 
+if TYPE_CHECKING:
+    from s2and.data import NameCounts
+
+logger = logging.getLogger("s2and")
+
 # Lazily-loaded fastText model to avoid heavy import-time cost
 _FASTTEXT_MODEL = None
 _FASTTEXT_MODEL_INITIALIZED = False
+_FASTTEXT_LOADING_ENABLED = True
+_FASTTEXT_LOAD_FAILED = False
 _FASTTEXT_MODEL_LOCK = threading.Lock()
 
 
-def _get_fasttext_model():
-    """Return a cached fastText model instance, loading on first use.
+def set_fasttext_loading_enabled(enabled: bool) -> None:
+    """Configure whether language detection may load the fastText model."""
 
-    Honors test/benchmark env var `S2AND_SKIP_FASTTEXT` to skip loading.
-    """
-    import os
+    global _FASTTEXT_LOADING_ENABLED
+    global _FASTTEXT_MODEL
+    global _FASTTEXT_MODEL_INITIALIZED
+    global _FASTTEXT_LOAD_FAILED
+    with _FASTTEXT_MODEL_LOCK:
+        resolved_enabled = bool(enabled)
+        if _FASTTEXT_LOADING_ENABLED == resolved_enabled:
+            if not resolved_enabled:
+                _FASTTEXT_MODEL = None
+                _FASTTEXT_MODEL_INITIALIZED = True
+                _FASTTEXT_LOAD_FAILED = False
+            elif (
+                _FASTTEXT_MODEL is None
+                and _FASTTEXT_MODEL_INITIALIZED
+                and not _FASTTEXT_LOAD_FAILED
+                and os.environ.get("S2AND_SKIP_FASTTEXT", "").lower() not in {"1", "true", "yes"}
+            ):
+                _FASTTEXT_MODEL_INITIALIZED = False
+            return
+        _FASTTEXT_LOADING_ENABLED = resolved_enabled
+        if resolved_enabled:
+            if _FASTTEXT_MODEL is not None or not _FASTTEXT_LOAD_FAILED:
+                _FASTTEXT_MODEL_INITIALIZED = False
+            return
+        _FASTTEXT_MODEL = None
+        _FASTTEXT_MODEL_INITIALIZED = True
+        _FASTTEXT_LOAD_FAILED = False
+
+
+def fasttext_loading_enabled() -> bool:
+    """Return whether language detection may load the fastText model."""
+
+    with _FASTTEXT_MODEL_LOCK:
+        return bool(_FASTTEXT_LOADING_ENABLED)
+
+
+def _get_fasttext_model():
+    """Return a cached fastText model instance, loading on first use."""
 
     global _FASTTEXT_MODEL
     global _FASTTEXT_MODEL_INITIALIZED
+    global _FASTTEXT_LOAD_FAILED
     if os.environ.get("S2AND_SKIP_FASTTEXT", "").lower() in {"1", "true", "yes"}:
-        _FASTTEXT_MODEL = None
-        _FASTTEXT_MODEL_INITIALIZED = True
+        with _FASTTEXT_MODEL_LOCK:
+            _FASTTEXT_MODEL = None
+            _FASTTEXT_MODEL_INITIALIZED = True
+            _FASTTEXT_LOAD_FAILED = False
         return None
-    if _FASTTEXT_MODEL_INITIALIZED:
-        return _FASTTEXT_MODEL
     with _FASTTEXT_MODEL_LOCK:
-        if os.environ.get("S2AND_SKIP_FASTTEXT", "").lower() in {"1", "true", "yes"}:
+        if not _FASTTEXT_LOADING_ENABLED:
             _FASTTEXT_MODEL = None
             _FASTTEXT_MODEL_INITIALIZED = True
             return None
@@ -50,16 +91,27 @@ def _get_fasttext_model():
             return _FASTTEXT_MODEL
         try:
             _FASTTEXT_MODEL = fasttext.load_model(cached_path(FASTTEXT_PATH))
-        except Exception:
-            # If loading fails, degrade gracefully to no fastText.
+            _FASTTEXT_LOAD_FAILED = False
+        except (OSError, RuntimeError, ValueError):
+            logger.exception("Failed to load fastText language model; language detection will skip fastText")
             _FASTTEXT_MODEL = None
+            _FASTTEXT_LOAD_FAILED = True
         _FASTTEXT_MODEL_INITIALIZED = True
         return _FASTTEXT_MODEL
 
 
 RE_NORMALIZE_WHOLE_NAME = re.compile(r"[^a-zA-Z\s]+")
 
-ORCID_PATTERN = re.compile(r"\d{4}-?\d{4}-?\d{4}-?\d{3}[0-9X]")
+DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212\ufe58\ufe63\uff0d"
+NAME_DASH_CHARS = frozenset(DASH_CHARS)
+ORCID_DASH_CLASS = re.escape(DASH_CHARS)
+ORCID_PATTERN = re.compile(
+    rf"(?i)(?<![0-9x])"
+    rf"\d{{4}}[{ORCID_DASH_CLASS}]?"
+    rf"\d{{4}}[{ORCID_DASH_CLASS}]?"
+    rf"\d{{4}}[{ORCID_DASH_CLASS}]?"
+    rf"\d{{3}}[0-9x](?![0-9x])"
+)
 
 DROPPED_AFFIXES = {
     "ab",
@@ -325,7 +377,8 @@ def detect_language(text: str):
         predicted_language_2 = cld2_pred[2][0][1]
         if predicted_language_2 == "un":
             predicted_language_2 = "un_2"
-    except Exception:
+    except (UnicodeError, cld2.error):
+        logger.exception("cld2 language detection failed; using unknown language marker")
         predicted_language_2 = "un_2"
 
     if predicted_language_ft == "un_ft" and predicted_language_2 == "un_2":
@@ -379,6 +432,31 @@ def normalize_text(text: str | None, special_case_apostrophes: bool = False) -> 
     return norm_text
 
 
+def normalize_orcid(value: Any) -> str | None:
+    """Return a canonical hyphenated ORCID, or None when no valid ORCID is present."""
+
+    if value is None:
+        return None
+    match = ORCID_PATTERN.search(str(value).strip())
+    if match is None:
+        return None
+    compact = "".join(character for character in match.group(0) if character not in NAME_DASH_CHARS).upper()
+    return f"{compact[0:4]}-{compact[4:8]}-{compact[8:12]}-{compact[12:16]}"
+
+
+def normalize_orcid_compact(value: Any) -> str | None:
+    """Return a compact legacy ORCID key, or None when no valid ORCID is present."""
+
+    normalized = normalize_orcid(value)
+    return None if normalized is None else normalized.replace("-", "")
+
+
+def has_name_dash(value: str | None) -> bool:
+    """Return whether a raw name contains a dash-like character."""
+
+    return any(character in NAME_DASH_CHARS for character in value or "")
+
+
 def split_first_middle_hyphen_aware(first_raw: str | None, middle_raw: str | None) -> tuple[str, str]:
     """Normalize and split first/middle with hyphen awareness for canonical fields.
 
@@ -393,7 +471,7 @@ def split_first_middle_hyphen_aware(first_raw: str | None, middle_raw: str | Non
     first_raw = first_raw or ""
     middle_raw = middle_raw or ""
 
-    has_dash_in_first = "-" in first_raw
+    has_dash_in_first = has_name_dash(first_raw)
     first_noapos = normalize_text(first_raw, special_case_apostrophes=True)
     middle_norm = normalize_text(middle_raw)
 
@@ -458,6 +536,8 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     -------
     float: the cosine similarity of the two vectors
     """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
     a_norm = norm(a)
     b_norm = norm(b)
     if a_norm == 0 or b_norm == 0:

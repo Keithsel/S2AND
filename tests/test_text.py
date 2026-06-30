@@ -6,6 +6,7 @@ from collections import Counter
 from typing import Any, cast
 
 import numpy as np
+import pytest
 from sklearn.metrics.pairwise import cosine_similarity
 
 from s2and.consts import NUMPY_NAN
@@ -24,7 +25,10 @@ from s2and.text import (
     jaccard,
     name_counts,
     name_text_features,
+    normalize_orcid,
+    normalize_orcid_compact,
     normalize_text,
+    split_first_middle_hyphen_aware,
 )
 
 
@@ -35,6 +39,22 @@ class TestClusterer(unittest.TestCase):
         assert "text" == normalize_text("TeXt")
         assert "te han zi xt" == normalize_text("te'漢字xt")
         assert "text" == normalize_text("te'xt", True)
+        assert "a b" == normalize_text("A1 B-2")
+
+    def test_normalize_orcid_canonicalizes_common_forms(self):
+        assert normalize_orcid(" https://orcid.org/0000-0002-1825-0097 ") == "0000-0002-1825-0097"
+        assert normalize_orcid("ORCID: 000000021825009x") == "0000-0002-1825-009X"
+        assert normalize_orcid_compact("ORCID: 000000021825009x") == "000000021825009X"
+        for dash in "-\u2010\u2011\u2012\u2013\u2014\u2212\ufe58\ufe63\uff0d":
+            assert normalize_orcid(dash.join(["0000", "0002", "1825", "0097"])) == "0000-0002-1825-0097"
+        assert normalize_orcid("https://orcid.org/0000\u20100002\u20101825\u20100097") == "0000-0002-1825-0097"
+        assert normalize_orcid("s000-0000-1879-1075X") is None
+        assert normalize_orcid("0000-0002-1825") is None
+
+    def test_split_first_middle_treats_unicode_dashes_as_hyphens(self):
+        assert split_first_middle_hyphen_aware("Amin-ul-Haq", None) == ("amin ul haq", "")
+        assert split_first_middle_hyphen_aware("Arif\u2010ullah", None) == ("arif ullah", "")
+        assert split_first_middle_hyphen_aware("Hua\uff0dli", None) == ("hua li", "")
 
     def test_name_similarity_features(self):
         assert [NUMPY_NAN] * 4 == name_text_features("", cast(Any, None))
@@ -192,7 +212,7 @@ def test_fasttext_model_lazy_load_is_thread_safe(monkeypatch):
     monkeypatch.setattr(text_module.fasttext, "load_model", _fake_load_model)
     monkeypatch.setattr(text_module, "cached_path", lambda path: path)
     monkeypatch.setattr(text_module, "FASTTEXT_PATH", "dummy_model_path.bin")
-    monkeypatch.delenv("S2AND_SKIP_FASTTEXT", raising=False)
+    text_module.set_fasttext_loading_enabled(True)
     text_module._FASTTEXT_MODEL = None
     text_module._FASTTEXT_MODEL_INITIALIZED = False
 
@@ -208,12 +228,143 @@ def test_fasttext_model_lazy_load_is_thread_safe(monkeypatch):
     assert all(model is fake_model for model in outputs)
 
 
-def test_fasttext_skip_overrides_cached_model(monkeypatch):
+def test_fasttext_skip_overrides_cached_model():
     import s2and.text as text_module
 
-    text_module._FASTTEXT_MODEL = object()
-    text_module._FASTTEXT_MODEL_INITIALIZED = True
+    text_module_any = cast(Any, text_module)
+    text_module_any.set_fasttext_loading_enabled(True)
+    text_module_any._FASTTEXT_MODEL = object()
+    text_module_any._FASTTEXT_MODEL_INITIALIZED = True
+    text_module_any.set_fasttext_loading_enabled(False)
+
+    assert text_module_any._get_fasttext_model() is None
+    assert text_module_any._FASTTEXT_MODEL is None
+
+
+def test_fasttext_skip_env_prevents_loading(monkeypatch):
+    import s2and.text as text_module
+
+    text_module_any = cast(Any, text_module)
+    load_calls = {"count": 0}
+
+    def _fake_load_model(_path: str):
+        load_calls["count"] += 1
+        return object()
+
     monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+    monkeypatch.setattr(text_module.fasttext, "load_model", _fake_load_model)
+    monkeypatch.setattr(text_module, "cached_path", lambda path: path)
+    text_module_any.set_fasttext_loading_enabled(True)
+    text_module_any._FASTTEXT_MODEL = object()
+    text_module_any._FASTTEXT_MODEL_INITIALIZED = True
+
+    assert text_module_any._get_fasttext_model() is None
+    assert text_module_any._FASTTEXT_MODEL is None
+    assert load_calls["count"] == 0
+
+
+def test_fasttext_can_reenable_after_skip_env(monkeypatch):
+    import s2and.text as text_module
+
+    fake_model = object()
+    load_calls = {"count": 0}
+
+    def _fake_load_model(_path: str):
+        load_calls["count"] += 1
+        return fake_model
+
+    monkeypatch.setattr(text_module.fasttext, "load_model", _fake_load_model)
+    monkeypatch.setattr(text_module, "cached_path", lambda path: path)
+    monkeypatch.setattr(text_module, "FASTTEXT_PATH", "dummy_model_path.bin")
+    text_module.set_fasttext_loading_enabled(True)
+    text_module._FASTTEXT_MODEL = None
+    text_module._FASTTEXT_MODEL_INITIALIZED = False
+
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+    assert text_module._get_fasttext_model() is None
+
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "0")
+    text_module.set_fasttext_loading_enabled(True)
+
+    assert text_module._get_fasttext_model() is fake_model
+    assert load_calls["count"] == 1
+
+
+def test_fasttext_enable_preserves_loaded_model(monkeypatch):
+    import s2and.text as text_module
+
+    fake_model = object()
+    load_calls = {"count": 0}
+
+    def _fake_load_model(_path: str):
+        load_calls["count"] += 1
+        return fake_model
+
+    monkeypatch.setattr(text_module.fasttext, "load_model", _fake_load_model)
+    monkeypatch.setattr(text_module, "cached_path", lambda path: path)
+    monkeypatch.setattr(text_module, "FASTTEXT_PATH", "dummy_model_path.bin")
+    text_module.set_fasttext_loading_enabled(True)
+    text_module._FASTTEXT_MODEL = None
+    text_module._FASTTEXT_MODEL_INITIALIZED = False
+
+    assert text_module._get_fasttext_model() is fake_model
+    text_module.set_fasttext_loading_enabled(True)
+
+    assert text_module._get_fasttext_model() is fake_model
+    assert load_calls["count"] == 1
+
+
+def test_fasttext_failed_load_remains_negative_cached_after_reenable(monkeypatch):
+    import s2and.text as text_module
+
+    load_calls = {"count": 0}
+
+    def _raise_os_error(_path: str):
+        load_calls["count"] += 1
+        raise OSError("missing model")
+
+    monkeypatch.setattr(text_module.fasttext, "load_model", _raise_os_error)
+    monkeypatch.setattr(text_module, "cached_path", lambda path: path)
+    monkeypatch.delenv("S2AND_SKIP_FASTTEXT", raising=False)
+    text_module.set_fasttext_loading_enabled(True)
+    text_module._FASTTEXT_MODEL = None
+    text_module._FASTTEXT_MODEL_INITIALIZED = False
+    text_module._FASTTEXT_LOAD_FAILED = False
 
     assert text_module._get_fasttext_model() is None
-    assert text_module._FASTTEXT_MODEL is None
+    assert text_module._get_fasttext_model() is None
+    text_module.set_fasttext_loading_enabled(True)
+    assert text_module._get_fasttext_model() is None
+
+    assert load_calls["count"] == 1
+
+
+def test_fasttext_unexpected_load_error_propagates(monkeypatch):
+    import s2and.text as text_module
+
+    def _raise_type_error(_path: str):
+        raise TypeError("bad monkeypatch")
+
+    monkeypatch.setattr(text_module.fasttext, "load_model", _raise_type_error)
+    monkeypatch.setattr(text_module, "cached_path", lambda path: path)
+    monkeypatch.delenv("S2AND_SKIP_FASTTEXT", raising=False)
+    text_module.set_fasttext_loading_enabled(True)
+    text_module._FASTTEXT_MODEL = None
+    text_module._FASTTEXT_MODEL_INITIALIZED = False
+
+    with pytest.raises(TypeError, match="bad monkeypatch"):
+        text_module._get_fasttext_model()
+
+
+def test_cld2_unexpected_error_propagates(monkeypatch):
+    import s2and.text as text_module
+
+    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
+
+    def _raise_type_error(_text: str):
+        raise TypeError("bad cld2 state")
+
+    monkeypatch.setattr(text_module.cld2, "detect", _raise_type_error)
+
+    with pytest.raises(TypeError, match="bad cld2 state"):
+        detect_language("hello world")

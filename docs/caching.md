@@ -5,7 +5,7 @@ This document describes every cache-like mechanism in S2AND and how it relates t
 
 ## Public API
 
-`use_cache` is the single public cache control on the main APIs:
+`use_cache` is the public control for the persistent pair-feature cache on the main pair-featurization APIs:
 
 - `featurize(..., use_cache=...)`
 - `many_pairs_featurize(..., use_cache=...)`
@@ -20,6 +20,8 @@ Important nuance:
 
 - `use_cache` does not disable same-process Rust featurizer reuse.
 - `use_cache` does not disable the artifact download cache used by `s2and.file_cache.cached_path`.
+- Direct Arrow/Rust production prediction paths bypass the persistent pair-feature SQLite cache; `use_cache` only affects
+  prediction paths that materialize pair features through the Python cache-aware featurization layer.
 
 ## Cache Inventory
 
@@ -27,6 +29,7 @@ Important nuance:
 | --- | --- | --- | --- |
 | Pair-feature cache | Yes | Reuse computed pairwise feature rows across repeated featurization/prediction | `<S2AND_CACHE>/<dataset>/<featurizer_version>/pair_features.sqlite3` |
 | Rust featurizer in-memory reuse | No | Reuse an already-built Rust featurizer within the current Python process | memory only |
+| Direct Arrow/Rust prediction inputs | No | Read request/runtime Arrow artifacts directly without pair-feature SQLite caching | request or bundle artifact paths |
 | Artifact download cache | No | Avoid re-downloading remote artifacts fetched through `cached_path()` | `<S2AND_CACHE>/artifacts` |
 
 `S2AND_CACHE` defaults to `~/.s2and`.
@@ -65,18 +68,6 @@ Operational behavior:
   process do not re-read SQLite; large cache-enabled runs can therefore still consume substantial
   RAM
 
-### Legacy JSON Compatibility
-
-Older S2AND versions wrote pair features to:
-
-```text
-<S2AND_CACHE>/<dataset>/<featurizer_version>/all_features.json
-```
-
-Current code still reads that file for compatibility. If a legacy JSON cache is loaded and the
-cache is later written, S2AND migrates those entries into `pair_features.sqlite3`. After that, the
-SQLite database is the authoritative persistent cache.
-
 ## Rust Featurizer Caches
 
 The Rust featurizer has two distinct reuse mechanisms.
@@ -86,13 +77,13 @@ The Rust featurizer has two distinct reuse mechanisms.
 When the same `ANDData` object is reused inside one Python process, S2AND keeps the built Rust
 featurizer in memory and reuses it on later calls. This is always enabled.
 
-Implications:
+Implications for compatibility paths:
 
-- `warm_rust_featurizer(dataset)` is useful for long-lived processes
+- `warm_rust_featurizer(dataset)` is useful for long-lived processes that still
+  run through an `ANDData` compatibility route
 - `use_cache=False` does not force a rebuild if the same dataset object already has a live cached
   Rust featurizer
-- Rust featurizers are not serialized to disk; process restarts rebuild them from the dataset or
-  JSON ingest paths
+- Rust featurizers are not serialized to disk; process restarts rebuild them from the dataset
 
 ## Artifact Download Cache
 
@@ -104,9 +95,8 @@ Implications:
 
 This cache is separate from `use_cache`. It is an input-artifact cache, not a featurization cache.
 
-Remote artifacts are keyed by URL plus the server validator. Current releases namespace validators as
-`etag:<value>` or `last-modified:<value>` before hashing. For compatibility, S2AND still probes the
-pre-0.50 raw-ETag filename before downloading.
+Remote artifacts are keyed by URL plus the server validator. Validators are namespaced as
+`etag:<value>` or `last-modified:<value>` before hashing.
 
 ## Interaction with Rust Batch Featurization
 
@@ -124,8 +114,13 @@ work even when the cache backend itself is fast.
 
 - Repeated training or repeated inference on the same dataset or pair set: use `use_cache=True`
 - One-shot experiments, one-pass offline jobs, or feature-development work: use `use_cache=False`
-- Long-lived services that want lower cold-start latency in a single process:
-  call `warm_rust_featurizer(dataset)` during startup
+- Long-lived compatibility services that still own an `ANDData` object and want
+  lower cold-start latency in a single process: call
+  `warm_rust_featurizer(dataset)` during startup
+- Production Arrow services should keep Arrow artifacts local and call
+  `Clusterer.predict_from_arrow_paths(...)` or Arrow-routed
+  `Clusterer.predict(...)`; `warm_rust_featurizer(dataset)` is not the Arrow
+  production warmup API
 If a job will not revisit the same pair set, `use_cache=False` is usually the right choice because
 it avoids unnecessary persistent writes.
 

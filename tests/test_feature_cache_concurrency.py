@@ -19,7 +19,6 @@ def _write_incremental_features_worker(
     featurizer_info.cache_directory = lambda _dataset_name: str(cache_dir)  # type: ignore[method-assign]
     featurizer_info.cache_db_path = lambda _dataset_name: cache_db_path  # type: ignore[method-assign]
     featurizer_info.cache_storage_key = lambda _dataset_name: cache_db_path  # type: ignore[method-assign]
-    featurizer_info.cache_file_path = lambda _dataset_name: str(cache_dir / "all_features.json")  # type: ignore[method-assign]
 
     start_event.wait(timeout=5.0)
 
@@ -65,7 +64,6 @@ def test_incremental_feature_cache_concurrent_process_writes_preserve_all_keys(t
     featurizer_info.cache_directory = lambda _dataset_name: str(cache_dir)  # type: ignore[method-assign]
     featurizer_info.cache_db_path = lambda _dataset_name: cache_db_path  # type: ignore[method-assign]
     featurizer_info.cache_storage_key = lambda _dataset_name: cache_db_path  # type: ignore[method-assign]
-    featurizer_info.cache_file_path = lambda _dataset_name: str(cache_dir / "all_features.json")  # type: ignore[method-assign]
     cached = featurizer_info.load_cache("shared_dataset")
 
     feature_keys = set(cached["features"].keys())

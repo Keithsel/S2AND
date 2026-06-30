@@ -434,14 +434,18 @@ def build_logistic_gate_matrix(
         retrieval_ranks=retrieval_ranks,
         component_keys=component_keys,
     )
-    first_name_bucket = _object_array(feature_values, "first_name_bucket", row_count)
     query_view = _object_array(feature_values, "query_view", row_count)
-    if (
-        "first_name_bucket" not in feature_values
-        and "query_first_token" in feature_values
-        and "query_view" in feature_values
-    ):
+    if "first_name_bucket" in feature_values:
+        first_name_bucket = _object_array(feature_values, "first_name_bucket", row_count)
+    elif "query_first_token" in feature_values and "query_view" in feature_values:
         first_name_bucket = first_name_bucket_array(feature_values["query_first_token"], feature_values["query_view"])
+    else:
+        if any(name.startswith("first_name_bucket_") for name in resolved_feature_names):
+            raise ValueError(
+                "logistic gate first_name_bucket_* features require 'first_name_bucket' or both"
+                " 'query_first_token' and 'query_view' in feature_values"
+            )
+        first_name_bucket = _object_array(feature_values, "first_name_bucket", row_count)
     has_query_first_token = "query_first_token" in feature_values
     has_query_author = "query_author" in feature_values
     query_first_token = _object_array(feature_values, "query_first_token", row_count)
@@ -635,13 +639,30 @@ def feature_values_from_runtime(
         values["retrieval_score"] = np.asarray(candidate_batch.retrieval_scores, dtype=np.float64)
     if candidate_batch.retrieval_ranks is not None:
         values["retrieval_rank"] = np.asarray(candidate_batch.retrieval_ranks, dtype=np.float64)
+    pairwise_column_set = (
+        {str(column) for column in feature_matrix.pairwise_stats.aggregate_feature_columns}
+        if feature_matrix.pairwise_stats is not None
+        else set()
+    )
     if row_signals is not None:
         for key, value in row_signals.items():
-            values[str(key)] = value
+            key = str(key)
+            if key in pairwise_column_set and key in values:
+                continue
+            values[key] = value
     if feature_matrix.pairwise_stats is not None:
-        pairwise_values = np.asarray(feature_matrix.pairwise_stats.feature_matrix(), dtype=np.float64)
-        for index, column in enumerate(feature_matrix.pairwise_stats.aggregate_feature_columns):
-            values[str(column)] = pairwise_values[:, index]
+        missing_pairwise_columns = [
+            str(column)
+            for column in feature_matrix.pairwise_stats.aggregate_feature_columns
+            if str(column) not in values
+        ]
+        if missing_pairwise_columns:
+            missing_pairwise_column_set = set(missing_pairwise_columns)
+            pairwise_values = np.asarray(feature_matrix.pairwise_stats.feature_matrix(), dtype=np.float64)
+            for index, column in enumerate(feature_matrix.pairwise_stats.aggregate_feature_columns):
+                column = str(column)
+                if column in missing_pairwise_column_set:
+                    values[column] = pairwise_values[:, index]
     return values
 
 

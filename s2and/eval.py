@@ -676,19 +676,22 @@ def b3_precision_recall_fscore(true_clus, pred_clus, skip_signatures=None):
 
     true_bigger_ratios, pred_bigger_ratios = [], []
     for item in list(tcset):
-        pred_cluster_i = pred_clusters[rev_pred_clusters[item]]
-        true_cluster_i = true_clusters[rev_true_clusters[item]]
+        pred_cluster_id = rev_pred_clusters[item]
+        true_cluster_id = rev_true_clusters[item]
+        pred_cluster_i = pred_clusters[pred_cluster_id]
+        true_cluster_i = true_clusters[true_cluster_id]
 
         if len(pred_cluster_i) >= len(true_cluster_i):
             pred_bigger_ratios.append(len(pred_cluster_i) / len(true_cluster_i))
         else:
             true_bigger_ratios.append(len(true_cluster_i) / len(pred_cluster_i))
 
-        if (pred_cluster_i, true_cluster_i) in intersections:
-            intersection = intersections[(pred_cluster_i, true_cluster_i)]
+        memo_key = (pred_cluster_id, true_cluster_id)
+        if memo_key in intersections:
+            intersection = intersections[memo_key]
         else:
             intersection = pred_cluster_i.intersection(true_cluster_i)
-            intersections[(pred_cluster_i, true_cluster_i)] = intersection
+            intersections[memo_key] = intersection
         _precision = len(intersection) / len(pred_cluster_i)
         _recall = len(intersection) / len(true_cluster_i)
         precision += _precision

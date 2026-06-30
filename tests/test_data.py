@@ -1,10 +1,13 @@
 import unittest
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pandas as pd
 import pytest
 
+import s2and.data as data_module
 from s2and.data import ANDData, _parse_sinonym_name
+from s2and.rust_lifecycle import PYTHON_ONLY_POLICY
 
 
 def test_maybe_load_list_empty_file_returns_empty_list(tmp_path):
@@ -12,6 +15,169 @@ def test_maybe_load_list_empty_file_returns_empty_list(tmp_path):
     empty_path.write_text("", encoding="utf-8")
 
     assert ANDData.maybe_load_list(str(empty_path)) == []
+
+
+def test_preprocess_signatures_drops_empty_normalized_affiliations() -> None:
+    dataset = ANDData(
+        signatures={
+            "s1": {
+                "signature_id": "s1",
+                "paper_id": 1,
+                "author_info": {
+                    "position": 0,
+                    "block": "a lovelace",
+                    "first": "Ada",
+                    "middle": "",
+                    "last": "Lovelace",
+                    "suffix": None,
+                    "email": None,
+                    "affiliations": [",", "\u00a0", "Analytical Engine Lab"],
+                },
+            }
+        },
+        papers={
+            "1": {
+                "paper_id": 1,
+                "title": "Notes",
+                "abstract": "",
+                "journal_name": "",
+                "venue": "",
+                "year": 1843,
+                "authors": [{"position": 0, "author_name": "Ada Lovelace"}],
+                "references": [],
+            }
+        },
+        name="empty_normalized_affiliations",
+        mode="inference",
+        load_name_counts=False,
+        preprocess=True,
+        n_jobs=1,
+    )
+
+    assert dataset.signatures["s1"].author_info_affiliations == ["analytical engine lab"]
+    assert "" not in dataset.signatures["s1"].author_info_affiliations
+
+
+def test_compute_reference_features_retains_unsigned_reference_papers() -> None:
+    dataset = ANDData(
+        signatures={
+            "s1": {
+                "signature_id": "s1",
+                "paper_id": "p1",
+                "author_info": {
+                    "position": 0,
+                    "block": "a lovelace",
+                    "first": "Ada",
+                    "middle": "",
+                    "last": "Lovelace",
+                    "suffix": None,
+                    "email": None,
+                    "affiliations": [],
+                },
+            }
+        },
+        papers={
+            "p1": {
+                "paper_id": "p1",
+                "title": "Signed Paper",
+                "abstract": "",
+                "journal_name": "",
+                "venue": "",
+                "year": 1843,
+                "authors": [{"position": 0, "author_name": "Ada Lovelace"}],
+                "references": ["p2"],
+            },
+            "p2": {
+                "paper_id": "p2",
+                "title": "Analytical Engine Notes",
+                "abstract": "",
+                "journal_name": "Computing",
+                "venue": "London",
+                "year": 1842,
+                "authors": [{"position": 0, "author_name": "Charles Babbage"}],
+                "references": [],
+            },
+        },
+        name="reference_feature_unsigned_paper",
+        mode="inference",
+        load_name_counts=False,
+        preprocess=True,
+        compute_reference_features=True,
+        n_jobs=1,
+    )
+
+    assert dataset.papers["p2"].in_signatures is False
+    assert dataset.papers["p1"].reference_details is not None
+    assert dataset.papers["p1"].reference_details[1]
+
+
+def test_anddata_passes_from_dataset_capability_to_rust_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        data_module,
+        "build_runtime_context",
+        lambda _operation: SimpleNamespace(
+            requested_backend="auto",
+            resolved_backend="rust",
+            use_rust=False,
+            run_id="test-run",
+            source="default",
+        ),
+    )
+    monkeypatch.setattr(
+        data_module,
+        "detect_rust_runtime_capabilities",
+        lambda: SimpleNamespace(
+            from_dataset_available=False,
+            from_dataset_paper_preprocess_available=True,
+        ),
+    )
+
+    def _capture_lifecycle_policy(**kwargs: Any):
+        captured.update(kwargs)
+        return PYTHON_ONLY_POLICY
+
+    monkeypatch.setattr(data_module, "build_rust_lifecycle_policy", _capture_lifecycle_policy)
+
+    ANDData(
+        signatures={
+            "s1": {
+                "signature_id": "s1",
+                "paper_id": 1,
+                "author_info": {
+                    "position": 0,
+                    "block": "a lovelace",
+                    "first": "Ada",
+                    "middle": "",
+                    "last": "Lovelace",
+                    "suffix": None,
+                    "email": None,
+                    "affiliations": [],
+                },
+            }
+        },
+        papers={
+            "1": {
+                "paper_id": 1,
+                "title": "Notes",
+                "abstract": "",
+                "journal_name": "",
+                "venue": "",
+                "year": 1843,
+                "authors": [{"position": 0, "author_name": "Ada Lovelace"}],
+                "references": [],
+            }
+        },
+        name="rust_lifecycle_capability",
+        mode="inference",
+        load_name_counts=False,
+        preprocess=False,
+        name_tuples=set(),
+    )
+
+    assert captured["backend"] == "rust"
+    assert captured["from_dataset_available"] is False
+    assert captured["from_dataset_paper_preprocess_available"] is True
 
 
 class TestData(unittest.TestCase):
@@ -93,6 +259,43 @@ class TestData(unittest.TestCase):
         assert len(train_pairs) == 1000
         assert len(val_pairs) == 500
         assert len(test_pairs) == 7244
+
+    def test_split_pairs_global_balanced_classes_uses_split_signatures(self):
+        self.qian_dataset.pair_sampling_mode = "global_balanced_classes"
+        self.qian_dataset.train_pairs_size = 1000
+        self.qian_dataset.val_pairs_size = 500
+        self.qian_dataset.test_pairs_size = 500
+        self.qian_dataset.random_seed = 1111
+        (
+            train_block_dict,
+            val_block_dict,
+            test_block_dict,
+        ) = self.qian_dataset.split_cluster_signatures()
+
+        train_pairs, val_pairs, test_pairs = self.qian_dataset.split_pairs(
+            train_block_dict, val_block_dict, test_block_dict
+        )
+
+        expected_train_pairs = self.qian_dataset.pair_sampling(
+            self.qian_dataset.train_pairs_size,
+            [signature for signatures in train_block_dict.values() for signature in signatures],
+            train_block_dict,
+        )
+        expected_val_pairs = self.qian_dataset.pair_sampling(
+            self.qian_dataset.val_pairs_size,
+            [signature for signatures in val_block_dict.values() for signature in signatures],
+            val_block_dict,
+        )
+        expected_test_pairs = self.qian_dataset.pair_sampling(
+            self.qian_dataset.test_pairs_size,
+            [signature for signatures in test_block_dict.values() for signature in signatures],
+            test_block_dict,
+        )
+
+        assert train_pairs == expected_train_pairs
+        assert val_pairs == expected_val_pairs
+        assert test_pairs == expected_test_pairs
+        assert train_pairs
 
     def test_blocks(self):
         original_blocks = self.dummy_dataset.get_original_blocks()
@@ -313,85 +516,6 @@ def test_pair_sampling_invalid_mode_raises_value_error():
             load_name_counts=False,
             preprocess=False,
         )
-
-
-def test_pair_sampling_legacy_flags_map_to_canonical_modes():
-    dataset = ANDData(
-        signatures={},
-        papers={},
-        clusters={},
-        name="legacy_pair_sampling_flags",
-        mode="train",
-        unit_of_data_split="signatures",
-        pair_sampling_block=False,
-        pair_sampling_balanced_classes=True,
-        load_name_counts=False,
-        preprocess=False,
-    )
-
-    assert dataset.pair_sampling_mode == "global_balanced_classes"
-    assert not dataset.pair_sampling_block
-    assert dataset.pair_sampling_balanced_classes
-    assert not dataset.pair_sampling_balanced_homonym_synonym
-
-    dataset = ANDData(
-        signatures={},
-        papers={},
-        clusters={},
-        name="legacy_pair_sampling_homonym",
-        mode="train",
-        pair_sampling_balanced_homonym_synonym=True,
-        load_name_counts=False,
-        preprocess=False,
-    )
-
-    assert dataset.pair_sampling_mode == "within_block_balanced_homonym_synonym"
-    assert dataset.pair_sampling_block
-    assert dataset.pair_sampling_balanced_classes
-    assert dataset.pair_sampling_balanced_homonym_synonym
-
-
-def test_pair_sampling_preserves_legacy_positional_random_seed():
-    dataset = ANDData(
-        {},
-        {},
-        "legacy_positional_pair_sampling_args",
-        "train",
-        {},
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        "s2",
-        "signatures",
-        1,
-        0.8,
-        0.1,
-        0.1,
-        30000,
-        5000,
-        5000,
-        False,
-        True,
-        False,
-        True,
-        4242,
-        False,
-        1,
-        False,
-    )
-
-    assert dataset.pair_sampling_mode == "global_balanced_classes"
-    assert dataset.all_test_pairs_flag is True
-    assert dataset.random_seed == 4242
 
 
 def test_pair_sampling_rejects_mixed_canonical_and_legacy_flags():

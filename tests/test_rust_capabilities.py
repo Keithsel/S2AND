@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import numpy as np
+from typing import Any, cast
+
 import pytest
 
-import s2and.rust_capabilities as rust_capabilities
-from s2and import runtime as _runtime
+import s2and.runtime as rust_capabilities
 
 # A rust extension version that satisfies the current minimum. Derived from the
 # guard itself so these fixtures track the lockstep version bump instead of going
 # stale on every release (see MIN_SUPPORTED_RUST_EXTENSION_VERSION).
-_SUPPORTED_VERSION = _runtime.min_supported_rust_extension_version_string()
+_SUPPORTED_VERSION = rust_capabilities.min_supported_rust_extension_version_string()
 
 
 def _missing_module(name: str) -> ModuleNotFoundError:
@@ -21,23 +21,14 @@ def _make_core_rust_featurizer(*, supports_from_dataset_paper_preprocess: bool =
         SUPPORTS_FROM_DATASET_PAPER_PREPROCESS = supports_from_dataset_paper_preprocess
 
         @staticmethod
-        def from_dataset(*args, **kwargs):
+        def from_arrow_paths(*args, **kwargs):
             return None
 
         @staticmethod
-        def from_json_paths(*args, **kwargs):
+        def from_dataset(*args, **kwargs):
             return None
-
-        def json_ingest_telemetry(self):
-            return {}
 
         def signature_ids(self):
-            return []
-
-        def get_constraint(self, *args, **kwargs):
-            return None
-
-        def get_constraints_matrix(self, *args, **kwargs):
             return []
 
         def get_constraints_matrix_indexed(self, *args, **kwargs):
@@ -52,18 +43,35 @@ def _make_core_rust_featurizer(*, supports_from_dataset_paper_preprocess: bool =
     return RustFeaturizer
 
 
+def _pair_plan_build_info(
+    *,
+    supported_kwargs: tuple[str, ...] = ("query_candidate_component_keys_by_signature_id",),
+    row_signals: tuple[str, ...] = ("row_orcid_match",),
+    raw_planner_methods: tuple[str, ...] = (
+        "from_query_signatures",
+        "plan_query_signatures",
+        "build_telemetry",
+    ),
+) -> dict[str, tuple[str, ...]]:
+    return {
+        "incremental_linking_pair_plan_supported_kwargs": supported_kwargs,
+        "incremental_linking_pair_plan_row_signals": row_signals,
+        "raw_arrow_query_signature_planner_methods": raw_planner_methods,
+    }
+
+
 def test_load_s2and_rust_extension_prefers_versioned_candidate_on_tie(monkeypatch):
     RustFeaturizer = _make_core_rust_featurizer()
 
     class ShimModule:
         __version__ = None
 
-    ShimModule.RustFeaturizer = RustFeaturizer
+    cast(Any, ShimModule).RustFeaturizer = RustFeaturizer
 
     class NativeModule:
         __version__ = _SUPPORTED_VERSION
 
-    NativeModule.RustFeaturizer = RustFeaturizer
+    cast(Any, NativeModule).RustFeaturizer = RustFeaturizer
 
     def _fake_import_module(name: str):
         if name == "s2and_rust":
@@ -113,7 +121,7 @@ def test_load_s2and_rust_extension_reraises_nested_missing_dependency(monkeypatc
     class ShimModule:
         __version__ = _SUPPORTED_VERSION
 
-    ShimModule.RustFeaturizer = RustFeaturizer
+    cast(Any, ShimModule).RustFeaturizer = RustFeaturizer
 
     def _fake_import_module(name: str):
         if name == "s2and_rust":
@@ -135,14 +143,10 @@ def test_detect_rust_runtime_capabilities_requires_core_markers():
         def from_dataset(*args, **kwargs):
             return None
 
-        @staticmethod
-        def from_json_paths(*args, **kwargs):
-            return None
-
     class Module:
         __version__ = "0.49.0"
 
-    Module.RustFeaturizer = MissingMarkerRustFeaturizer
+    cast(Any, Module).RustFeaturizer = MissingMarkerRustFeaturizer
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
     assert capabilities.extension_importable is True
@@ -156,7 +160,7 @@ def test_detect_rust_runtime_capabilities_rejects_old_version():
     class Module:
         __version__ = "0.49.9"
 
-    Module.RustFeaturizer = RustFeaturizer
+    cast(Any, Module).RustFeaturizer = RustFeaturizer
 
     blocked = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
     assert blocked.core_runtime_available is False
@@ -169,7 +173,7 @@ def test_detect_rust_runtime_capabilities_rejects_unparseable_version():
     class Module:
         __version__ = "dev-local"
 
-    Module.RustFeaturizer = RustFeaturizer
+    cast(Any, Module).RustFeaturizer = RustFeaturizer
 
     blocked = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
     assert blocked.core_runtime_available is False
@@ -182,30 +186,21 @@ def test_detect_rust_runtime_capabilities_reads_from_dataset_paper_preprocess_ma
     class Module:
         __version__ = _SUPPORTED_VERSION
 
-    Module.RustFeaturizer = RustFeaturizer
+    cast(Any, Module).RustFeaturizer = RustFeaturizer
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
     assert capabilities.core_runtime_available is True
+    assert capabilities.from_dataset_available is True
     assert capabilities.from_dataset_paper_preprocess_available is True
 
 
-def test_detect_rust_runtime_capabilities_requires_json_ingest_telemetry():
-    class RustFeaturizerWithoutTelemetry:
+def test_detect_rust_runtime_capabilities_does_not_require_json_ingest_markers():
+    class RustFeaturizerWithoutJsonCompat:
         @staticmethod
-        def from_dataset(*args, **kwargs):
-            return None
-
-        @staticmethod
-        def from_json_paths(*args, **kwargs):
+        def from_arrow_paths(*args, **kwargs):
             return None
 
         def signature_ids(self):
-            return []
-
-        def get_constraint(self, *args, **kwargs):
-            return None
-
-        def get_constraints_matrix(self, *args, **kwargs):
             return []
 
         def get_constraints_matrix_indexed(self, *args, **kwargs):
@@ -219,17 +214,19 @@ def test_detect_rust_runtime_capabilities_requires_json_ingest_telemetry():
 
     class Module:
         __version__ = _SUPPORTED_VERSION
-        RustFeaturizer = RustFeaturizerWithoutTelemetry
+        RustFeaturizer = RustFeaturizerWithoutJsonCompat
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
 
-    assert capabilities.core_runtime_available is False
-    assert "json_ingest_telemetry" in capabilities.reason
+    assert capabilities.core_runtime_available is True
+    assert capabilities.from_dataset_available is False
+    assert capabilities.from_dataset_paper_preprocess_available is False
+    assert capabilities.reason == "rust_core_available"
 
 
 def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():
     class NamedRustFeaturizer(_make_core_rust_featurizer()):
-        def linker_pair_index_arrays_aggregate_stats(self, *args, **kwargs):
+        def linker_pair_index_arrays_and_aggregate_stats(self, *args, **kwargs):
             return None
 
         def linker_pair_index_arrays_constraint_labels(self, *args, **kwargs):
@@ -238,27 +235,24 @@ def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():
         def linker_pair_distance_accumulators(self, *args, **kwargs):
             return None
 
-    class PairPlanMethod:
-        __text_signature__ = (
-            "($self, queries, query_signature_indices, component_member_indices_by_key, top_k, "
-            "num_threads=None, query_signature_ids=None, retrieval_subblock_index=None, "
-            "query_candidate_component_keys_by_signature_id=None, full_first_global_backfill_count=0)"
-        )
-
-        def __call__(self, *args, **kwargs):
-            return None
-
     class NamedRustHybridCentroidRetriever:
-        def top_k_hybrid_centroid(self, *args, **kwargs):
+        def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):
             return None
 
-        top_k_hybrid_centroid_pair_plan = PairPlanMethod()
+    class NamedRawBlockQueryCandidatePlanner:
+        @staticmethod
+        def from_query_signatures(*args, **kwargs):
+            return None
 
     class Module:
         __version__ = _SUPPORTED_VERSION
-        INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS = ("row_orcid_match",)
         RustFeaturizer = NamedRustFeaturizer
         RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
+        RawBlockQueryCandidatePlanner = NamedRawBlockQueryCandidatePlanner
+
+        @staticmethod
+        def get_build_info():
+            return _pair_plan_build_info()
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
 
@@ -266,33 +260,47 @@ def test_detect_rust_runtime_capabilities_reports_incremental_linker_names():
     assert "indexed_pair_array_featurization_v1" in capabilities.named_capabilities
     assert "incremental_linking_pair_plan_v1" in capabilities.named_capabilities
     assert "incremental_linking_constraint_arrays_v1" in capabilities.named_capabilities
+    assert "raw_arrow_query_signature_planner_v1" in capabilities.named_capabilities
+
+
+def test_detect_rust_runtime_capabilities_rejects_stale_raw_query_signature_planner_abi():
+    class NamedRawPlanner:
+        @staticmethod
+        def from_query_signatures(*args, **kwargs):
+            return None
+
+    class Module:
+        __version__ = _SUPPORTED_VERSION
+        RustFeaturizer = _make_core_rust_featurizer()
+        RawBlockQueryCandidatePlanner = NamedRawPlanner
+
+        @staticmethod
+        def get_build_info():
+            return _pair_plan_build_info(raw_planner_methods=("from_query_signatures",))
+
+    capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
+
+    assert capabilities.core_runtime_available is True
+    assert "raw_arrow_query_signature_planner_v1" not in capabilities.named_capabilities
 
 
 def test_detect_rust_runtime_capabilities_rejects_stale_incremental_pair_plan_abi():
     class NamedRustFeaturizer(_make_core_rust_featurizer()):
-        def linker_pair_index_arrays_aggregate_stats(self, *args, **kwargs):
-            return None
-
-    class StalePairPlanMethod:
-        __text_signature__ = (
-            "($self, queries, query_signature_indices, component_member_indices_by_key, top_k, "
-            "num_threads=None, query_signature_ids=None, retrieval_subblock_index=None, "
-            "full_first_global_backfill_count=0)"
-        )
-
-        def __call__(self, *args, **kwargs):
+        def linker_pair_index_arrays_and_aggregate_stats(self, *args, **kwargs):
             return None
 
     class NamedRustHybridCentroidRetriever:
-        def top_k_hybrid_centroid(self, *args, **kwargs):
+        def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):
             return None
-
-        top_k_hybrid_centroid_pair_plan = StalePairPlanMethod()
 
     class Module:
         __version__ = _SUPPORTED_VERSION
         RustFeaturizer = NamedRustFeaturizer
         RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
+
+        @staticmethod
+        def get_build_info():
+            return _pair_plan_build_info(supported_kwargs=())
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
 
@@ -303,30 +311,21 @@ def test_detect_rust_runtime_capabilities_rejects_stale_incremental_pair_plan_ab
 
 def test_detect_rust_runtime_capabilities_requires_pair_plan_orcid_signal_marker():
     class NamedRustFeaturizer(_make_core_rust_featurizer()):
-        def linker_pair_index_arrays_aggregate_stats(self, *args, **kwargs):
-            return None
-
-    class PairPlanMethod:
-        __text_signature__ = (
-            "($self, queries, query_signature_indices, component_member_indices_by_key, top_k, "
-            "num_threads=None, query_signature_ids=None, retrieval_subblock_index=None, "
-            "query_candidate_component_keys_by_signature_id=None, full_first_global_backfill_count=0)"
-        )
-
-        def __call__(self, *args, **kwargs):
+        def linker_pair_index_arrays_and_aggregate_stats(self, *args, **kwargs):
             return None
 
     class NamedRustHybridCentroidRetriever:
-        def top_k_hybrid_centroid(self, *args, **kwargs):
+        def top_k_hybrid_centroid_pair_plan(self, *args, **kwargs):
             return None
-
-        top_k_hybrid_centroid_pair_plan = PairPlanMethod()
 
     class Module:
         __version__ = _SUPPORTED_VERSION
-        INCREMENTAL_LINKING_PAIR_PLAN_ROW_SIGNALS = ()
         RustFeaturizer = NamedRustFeaturizer
         RustHybridCentroidRetriever = NamedRustHybridCentroidRetriever
+
+        @staticmethod
+        def get_build_info():
+            return _pair_plan_build_info(row_signals=())
 
     capabilities = rust_capabilities.detect_rust_runtime_capabilities(extension_module=Module)
 
@@ -340,20 +339,21 @@ def test_rust_get_build_info_contract():
 
     get_build_info = getattr(s2and_rust, "get_build_info", None)
     if not callable(get_build_info):
-        pytest.skip("s2and_rust.get_build_info unavailable")
+        raise pytest.skip.Exception("s2and_rust.get_build_info unavailable")
 
     info = get_build_info()
     assert isinstance(info, dict)
     for key in ("crate_version", "profile", "debug_assertions", "opt_level", "target"):
         assert key in info
     row_signals = tuple(info.get("incremental_linking_pair_plan_row_signals", ()))
-    if not row_signals:
-        plan = s2and_rust.RustHybridCentroidRetriever([], include_exemplars=True).top_k_hybrid_centroid_pair_plan(
-            [],
-            np.asarray([], dtype=np.uint32),
-            {},
-            1,
-            1,
-        )
-        row_signals = tuple(plan)
     assert "row_orcid_match" in row_signals
+    supported_kwargs = tuple(info.get("incremental_linking_pair_plan_supported_kwargs", ()))
+    assert "query_candidate_component_keys_by_signature_id" in supported_kwargs
+    if "raw_arrow_query_signature_planner_methods" not in info:
+        raise pytest.skip.Exception(
+            "installed local s2and_rust extension was built before raw-planner build-info markers"
+        )
+    raw_planner_methods = tuple(info.get("raw_arrow_query_signature_planner_methods", ()))
+    assert "from_query_signatures" in raw_planner_methods
+    assert "plan_query_signatures" in raw_planner_methods
+    assert "build_telemetry" in raw_planner_methods

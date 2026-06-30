@@ -12,9 +12,11 @@ for the Rust integration.
 | File | Purpose |
 |---|---|
 | [baselines.md](baselines.md) | Gate operator guide: canonical gate commands, artifact conventions, and promotion policy. Start here when verifying Rust behavior or promoting a new baseline. |
-| [runtime.md](runtime.md) | Runtime contract: backend resolution (`python`/`rust`/`auto`), stage defaults, failure semantics, verification gates, risk register, and key capability gates (incl. training-mode deferred paper preprocessing). |
-| [artifact_divergence.md](artifact_divergence.md) | Artifact format divergence map between Python and Rust paths. Format migration plan (MessagePack, Safetensors) and deferred unification backlog. |
-| [raw_block_query_candidate_plan.md](raw_block_query_candidate_plan.md) | Design spec for a local Rust-only `raw block + query -> current-linker candidate plan` shortcut for single-query incremental requests. |
+| [runtime.md](runtime.md) | Runtime contract: backend resolution (`python`/`rust`/`auto`), stage defaults, failure semantics, verification gates, and key capability gates (incl. training-mode deferred paper preprocessing). |
+| [inference_architecture.md](inference_architecture.md) | Current Rust inference boundary, before/after table, name-count decision, and remaining Python-heavy paths. |
+| [public_surface_inventory.md](public_surface_inventory.md) | Python-visible Rust/PyO3 surface inventory used to plan API cleanup and module splitting. |
+| [artifact_formats.md](artifact_formats.md) | Current artifact-format choices and rejected alternatives. |
+| [arrow_dataset_spec.md](arrow_dataset_spec.md) | Required Arrow dataset layout, schemas, manifests, and validation checks for direct Rust predict and predict_incremental inputs. |
 | [profiling/](profiling/) | Point-in-time profiling snapshots, named by date (indexed in `baselines.md`). Historical evidence, not active gates. |
 
 ---
@@ -23,14 +25,13 @@ for the Rust integration.
 
 - **`baselines.md` is the gate authority.** Any promotion decision must cite an artifact from there.
 - **Point-in-time profiling evidence** belongs in `profiling/YYYY-MM-DD.md`, not inline in design docs.
-- **Next steps + backlog** live in `docs/work_plan.md` (see `Backlog` section for long-term ideas/refactors).
+- **Next steps + backlog** live in `docs/work_plan.md`.
 - **Artifacts** (benchmark JSONs, logs) live under `scratch/` (gitignored).
 
 ---
 
 ## Quick links
 
-- Next steps: [`docs/work_plan.md`](../work_plan.md)
-- Backlog: [`docs/work_plan.md#backlog`](../work_plan.md#backlog)
+- Rust/Arrow execution backlog: [`docs/work_plan.md`](../work_plan.md)
 - Verification commands: [`runtime.md` -- Verification Commands section](runtime.md)
 - Gate commands + artifact conventions: [`baselines.md`](baselines.md)

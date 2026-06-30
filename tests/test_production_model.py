@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from s2and.arrow_inputs import MissingArrowArtifactError
 from s2and.data import ANDData
 from s2and.model import _ensure_lightgbm_fitted, _selected_feature_indices
 from s2and.production_bundle import finalize_production_bundle, write_pairwise_production_bundle
 from s2and.production_model import NativeLightGBMBinaryClassifier, _config_choice, load_production_model
 from s2and.serialization import load_pickle_with_verified_label_encoder_compat
-from tests.helpers import import_s2and_rust
+from tests.helpers import import_s2and_rust, tiny_name_counts
+
+_NATIVE_BUNDLE_PATH = "s2and/data/production_model_v1.21"
+_LEGACY_PICKLE_PATH = "s2and/data/production_model_v1.2.pickle"
 
 
 def _load_dummy_inference_dataset(name: str) -> ANDData:
@@ -22,7 +27,7 @@ def _load_dummy_inference_dataset(name: str) -> ANDData:
         clusters="tests/dummy/clusters.json",
         name=name,
         mode="inference",
-        load_name_counts=True,
+        load_name_counts=tiny_name_counts(),
         preprocess=True,
         n_jobs=1,
     )
@@ -48,10 +53,11 @@ def _predict_dummy_block(clusterer, *, batching_threshold: int | None) -> dict[s
 
 
 def test_native_production_bundle_loads_as_mutable_clusterer() -> None:
-    clusterer = load_production_model("s2and/data/production_model_v1.21")
+    clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
 
     assert isinstance(clusterer.classifier, NativeLightGBMBinaryClassifier)
     assert isinstance(clusterer.nameless_classifier, NativeLightGBMBinaryClassifier)
+    assert clusterer.incremental_linker_artifact_dir is not None
     assert Path(clusterer.incremental_linker_artifact_dir).name == "incremental_linker"
     assert clusterer.production_model_bundle_version == "1.21"
 
@@ -65,14 +71,14 @@ def test_native_production_bundle_loads_as_mutable_clusterer() -> None:
 
 
 def test_native_lightgbm_set_params_rejects_unknown_params() -> None:
-    clusterer = load_production_model("s2and/data/production_model_v1.21")
+    clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
 
     with pytest.raises(ValueError, match="Invalid parameter"):
         clusterer.classifier.set_params(learning_rate=0.1)
 
 
 def test_native_lightgbm_deepcopy_does_not_require_model_path(tmp_path: Path) -> None:
-    clusterer = load_production_model("s2and/data/production_model_v1.21")
+    clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
     classifier = clusterer.classifier
     features = np.zeros((2, classifier.n_features_in_), dtype=np.float64)
     classifier.model_path = str(tmp_path / "missing_model.txt")
@@ -84,10 +90,8 @@ def test_native_lightgbm_deepcopy_does_not_require_model_path(tmp_path: Path) ->
 
 
 def test_native_pairwise_models_match_v12_pickle_fixture() -> None:
-    native_clusterer = load_production_model("s2and/data/production_model_v1.21")
-    legacy_clusterer = load_pickle_with_verified_label_encoder_compat("s2and/data/production_model_v1.2.pickle")[
-        "clusterer"
-    ]
+    native_clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
+    legacy_clusterer = load_pickle_with_verified_label_encoder_compat(_LEGACY_PICKLE_PATH)["clusterer"]
     _ensure_lightgbm_fitted(legacy_clusterer.classifier)
     _ensure_lightgbm_fitted(legacy_clusterer.nameless_classifier)
 
@@ -103,6 +107,8 @@ def test_native_pairwise_models_match_v12_pickle_fixture() -> None:
         rtol=1e-10,
         atol=1e-10,
     )
+    assert native_clusterer.nameless_classifier is not None
+    assert legacy_clusterer.nameless_classifier is not None
     np.testing.assert_allclose(
         native_clusterer.nameless_classifier.predict_proba(nameless_features),
         legacy_clusterer.nameless_classifier.predict_proba(nameless_features),
@@ -111,21 +117,15 @@ def test_native_pairwise_models_match_v12_pickle_fixture() -> None:
     )
 
 
-@pytest.mark.parametrize("backend", ["python", "rust"])
-def test_native_clusterer_predict_matches_v12_pickle(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
-    if backend == "rust":
-        rust_available, rust_error = import_s2and_rust(required_method="from_dataset")
-        if not rust_available:
-            pytest.skip(f"Rust runtime unavailable: {rust_error!r}")
-
-    monkeypatch.setenv("S2AND_BACKEND", backend)
+def test_native_clusterer_predict_matches_v12_pickle_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("S2AND_BACKEND", "python")
 
     for batching_threshold in (None, 7):
         native_clusterer = _prepare_prediction_clusterer(
-            load_production_model("s2and/data/production_model_v1.21", require_incremental_linker=False)
+            load_production_model(_NATIVE_BUNDLE_PATH, require_incremental_linker=False)
         )
         legacy_clusterer = _prepare_prediction_clusterer(
-            load_pickle_with_verified_label_encoder_compat("s2and/data/production_model_v1.2.pickle")["clusterer"]
+            load_pickle_with_verified_label_encoder_compat(_LEGACY_PICKLE_PATH)["clusterer"]
         )
 
         assert _predict_dummy_block(native_clusterer, batching_threshold=batching_threshold) == _predict_dummy_block(
@@ -134,17 +134,31 @@ def test_native_clusterer_predict_matches_v12_pickle(monkeypatch: pytest.MonkeyP
         )
 
 
+def test_native_clusterer_predict_rust_requires_arrow_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    rust_available, rust_error = import_s2and_rust(required_method="from_dataset")
+    if not rust_available:
+        raise pytest.skip.Exception(f"Rust runtime unavailable: {rust_error!r}")
+
+    monkeypatch.setenv("S2AND_BACKEND", "rust")
+    native_clusterer = _prepare_prediction_clusterer(
+        load_production_model(_NATIVE_BUNDLE_PATH, require_incremental_linker=False)
+    )
+
+    with pytest.raises(MissingArrowArtifactError, match="Rust production prediction no longer falls back"):
+        _predict_dummy_block(native_clusterer, batching_threshold=None)
+
+
 def test_native_clusterer_runtime_config_matches_v12_pickle() -> None:
-    native_clusterer = load_production_model("s2and/data/production_model_v1.21")
-    legacy_clusterer = load_pickle_with_verified_label_encoder_compat("s2and/data/production_model_v1.2.pickle")[
-        "clusterer"
-    ]
+    native_clusterer = load_production_model(_NATIVE_BUNDLE_PATH)
+    legacy_clusterer = load_pickle_with_verified_label_encoder_compat(_LEGACY_PICKLE_PATH)["clusterer"]
 
     assert type(native_clusterer.cluster_model) is type(legacy_clusterer.cluster_model)
     assert native_clusterer.cluster_model.linkage == legacy_clusterer.cluster_model.linkage
     assert native_clusterer.cluster_model.eps == 0.65
     assert native_clusterer.featurizer_info.features_to_use == legacy_clusterer.featurizer_info.features_to_use
     assert native_clusterer.featurizer_info.featurizer_version == legacy_clusterer.featurizer_info.featurizer_version
+    assert native_clusterer.nameless_featurizer_info is not None
+    assert legacy_clusterer.nameless_featurizer_info is not None
     assert (
         native_clusterer.nameless_featurizer_info.features_to_use
         == legacy_clusterer.nameless_featurizer_info.features_to_use
@@ -169,7 +183,7 @@ def test_native_clusterer_runtime_config_matches_v12_pickle() -> None:
 
 
 def test_pairwise_stage_finalizes_into_loadable_production_bundle(tmp_path: Path) -> None:
-    source_bundle = Path("s2and/data/production_model_v1.21")
+    source_bundle = Path(_NATIVE_BUNDLE_PATH)
     source_clusterer = load_production_model(source_bundle)
     output_bundle = tmp_path / "production_model_v9.9"
 
@@ -204,6 +218,7 @@ def test_pairwise_stage_finalizes_into_loadable_production_bundle(tmp_path: Path
     assert final_summary.bundle_status == "complete"
     loaded = load_production_model(output_bundle)
     assert loaded.production_model_bundle_version == "9.9"
+    assert loaded.incremental_linker_artifact_dir is not None
     assert Path(loaded.incremental_linker_artifact_dir) == output_bundle / "incremental_linker"
 
     with pytest.raises(ValueError, match="existing incremental linker artifacts"):
@@ -212,6 +227,28 @@ def test_pairwise_stage_finalizes_into_loadable_production_bundle(tmp_path: Path
             output_bundle,
             bundle_version="9.9",
             source_model_version="9.9",
+        )
+
+
+def test_finalize_production_bundle_rejects_invalid_incremental_linker_artifact(tmp_path: Path) -> None:
+    source_bundle = Path(_NATIVE_BUNDLE_PATH)
+    corrupt_linker = tmp_path / "corrupt_incremental_linker"
+    shutil.copytree(source_bundle / "incremental_linker", corrupt_linker)
+    metadata_path = corrupt_linker / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["booster_sha256"] = "0" * 64
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="booster_sha256 mismatch"):
+        finalize_production_bundle(
+            pairwise_bundle_dir=source_bundle,
+            output_bundle_dir=tmp_path / "production_model_v9.8",
+            incremental_linker_artifact_dir=corrupt_linker,
+            target_json=source_bundle / "reproducibility" / "incremental_linker_training_target.json",
+            bundle_version="9.8",
+            pairwise_model_version="9.8",
+            incremental_linker_version="9.8",
+            validate=True,
         )
 
 

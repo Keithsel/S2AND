@@ -28,9 +28,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 try:
-    import ijson  # type: ignore
+    import ijson  # type: ignore[unresolved-import]
 except ModuleNotFoundError:
-    ijson = None  # type: ignore[assignment]
+    ijson = None
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CLUSTER_LOG_INTERVAL = 250_000

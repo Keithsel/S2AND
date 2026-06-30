@@ -12,6 +12,52 @@ from s2and.incremental_linking.query_adapter import ClusterSummary, QueryFeature
 from s2and.runtime import detect_rust_runtime_capabilities
 
 
+def tiny_name_counts() -> dict[str, dict[str, int]]:
+    """Return a small deterministic name-count artifact for dummy tests."""
+
+    return {
+        "first_dict": {
+            "abdul": 10,
+            "alexander": 20,
+            "dr": 30,
+        },
+        "last_dict": {
+            "sattar": 40,
+            "konovalov": 50,
+        },
+        "first_last_dict": {
+            "abdul sattar": 60,
+            "alexander konovalov": 70,
+            "dr sattar": 80,
+        },
+        "last_first_initial_dict": {
+            "sattar a": 90,
+            "sattar d": 100,
+            "konovalov a": 110,
+        },
+    }
+
+
+def tiny_name_counts_tuple() -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
+    """Return tiny name counts in the tuple shape used by the cached loader."""
+
+    counts = tiny_name_counts()
+    return (
+        counts["first_dict"],
+        counts["last_dict"],
+        counts["first_last_dict"],
+        counts["last_first_initial_dict"],
+    )
+
+
+def patch_tiny_name_counts_loader(monkeypatch: Any) -> None:
+    """Patch the production name-count loader to avoid huge fixture generation."""
+
+    import s2and.data as data_module
+
+    monkeypatch.setattr(data_module, "_load_name_counts_cached", tiny_name_counts_tuple)
+
+
 def equalish(a: float, b: float, rel_tol: float = 1e-6, abs_tol: float = 1e-3) -> bool:
     if math.isnan(float(a)) and math.isnan(float(b)):
         return True
@@ -65,17 +111,18 @@ def build_dummy_dataset(
     name: str,
     *,
     mode: str = "train",
-    load_name_counts: bool = False,
+    load_name_counts: bool | dict[str, dict[str, int]] = False,
     compute_reference_features: bool = False,
     n_jobs: int = 1,
 ) -> ANDData:
+    resolved_name_counts = tiny_name_counts() if load_name_counts is True else load_name_counts
     return ANDData(
         "tests/dummy/signatures.json",
         "tests/dummy/papers.json",
         clusters="tests/dummy/clusters.json",
         name=name,
         mode=mode,
-        load_name_counts=load_name_counts,
+        load_name_counts=resolved_name_counts,
         preprocess=True,
         n_jobs=n_jobs,
         compute_reference_features=compute_reference_features,

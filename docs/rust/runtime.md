@@ -1,6 +1,6 @@
 # Rust Runtime Contract
 
-Status date: 2026-03-02
+Status date: 2026-05-25
 
 This document defines the operational contract for the Rust extension: backend
 resolution, stage defaults, failure semantics, verification gates, and the risk
@@ -10,12 +10,16 @@ register. Active benchmark baselines live in `baselines.md`.
 
 ## Goal
 
-Primary train/eval command:
+Primary Rust gate commands are the canonical `scripts/rust_suite.py` workflows
+documented in [baselines.md](baselines.md):
+
 ```
-uv run python scripts/archive/transfer_experiment_internal.py \
-  --experiment_name inventors_s2and_union_eval \
-  --leave_self_in --skip_individual_models --random_seed 1 --n_jobs 8
+uv run python scripts/rust_suite.py compare ...
+uv run python scripts/rust_suite.py transfer-mini ...
+uv run python scripts/rust_suite.py stress-rebuild ...
 ```
+
+Archived transfer scripts are historical and are not the primary runtime gate.
 
 Project goals:
 1. Keep quality parity with Python.
@@ -44,8 +48,12 @@ Python path remains available via explicit backend and stage overrides at any ti
   - If Rust core capability is unavailable: resolve to Python.
   - If Rust core capability is available: resolve to Rust.
 - Invalid values raise `ValueError`.
-- Capability check is centralized in `s2and/rust_capabilities.py`:
-  core runtime requires extension importability + `RustFeaturizer.from_dataset`.
+- Capability detection is centralized in `s2and/runtime.py`.
+- Core runtime capability requires extension importability plus the current
+  Rust markers used by production Arrow paths: direct Arrow ingest, indexed
+  featurization, constraints, seed updates, and name-count index support.
+  `ANDData`/`from_dataset` remains the maintained compatibility, training,
+  benchmark, and parity surface; it is not the production inference authority.
 
 ### Stage defaults (resolved backend = `rust`)
 
@@ -55,8 +63,9 @@ Python path remains available via explicit backend and stage overrides at any ti
 | `constraints` | Rust |
 | `pair_featurization` | Rust |
 
-- Inference defaults to JSON ingest (`from_json_paths`) when JSON paths are available.
-- Train/eval and non-path inference payloads use `from_dataset`.
+- Direct Arrow inputs are the production inference boundary. Rust production
+  prediction fails fast when required Arrow paths are incomplete.
+- Train/eval and classic `ANDData` payloads use `from_dataset`.
 - `S2AND_BACKEND` controls all stages uniformly.
 
 ### Failure semantics
@@ -92,7 +101,10 @@ These gates must pass before promoting any Rust defaults further.
 3. Rust featurizer cache/build lifecycle core machinery.
 
 **Intentionally divergent** (by design):
-1. Inference-only JSON ingest (`from_json_paths`) — requires file paths that train/eval doesn't have.
+1. Direct Arrow inference uses typed runtime files that train/eval does not
+   require.
+2. Classic train/eval still starts from `ANDData`; production file-backed
+   inference starts from Arrow artifacts.
 
 ---
 
@@ -109,8 +121,9 @@ These gates must pass before promoting any Rust defaults further.
 
 Key design decisions and their rationale (in order of implementation):
 
-- **Batch constraint APIs** (`get_constraints_matrix`, `get_constraints_matrix_indexed`): integrated
-  across `distance_matrix_helper` and `_predict_incremental_helper`.
+- **Batch constraint APIs** (`get_constraints_matrix_indexed`,
+  `get_constraints_block_upper_triangle_indexed`): integrated across
+  `distance_matrix_helper` and `_predict_incremental_helper`.
 - **Compact `CounterData`**: replaced `HashMap<String, f64>` with `Vec<(u64, f32)>` sorted by
   FNV-1a 64-bit hash; `counter_jaccard_data` uses binary search. ~400 MB savings on kisti.
   Disk-cache version bumped to 5. Note: 64-bit birthday collision risk is very low at million-scale
@@ -133,8 +146,7 @@ In training/eval mode, S2AND can skip Python paper preprocessing (`preprocess_pa
 `RustFeaturizer.from_dataset` compute missing paper-derived fields from raw strings. This targets the GIL-bound
 `preprocess_paper_1` bottleneck on Windows and reduces wall time when the Rust backend is enabled.
 
-Note: in Rust inference with JSON ingest (`from_json_paths`), Python paper preprocessing is also skipped. This section
-describes the training/eval `from_dataset` bypass.
+This section describes the training/eval `from_dataset` bypass.
 
 ### Gating (when Python paper preprocessing is skipped)
 
@@ -161,20 +173,9 @@ Maintenance checklist:
    - `uv run pytest -q tests/test_rust_from_dataset_contract.py tests/test_preprocess_papers_parallel_defaults.py tests/test_rust_lifecycle.py tests/test_rust_capabilities.py`
 3. Optional: rerun transfer-mini compare and write the JSON under `scratch/baselines_YYYYMMDD/` (see `baselines.md`).
 
-### Open follow-up
-
-- If training needs `compute_reference_features=True`, either port reference-details preprocessing to Rust or keep the gate.
-
----
-
-## High-impact risk register
-
-### Accepted (monitored, low severity)
-
-| Risk | Notes |
-|---|---|
-| Featurizer cold-start serialization: global cache lock spans full build/load path | Lock scope is correct and necessary for atomicity. Contention under `n_jobs=4-8` not observed. |
-| Name-count precedence drift | Canonicalization shims (`_canonicalize_last_for_counts`, `_lasts_equivalent_for_constraint`) introduce implicit precedence assumptions. Shims will be removed after normalization migration phase 4. |
+Current watchlist items for this area are tracked in
+[../work_plan.md](../work_plan.md), especially the reference-feature training
+gate and blocked normalization migration.
 
 ---
 
@@ -195,5 +196,5 @@ uv run pytest -q
 
 **Runtime policy coverage:**
 ```
-uv run pytest -q tests/test_runtime.py tests/test_runtime_policy.py
+uv run pytest -q tests/test_runtime.py tests/test_rust_lifecycle.py
 ```

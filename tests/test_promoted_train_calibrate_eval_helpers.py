@@ -23,6 +23,7 @@ from s2and.incremental_linking_training.classic import (
     _apply_classic_train_row_cap,
     _build_classic_classifier,
     _classic_feature_matrix,
+    _drop_unlabeled_singleton_orcid_rows,
     _evaluate_logistic_manual_holdout,
     _evaluate_logistic_scored_windows,
     _fit_multiclass_logistic_gate,
@@ -131,6 +132,40 @@ def test_official_table_loader_reads_parquet_with_usecols(tmp_path: Path) -> Non
     loaded = _read_official_table(path, usecols=["query_group_id", "label"])
 
     assert loaded.to_dict(orient="records") == [{"query_group_id": "001", "label": 1}]
+
+
+def test_drop_unlabeled_singleton_orcid_rows_reports_removed_queries() -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "query_group_id": "drop_me",
+                "label": 0,
+                "supervision_type": "unlabeled_singleton_orcid",
+            },
+            {
+                "query_group_id": "keep_me",
+                "label": 1,
+                "supervision_type": "positive_repeat_orcid",
+            },
+            {
+                "query_group_id": "mixed",
+                "label": 0,
+                "supervision_type": "unlabeled_singleton_orcid",
+            },
+            {
+                "query_group_id": "mixed",
+                "label": 1,
+                "supervision_type": "positive_repeat_orcid",
+            },
+        ]
+    )
+
+    cleaned, summary = _drop_unlabeled_singleton_orcid_rows(rows, context="unit")
+
+    assert cleaned["query_group_id"].tolist() == ["keep_me", "mixed"]
+    assert summary["rows_removed"] == 2
+    assert summary["negative_rows_removed"] == 2
+    assert summary["queries_removed"] == 1
 
 
 def test_promoted_stratified_loader_prefers_public_rows_over_shadowing_calibration_rows(
@@ -930,7 +965,14 @@ def test_minimal_raw_materialization_skips_tables_empty_after_dataset_filter(
     source_bundle = OfficialBundle(
         root=source_root,
         bundle_name="demo",
-        assets={},
+        assets={
+            "featureless_rows": {
+                "files": {
+                    "train_path": "labels/train.parquet",
+                    "hwang_eval_path": "labels/hwang_eval.parquet",
+                }
+            }
+        },
         models={"classic": {}},
         expected_metrics={},
     )
@@ -981,8 +1023,6 @@ def test_minimal_raw_materialization_skips_tables_empty_after_dataset_filter(
         max_exemplars=1,
         max_top_k=1,
         reuse_existing_features=False,
-        rust_build_path=None,
-        allow_normalization_version_mismatch=False,
         pairwise_model_nan_value=float("nan"),
         pairwise_aggregate_nan_value=0.0,
         row_nan_policy="finite",

@@ -95,7 +95,7 @@ def _rust_payload(candidate_batch: LinkerCandidateBatch, row_signals: Mapping[st
         "dominant_first_name": _rust_string_signal(row_signals, "dominant_first_name", row_count),
         "query_first_token": _rust_string_signal(row_signals, "query_first_token", row_count),
     }
-    if "family_id" in row_signals:
+    if row_signals.get("family_id") is not None:
         payload["family_id"] = _rust_string_signal(row_signals, "family_id", row_count)
     for signal in (
         "retrieval_score",

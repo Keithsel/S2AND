@@ -1,13 +1,18 @@
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import pytest
 
 import s2and.feature_port as feature_port
-import s2and.rust_capabilities as rust_capabilities
-from s2and.data import ANDData, NameCounts
+import s2and.runtime as runtime
+from s2and.arrow_inputs import MissingArrowArtifactError
+from s2and.data import ANDData
+from s2and.incremental_linking.feature_block import write_name_counts_index
+from tests.helpers import patch_tiny_name_counts_loader
 
 
 def _missing_module(name: str) -> ModuleNotFoundError:
@@ -16,7 +21,6 @@ def _missing_module(name: str) -> ModuleNotFoundError:
 
 class DummyRustFeaturizer:
     created = []
-    from_json_created = []
     signature_overlay_payloads = []
 
     def __init__(self, dataset_name: str):
@@ -25,17 +29,8 @@ class DummyRustFeaturizer:
     def signature_ids(self):
         return []
 
-    def get_constraint(self, *_args, **_kwargs):
-        return None
-
-    def get_constraints_matrix(self, *_args, **_kwargs):
-        return []
-
     def get_constraints_matrix_indexed(self, *_args, **_kwargs):
         return []
-
-    def json_ingest_telemetry(self):
-        return {"stage_seconds": {}, "counts": {}}
 
     @classmethod
     def from_dataset(cls, dataset, _require_value, _disallow_value, _num_threads=None):
@@ -43,9 +38,8 @@ class DummyRustFeaturizer:
         return cls(dataset.name)
 
     @classmethod
-    def from_json_paths(cls, *_args, **_kwargs):
-        cls.from_json_created.append((_args, _kwargs))
-        return cls("json")
+    def from_arrow_paths(cls, *_args, **_kwargs):
+        return cls("arrow")
 
     def update_signature_name_counts(self, signatures):
         self.__class__.signature_overlay_payloads.append(signatures)
@@ -59,7 +53,14 @@ class DummyRustFeaturizer:
         raise AssertionError("Disk cache path should not be used in this test")
 
     def update_cluster_seeds(self, _require_map, _disallow_set):
-        return None
+        self.cluster_seeds_require_state = {str(key): str(value) for key, value in dict(_require_map).items()}
+        self.cluster_seeds_disallow_state = {(str(left), str(right)) for left, right in set(_disallow_set)}
+
+    def cluster_seeds_require(self):
+        return list(getattr(self, "cluster_seeds_require_state", {}).items())
+
+    def cluster_seeds_disallow(self):
+        return list(getattr(self, "cluster_seeds_disallow_state", set()))
 
 
 class DummyRustModule:
@@ -77,6 +78,8 @@ class DummyDataset(ANDData):
         self.compute_reference_features = False
         self.preprocess = True
         self.n_jobs = 1
+        self.original_signatures_path = None
+        self.original_papers_path = None
         self.cluster_seeds_require = {}
         self.cluster_seeds_disallow = set()
         self.signatures_path = None
@@ -107,14 +110,16 @@ def _cache_size() -> int:
     return sum(len(entries) for entries in feature_port._RUST_FEATURIZER_CACHE.values())
 
 
+def _cache_keys(dataset: DummyDataset) -> list[feature_port._RustFeaturizerCacheKey]:
+    return list(feature_port._RUST_FEATURIZER_CACHE[dataset])
+
+
 @pytest.fixture(autouse=True)
 def _reset_feature_port_state(monkeypatch):
     feature_port.clear_rust_featurizer_cache()
     DummyRustFeaturizer.created = []
-    DummyRustFeaturizer.from_json_created = []
     DummyRustFeaturizer.signature_overlay_payloads = []
     monkeypatch.setattr(feature_port, "s2and_rust", DummyRustModule)
-    monkeypatch.delenv("S2AND_RUST_NAME_COUNTS_JSON", raising=False)
     yield
     feature_port.clear_rust_featurizer_cache()
 
@@ -157,91 +162,398 @@ def test_rust_featurizer_available_reloads_extension_when_missing(monkeypatch):
     assert load_calls["count"] == 1
 
 
-def test_rust_signature_preprocess_available_reloads_extension_when_missing(monkeypatch):
-    sentinel_module = SimpleNamespace(signature_ngrams_batch=lambda *_args, **_kwargs: None)
-    load_calls = {"count": 0}
+def test_rust_featurizer_cache_tracks_cluster_seed_version():
+    dataset = DummyDataset("seed_version_cache_dataset", mode="train")
 
-    def _load_stub():
-        load_calls["count"] += 1
-        return sentinel_module
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset._cluster_seeds_version = 1
+    second = feature_port._get_rust_featurizer(dataset)
 
-    def _detect_stub(*, extension_module):
-        return SimpleNamespace(core_runtime_available=extension_module is sentinel_module)
-
-    monkeypatch.setattr(feature_port, "s2and_rust", None)
-    monkeypatch.setattr(feature_port, "load_s2and_rust_extension", _load_stub)
-    monkeypatch.setattr(feature_port, "detect_rust_runtime_capabilities", _detect_stub)
-
-    assert feature_port.rust_signature_preprocess_available() is True
-    assert feature_port.s2and_rust is sentinel_module
-    assert load_calls["count"] == 1
-
-
-def test_rust_featurizer_in_memory_cache_keeps_inference_entries():
-    d1 = DummyDataset("d1", mode="inference")
-    d2 = DummyDataset("d2", mode="inference")
-    d3 = DummyDataset("d3", mode="inference")
-
-    feature_port._get_rust_featurizer(d1)
-    feature_port._get_rust_featurizer(d2)
-    feature_port._get_rust_featurizer(d3)
-
-    assert _cache_size() == 3
-
-
-def test_rust_featurizer_reuses_live_dataset_entry():
-    dataset = DummyDataset("no_cache_dataset", mode="train")
-
-    feature_port._get_rust_featurizer(dataset)
-    feature_port._get_rust_featurizer(dataset)
-
-    assert DummyRustFeaturizer.created == ["no_cache_dataset"]
+    assert second is not first
+    assert DummyRustFeaturizer.created == ["seed_version_cache_dataset", "seed_version_cache_dataset"]
     assert _cache_size() == 1
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=1)]
 
 
-def test_warm_rust_featurizer_populates_in_memory_cache():
-    dataset = DummyDataset("warm_dataset", mode="train")
+def test_rust_featurizer_cache_retries_when_seed_version_changes_during_lookup(monkeypatch):
+    dataset = DummyDataset("seed_version_race_dataset", mode="train")
+    versions = [0, 1]
 
-    feature_port.warm_rust_featurizer(dataset)
-    feature_port._get_rust_featurizer(dataset)
+    def next_seed_version(_dataset):
+        if versions:
+            return versions.pop(0)
+        return 1
 
-    assert DummyRustFeaturizer.created == ["warm_dataset"]
-    assert _cache_size() == 1
+    monkeypatch.setattr(feature_port, "_cluster_seeds_version_for_cache", next_seed_version)
+    monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_MAX_RETRIES", 3)
+
+    featurizer = feature_port._get_rust_featurizer(dataset)
+
+    assert featurizer.dataset_name == "seed_version_race_dataset"
+    assert DummyRustFeaturizer.created == ["seed_version_race_dataset"]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=1)]
 
 
-def test_rust_featurizer_cache_keeps_distinct_build_options(monkeypatch):
-    dataset = DummyDataset("option_cache_dataset", mode="train")
-    build_calls: list[tuple[str, bool]] = []
+def test_rust_featurizer_cache_retries_when_seed_version_changes_during_build(monkeypatch):
+    dataset = DummyDataset("seed_version_build_race_dataset", mode="train")
+    dataset._cluster_seeds_version = 0
+    build_calls = {"count": 0}
 
-    def _build_stub(dataset_arg, *, requested_build_path, allow_normalization_version_mismatch):
-        build_calls.append((requested_build_path, bool(allow_normalization_version_mismatch)))
+    def _build_stub(dataset_arg):
+        build_calls["count"] += 1
+        if build_calls["count"] == 1:
+            dataset_arg._cluster_seeds_version = 1
+            featurizer_name = "stale"
+        else:
+            featurizer_name = "fresh"
         return (
-            DummyRustFeaturizer(f"{dataset_arg.name}:{requested_build_path}:{allow_normalization_version_mismatch}"),
-            requested_build_path,
+            DummyRustFeaturizer(featurizer_name),
             {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
-            1,
             0.0,
         )
 
     monkeypatch.setattr(feature_port, "_build_rust_featurizer_strict", _build_stub)
 
-    first = feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
-    feature_port.warm_rust_featurizer(
-        dataset,
-        rust_build_path="from_json_paths",
-        allow_normalization_version_mismatch=True,
-    )
-    first_again = feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
-    json_entry = feature_port._get_rust_featurizer(
-        dataset,
-        rust_build_path="from_json_paths",
-        allow_normalization_version_mismatch=True,
+    featurizer = feature_port._get_rust_featurizer(dataset)
+
+    assert featurizer.dataset_name == "fresh"
+    assert build_calls["count"] == 2
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=1)]
+
+
+@pytest.mark.parametrize(
+    ("case_name", "mutate_dataset"),
+    [
+        ("compute_reference_features", lambda dataset: setattr(dataset, "compute_reference_features", True)),
+        ("preprocess", lambda dataset: setattr(dataset, "preprocess", False)),
+        ("n_jobs", lambda dataset: setattr(dataset, "n_jobs", 2)),
+        ("signatures_path", lambda dataset: setattr(dataset, "signatures_path", "new_signatures.json")),
+        ("signatures", lambda dataset: dataset.signatures.__setitem__("s1", object())),
+        ("papers", lambda dataset: dataset.papers.__setitem__("p1", object())),
+        ("specter_embeddings", lambda dataset: setattr(dataset, "specter_embeddings", {"p1": object()})),
+        ("name_tuples", lambda dataset: dataset.name_tuples.add(("bill", "william"))),
+    ],
+)
+def test_rust_featurizer_cache_tracks_material_from_dataset_fields(case_name, mutate_dataset):
+    dataset = DummyDataset(f"material_cache_{case_name}", mode="train")
+
+    first = feature_port._get_rust_featurizer(dataset)
+    mutate_dataset(dataset)
+    second = feature_port._get_rust_featurizer(dataset)
+
+    assert second is not first
+    assert DummyRustFeaturizer.created == [dataset.name, dataset.name]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset)]
+
+
+def test_rust_featurizer_cache_tracks_material_mutation_beyond_prefix_sample():
+    dataset = DummyDataset("material_cache_full_digest", mode="train")
+    dataset.signatures = {f"s{index}": object() for index in range(64)}
+
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset.signatures["s63"] = object()
+    second = feature_port._get_rust_featurizer(dataset)
+
+    assert second is not first
+    assert DummyRustFeaturizer.created == [dataset.name, dataset.name]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset)]
+
+
+def test_rust_featurizer_cache_tracks_in_place_numpy_embedding_mutation(monkeypatch):
+    class EmbeddingRustFeaturizer(DummyRustFeaturizer):
+        snapshots: list[float] = []
+
+        @classmethod
+        def from_dataset(cls, dataset, _require_value, _disallow_value, _num_threads=None):
+            cls.snapshots.append(float(dataset.specter_embeddings["p"][0]))
+            return cls(dataset.name)
+
+    class EmbeddingRustModule:
+        __version__ = "0.51.0"
+        RustFeaturizer = EmbeddingRustFeaturizer
+
+    monkeypatch.setattr(feature_port, "s2and_rust", EmbeddingRustModule)
+    dataset = DummyDataset("embedding_mutation_cache_dataset", mode="train")
+    dataset.specter_embeddings = {"p": np.asarray([0.0], dtype=np.float32)}
+
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset.specter_embeddings["p"][0] = 1.0
+    second = feature_port._get_rust_featurizer(dataset)
+
+    assert second is not first
+    assert EmbeddingRustFeaturizer.snapshots == [0.0, 1.0]
+
+
+def test_update_rust_cluster_seeds_reuses_cached_featurizer_without_default_version_bump():
+    from s2and.rust_calls import update_rust_cluster_seeds
+
+    dataset = DummyDataset("direct_seed_update_dataset", mode="train")
+    dataset._cluster_seeds_version = 1
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset.cluster_seeds_require["s1"] = "c1"
+
+    update_rust_cluster_seeds(dataset)
+
+    assert int(dataset._cluster_seeds_version) == 1
+    assert DummyRustFeaturizer.created == ["direct_seed_update_dataset"]
+    assert feature_port._get_rust_featurizer(dataset) is first
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=1)]
+
+
+def test_update_rust_cluster_seeds_allows_explicit_version_bump():
+    from s2and.rust_calls import update_rust_cluster_seeds
+
+    dataset = DummyDataset("explicit_seed_update_bump_dataset", mode="train")
+    dataset._cluster_seeds_version = 1
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset.cluster_seeds_require["s1"] = "c1"
+
+    update_rust_cluster_seeds(dataset, bump_version=True)
+
+    assert int(dataset._cluster_seeds_version) == 2
+    assert DummyRustFeaturizer.created == ["explicit_seed_update_bump_dataset"]
+    assert feature_port._get_rust_featurizer(dataset) is first
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=2)]
+
+
+def test_update_rust_cluster_seeds_blocks_cache_prune_until_promotion():
+    from s2and.rust_calls import update_rust_cluster_seeds
+
+    dataset = DummyDataset("seed_update_promotion_race_dataset", mode="train")
+    dataset._cluster_seeds_version = 1
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset.cluster_seeds_require["s1"] = "c1"
+    dataset._cluster_seeds_version = 2
+    update_started = threading.Event()
+    release_update = threading.Event()
+    update_errors: list[Exception] = []
+    getter_errors: list[Exception] = []
+    getter_results: list[DummyRustFeaturizer] = []
+
+    def blocking_update(_require_map, _disallow_set):
+        update_started.set()
+        assert release_update.wait(timeout=2)
+
+    first.update_cluster_seeds = blocking_update
+
+    def update_worker():
+        try:
+            update_rust_cluster_seeds(dataset)
+        except Exception as exc:  # pragma: no cover - assertion guard
+            update_errors.append(exc)
+
+    def getter_worker():
+        try:
+            getter_results.append(feature_port._get_rust_featurizer(dataset))
+        except Exception as exc:  # pragma: no cover - assertion guard
+            getter_errors.append(exc)
+
+    update_thread = threading.Thread(target=update_worker)
+    update_thread.start()
+    assert update_started.wait(timeout=2)
+
+    getter_thread = threading.Thread(target=getter_worker)
+    getter_thread.start()
+    time.sleep(0.05)
+
+    assert getter_results == []
+    assert DummyRustFeaturizer.created == ["seed_update_promotion_race_dataset"]
+
+    release_update.set()
+    update_thread.join(timeout=5)
+    getter_thread.join(timeout=5)
+
+    assert not update_thread.is_alive()
+    assert not getter_thread.is_alive()
+    assert update_errors == []
+    assert getter_errors == []
+    assert getter_results == [first]
+    assert DummyRustFeaturizer.created == ["seed_update_promotion_race_dataset"]
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=2)]
+
+
+def test_update_rust_cluster_seeds_leaves_version_unchanged_on_ffi_failure():
+    from s2and.rust_calls import update_rust_cluster_seeds
+
+    dataset = DummyDataset("failed_seed_update_dataset", mode="train")
+    dataset._cluster_seeds_version = 1
+    featurizer = feature_port._get_rust_featurizer(dataset)
+
+    def fail_update(_require_map, _disallow_set):
+        raise RuntimeError("ffi failed")
+
+    featurizer.update_cluster_seeds = fail_update
+
+    with pytest.raises(RuntimeError, match="ffi failed"):
+        update_rust_cluster_seeds(dataset)
+
+    assert int(dataset._cluster_seeds_version) == 1
+    assert _cache_keys(dataset) == [feature_port._rust_featurizer_cache_key(dataset, cluster_seeds_version=1)]
+
+
+def test_update_rust_cluster_seeds_rolls_back_featurizer_on_promotion_failure(monkeypatch):
+    from s2and import rust_calls
+    from s2and.rust_calls import update_rust_cluster_seeds
+
+    dataset = DummyDataset("promotion_failure_seed_update_dataset", mode="train")
+    dataset._cluster_seeds_version = 1
+    featurizer = feature_port._get_rust_featurizer(dataset)
+    featurizer.update_cluster_seeds({"old": "c0"}, {("old", "other")})
+    dataset.cluster_seeds_require["s1"] = "c1"
+
+    def fail_promote(_dataset, _featurizer, *, target_seed_version):
+        del _dataset, _featurizer, target_seed_version
+        raise RuntimeError("promotion failed")
+
+    monkeypatch.setattr(rust_calls, "_promote_rust_featurizer_cluster_seed_version", fail_promote)
+
+    with pytest.raises(RuntimeError, match="promotion failed"):
+        update_rust_cluster_seeds(dataset, bump_version=True)
+
+    assert int(dataset._cluster_seeds_version) == 1
+    assert featurizer.cluster_seeds_require() == [("old", "c0")]
+    assert featurizer.cluster_seeds_disallow() == [("old", "other")]
+
+
+def test_rust_featurizer_cache_rejects_invalid_cluster_seed_version():
+    dataset = DummyDataset("bad_seed_version_cache_dataset", mode="train")
+
+    first = feature_port._get_rust_featurizer(dataset)
+    dataset._cluster_seeds_version = "bad"
+
+    with pytest.raises(ValueError, match="invalid literal"):
+        feature_port._get_rust_featurizer(dataset)
+
+    assert first.dataset_name == "bad_seed_version_cache_dataset"
+    assert DummyRustFeaturizer.created == ["bad_seed_version_cache_dataset"]
+    assert _cache_size() == 1
+
+
+def test_build_rust_featurizer_from_arrow_paths_rejects_none_path(monkeypatch):
+    class ArrowRustFeaturizer(DummyRustFeaturizer):
+        @classmethod
+        def from_arrow_paths(cls, *_args, **_kwargs):
+            raise AssertionError("from_arrow_paths should not be called for invalid paths")
+
+    class ArrowRustModule:
+        __version__ = "0.51.0"
+        RustFeaturizer = ArrowRustFeaturizer
+
+    monkeypatch.setattr(feature_port, "s2and_rust", ArrowRustModule)
+
+    with pytest.raises(ValueError, match="papers.*None"):
+        feature_port.build_rust_featurizer_from_arrow_paths(
+            {
+                "signatures": "signatures.arrow",
+                "papers": None,
+            }
+        )
+
+
+def test_build_rust_featurizer_from_arrow_paths_requires_index_for_name_counts(monkeypatch, tmp_path):
+    calls: list[dict[str, Any]] = []
+
+    class ArrowRustFeaturizer(DummyRustFeaturizer):
+        @classmethod
+        def from_arrow_paths(cls, paths, _signature_ids, _name_tuples, *_args):
+            calls.append({"paths": dict(paths)})
+            return cls("arrow")
+
+    class ArrowRustModule:
+        __version__ = "0.51.0"
+        RustFeaturizer = ArrowRustFeaturizer
+
+    monkeypatch.setattr(feature_port, "s2and_rust", ArrowRustModule)
+    for filename in ("signatures.arrow", "papers.arrow", "paper_authors.arrow"):
+        (tmp_path / filename).touch()
+    paths = {
+        "signatures": str(tmp_path / "signatures.arrow"),
+        "papers": str(tmp_path / "papers.arrow"),
+        "paper_authors": str(tmp_path / "paper_authors.arrow"),
+        "signatures_batch_index": str(tmp_path / "signatures.index"),
+        "papers_batch_index": str(tmp_path / "papers.index"),
+        "paper_authors_batch_index": str(tmp_path / "paper_authors.index"),
+    }
+    for key in ("signatures_batch_index", "papers_batch_index", "paper_authors_batch_index"):
+        Path(paths[key]).touch()
+
+    with pytest.raises(MissingArrowArtifactError) as exc_info:
+        feature_port.build_rust_featurizer_from_arrow_paths(
+            paths,
+            load_name_counts=True,
+        )
+    assert exc_info.value.missing_keys == ("name_counts_index",)
+
+    patch_tiny_name_counts_loader(monkeypatch)
+    index_path, _metrics = write_name_counts_index(tmp_path / "name_counts_index")
+    result = feature_port.build_rust_featurizer_from_arrow_paths(
+        {**paths, "name_counts_index": index_path},
+        load_name_counts=True,
     )
 
-    assert first_again is first
-    assert json_entry.dataset_name == "option_cache_dataset:from_json_paths:True"
-    assert build_calls == [("from_dataset", False), ("from_json_paths", True)]
-    assert _cache_size() == 2
+    assert result.dataset_name == "arrow"
+    assert calls == [
+        {
+            "paths": {**paths, "name_counts_index": index_path},
+        }
+    ]
+
+
+def test_build_rust_featurizer_from_arrow_paths_requires_batch_indexes_by_default(monkeypatch, tmp_path):
+    class ArrowRustFeaturizer(DummyRustFeaturizer):
+        @classmethod
+        def from_arrow_paths(cls, *_args, **_kwargs):
+            return cls("arrow")
+
+    class ArrowRustModule:
+        __version__ = "0.51.0"
+        RustFeaturizer = ArrowRustFeaturizer
+
+    monkeypatch.setattr(feature_port, "s2and_rust", ArrowRustModule)
+    paths = {
+        "signatures": str(tmp_path / "signatures.arrow"),
+        "papers": str(tmp_path / "papers.arrow"),
+        "paper_authors": str(tmp_path / "paper_authors.arrow"),
+    }
+    for path in paths.values():
+        Path(path).touch()
+
+    with pytest.raises(ValueError, match="signatures_batch_index"):
+        feature_port.build_rust_featurizer_from_arrow_paths(paths)
+
+    with pytest.raises(ValueError, match="missing_papers.arrow"):
+        feature_port.build_rust_featurizer_from_arrow_paths(
+            {
+                **paths,
+                "papers": str(tmp_path / "missing_papers.arrow"),
+                "signatures_batch_index": str(tmp_path / "signatures.index"),
+                "papers_batch_index": str(tmp_path / "papers.index"),
+                "paper_authors_batch_index": str(tmp_path / "paper_authors.index"),
+            },
+        )
+
+    with pytest.raises(ValueError, match="name_pairs"):
+        feature_port.build_rust_featurizer_from_arrow_paths(
+            {
+                **paths,
+                "name_pairs": str(tmp_path / "missing_name_pairs.arrow"),
+                "signatures_batch_index": str(tmp_path / "signatures.index"),
+                "papers_batch_index": str(tmp_path / "papers.index"),
+                "paper_authors_batch_index": str(tmp_path / "paper_authors.index"),
+            },
+        )
+
+    index_paths = {
+        "signatures_batch_index": str(tmp_path / "signatures.index"),
+        "papers_batch_index": str(tmp_path / "papers.index"),
+        "paper_authors_batch_index": str(tmp_path / "paper_authors.index"),
+    }
+    for path in index_paths.values():
+        Path(path).touch()
+
+    result = feature_port.build_rust_featurizer_from_arrow_paths({**paths, **index_paths})
+    assert result.dataset_name == "arrow"
 
 
 def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
@@ -251,8 +563,7 @@ def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
     build_windows: dict[str, tuple[float, float]] = {}
     window_lock = threading.Lock()
 
-    def _build_stub(dataset, *, requested_build_path, allow_normalization_version_mismatch):
-        assert allow_normalization_version_mismatch is False
+    def _build_stub(dataset):
         ready.wait(timeout=2)
         build_start = time.perf_counter()
         time.sleep(0.25)
@@ -261,9 +572,7 @@ def test_concurrent_builds_for_distinct_datasets_do_not_serialize(monkeypatch):
             build_windows[dataset.name] = (build_start, build_end)
         return (
             DummyRustFeaturizer(dataset.name),
-            requested_build_path,
             {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
-            1,
             0.25,
         )
 
@@ -301,16 +610,13 @@ def test_concurrent_builds_for_same_dataset_share_single_inflight_build(monkeypa
     ready = threading.Event()
     build_calls = {"count": 0}
 
-    def _build_stub(dataset_arg, *, requested_build_path, allow_normalization_version_mismatch):
-        assert allow_normalization_version_mismatch is False
+    def _build_stub(dataset_arg):
         build_calls["count"] += 1
         ready.wait(timeout=2)
         time.sleep(0.25)
         return (
             DummyRustFeaturizer(dataset_arg.name),
-            requested_build_path,
             {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
-            1,
             0.25,
         )
 
@@ -342,7 +648,7 @@ def test_concurrent_builds_for_same_dataset_share_single_inflight_build(monkeypa
 
 def test_increment_rust_featurizer_build_count_is_thread_safe():
     dataset = DummyDataset("build_count_threadsafe", mode="train")
-    cache_key = feature_port._rust_featurizer_cache_key("from_dataset", False)  # noqa: SLF001
+    cache_key = feature_port._rust_featurizer_cache_key(dataset)  # noqa: SLF001
     with feature_port._RUST_FEATURIZER_CACHE_LOCK:
         feature_port._RUST_FEATURIZER_CACHE[dataset] = {
             cache_key: feature_port._CacheEntry(
@@ -405,7 +711,7 @@ def test_get_rust_featurizer_retries_empty_wait_then_builds(monkeypatch):
     dataset = DummyDataset("empty_wait_then_build", mode="train")
     attempts = {"count": 0}
     build_calls = {"count": 0}
-    inflight = feature_port._InFlightFeaturizerBuild("from_dataset")
+    inflight = feature_port._InFlightFeaturizerBuild()
     expected_featurizer = DummyRustFeaturizer("built_after_empty_wait")
     monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_MAX_RETRIES", 2)
     monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_BACKOFF_SECONDS", 0.0)
@@ -432,203 +738,53 @@ def test_get_rust_featurizer_retries_empty_wait_then_builds(monkeypatch):
     assert build_calls["count"] == 1
 
 
-def test_json_ingest_is_inference_only():
-    dataset = DummyDataset("train_dataset", mode="train")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
+def test_get_rust_featurizer_raises_after_repeated_stale_build(monkeypatch):
+    dataset = DummyDataset("stale_build_retry_budget", mode="train")
+    runtime_context = type("RuntimeContext", (), {"operation": "test_stale_build", "run_id": "run-stale-build"})()
+    inflight = feature_port._InFlightFeaturizerBuild()
+    build_calls = {"count": 0}
+    monkeypatch.setattr(feature_port, "RUST_FEATURIZER_EMPTY_WAIT_MAX_RETRIES", 2)
+
+    def _always_build(_dataset, *, build_context):
+        del build_context
+        return None, inflight
+
+    def _always_stale(_dataset, *, inflight_build, build_context):
+        del build_context
+        assert inflight_build is inflight
+        build_calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(feature_port, "_get_or_wait_for_cached", _always_build)
+    monkeypatch.setattr(feature_port, "_build_and_cache_rust_featurizer", _always_stale)
+
+    with pytest.raises(RuntimeError, match="stale build state") as exc_info:
+        feature_port._get_rust_featurizer(dataset, runtime_context=runtime_context)
+
+    message = str(exc_info.value)
+    assert "dataset=stale_build_retry_budget" in message
+    assert "run=run-stale-build" in message
+    assert "attempts=3" in message
+    assert build_calls["count"] == 3
+
+
+@pytest.mark.parametrize(
+    ("mode", "with_json_paths"),
+    [
+        ("train", True),
+        ("inference", False),
+        ("inference", True),
+    ],
+)
+def test_rust_featurizer_build_uses_dataset_constructor(mode: str, with_json_paths: bool):
+    dataset = DummyDataset(f"{mode}_paths{int(with_json_paths)}", mode=mode)
+    if with_json_paths:
+        dataset.signatures_path = "signatures.json"
+        dataset.papers_path = "papers.json"
 
     feature_port._get_rust_featurizer(dataset)
 
-    assert DummyRustFeaturizer.created == ["train_dataset"]
-    assert DummyRustFeaturizer.from_json_created == []
-
-
-def test_inference_without_json_paths_uses_from_dataset():
-    dataset = DummyDataset("inference_no_paths", mode="inference")
-
-    feature_port._get_rust_featurizer(dataset)
-
-    assert DummyRustFeaturizer.created == ["inference_no_paths"]
-    assert DummyRustFeaturizer.from_json_created == []
-
-
-def test_json_ingest_routes_canonical_payload(monkeypatch):
-    monkeypatch.delenv("S2AND_RUST_NAME_COUNTS_JSON", raising=False)
-    dataset = DummyDataset("inference_dataset", mode="inference")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
-    dataset.clusters_path = "clusters.json"
-    dataset.cluster_seeds_path = "cluster_seeds.json"
-    dataset.specter_embeddings_path = "specter.pkl"
-    dataset.compute_reference_features = True
-    dataset.preprocess = False
-    dataset.n_jobs = 8
-
-    feature_port._get_rust_featurizer(dataset)
-
-    assert DummyRustFeaturizer.created == []
-    assert len(DummyRustFeaturizer.from_json_created) == 1
-    args, kwargs = DummyRustFeaturizer.from_json_created[0]
-    assert kwargs == {}
-    assert args == (
-        "signatures.json",
-        "papers.json",
-        "cluster_seeds.json",
-        "specter.pkl",
-        None,
-        None,
-        False,
-        True,
-        feature_port.CLUSTER_SEEDS_LOOKUP["require"],
-        feature_port.CLUSTER_SEEDS_LOOKUP["disallow"],
-        8,
-        None,
-        False,
-    )
-
-
-def test_rust_build_path_argument_forces_from_dataset_even_with_json_paths():
-    dataset = DummyDataset("inference_dataset", mode="inference")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
-
-    feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
-
-    assert DummyRustFeaturizer.created == ["inference_dataset"]
-    assert DummyRustFeaturizer.from_json_created == []
-
-
-def test_rust_build_path_argument_rebuilds_cached_different_path():
-    dataset = DummyDataset("inference_dataset", mode="inference")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
-
-    feature_port._get_rust_featurizer(dataset)
-    feature_port._get_rust_featurizer(dataset, rust_build_path="from_dataset")
-
-    assert len(DummyRustFeaturizer.from_json_created) == 1
-    assert DummyRustFeaturizer.created == ["inference_dataset"]
-
-
-def test_json_ingest_overlay_payload_includes_only_signatures_with_name_counts():
-    dataset = DummyDataset("inference_dataset", mode="inference")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
-    dataset.signatures = {
-        "s1": type(
-            "Sig",
-            (),
-            {
-                "author_info_name_counts": NameCounts(
-                    first=1.0,
-                    last=2.0,
-                    first_last=3.0,
-                    last_first_initial=4.0,
-                ),
-                "extra": "full_signature",
-            },
-        )(),
-        "s2": type("Sig", (), {"author_info_name_counts": None, "extra": "ignored"})(),
-    }
-
-    feature_port._get_rust_featurizer(dataset)
-
-    assert len(DummyRustFeaturizer.signature_overlay_payloads) == 1
-    payload = DummyRustFeaturizer.signature_overlay_payloads[0]
-    assert list(payload.keys()) == ["s1"]
-    payload_entry = payload["s1"]
-    assert hasattr(payload_entry, "author_info_name_counts")
-    assert not hasattr(payload_entry, "extra")
-    assert payload_entry.author_info_name_counts.first == 1.0
-    assert payload_entry.author_info_name_counts.last == 2.0
-    assert payload_entry.author_info_name_counts.first_last == 3.0
-    assert payload_entry.author_info_name_counts.last_first_initial == 4.0
-
-
-def test_signature_name_counts_overlay_payload_surfaces_items_failure():
-    class FailingSignatures:
-        def __len__(self):
-            return 2
-
-        def items(self):
-            raise TypeError("items failed")
-
-    dataset = DummyDataset("overlay_items_failure", mode="inference")
-    dataset.signatures = FailingSignatures()
-
-    with pytest.raises(RuntimeError, match="iterating signatures"):
-        feature_port._signature_name_counts_overlay_payload_from_dataset(dataset)
-
-
-def test_json_ingest_prefers_dataset_name_counts_over_artifact(monkeypatch):
-    monkeypatch.setenv("S2AND_RUST_NAME_COUNTS_JSON", "name_counts.json")
-    dataset = DummyDataset("telemetry_json_dataset", mode="inference")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
-    dataset.signatures = {
-        "s1": type(
-            "Sig",
-            (),
-            {
-                "author_info_name_counts": NameCounts(
-                    first=1.0,
-                    last=2.0,
-                    first_last=3.0,
-                    last_first_initial=4.0,
-                )
-            },
-        )(),
-        "s2": type("Sig", (), {"author_info_name_counts": None})(),
-    }
-
-    feature_port._get_rust_featurizer(dataset)
-
-    args, _kwargs = DummyRustFeaturizer.from_json_created[0]
-    assert args[5] is None
-
-
-def test_json_ingest_uses_name_counts_artifact_when_dataset_has_no_counts(tmp_path, monkeypatch):
-    artifact_path = tmp_path / "name_counts.json"
-    artifact_path.write_text('{"normalization_version":"legacy_compat","counts":{}}', encoding="utf-8")
-
-    monkeypatch.setenv("S2AND_RUST_NAME_COUNTS_JSON", str(artifact_path))
-    dataset = DummyDataset("telemetry_json_dataset", mode="inference")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
-    dataset.signatures = {"s1": type("Sig", (), {"author_info_name_counts": None})()}
-
-    feature_port._get_rust_featurizer(dataset)
-
-    args, _kwargs = DummyRustFeaturizer.from_json_created[0]
-    assert args[5] == str(artifact_path)
-    assert args[12] is False
-
-
-def test_json_ingest_normalization_mismatch_allowance_is_explicit(tmp_path, monkeypatch):
-    artifact_path = tmp_path / "name_counts.json"
-    artifact_path.write_text('{"normalization_version":"other","counts":{}}', encoding="utf-8")
-
-    monkeypatch.setenv("S2AND_RUST_NAME_COUNTS_JSON", str(artifact_path))
-    dataset = DummyDataset("normalization_mismatch_explicit", mode="inference")
-    dataset.signatures_path = "signatures.json"
-    dataset.papers_path = "papers.json"
-    dataset.signatures = {"s1": type("Sig", (), {"author_info_name_counts": None})()}
-
-    feature_port._get_rust_featurizer(dataset, allow_normalization_version_mismatch=True)
-
-    args, _kwargs = DummyRustFeaturizer.from_json_created[0]
-    assert args[5] == str(artifact_path)
-    assert args[12] is True
-
-
-def test_explicit_from_json_paths_requires_json_paths():
-    dataset = DummyDataset("missing_json_paths", mode="train")
-
-    with pytest.raises(RuntimeError, match="signatures_path/papers_path are missing"):
-        feature_port._get_rust_featurizer(dataset, rust_build_path="from_json_paths")
-
-    assert DummyRustFeaturizer.created == []
-    assert DummyRustFeaturizer.from_json_created == []
+    assert DummyRustFeaturizer.created == [dataset.name]
 
 
 def test_explicit_evict_and_clear_api():
@@ -648,6 +804,107 @@ def test_explicit_evict_and_clear_api():
     assert _cache_size() == 0
 
 
+def test_evict_during_inflight_build_discards_stale_result(monkeypatch):
+    dataset = DummyDataset("evict_inflight", mode="train")
+    first_build_started = threading.Event()
+    release_first_build = threading.Event()
+    build_calls = {"count": 0}
+
+    def _build_stub(dataset_arg):
+        build_calls["count"] += 1
+        if build_calls["count"] == 1:
+            first_build_started.set()
+            release_first_build.wait(timeout=2)
+            return (
+                DummyRustFeaturizer(f"{dataset_arg.name}_stale"),
+                {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
+                0.0,
+            )
+        return (
+            DummyRustFeaturizer(f"{dataset_arg.name}_fresh"),
+            {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
+            0.0,
+        )
+
+    monkeypatch.setattr(feature_port, "_build_rust_featurizer_strict", _build_stub)
+    results: list[DummyRustFeaturizer] = []
+    errors: list[Exception] = []
+
+    def _worker():
+        try:
+            results.append(feature_port._get_rust_featurizer(dataset))
+        except Exception as exc:  # pragma: no cover - assertion guard
+            errors.append(exc)
+
+    thread = threading.Thread(target=_worker)
+    thread.start()
+    assert first_build_started.wait(timeout=2)
+    assert feature_port.evict_rust_featurizer(dataset) is False
+    release_first_build.set()
+    thread.join(timeout=5)
+
+    assert errors == []
+    assert [result.dataset_name for result in results] == ["evict_inflight_fresh"]
+    assert build_calls["count"] == 2
+    assert feature_port._get_rust_featurizer(dataset).dataset_name == "evict_inflight_fresh"
+
+
+def test_clear_during_inflight_build_discards_stale_result(monkeypatch):
+    dataset = DummyDataset("clear_inflight", mode="train")
+    first_build_started = threading.Event()
+    release_first_build = threading.Event()
+    build_calls = {"count": 0}
+
+    def _build_stub(dataset_arg):
+        build_calls["count"] += 1
+        if build_calls["count"] == 1:
+            first_build_started.set()
+            release_first_build.wait(timeout=2)
+            return (
+                DummyRustFeaturizer(f"{dataset_arg.name}_stale"),
+                {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
+                0.0,
+            )
+        return (
+            DummyRustFeaturizer(f"{dataset_arg.name}_fresh"),
+            {"pre_build_seconds": 0.0, "ffi_seconds": 0.0, "post_build_seconds": 0.0},
+            0.0,
+        )
+
+    monkeypatch.setattr(feature_port, "_build_rust_featurizer_strict", _build_stub)
+    results: list[DummyRustFeaturizer] = []
+    errors: list[Exception] = []
+
+    def _worker():
+        try:
+            results.append(feature_port._get_rust_featurizer(dataset))
+        except Exception as exc:  # pragma: no cover - assertion guard
+            errors.append(exc)
+
+    thread = threading.Thread(target=_worker)
+    thread.start()
+    assert first_build_started.wait(timeout=2)
+    assert feature_port.clear_rust_featurizer_cache() == 0
+    release_first_build.set()
+    thread.join(timeout=5)
+
+    assert errors == []
+    assert [result.dataset_name for result in results] == ["clear_inflight_fresh"]
+    assert build_calls["count"] == 2
+    assert feature_port._get_rust_featurizer(dataset).dataset_name == "clear_inflight_fresh"
+
+
+def test_evict_rust_featurizer_clears_build_counts():
+    dataset = DummyDataset("evict_build_counts", mode="train")
+    cache_key = feature_port._rust_featurizer_cache_key(dataset)  # noqa: SLF001
+
+    feature_port._get_rust_featurizer(dataset)
+
+    assert feature_port._rust_featurizer_build_count(dataset, cache_key) == 1  # noqa: SLF001
+    assert feature_port.evict_rust_featurizer(dataset) is True
+    assert feature_port._rust_featurizer_build_count(dataset, cache_key) == 0  # noqa: SLF001
+
+
 def test_load_s2and_rust_extension_falls_back_from_namespace_package(monkeypatch):
     class NamespaceOnly:
         pass
@@ -662,9 +919,9 @@ def test_load_s2and_rust_extension_falls_back_from_namespace_package(monkeypatch
             return NativeExtension
         raise _missing_module(name)
 
-    monkeypatch.setattr(rust_capabilities.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(runtime.importlib, "import_module", fake_import_module)
 
-    loaded = rust_capabilities.load_s2and_rust_extension()
+    loaded = runtime.load_s2and_rust_extension()
     assert loaded is NativeExtension
 
 
@@ -672,10 +929,6 @@ def test_load_s2and_rust_extension_returns_first_valid_module(monkeypatch):
     class ValidRustFeaturizer:
         @staticmethod
         def from_dataset(*args, **kwargs):
-            return None
-
-        @staticmethod
-        def from_json_paths(*args, **kwargs):
             return None
 
         def signature_ids(self):
@@ -689,7 +942,7 @@ def test_load_s2and_rust_extension_returns_first_valid_module(monkeypatch):
             return TopLevelModule
         raise _missing_module(name)
 
-    monkeypatch.setattr(rust_capabilities.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(runtime.importlib, "import_module", fake_import_module)
 
-    loaded = rust_capabilities.load_s2and_rust_extension()
+    loaded = runtime.load_s2and_rust_extension()
     assert loaded is TopLevelModule

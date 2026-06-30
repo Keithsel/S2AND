@@ -25,14 +25,10 @@ RESULT_MARKERS: dict[str, tuple[str, str]] = {
     "profile": ("===S2AND_PROFILE_RESULT_START===", "===S2AND_PROFILE_RESULT_END==="),
     "compare": ("===S2AND_COMPARE_RESULT_START===", "===S2AND_COMPARE_RESULT_END==="),
     "largest_block": ("===S2AND_LARGEST_BLOCK_RESULT_START===", "===S2AND_LARGEST_BLOCK_RESULT_END==="),
-    "big_block": ("===S2AND_BIG_BLOCK_RESULT_START===", "===S2AND_BIG_BLOCK_RESULT_END==="),
 }
 
 DEFAULT_ENV_KEYS = (
     "S2AND_BACKEND",
-    "S2AND_SKIP_FASTTEXT",
-    "S2AND_NORMALIZATION_VERSION",
-    "S2AND_RUST_NAME_COUNTS_JSON",
     "PYTHONHASHSEED",
     "RAYON_NUM_THREADS",
     "OMP_NUM_THREADS",
@@ -200,7 +196,9 @@ def collect_rust_extension_identity(
     fail_if_unavailable: bool = False,
 ) -> dict[str, Any]:
     try:
-        import s2and_rust
+        from s2and.runtime import load_s2and_rust_extension
+
+        s2and_rust = load_s2and_rust_extension()
     except Exception as exc:
         if fail_if_unavailable or require_release:
             raise RuntimeError(f"Failed to import s2and_rust: {exc}") from exc
@@ -209,6 +207,11 @@ def collect_rust_extension_identity(
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
+    if s2and_rust is None:
+        message = "s2and_rust native extension is unavailable"
+        if fail_if_unavailable or require_release:
+            raise RuntimeError(message)
+        return {"available": False, "error_type": "MissingNativeExtension", "error": message}
 
     module_path_raw = getattr(s2and_rust, "__file__", None)
     if module_path_raw is None:

@@ -10,9 +10,10 @@ from typing import Any
 
 import numpy as np
 
-from s2and import feature_port, memory_budget
+from s2and import feature_port, memory_budget, rust_calls
 from s2and.data import ANDData
 from s2and.featurizer import FeaturizationInfo
+from s2and.incremental_linking.array_validation import as_retrieval_rank_uint16_1d, as_uint32_1d
 from s2and.thread_config import resolve_n_jobs
 
 PROD_PAIRWISE_FEATURE_GROUPS: tuple[str, ...] = (
@@ -212,12 +213,18 @@ class LinkerCandidateBatch:
             raise ValueError(
                 f"retrieval_scores must have length row_count: {len(self.retrieval_scores)} != {row_count}"
             )
-        if self.retrieval_ranks is not None and len(self.retrieval_ranks) != row_count:
-            raise ValueError(f"retrieval_ranks must have length row_count: {len(self.retrieval_ranks)} != {row_count}")
+        ranks = (
+            None
+            if self.retrieval_ranks is None
+            else as_retrieval_rank_uint16_1d("retrieval_ranks", self.retrieval_ranks)
+        )
+        if ranks is not None and len(ranks) != row_count:
+            raise ValueError(f"retrieval_ranks must have length row_count: {len(ranks)} != {row_count}")
         object.__setattr__(self, "row_count", row_count)
         object.__setattr__(self, "left_signature_indices", left)
         object.__setattr__(self, "right_signature_indices", right)
         object.__setattr__(self, "pair_row_indices", rows)
+        object.__setattr__(self, "retrieval_ranks", ranks)
         if self.row_query_signature_indices is not None:
             object.__setattr__(
                 self,
@@ -239,10 +246,7 @@ def promoted_pairwise_aggregate_columns() -> tuple[str, ...]:
 
 
 def _as_uint32_1d(name: str, values: Sequence[Any] | np.ndarray) -> np.ndarray:
-    array = np.ascontiguousarray(values, dtype=np.uint32)
-    if array.ndim != 1:
-        raise ValueError(f"{name} must be a 1D array, got shape={array.shape}")
-    return array
+    return as_uint32_1d(name, values)
 
 
 def build_candidate_batch_from_members(
@@ -287,7 +291,9 @@ def build_candidate_batch_from_members(
         row_component_keys=None if row_component_keys is None else tuple(row_component_keys),
         labels=None if labels is None else np.asarray(labels),
         retrieval_scores=None if retrieval_scores is None else np.asarray(retrieval_scores, dtype=np.float32),
-        retrieval_ranks=None if retrieval_ranks is None else np.asarray(retrieval_ranks, dtype=np.uint16),
+        retrieval_ranks=None
+        if retrieval_ranks is None
+        else as_retrieval_rank_uint16_1d("retrieval_ranks", retrieval_ranks),
     )
 
 
@@ -337,8 +343,19 @@ def _chunk_plan_pairs(plan: memory_budget.RustBatchChunkPlan) -> int:
     return int(plan.chunk_pairs)
 
 
+def resolve_linker_pairwise_featurizer(
+    dataset: ANDData | None,
+    featurizer: Any | None,
+    *,
+    runtime_context: Any | None = None,
+) -> Any:
+    """Return the Rust featurizer used for linker pairwise array APIs."""
+
+    return rust_calls._resolve_featurizer(dataset, featurizer, runtime_context)  # noqa: SLF001
+
+
 def iter_candidate_batch_pair_feature_chunks_rust(
-    dataset: ANDData,
+    dataset: ANDData | None,
     candidate_batch: LinkerCandidateBatch,
     *,
     matrix_indices: Sequence[int] | None = None,
@@ -371,11 +388,7 @@ def iter_candidate_batch_pair_feature_chunks_rust(
             total_ram_bytes=total_ram_bytes,
         )
     chunk_pairs = _chunk_plan_pairs(plan)
-    if featurizer is None:
-        featurizer = feature_port._get_rust_featurizer(  # noqa: SLF001
-            dataset,
-            runtime_context=runtime_context,
-        )
+    featurizer = resolve_linker_pairwise_featurizer(dataset, featurizer, runtime_context=runtime_context)
 
     for start in range(0, candidate_batch.pair_count, chunk_pairs):
         stop = min(candidate_batch.pair_count, start + chunk_pairs)
@@ -417,7 +430,7 @@ def iter_candidate_batch_pair_feature_chunks_rust(
 
 
 def compute_candidate_batch_pairwise_aggregate_stats_rust(
-    dataset: ANDData,
+    dataset: ANDData | None,
     candidate_batch: LinkerCandidateBatch,
     *,
     aggregate_feature_names: Sequence[str] = PROMOTED_PAIRWISE_AGG_BASE_FEATURE_NAMES,
@@ -454,30 +467,36 @@ def compute_candidate_batch_pairwise_aggregate_stats_rust(
     mins = np.full((candidate_batch.row_count, len(aggregate_indices)), np.inf, dtype=np.float64)
     maxs = np.full((candidate_batch.row_count, len(aggregate_indices)), -np.inf, dtype=np.float64)
     chunk_count = 0
-    for chunk in iter_candidate_batch_pair_feature_chunks_rust(
-        dataset,
-        candidate_batch,
-        matrix_indices=aggregate_indices,
-        aggregate_indices=aggregate_indices,
-        n_jobs=n_jobs,
-        total_ram_bytes=total_ram_bytes,
-        nan_value=nan_value,
-        runtime_context=runtime_context,
-        featurizer=featurizer,
-        chunk_plan=plan,
-    ):
+    chunk_pairs = _chunk_plan_pairs(plan)
+    featurizer = resolve_linker_pairwise_featurizer(dataset, featurizer, runtime_context=runtime_context)
+    for start in range(0, candidate_batch.pair_count, chunk_pairs):
+        stop = min(candidate_batch.pair_count, start + chunk_pairs)
+        row_chunk = candidate_batch.pair_row_indices[start:stop]
+        global_rows, local_row_indices = _localize_row_indices(row_chunk)
+        chunk_counts, chunk_valid_counts, chunk_sums, chunk_mins, chunk_maxs = (
+            feature_port.build_linker_pair_aggregate_stats_arrays_rust(
+                dataset,
+                candidate_batch.left_signature_indices[start:stop],
+                candidate_batch.right_signature_indices[start:stop],
+                local_row_indices,
+                len(global_rows),
+                aggregate_indices=list(aggregate_indices),
+                num_threads=resolve_n_jobs(n_jobs),
+                nan_value=float(nan_value),
+                runtime_context=runtime_context,
+                featurizer=featurizer,
+            )
+        )
         chunk_count += 1
-        observed = chunk.counts > 0
+        observed = chunk_counts > 0
         if not np.any(observed):
             continue
-        rows = chunk.global_row_indices[observed]
-        counts[rows] += chunk.counts[observed].astype(np.uint64, copy=False)
-        if chunk.valid_counts is None:
-            raise RuntimeError("nan-aware pairwise aggregate chunks must include valid_counts")
-        valid_counts[rows] += chunk.valid_counts[observed]
-        sums[rows] += chunk.sums[observed]
-        mins[rows] = np.minimum(mins[rows], chunk.mins[observed])
-        maxs[rows] = np.maximum(maxs[rows], chunk.maxs[observed])
+        rows = global_rows[observed]
+        counts[rows] += chunk_counts[observed].astype(np.uint64, copy=False)
+        valid_counts[rows] += chunk_valid_counts[observed]
+        sums[rows] += chunk_sums[observed]
+        mins[rows] = np.minimum(mins[rows], chunk_mins[observed])
+        maxs[rows] = np.maximum(maxs[rows], chunk_maxs[observed])
     return PairwiseAggregateStats(
         counts=counts,
         sums=sums,

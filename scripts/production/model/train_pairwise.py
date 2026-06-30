@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_FEATURE_CACHE_ROOT = REPO_ROOT / "data" / ".feature_cache"
 os.environ.setdefault("S2AND_CACHE", str(DEFAULT_FEATURE_CACHE_ROOT))
+os.environ.setdefault("S2AND_BACKEND", "rust")
 
 from s2and.consts import FEATURIZER_VERSION, PROJECT_ROOT_PATH  # noqa: E402
 from s2and.data import ANDData  # noqa: E402
@@ -290,9 +291,12 @@ def train_pairwise_bundle(args: argparse.Namespace) -> dict[str, Any]:
         nameless_featurizer_info=nameless_featurizer_info,
     )
     union_clusterer.fit(anddatas)
+    best_params = union_clusterer.best_params
+    if best_params is None:
+        raise RuntimeError("Clusterer fitting did not produce best clustering parameters.")
 
     training_summary = {
-        "best_clustering_params": dict(union_clusterer.best_params),
+        "best_clustering_params": dict(best_params),
         "elapsed_seconds": round(float(time.perf_counter() - started), 3),
         "main_train_rows": int(X_train.shape[0]),
         "main_val_rows": int(X_val.shape[0]),

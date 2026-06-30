@@ -4,7 +4,6 @@ import os
 import pickle
 import platform
 import re
-import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
@@ -39,13 +38,14 @@ from s2and.text import (
     AFFILIATIONS_STOP_WORDS,
     DROPPED_AFFIXES,
     NAME_PREFIXES,
-    ORCID_PATTERN,
     VENUE_STOP_WORDS,
     compute_block,
     detect_language,
     first_names_name_compatible,
     get_text_ngrams,
     get_text_ngrams_words,
+    has_name_dash,
+    normalize_orcid_compact,
     normalize_text,
     split_first_middle_hyphen_aware,
 )
@@ -239,6 +239,11 @@ def _signature_preprocess_backend_decision(runtime_context: RuntimeContext) -> b
 
 
 def _ordered_coauthors_for_signature(signature: "Signature", papers: dict[str, "Paper"]) -> list[str]:
+    if signature.author_info_position is None:
+        raise ValueError(
+            "Signature is missing author_info_position for coauthor ngram materialization "
+            f"(signature_id={signature.signature_id} paper_id={signature.paper_id})"
+        )
     paper = papers.get(str(signature.paper_id))
     if paper is None:
         logger.warning(
@@ -248,7 +253,7 @@ def _ordered_coauthors_for_signature(signature: "Signature", papers: dict[str, "
             signature.paper_id,
         )
         return []
-    # Rust JSON ingest can skip Python paper preprocessing, so `paper.authors` may still hold raw names here.
+    # Rust deferred paper preprocessing can leave `paper.authors` as raw names here.
     return [
         normalize_text(author.author_name)
         for author in paper.authors
@@ -284,6 +289,8 @@ def _build_signature_ngram_texts(
     affiliation_values = (
         [normalize_text(affiliation) for affiliation in affiliations] if normalize_affiliations else affiliations
     )
+    coauthor_values = [value for value in coauthor_values if value]
+    affiliation_values = [value for value in affiliation_values if value]
     coauthor_text = " ".join(coauthor_values) if len(coauthor_values) > 0 else ""
     affiliation_text = " ".join(affiliation_values)
     return coauthor_text, affiliation_text
@@ -471,9 +478,10 @@ class ANDData:
     ):
         init_start = time.perf_counter()
         self.runtime_context = build_runtime_context("dataset_build")
-        self.signatures_path = signatures if isinstance(signatures, str) else None
-        self.papers_path = papers if isinstance(papers, str) else None
-        self._rust_ingest_tmpdir = None  # TemporaryDirectory; prevent leak
+        self.original_signatures_path = signatures if isinstance(signatures, str) else None
+        self.original_papers_path = papers if isinstance(papers, str) else None
+        self.signatures_path = self.original_signatures_path
+        self.papers_path = self.original_papers_path
         self._s2and_python_pair_ngrams_ready: bool = False
         self._rust_cluster_seeds_require_id: int | None = None
         self._rust_cluster_seeds_require_len: int | None = None
@@ -487,15 +495,11 @@ class ANDData:
         self.rust_lifecycle_policy = build_rust_lifecycle_policy(
             backend=self.runtime_context.resolved_backend,
             mode=mode,
-            has_signatures_path=self.signatures_path is not None,
-            has_papers_path=self.papers_path is not None,
             preprocess=preprocess,
             compute_reference_features=compute_reference_features,
-            use_rust=self.runtime_context.use_rust,
+            from_dataset_available=rust_capabilities.from_dataset_available,
             from_dataset_paper_preprocess_available=rust_capabilities.from_dataset_paper_preprocess_available,
-            use_sinonym_overwrite=use_sinonym_overwrite,
         )
-        defer_rust_json_ingest_write_for_sinonym = self.rust_lifecycle_policy.defer_rust_json_ingest_write_for_sinonym
         pair_sampling_mode = _resolve_pair_sampling_mode(
             pair_sampling_mode=pair_sampling_mode,
             pair_sampling_block=pair_sampling_block,
@@ -525,7 +529,6 @@ class ANDData:
         signatures_stage_start = time.perf_counter()
         logger.info("loading signatures")
         raw_signatures = self.maybe_load_json(signatures)
-        raw_signatures_for_json: dict[Any, Any] | None = None
         self.signatures = {}
         # convert dictionary to namedtuples for memory reduction
         for signature_id, signature in raw_signatures.items():
@@ -546,11 +549,16 @@ class ANDData:
                 author_info_affiliations_n_grams=None,
                 author_info_coauthor_n_grams=None,
                 author_info_email=signature["author_info"]["email"],
+                # use_orcid_id is an offline data-prep knob used by training data
+                # construction (incremental_linking_training.data_loading) to build
+                # datasets that strip ORCIDs entirely. Production callers leave the
+                # default True and let the per-request `Clusterer.suppress_orcid` flag
+                # drive ORCID enablement (which threads to Rust via `orcid_enabled` in
+                # raw_arrow_features). The two control surfaces are equivalent in
+                # effect; do not mix them.
                 author_info_orcid=(
-                    signature["author_info"]["source_ids"][0]
-                    if use_orcid_id
-                    and "source_id_source" in signature["author_info"]
-                    and signature["author_info"]["source_id_source"] == "ORCID"
+                    (signature["author_info"].get("source_ids") or [None])[0]
+                    if use_orcid_id and signature["author_info"].get("source_id_source") == "ORCID"
                     else None
                 ),
                 author_info_name_counts=None,
@@ -572,30 +580,19 @@ class ANDData:
             len(self.signatures),
         )
 
-        # Determine the set of papers referenced by signatures
+        # Determine the set of papers referenced by signatures.
         needed_paper_ids: set[str] = set(str(sig.paper_id) for sig in self.signatures.values())
 
         papers_stage_start = time.perf_counter()
         logger.info("loading papers (subset referenced by signatures)")
         raw_papers = self.maybe_load_json(papers)
-        filtered_papers = {pid: p for pid, p in raw_papers.items() if str(pid) in needed_paper_ids}
-        rust_json_ingest_from_paths = bool(
-            self.rust_lifecycle_policy.rust_build_path == "from_json_paths"
-            and self.signatures_path is not None
-            and self.papers_path is not None
-        )
-        if (
-            rust_json_ingest_from_paths
-            and len(filtered_papers) < len(raw_papers)
-            and not defer_rust_json_ingest_write_for_sinonym
-        ):
-            if raw_signatures_for_json is None:
-                raw_signatures_for_json = dict(raw_signatures)
-            self._materialize_rust_json_ingest_filtered_payload(
-                raw_signatures_for_json=raw_signatures_for_json,
-                filtered_papers_for_json=filtered_papers,
-                source_papers_count=len(raw_papers),
-            )
+        retained_paper_ids = set(needed_paper_ids)
+        if compute_reference_features:
+            for pid, paper in raw_papers.items():
+                if str(pid) not in needed_paper_ids:
+                    continue
+                retained_paper_ids.update(str(reference_id) for reference_id in paper.get("references", []))
+        filtered_papers = {pid: p for pid, p in raw_papers.items() if str(pid) in retained_paper_ids}
         self.papers = {}
         # convert dictionary to namedtuples for memory reduction
         for paper_id, paper in filtered_papers.items():
@@ -663,18 +660,6 @@ class ANDData:
                 self.papers, sinonym_results, allow_overwrite_pos=allow_overwrite_pos
             )
             logger.info(f"Sinonym overwrote {paper_overwrite_count} paper author name(s)")
-            if defer_rust_json_ingest_write_for_sinonym:
-                if raw_signatures_for_json is None:
-                    raw_signatures_for_json = dict(raw_signatures)
-                self._sync_in_memory_names_to_rust_json_payload(
-                    raw_signatures_for_json=raw_signatures_for_json,
-                    filtered_papers_for_json=filtered_papers,
-                )
-                self._materialize_rust_json_ingest_filtered_payload(
-                    raw_signatures_for_json=raw_signatures_for_json,
-                    filtered_papers_for_json=filtered_papers,
-                    source_papers_count=len(raw_papers),
-                )
 
         self.name = name
         self.mode = mode
@@ -712,7 +697,8 @@ class ANDData:
                             self.cluster_seeds_require[signature_id_a] = cluster_num
                             root_added = True
                         self.cluster_seeds_require[signature_id_b] = cluster_num
-                cluster_num += 1
+                if root_added:
+                    cluster_num += 1
             self.max_seed_cluster_id = cluster_num
         logger.info("loaded cluster seeds")
         # Versioned seed state for Rust sync dedupe.
@@ -866,74 +852,6 @@ class ANDData:
 
         return self.pair_sampling_mode == "within_block_balanced_homonym_synonym"
 
-    def _sync_in_memory_names_to_rust_json_payload(
-        self,
-        *,
-        raw_signatures_for_json: dict[Any, Any],
-        filtered_papers_for_json: dict[Any, Any],
-    ) -> None:
-        for signature_id, signature in self.signatures.items():
-            signature_payload = raw_signatures_for_json.get(signature_id)
-            if signature_payload is None:
-                signature_payload = raw_signatures_for_json.get(str(signature_id))
-            if not isinstance(signature_payload, dict):
-                continue
-            author_info_payload = signature_payload.get("author_info")
-            if not isinstance(author_info_payload, dict):
-                continue
-            author_info_payload["first"] = signature.author_info_first
-            author_info_payload["middle"] = signature.author_info_middle
-            author_info_payload["last"] = signature.author_info_last
-            author_info_payload["block"] = signature.author_info_block
-
-        for paper_id, paper_payload in filtered_papers_for_json.items():
-            paper = self.papers.get(paper_id)
-            if paper is None:
-                paper = self.papers.get(str(paper_id))
-            if paper is None or not isinstance(paper_payload, dict):
-                continue
-            author_payloads = paper_payload.get("authors")
-            if not isinstance(author_payloads, list):
-                continue
-            position_to_name: dict[Any, str] = {}
-            for author in paper.authors:
-                position_to_name[author.position] = author.author_name
-                position_to_name[str(author.position)] = author.author_name
-            for author_payload in author_payloads:
-                if not isinstance(author_payload, dict):
-                    continue
-                author_name = position_to_name.get(author_payload.get("position"))
-                if author_name is not None:
-                    author_payload["author_name"] = author_name
-
-    def _materialize_rust_json_ingest_filtered_payload(
-        self,
-        *,
-        raw_signatures_for_json: dict[Any, Any],
-        filtered_papers_for_json: dict[Any, Any],
-        source_papers_count: int,
-    ) -> None:
-        filtered_paths_start = time.perf_counter()
-        if self._rust_ingest_tmpdir is None:
-            self._rust_ingest_tmpdir = tempfile.TemporaryDirectory(prefix="s2and_rust_json_ingest_")
-        filtered_dir = self._rust_ingest_tmpdir.name
-        filtered_signatures_path = os.path.join(filtered_dir, "signatures_filtered.json")
-        filtered_papers_path = os.path.join(filtered_dir, "papers_filtered.json")
-        with open(filtered_signatures_path, "w", encoding="utf-8") as signatures_file:
-            json.dump(raw_signatures_for_json, signatures_file)
-        with open(filtered_papers_path, "w", encoding="utf-8") as papers_file:
-            json.dump(filtered_papers_for_json, papers_file)
-        self.signatures_path = filtered_signatures_path
-        self.papers_path = filtered_papers_path
-        logger.info(
-            "Rust JSON ingest: materialized filtered JSON payloads signatures=%d papers=%d source_papers=%d "
-            "seconds=%.3f",
-            len(raw_signatures_for_json),
-            len(filtered_papers_for_json),
-            source_papers_count,
-            time.perf_counter() - filtered_paths_start,
-        )
-
     def _compute_signature_name_counts(
         self,
         signature: Signature,
@@ -961,7 +879,7 @@ class ANDData:
             counts_first_without_apostrophe.split(" ")[0] if counts_first_without_apostrophe else ""
         )
         first_for_counts = first_normalized_token_for_counts
-        if "-" in first_raw:
+        if has_name_dash(first_raw):
             joined = (counts_first_without_apostrophe or "").replace(" ", "")
             if joined:
                 first_for_counts = joined
@@ -1112,7 +1030,9 @@ class ANDData:
                             stored_last_normalized = normalize_text(signature.author_info_last)
                             stored_suffix_normalized = normalize_text(signature.author_info_suffix or "")
                             affiliations = [
-                                normalize_text(affiliation) for affiliation in signature.author_info_affiliations
+                                normalized_affiliation
+                                for affiliation in signature.author_info_affiliations
+                                if (normalized_affiliation := normalize_text(affiliation))
                             ]
                             if not defer_signature_ngrams_to_rust:
                                 coauthor_text, affiliation_text = _build_signature_ngram_texts(
@@ -1143,13 +1063,8 @@ class ANDData:
                                 ]
                             )
 
-                            # we need a regex to extract the 16 digits, keeping in mind the last digit could be X
                             if signature.author_info_orcid is not None:
-                                orcid = re.findall(ORCID_PATTERN, signature.author_info_orcid)
-                                if len(orcid) > 0:
-                                    normalized_orcid = orcid[0].upper().replace("-", "")
-                                else:
-                                    normalized_orcid = None
+                                normalized_orcid = normalize_orcid_compact(signature.author_info_orcid)
 
                     batch_rows.append(
                         {
@@ -1548,8 +1463,8 @@ class ANDData:
         first_2, middle_2_text = _materialize_constraint_name_parts(signature_2)
         middle_1 = middle_1_text.split()
 
-        orcid_1 = signature_1.author_info_orcid
-        orcid_2 = signature_2.author_info_orcid
+        orcid_1 = normalize_orcid_compact(signature_1.author_info_orcid)
+        orcid_2 = normalize_orcid_compact(signature_2.author_info_orcid)
 
         # Explicit disallow pairs are hard negatives; the incremental flag only
         # suppresses seed-cluster require groups and derived cross-group disallows.
@@ -1654,6 +1569,8 @@ class ANDData:
         """
         x = []
         y = []
+        # The seeded stratified split is order-sensitive. Preserve the incoming
+        # block order here; sorting changes pinned production-eval test sets.
         for block_id, signature in blocks_dict.items():
             x.append(block_id)
             y.append(len(signature))
@@ -1893,22 +1810,38 @@ class ANDData:
             and isinstance(val_signatures, dict)
             and isinstance(test_signatures, dict)
         )
+        use_block_sampling = self.pair_sampling_block
+        train_signature_ids = (
+            [] if use_block_sampling else [sig for signatures in train_signatures.values() for sig in signatures]
+        )
+        val_signature_ids = (
+            [] if use_block_sampling else [sig for signatures in val_signatures.values() for sig in signatures]
+        )
+        test_signature_ids = (
+            [] if use_block_sampling else [sig for signatures in test_signatures.values() for sig in signatures]
+        )
+
         train_pairs = self.pair_sampling(
             self.train_pairs_size,
-            [],
+            train_signature_ids,
             train_signatures,
         )
         val_pairs = (
             self.pair_sampling(
                 self.val_pairs_size,
-                [],
+                val_signature_ids,
                 val_signatures,
             )
             if len(val_signatures) > 0
             else []
         )
 
-        test_pairs = self.pair_sampling(self.test_pairs_size, [], test_signatures, self.all_test_pairs_flag)
+        test_pairs = self.pair_sampling(
+            self.test_pairs_size,
+            test_signature_ids,
+            test_signatures,
+            self.all_test_pairs_flag,
+        )
 
         return train_pairs, val_pairs, test_pairs
 
@@ -2488,6 +2421,7 @@ def apply_sinonym_overwrites_to_papers(
         if not by_pos:
             continue
         new_authors = []
+        changed = False
         for a in paper.authors:
             repl = by_pos.get(a.position) if isinstance(by_pos, dict) else None
             if repl:
@@ -2504,9 +2438,10 @@ def apply_sinonym_overwrites_to_papers(
                     if new_name and new_name != a.author_name:
                         new_authors.append(Author(author_name=new_name, position=a.position))
                         updates += 1
+                        changed = True
                         continue
             new_authors.append(a)
-        if new_authors and new_authors != list(paper.authors):
+        if changed:
             papers[key] = paper._replace(authors=new_authors)
     return updates
 

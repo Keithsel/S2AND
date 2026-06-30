@@ -15,16 +15,19 @@ uv venv --python 3.7.9
 
 Then install the pinned environment from `paper_experiments_env.txt` inside that isolated environment and rerun the paper experiment command set from the `s2and_paper` branch. The current branch keeps a reference copy at `scripts/archive/paper_experiments.sh`, but that file is historical and not the supported entrypoint for current `main` development.
 
-## Old released model artifacts
+## Paper-era released artifacts
 
-Older released pickles such as:
+Paper-era seed artifacts such as:
 
-- `production_model.pickle`
 - `full_union_seed_*.pickle`
 
-are paper-era artifacts and only run on the `s2and_paper` branch, not on `main`.
+are legacy artifacts for reproducing the original paper setup and should be used
+from the `s2and_paper` branch, not current `main`.
 
-Those pickles store a dictionary with a `clusterer` key rather than a bare clusterer object.
+Some historical model pickles used by the paper-era branch stored a dictionary
+with a `clusterer` key rather than a bare clusterer object. Current `main`
+compatibility artifacts use versioned names such as `production_model_v1.2.pickle`
+and are covered below.
 
 ## Current branch
 
@@ -44,7 +47,9 @@ replay scripts should not depend on machine-local analysis artifacts.
 
 For repeated promoted-linker replay, materialized feature bundles can be reused
 only through the explicit `precomputed-promoted` mode. The bundle must be
-portable and validated against the replay target JSON; local scratch paths are
-not accepted as artifact metadata.
+portable and validated against the replay target JSON. Feature-table metadata in
+the reusable input bundle must use bundle-relative paths; finalized production
+artifact audit metadata may still record historical scratch/provenance paths,
+but replay must not depend on them.
 
 See [production_inference.md](production_inference.md) for the current inference contract.

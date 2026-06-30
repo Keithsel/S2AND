@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import logging
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,14 +32,13 @@ else:
     from _rust_suite.common import get_result_markers as common_get_result_markers
 
 RESULT_JSON_START, RESULT_JSON_END = common_get_result_markers("profile")
-MEMORY_TELEMETRY_JSONL_ENV = "S2AND_MEMORY_TELEMETRY_JSONL"
 
 _MODULE_IMPORTS = {
     "compare": "_rust_suite.compare_cmd",
     "transfer_mini": "_rust_suite.transfer_mini_cmd",
     "prod_inference": "_rust_suite.prod_inference_cmd",
     "largest_block": "_rust_suite.largest_block_cmd",
-    "big_block_incremental": "_rust_suite.big_block_incremental_cmd",
+    "promoted_incremental_arrow_profile": "_rust_suite.promoted_incremental_arrow_profile_cmd",
     "featurizer_reuse": "_rust_suite.featurizer_reuse_cmd",
     "stress_rebuild": "_rust_suite.stress_rebuild_cmd",
     "calibrate_phase_a": "_rust_suite.calibrate_phase_a_cmd",
@@ -84,11 +82,14 @@ def _configure_file_logging(log_file: str | None) -> logging.FileHandler | None:
 
 
 def _configure_memory_telemetry_jsonl(path: str | None) -> None:
+    from s2and import memory_budget
+
     if not path:
+        memory_budget.configure_memory_telemetry_jsonl(None)
         return
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    os.environ[MEMORY_TELEMETRY_JSONL_ENV] = str(output_path)
+    memory_budget.configure_memory_telemetry_jsonl(output_path)
 
 
 def _active_global_cli_args() -> list[str]:
@@ -128,9 +129,12 @@ def _single_run(
     profile_output_path: str,
     model_path: str = str(PACKAGE_DATA_ROOT / "production_model_v1.21"),
     data_root: str = str(PACKAGE_DATA_ROOT / "s2and_mini"),
+    arrow_data_root: str = str(PACKAGE_DATA_ROOT),
     specter_file: str = "",
+    specter_suffix: str = "_specter2.pkl",
     rust_warm_featurizer_before_predict: int = 0,
     run_label: str | None = None,
+    input_format: str = "json",
 ) -> dict[str, Any]:
     result = _load_internal_module("prod_inference")._single_run(
         backend=backend,
@@ -139,9 +143,12 @@ def _single_run(
         profile_output_path=profile_output_path,
         model_path=model_path,
         data_root=data_root,
+        arrow_data_root=arrow_data_root,
         specter_file=specter_file,
+        specter_suffix=specter_suffix,
         rust_warm_featurizer_before_predict=rust_warm_featurizer_before_predict,
         run_label=run_label,
+        input_format=input_format,
     )
     # Ensure metadata points to the canonical CLI entrypoint (this file), even if
     # internal modules are invoked directly.
@@ -158,10 +165,13 @@ def _run_single_subprocess(
     profile_output_path: str,
     model_path: str = str(PACKAGE_DATA_ROOT / "production_model_v1.21"),
     data_root: str = str(PACKAGE_DATA_ROOT / "s2and_mini"),
+    arrow_data_root: str = str(PACKAGE_DATA_ROOT),
     specter_file: str = "",
+    specter_suffix: str = "_specter2.pkl",
     rust_warm_featurizer_before_predict: int = 0,
     single_write_json: str = "",
     run_label: str = "",
+    input_format: str = "json",
 ) -> dict[str, Any]:
     script_path_resolved = Path(script_path)
     if script_path_resolved.name == Path(__file__).name:
@@ -184,6 +194,12 @@ def _run_single_subprocess(
             model_path,
             "--data-root",
             data_root,
+            "--arrow-data-root",
+            arrow_data_root,
+            "--input-format",
+            input_format,
+            "--specter-suffix",
+            specter_suffix,
         ]
         if specter_file:
             cmd.extend(["--specter-file", specter_file])
@@ -203,10 +219,13 @@ def _run_single_subprocess(
         profile_output_path=profile_output_path,
         model_path=model_path,
         data_root=data_root,
+        arrow_data_root=arrow_data_root,
         specter_file=specter_file,
+        specter_suffix=specter_suffix,
         rust_warm_featurizer_before_predict=rust_warm_featurizer_before_predict,
         single_write_json=single_write_json,
         run_label=run_label,
+        input_format=input_format,
     )
 
 
@@ -230,10 +249,6 @@ _PROXY_EXPORTS: dict[str, tuple[str, str]] = {
         "largest_block",
         "_pairwise_precision_recall_fscore_with_singleton_fix",
     ),
-    "_effective_seed_cluster_count": ("big_block_incremental", "_effective_seed_cluster_count"),
-    "_build_cluster_seeds": ("big_block_incremental", "_build_cluster_seeds"),
-    "_paper_has_block_safe_author_names": ("big_block_incremental", "_paper_has_block_safe_author_names"),
-    "_validate_args": ("big_block_incremental", "_validate_args"),
     "run_rebuild_stress": ("stress_rebuild", "run_rebuild_stress"),
     "_rss_growth_fraction": ("stress_rebuild", "_rss_growth_fraction"),
 }
@@ -268,10 +283,10 @@ _COMMANDS = {
         "help": "Largest-block compare/single profiling workflow.",
         "main_kind": "noargv",
     },
-    "big-block-incremental": {
-        "module": "big_block_incremental",
-        "help": "Big-block incremental baseline/promoted-linker workflow.",
-        "main_kind": "noargv",
+    "promoted-incremental-arrow-profile": {
+        "module": "promoted_incremental_arrow_profile",
+        "help": "Arrow-only promoted incremental linker profiling workflow.",
+        "main_kind": "argv",
     },
     "featurizer-reuse": {
         "module": "featurizer_reuse",
@@ -366,7 +381,9 @@ def main(argv: list[str] | None = None) -> int:
     global _ACTIVE_LOG_FILE, _ACTIVE_MEMORY_TELEMETRY_JSONL
     previous_log_file = _ACTIVE_LOG_FILE
     previous_memory_telemetry = _ACTIVE_MEMORY_TELEMETRY_JSONL
-    previous_memory_telemetry_env = os.environ.get(MEMORY_TELEMETRY_JSONL_ENV)
+    from s2and import memory_budget
+
+    previous_memory_telemetry_path = memory_budget.memory_telemetry_jsonl_path()
     _ACTIVE_LOG_FILE = parsed.log_file
     _ACTIVE_MEMORY_TELEMETRY_JSONL = parsed.memory_telemetry_jsonl
     file_handler = _configure_file_logging(parsed.log_file)
@@ -380,11 +397,7 @@ def main(argv: list[str] | None = None) -> int:
             file_handler.close()
         _ACTIVE_LOG_FILE = previous_log_file
         _ACTIVE_MEMORY_TELEMETRY_JSONL = previous_memory_telemetry
-        if parsed.memory_telemetry_jsonl:
-            if previous_memory_telemetry_env is None:
-                os.environ.pop(MEMORY_TELEMETRY_JSONL_ENV, None)
-            else:
-                os.environ[MEMORY_TELEMETRY_JSONL_ENV] = previous_memory_telemetry_env
+        memory_budget.configure_memory_telemetry_jsonl(previous_memory_telemetry_path)
 
 
 if __name__ == "__main__":

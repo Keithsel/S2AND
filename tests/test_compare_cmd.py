@@ -2,10 +2,29 @@ from __future__ import annotations
 
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 import scripts._rust_suite.compare_cmd as compare_cmd
+
+
+def test_collect_rust_package_info_loads_lazy_extension(monkeypatch) -> None:
+    from s2and import feature_port
+
+    fake_module = SimpleNamespace(__version__="0.51.0", __name__="s2and_rust", __file__="native.pyd")
+    monkeypatch.setattr(feature_port, "s2and_rust", None)
+    monkeypatch.setattr(feature_port, "_ensure_s2and_rust_loaded", lambda: fake_module)
+    monkeypatch.setattr(
+        compare_cmd,
+        "collect_rust_extension_identity",
+        lambda **_kwargs: {"module_path": "native.pyd"},
+    )
+
+    info = compare_cmd._collect_rust_package_info(False, False)  # noqa: SLF001
+
+    assert info["version"] == "0.51.0"
+    assert info["module_name"] == "s2and_rust"
 
 
 def test_run_single_loads_name_counts_for_name_count_features(monkeypatch, tmp_path: Path) -> None:

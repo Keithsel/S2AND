@@ -49,24 +49,11 @@ def get_from_cache(url: str, cache_dir: str | None = None) -> str:
     cache_path = os.path.join(cache_dir, url_to_filename(url, remote_validator))
     if os.path.exists(cache_path):
         return cache_path
-    legacy_cache_path = _legacy_cache_path(url, remote_validator, cache_dir)
-    if legacy_cache_path is not None and os.path.exists(legacy_cache_path):
-        return legacy_cache_path
 
     logger.info("%s not found in cache; downloading to %s", url, cache_path)
     _download_to_cache(url, cache_path)
     _write_metadata(cache_path, {"url": url, "etag": remote_validator})
     return cache_path
-
-
-def _legacy_cache_path(url: str, remote_validator: str | None, cache_dir: str) -> str | None:
-    """Return the pre-0.50 cache path for validator-prefixed artifact names."""
-    if remote_validator is None:
-        return None
-    for prefix in ("etag:", "last-modified:"):
-        if remote_validator.startswith(prefix):
-            return os.path.join(cache_dir, url_to_filename(url, remote_validator.removeprefix(prefix)))
-    return None
 
 
 def _remote_cache_validator(url: str) -> str | None:

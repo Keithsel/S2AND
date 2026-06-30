@@ -13,14 +13,11 @@ from s2and.data import ANDData
 from s2and.feature_port import (
     _get_rust_featurizer,
     build_linker_pair_distance_accumulators_rust,
-    featurize_pair_rust,
     get_constraint_labels_index_arrays_rust,
-    get_constraint_rust,
     get_constraints_matrix_indexed_rust,
-    get_constraints_matrix_rust,
 )
 from s2and.featurizer import _single_pair_featurize
-from tests.helpers import equalish, import_s2and_rust
+from tests.helpers import equalish, import_s2and_rust, tiny_name_counts
 
 HAS_RUST, _rust_import_payload = import_s2and_rust(required_method="from_dataset", prefer_site_packages=True)
 _RUST_IMPORT_ERROR = None if HAS_RUST else _rust_import_payload
@@ -35,6 +32,33 @@ if not HAS_RUST:
 def _paper_for_sig(dataset, sig_id):
     sig = dataset.signatures[sig_id]
     return dataset.papers[str(sig.paper_id)]
+
+
+def _featurize_pair_indexed_rust(dataset, sig_id_1: str, sig_id_2: str) -> np.ndarray:
+    rust_featurizer = _get_rust_featurizer(dataset)
+    signature_id_to_index = {str(sig_id): index for index, sig_id in enumerate(rust_featurizer.signature_ids())}
+    return np.asarray(
+        rust_featurizer.featurize_pairs_matrix_indexed(
+            [(signature_id_to_index[str(sig_id_1)], signature_id_to_index[str(sig_id_2)])],
+            None,
+            getattr(dataset, "n_jobs", 1),
+            np.nan,
+        ),
+        dtype=np.float64,
+    )[0]
+
+
+def _constraint_indexed_rust(dataset, sig_id_1: str, sig_id_2: str, **kwargs):
+    rust_featurizer = kwargs.pop("featurizer", None)
+    if rust_featurizer is None:
+        rust_featurizer = _get_rust_featurizer(dataset)
+    signature_id_to_index = {str(sig_id): index for index, sig_id in enumerate(rust_featurizer.signature_ids())}
+    return get_constraints_matrix_indexed_rust(
+        dataset,
+        [(signature_id_to_index[str(sig_id_1)], signature_id_to_index[str(sig_id_2)])],
+        featurizer=rust_featurizer,
+        **kwargs,
+    )[0]
 
 
 def _load_dataset_from_dir(data_dir, name, *, compute_reference_features=False):
@@ -56,7 +80,7 @@ def _load_dataset_from_dir(data_dir, name, *, compute_reference_features=False):
         val_pairs_size=10000,
         test_pairs_size=10000,
         n_jobs=1,
-        load_name_counts=True,
+        load_name_counts=tiny_name_counts(),
         preprocess=True,
         random_seed=42,
         name_tuples="filtered",
@@ -118,7 +142,7 @@ def _build_labeled_pairs(sig_ids, count=20, seed=123):
 
 @pytest.fixture(scope="session")
 def dataset():
-    with _temporary_env(S2AND_SKIP_FASTTEXT="1", S2AND_BACKEND="python"):
+    with _temporary_env(S2AND_BACKEND="python"):
         # Avoid reusing stale process-level env caches between parity fixtures.
         _reset_featurizer_env_caches()
 
@@ -269,10 +293,10 @@ def test_rust_featurizer_supports_string_paper_ids():
         compute_reference_features=False,
     )
 
-    features = featurize_pair_rust(ds, "s1", "s2")
+    features = _featurize_pair_indexed_rust(ds, "s1", "s2")
     assert len(features) > 0
 
-    constraint = get_constraint_rust(ds, "s1", "s2")
+    constraint = _constraint_indexed_rust(ds, "s1", "s2")
     assert constraint is None or isinstance(constraint, int | float)
 
 
@@ -358,7 +382,7 @@ def test_single_initial_name_text_features_match_rust(monkeypatch: pytest.Monkey
         compute_reference_features=False,
     )
     ref_features, _ = _single_pair_featurize(("s1", "s2"), dataset=ds)
-    rust_features = featurize_pair_rust(ds, "s1", "s2")
+    rust_features = _featurize_pair_indexed_rust(ds, "s1", "s2")
     feature_names = featurizer_mod.FeaturizationInfo().get_feature_names()
 
     assert ds.get_constraint("s1", "s2") is None
@@ -368,10 +392,10 @@ def test_single_initial_name_text_features_match_rust(monkeypatch: pytest.Monkey
         assert equalish(ref_features[idx], rust_features[idx])
 
 
-def test_featurize_pair_rust_parity(dataset, sample_pairs):
+def test_indexed_pair_matrix_rust_parity(dataset, sample_pairs):
     for s1, s2 in sample_pairs:
         ref_features, _ = _single_pair_featurize((s1, s2), dataset=dataset)
-        rust_features = featurize_pair_rust(dataset, s1, s2)
+        rust_features = _featurize_pair_indexed_rust(dataset, s1, s2)
         assert len(ref_features) == len(rust_features)
         for idx, (ref_val, got_val) in enumerate(zip(ref_features, rust_features, strict=True)):
             assert equalish(ref_val, got_val), (
@@ -380,8 +404,6 @@ def test_featurize_pair_rust_parity(dataset, sample_pairs):
 
 
 def test_many_pairs_end_to_end_parity_python_vs_rust(monkeypatch):
-    monkeypatch.setenv("S2AND_SKIP_FASTTEXT", "1")
-
     data_dir = os.path.join(PROJECT_ROOT_PATH, "tests", "dummy")
 
     monkeypatch.setenv("S2AND_BACKEND", "python")
@@ -430,7 +452,7 @@ def test_many_pairs_end_to_end_parity_python_vs_rust(monkeypatch):
     _reset_featurizer_env_caches()
 
 
-def test_get_constraint_rust_ignores_reliable_language_mismatch():
+def test_indexed_constraint_rust_ignores_reliable_language_mismatch():
     data_dir = os.path.join(PROJECT_ROOT_PATH, "tests", "dummy")
     ds = _load_dataset_from_dir(data_dir, "dummy_language_constraint_removed")
 
@@ -443,7 +465,7 @@ def test_get_constraint_rust_ignores_reliable_language_mismatch():
     ds.papers[paper_id_2] = ds.papers[paper_id_2]._replace(predicted_language="fr", is_reliable=True)
 
     ref_val = ds.get_constraint(s1, s2)
-    got_val = get_constraint_rust(ds, s1, s2)
+    got_val = _constraint_indexed_rust(ds, s1, s2)
 
     assert ref_val is None
     assert got_val is None
@@ -452,18 +474,16 @@ def test_get_constraint_rust_ignores_reliable_language_mismatch():
     signature_ids = list(rust_featurizer.signature_ids())
     signature_index = {sig_id: idx for idx, sig_id in enumerate(signature_ids)}
 
-    got_string = get_constraints_matrix_rust(ds, [(s1, s2)], featurizer=rust_featurizer)
     got_indexed = get_constraints_matrix_indexed_rust(
         ds,
         [(signature_index[s1], signature_index[s2])],
         featurizer=rust_featurizer,
     )
 
-    assert got_string == [None]
     assert got_indexed == [None]
 
 
-def test_get_constraint_rust_uses_dataset_name_tuple_aliases():
+def test_indexed_constraint_rust_uses_dataset_name_tuple_aliases():
     signatures = {
         "s1": {
             "signature_id": "s1",
@@ -543,7 +563,7 @@ def test_get_constraint_rust_uses_dataset_name_tuple_aliases():
 
     assert ds.get_constraint("s1", "s2") is None
     rust_featurizer = _get_rust_featurizer(ds)
-    assert get_constraint_rust(ds, "s1", "s2", featurizer=rust_featurizer) is None
+    assert _constraint_indexed_rust(ds, "s1", "s2", featurizer=rust_featurizer) is None
     signature_ids = list(rust_featurizer.signature_ids())
     signature_index = {sig_id: idx for idx, sig_id in enumerate(signature_ids)}
     indexed_values = get_constraints_matrix_indexed_rust(
@@ -561,29 +581,23 @@ def test_get_constraints_matrix_indexed_rust_parity(dataset, constraint_pairs):
     indexed_pairs = [(signature_index[s1], signature_index[s2]) for s1, s2 in constraint_pairs]
 
     expected = [dataset.get_constraint(s1, s2) for s1, s2 in constraint_pairs]
-    string_values = get_constraints_matrix_rust(dataset, constraint_pairs, featurizer=rust_featurizer)
     indexed_values = get_constraints_matrix_indexed_rust(dataset, indexed_pairs, featurizer=rust_featurizer)
-    assert len(string_values) == len(expected)
     assert len(indexed_values) == len(expected)
-    for pair, ref_val, string_val, indexed_val in zip(
+    for pair, ref_val, indexed_val in zip(
         constraint_pairs,
         expected,
-        string_values,
         indexed_values,
         strict=True,
     ):
-        assert ref_val == string_val, (
-            f"Batch string constraint mismatch for pair {pair}: ref={ref_val}, got={string_val}"
-        )
-        assert string_val == indexed_val, (
-            f"Batch indexed constraint mismatch for pair {pair}: string={string_val}, indexed={indexed_val}"
-        )
+        assert (
+            ref_val == indexed_val
+        ), f"Batch indexed constraint mismatch for pair {pair}: ref={ref_val}, indexed={indexed_val}"
 
 
 def test_linker_constraint_labels_index_arrays_match_indexed_constraints_large(dataset, constraint_pairs):
     rust_featurizer = _get_rust_featurizer(dataset)
     if not hasattr(rust_featurizer, "linker_pair_index_arrays_constraint_labels"):
-        pytest.skip("linker_pair_index_arrays_constraint_labels is unavailable")
+        raise pytest.skip.Exception("linker_pair_index_arrays_constraint_labels is unavailable")
 
     signature_ids = list(rust_featurizer.signature_ids())
     signature_index = {sig_id: idx for idx, sig_id in enumerate(signature_ids)}
@@ -616,7 +630,7 @@ def test_linker_constraint_labels_index_arrays_match_indexed_constraints_large(d
 def test_linker_pair_distance_accumulators_match_python_large(dataset):
     rust_featurizer = _get_rust_featurizer(dataset)
     if not hasattr(rust_featurizer, "linker_pair_distance_accumulators"):
-        pytest.skip("linker_pair_distance_accumulators is unavailable")
+        raise pytest.skip.Exception("linker_pair_distance_accumulators is unavailable")
 
     rng = np.random.default_rng(20260509)
     row_count = 503
@@ -668,10 +682,9 @@ def test_linker_pair_distance_accumulators_match_python_large(dataset):
         {"incremental_dont_use_cluster_seeds": True},
     ],
 )
-def test_get_constraints_matrix_rust_flag_parity(dataset, constraint_pairs, constraint_kwargs):
+def test_get_constraints_matrix_indexed_rust_flag_parity(dataset, constraint_pairs, constraint_kwargs):
     rust_featurizer = _get_rust_featurizer(dataset)
     expected = [dataset.get_constraint(s1, s2, **constraint_kwargs) for s1, s2 in constraint_pairs]
-    got_string = get_constraints_matrix_rust(dataset, constraint_pairs, featurizer=rust_featurizer, **constraint_kwargs)
 
     signature_ids = list(rust_featurizer.signature_ids())
     signature_index = {sig_id: idx for idx, sig_id in enumerate(signature_ids)}
@@ -683,8 +696,7 @@ def test_get_constraints_matrix_rust_flag_parity(dataset, constraint_pairs, cons
         **constraint_kwargs,
     )
 
-    for pair, ref_val, string_val, indexed_val in zip(constraint_pairs, expected, got_string, got_indexed, strict=True):
-        assert ref_val == string_val, f"Flag parity mismatch (string) for pair {pair}: ref={ref_val}, got={string_val}"
+    for pair, ref_val, indexed_val in zip(constraint_pairs, expected, got_indexed, strict=True):
         assert (
-            string_val == indexed_val
-        ), f"Flag parity mismatch (indexed) for pair {pair}: string={string_val}, indexed={indexed_val}"
+            ref_val == indexed_val
+        ), f"Flag parity mismatch (indexed) for pair {pair}: ref={ref_val}, got={indexed_val}"

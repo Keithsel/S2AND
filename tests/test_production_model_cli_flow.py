@@ -309,6 +309,7 @@ def test_tiny_qian_production_model_two_step_cli_flow(tmp_path: Path) -> None:
 
     clusterer = load_production_model(bundle_dir)
     assert clusterer.production_model_bundle_status == "complete"
+    assert clusterer.incremental_linker_artifact_dir is not None
     assert Path(clusterer.incremental_linker_artifact_dir) == bundle_dir / "incremental_linker"
     artifact_metadata = json.loads((bundle_dir / "incremental_linker" / "metadata.json").read_text(encoding="utf-8"))
     assert artifact_metadata["gate_surface"] == "promoted_numpy_logistic_gate"

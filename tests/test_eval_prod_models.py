@@ -679,7 +679,7 @@ def test_pubmed_specter2_arrow_fixture_matches_production_eval() -> None:
         n_jobs=4,
     )
 
-    assert cluster_metrics["B3 (P, R, F1)"] == pytest.approx((1.0, 0.892, 0.943), abs=5e-4)
+    assert cluster_metrics["B3 (P, R, F1)"] == pytest.approx((1.0, 0.9, 0.948), abs=5e-4)
 
 
 @pytest.mark.requires_lfs

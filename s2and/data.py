@@ -558,8 +558,7 @@ class ANDData:
                 # effect; do not mix them.
                 author_info_orcid=(
                     (signature["author_info"].get("source_ids") or [None])[0]
-                    if use_orcid_id
-                    and signature["author_info"].get("source_id_source") == "ORCID"
+                    if use_orcid_id and signature["author_info"].get("source_id_source") == "ORCID"
                     else None
                 ),
                 author_info_name_counts=None,

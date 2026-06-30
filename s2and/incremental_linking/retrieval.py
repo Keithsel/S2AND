@@ -630,14 +630,10 @@ def build_linker_retrieval_batch_rust(
         dtype=object,
     )
     query_index_to_offset = {
-        int(query_index): offset
-        for offset, query_index in enumerate(query_signature_indices_array)
+        int(query_index): offset for offset, query_index in enumerate(query_signature_indices_array)
     }
     query_authors_per_row = np.asarray(
-        [
-            per_query_authors[query_index_to_offset[int(query_index)]]
-            for query_index in row_query_signature_indices_arr
-        ],
+        [per_query_authors[query_index_to_offset[int(query_index)]] for query_index in row_query_signature_indices_arr],
         dtype=object,
     )
     row_signals: dict[str, Any] = {

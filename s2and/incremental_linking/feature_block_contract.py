@@ -379,7 +379,7 @@ class FeatureBlock:
             flat = pa.array(np.ravel(self.specter_embeddings), type=pa.float32())
             tables["specter"] = pa.table(
                 {
-                    "paper_id": list(self.specter_paper_ids),
+                    "paper_id": pa.array(list(self.specter_paper_ids), type=pa.string()),
                     "embedding": pa.FixedSizeListArray.from_arrays(flat, int(self.specter_embeddings.shape[1])),
                 }
             )

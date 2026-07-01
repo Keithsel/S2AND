@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import scripts.convert_to_arrow as convert_module
+from s2and.arrow_inputs import validate_arrow_prediction_artifacts
 from s2and.incremental_linking.feature_block import FEATURE_BLOCK_ARROW_MANIFEST_SCHEMA_VERSION
 from scripts.convert_to_arrow import convert_service_json_to_arrow
 
@@ -275,6 +276,42 @@ def test_convert_service_json_to_arrow_falls_back_from_explicit_null_paper_embed
 
     assert manifest["paper_embedding_count"] == 1
     assert _read_table(str(_manifest_path(manifest, tmp_path / "arrow" / "service_payload", "specter"))).num_rows == 1
+
+
+def test_convert_service_json_to_arrow_emits_empty_specter_for_empty_embeddings(tmp_path: Path) -> None:
+    payload = _minimal_service_payload("s1", 1)
+    payload["paper_embeddings"] = {}
+    input_json = tmp_path / "service_payload.json"
+    input_json.write_text(json.dumps(payload), encoding="utf-8")
+
+    manifest = convert_service_json_to_arrow(
+        input_json=input_json,
+        output_root=tmp_path / "arrow",
+        dataset_name="service_payload",
+        name_counts_index_root=tmp_path,
+        n_jobs=1,
+        overwrite=True,
+        skip_name_counts_index=True,
+    )
+    dataset_dir = tmp_path / "arrow" / "service_payload"
+    resolved_paths = {key: str(_manifest_path(manifest, dataset_dir, key)) for key in manifest["paths"]}
+
+    specter = _read_table(resolved_paths["specter"])
+    embedding_type = specter.schema.field("embedding").type
+    assert specter.num_rows == 0
+    assert pa.types.is_fixed_size_list(embedding_type)
+    assert embedding_type.list_size == 1
+    assert manifest["validation"]["specter_count"] == 0
+    assert manifest["validation"]["missing_specter_paper_count"] == 1
+    assert "specter_batch_index" in resolved_paths
+    validate_arrow_prediction_artifacts(
+        resolved_paths,
+        require_specter=True,
+        require_name_counts_index=False,
+        require_batch_indexes=True,
+        context="test",
+        producer_hint="test",
+    )
 
 
 def test_root_manifest_lock_removes_dead_pid_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

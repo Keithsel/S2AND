@@ -746,6 +746,42 @@ def test_raw_arrow_candidate_plan_keeps_zero_specter_vectors(tmp_path: Path) -> 
     assert np.isfinite(np.asarray(raw_plan["specter_centroid_similarity"], dtype=np.float32)).all()
 
 
+def test_rust_featurizer_from_arrow_paths_accepts_empty_specter_table(tmp_path: Path) -> None:
+    paths = _base_arrow_paths(tmp_path, with_indexes=False)
+    paths["specter"] = _write_ipc(
+        tmp_path / "specter.arrow",
+        pa.table(
+            {
+                "paper_id": pa.array([], type=pa.string()),
+                "embedding": pa.FixedSizeListArray.from_arrays(pa.array([], type=pa.float32()), 1),
+            }
+        ),
+    )
+    paths, _index_metrics = write_raw_arrow_batch_lookup_indexes(paths, tmp_path)
+
+    featurizer = s2and_rust.RustFeaturizer.from_arrow_paths(
+        paths,
+        ["q1", "s1"],
+        set(),
+        True,
+        0.0,
+        10000.0,
+        1,
+    )
+    signature_index = {str(signature_id): index for index, signature_id in enumerate(featurizer.signature_ids())}
+    matrix = np.asarray(
+        featurizer.featurize_pairs_matrix_indexed(
+            [(signature_index["q1"], signature_index["s1"])],
+            None,
+            1,
+            np.nan,
+        )
+    )
+
+    assert matrix.shape == (1, 39)
+    assert np.isnan(matrix).any()
+
+
 def test_raw_arrow_candidate_plan_rejects_hidden_query_view(tmp_path: Path) -> None:
     paths = _base_arrow_paths(tmp_path)
 

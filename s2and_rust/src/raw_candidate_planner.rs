@@ -72,6 +72,19 @@ fn validate_raw_arrow_query_signature_ids(query_signature_ids: &[String]) -> PyR
     Ok(())
 }
 
+fn validate_signatures_batch_index_before_missing_signature_error(
+    paths: &RawArrowPlannerPaths,
+) -> PyResult<()> {
+    if let Some(index_path) = paths.signatures_batch_index_path.as_deref() {
+        crate::arrow_batch_lookup::validate_arrow_batch_lookup_index(
+            index_path,
+            &paths.signatures_path,
+            "signature_id",
+        )?;
+    }
+    Ok(())
+}
+
 fn build_retriever_from_raw_arrow_components(
     py: Python<'_>,
     component_order: &[String],
@@ -334,6 +347,7 @@ fn read_reusable_raw_arrow_query_inputs(
     let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
     for signature_id in query_signature_ids.iter() {
         if !signatures.contains_key(signature_id) {
+            validate_signatures_batch_index_before_missing_signature_error(paths)?;
             return Err(pyo3::exceptions::PyKeyError::new_err(format!(
                 "query signature_id '{}' is missing from signatures Arrow input",
                 signature_id
@@ -486,7 +500,8 @@ impl RawBlockQueryCandidatePlanner {
                         existing.push(component_key.clone());
                     } else {
                         let owned_id = signature_id.clone();
-                        component_keys_by_member.insert(owned_id.clone(), vec![component_key.clone()]);
+                        component_keys_by_member
+                            .insert(owned_id.clone(), vec![component_key.clone()]);
                         seed_signature_ids.push(owned_id);
                     }
                 }
@@ -507,6 +522,7 @@ impl RawBlockQueryCandidatePlanner {
         let read_signatures_secs = read_signatures_start.elapsed().as_secs_f64();
         for signature_id in seed_signature_ids.iter() {
             if !signatures.contains_key(signature_id) {
+                validate_signatures_batch_index_before_missing_signature_error(&paths)?;
                 return Err(pyo3::exceptions::PyKeyError::new_err(format!(
                     "cluster seed signature_id '{}' is missing from signatures Arrow input",
                     signature_id

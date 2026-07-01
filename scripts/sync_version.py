@@ -67,6 +67,14 @@ def version_targets() -> tuple[VersionTarget, ...]:
             pattern=rf"(?m)^(?P<prefix>echo )(?P<version>{SEMVER_PATTERN})(?P<suffix> > VERSION\s*)$",
         ),
         VersionTarget(
+            name="rust_readme_checkout_version",
+            relative_path=Path("s2and_rust") / "README.md",
+            pattern=(
+                rf"(?m)^(?P<prefix>This checkout is `)(?P<version>{SEMVER_PATTERN})"
+                rf"(?P<suffix>`, so use a local build when working from this tree\s*)$"
+            ),
+        ),
+        VersionTarget(
             name="cargo_lock",
             relative_path=Path("s2and_rust") / "Cargo.lock",
             pattern=(
@@ -117,23 +125,28 @@ def _single_match(path: Path, pattern: str) -> tuple[str, re.Match[str]]:
     return text, matches[0]
 
 
-def _version_from_match(match: re.Match[str]) -> str:
+def _versions_from_match(match: re.Match[str]) -> tuple[str, ...]:
     groups = match.groupdict()
     if groups.get("version") is not None:
-        return groups["version"]
+        versions = [groups["version"]]
+        if groups.get("version_2") is not None:
+            versions.append(groups["version_2"])
+        return tuple(versions)
     version_tuple = groups.get("version_tuple")
     if version_tuple is None:
         raise SystemExit("Internal error: version pattern has neither version nor version_tuple group")
     parts = [part.strip() for part in version_tuple.split(",")]
     if len(parts) != 3 or any(not part.isdigit() for part in parts):
         raise SystemExit(f"Invalid runtime version tuple: {version_tuple}")
-    return ".".join(parts)
+    return (".".join(parts),)
 
 
 def _replacement_from_match(match: re.Match[str], version: str) -> str:
     groups = match.groupdict()
     if groups.get("indent") is not None:
         return f'{groups["indent"]}"s2and-rust=={version}{groups["suffix"]}'
+    if groups.get("version_2") is not None:
+        return f'{groups["prefix"]}{version}{groups["middle"]}{version}{groups["suffix"]}'
     if groups.get("version_tuple") is not None:
         return f'{groups["prefix"]}{_version_tuple_literal(version)}{groups["suffix"]}'
     return f'{groups["prefix"]}{version}{groups["suffix"]}'
@@ -151,9 +164,9 @@ def sync_target(root: Path, target: VersionTarget, version: str) -> None:
 def check_target(root: Path, target: VersionTarget, expected: str) -> None:
     path = target.path(root)
     _, match = _single_match(path, target.pattern)
-    found = _version_from_match(match)
-    if found != expected:
-        raise SystemExit(f"Version mismatch in {path} ({target.name}): found {found}, expected {expected}")
+    for found in _versions_from_match(match):
+        if found != expected:
+            raise SystemExit(f"Version mismatch in {path} ({target.name}): found {found}, expected {expected}")
 
 
 def sync_version(version: str, root: Path = ROOT) -> None:

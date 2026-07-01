@@ -49,6 +49,13 @@ Load this directory once with `load_production_model(...)`. The returned object
 is still a normal mutable `Clusterer`, so callers can set `clusterer.n_jobs`,
 `clusterer.use_cache`, or `clusterer.cluster_model.eps` just as they did with
 the old pickle-loaded clusterer.
+For v1.2-derived production artifacts, including `production_model_v1.2.pickle`
+and `production_model_v1.21/`, the loader applies the published runtime
+FastCluster threshold `eps=0.65` before returning the clusterer.
+Native bundles resolve that override from manifest/config metadata plus the
+directory name. Legacy pickle artifacts do not carry bundle metadata, so their
+override is path-name scoped; a v1.2-derived pickle saved under a noncanonical
+filename is loaded with its stored `eps`.
 
 The `pairwise/*.lgb` files are native LightGBM models, so Python can load them
 without pickle and Rust/other runtimes can consume the same format directly.
@@ -439,6 +446,12 @@ including subblocked large-block prediction, it follows the same strict artifact
 rule and raises instead of falling back to `ANDData`; select the Python backend
 explicitly for compatibility/reference execution.
 
+Request-time filtered Arrow reads validate sidecar magic, key column, file
+length, source file size, and whether the source changed during the read. They
+intentionally do not fingerprint the full source file per request. Run strict
+fingerprint validation when publishing or deploying Arrow artifacts, and rebuild
+batch indexes after any source Arrow rewrite, including same-size rewrites.
+
 Incremental prediction with explicit RAM budget:
 
 ```python
@@ -451,6 +464,38 @@ result = clusterer.predict_incremental(
 
 clusters = result["clusters"]
 ```
+
+Incremental prediction directly from Arrow paths, without constructing an
+`ANDData`-shaped dataset object:
+
+```python
+result = clusterer.predict_incremental_from_arrow_paths(
+    block_signatures,
+    {
+        "signatures": ".../signatures.arrow",
+        "papers": ".../papers.arrow",
+        "paper_authors": ".../paper_authors.arrow",
+        "signatures_batch_index": ".../signatures.signatures_batch_index.bin",
+        "papers_batch_index": ".../papers.papers_batch_index.bin",
+        "paper_authors_batch_index": ".../paper_authors.paper_authors_batch_index.bin",
+        "specter": ".../specter2.arrow",
+        "specter_batch_index": ".../specter2.specter_batch_index.bin",
+        "name_counts_index": ".../name_counts_index",
+        "cluster_seeds": ".../cluster_seeds.arrow",
+    },
+    batching_threshold=5000,
+    total_ram_bytes=32 * 1024**3,
+    name_tuples="filtered",
+)
+
+clusters = result["clusters"]
+```
+
+The direct Arrow incremental API preserves caller-supplied seed component ids
+from `cluster_seeds` or `cluster_seeds_require`. The legacy `ANDData`
+cluster-seed JSON loader may instead densify seed component ids to `0..N-1`.
+Compare partitions rather than exact cluster-id keys when checking parity
+between these entrypoints.
 
 ### Rust promoted incremental target
 

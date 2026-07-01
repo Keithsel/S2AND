@@ -4,6 +4,7 @@ import re
 import threading
 import warnings
 from collections import Counter
+from collections.abc import Set
 from typing import TYPE_CHECKING, Any
 
 import fasttext
@@ -649,7 +650,7 @@ def same_prefix_tokens(a: str, b: str) -> bool:
     return True
 
 
-def first_names_name_compatible(first_a: str, first_b: str, name_tuples: set[tuple[str, str]]) -> bool:
+def first_names_name_compatible(first_a: str, first_b: str, name_tuples: Set[tuple[str, str]]) -> bool:
     """Return current legacy-compatible first-name compatibility.
 
     This keeps the normalization migration shim in one place: legacy

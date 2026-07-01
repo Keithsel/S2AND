@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,6 +22,9 @@ from s2and.thread_config import resolve_n_jobs
 PRODUCTION_MODEL_BUNDLE_SCHEMA_VERSION = "s2and_production_model_bundle_v1"
 PAIRWISE_PREDICTION_FIXTURE_SCHEMA_VERSION = "pairwise_prediction_fixture_v1"
 DEFAULT_PRODUCTION_MODEL_DIR = Path(_PACKAGE_DATA_DIR) / "production_model_v1.21"
+PUBLISHED_PRODUCTION_MODEL_RUNTIME_CLUSTER_EPS = 0.65
+_RUNTIME_CLUSTER_EPS_OVERRIDE_VERSIONS = frozenset({"1.2", "1.21"})
+_PRODUCTION_MODEL_PATH_PREFIX = "production_model_v"
 _INCREMENTAL_BROADCAST_MODES = frozenset({"always", "never", "top1_consensus"})
 _INCREMENTAL_SEED_SCORE_MODES = frozenset({"mean", "min", "mean_min_hybrid"})
 
@@ -175,9 +179,62 @@ def _validate_incremental_linker_metadata(linker_dir: Path) -> None:
     load_incremental_linking_artifact(linker_dir, require_rust_capabilities=False)
 
 
+def _production_model_path_version(path: Path) -> str | None:
+    name = path.name.removesuffix(".pickle")
+    if not name.startswith(_PRODUCTION_MODEL_PATH_PREFIX):
+        return None
+    version = name.removeprefix(_PRODUCTION_MODEL_PATH_PREFIX)
+    return version or None
+
+
+def _production_runtime_cluster_eps(
+    model_path: Path,
+    *,
+    manifest: Mapping[str, Any] | None = None,
+    clusterer_config: Mapping[str, Any] | None = None,
+) -> float | None:
+    versions: set[str] = set()
+    path_version = _production_model_path_version(model_path)
+    if path_version is not None:
+        versions.add(path_version)
+    for payload, keys in (
+        (manifest, ("bundle_version", "pairwise_model_version")),
+        (clusterer_config, ("bundle_version", "source_model_version")),
+    ):
+        if payload is None:
+            continue
+        for key in keys:
+            value = payload.get(key)
+            if value is not None:
+                versions.add(str(value))
+    if versions.isdisjoint(_RUNTIME_CLUSTER_EPS_OVERRIDE_VERSIONS):
+        return None
+    return PUBLISHED_PRODUCTION_MODEL_RUNTIME_CLUSTER_EPS
+
+
+def _apply_production_runtime_cluster_eps(clusterer: Clusterer, eps: float | None) -> Clusterer:
+    if eps is None:
+        return clusterer
+    if not isinstance(clusterer.cluster_model, FastCluster):
+        raise TypeError(
+            "Published production runtime cluster eps override requires "
+            f"FastCluster, got {type(clusterer.cluster_model)!r}"
+        )
+    best_params = getattr(clusterer, "best_params", None)
+    clusterer.best_params = dict(best_params or {})
+    clusterer.best_params["eps"] = float(eps)
+    clusterer.set_params({"eps": float(eps)})
+    return clusterer
+
+
 def _load_bundle_clusterer(bundle_dir: Path, *, require_incremental_linker: bool = True) -> Clusterer:
     manifest = _validate_manifest(bundle_dir)
     clusterer_config = _read_json(bundle_dir / str(manifest["files"]["clusterer_config"]))
+    runtime_cluster_eps = _production_runtime_cluster_eps(
+        bundle_dir,
+        manifest=manifest,
+        clusterer_config=clusterer_config,
+    )
 
     featurizer_info = _featurization_info_from_payload(clusterer_config["featurizer_info"])
     nameless_featurizer_info = _featurization_info_from_payload(clusterer_config["nameless_featurizer_info"])
@@ -246,7 +303,7 @@ def _load_bundle_clusterer(bundle_dir: Path, *, require_incremental_linker: bool
     clusterer.production_model_bundle_dir = bundle_dir
     clusterer.production_model_bundle_version = str(manifest["bundle_version"])
     clusterer.production_model_bundle_status = str(manifest.get("bundle_status", "complete"))
-    return clusterer
+    return _apply_production_runtime_cluster_eps(clusterer, runtime_cluster_eps)
 
 
 def load_production_model(path: str | Path | None = None, *, require_incremental_linker: bool = True) -> Clusterer:
@@ -266,4 +323,5 @@ def load_production_model(path: str | Path | None = None, *, require_incremental
     clusterer = loaded.get("clusterer") if isinstance(loaded, dict) else loaded
     if not isinstance(clusterer, Clusterer):
         raise TypeError(f"Expected a Clusterer in production model artifact, got {type(clusterer)!r}")
-    return clusterer
+    runtime_cluster_eps = _production_runtime_cluster_eps(model_path)
+    return _apply_production_runtime_cluster_eps(clusterer, runtime_cluster_eps)

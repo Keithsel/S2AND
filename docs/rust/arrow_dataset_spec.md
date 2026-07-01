@@ -114,6 +114,9 @@ Notes:
 - `specter.arrow` is the SPECTER v1 embedding table. `specter2.arrow` is the
   SPECTER v2 embedding table. Include whichever model family will be used; eval
   bundles usually include both.
+- If embeddings are requested but no block papers have embeddings, emit a valid
+  zero-row `specter.arrow` rather than omitting the table so production
+  prediction degrades through missing-vector features.
 - The Arrow files must be Arrow IPC file format, not Arrow stream format. The
   current writer uses `pyarrow.ipc.new_file(...)`; readers use
   `pyarrow.ipc.open_file(...)` and memory maps.

@@ -243,7 +243,13 @@ def promoted_incremental_component_sizes(cluster_seeds_require: Mapping[str, int
 
 
 def _signature_orcid(dataset: ANDData, signature_id: str) -> str | None:
-    value = getattr(dataset.signatures[str(signature_id)], "author_info_orcid", None)
+    signatures = getattr(dataset, "signatures", None)
+    if not isinstance(signatures, Mapping):
+        return None
+    signature = signatures.get(str(signature_id))
+    if signature is None:
+        return None
+    value = getattr(signature, "author_info_orcid", None)
     return query_adapter_module.normalize_orcid(value)
 
 

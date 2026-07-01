@@ -6,13 +6,15 @@ from types import SimpleNamespace
 
 import numpy as np
 
+import s2and.runtime as runtime
 import scripts._rust_suite.compare_cmd as compare_cmd
 
 
 def test_collect_rust_package_info_loads_lazy_extension(monkeypatch) -> None:
     from s2and import feature_port
 
-    fake_module = SimpleNamespace(__version__="0.51.0", __name__="s2and_rust", __file__="native.pyd")
+    current_version = runtime.min_supported_rust_extension_version_string()
+    fake_module = SimpleNamespace(__version__=current_version, __name__="s2and_rust", __file__="native.pyd")
     monkeypatch.setattr(feature_port, "s2and_rust", None)
     monkeypatch.setattr(feature_port, "_ensure_s2and_rust_loaded", lambda: fake_module)
     monkeypatch.setattr(
@@ -23,7 +25,7 @@ def test_collect_rust_package_info_loads_lazy_extension(monkeypatch) -> None:
 
     info = compare_cmd._collect_rust_package_info(False, False)  # noqa: SLF001
 
-    assert info["version"] == "0.51.0"
+    assert info["version"] == current_version
     assert info["module_name"] == "s2and_rust"
 
 

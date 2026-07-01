@@ -64,7 +64,7 @@ class DummyRustFeaturizer:
 
 
 class DummyRustModule:
-    __version__ = "0.51.0"
+    __version__ = runtime.min_supported_rust_extension_version_string()
     RustFeaturizer = DummyRustFeaturizer
 
 
@@ -270,7 +270,7 @@ def test_rust_featurizer_cache_tracks_in_place_numpy_embedding_mutation(monkeypa
             return cls(dataset.name)
 
     class EmbeddingRustModule:
-        __version__ = "0.51.0"
+        __version__ = runtime.min_supported_rust_extension_version_string()
         RustFeaturizer = EmbeddingRustFeaturizer
 
     monkeypatch.setattr(feature_port, "s2and_rust", EmbeddingRustModule)
@@ -437,7 +437,7 @@ def test_build_rust_featurizer_from_arrow_paths_rejects_none_path(monkeypatch):
             raise AssertionError("from_arrow_paths should not be called for invalid paths")
 
     class ArrowRustModule:
-        __version__ = "0.51.0"
+        __version__ = runtime.min_supported_rust_extension_version_string()
         RustFeaturizer = ArrowRustFeaturizer
 
     monkeypatch.setattr(feature_port, "s2and_rust", ArrowRustModule)
@@ -461,7 +461,7 @@ def test_build_rust_featurizer_from_arrow_paths_requires_index_for_name_counts(m
             return cls("arrow")
 
     class ArrowRustModule:
-        __version__ = "0.51.0"
+        __version__ = runtime.min_supported_rust_extension_version_string()
         RustFeaturizer = ArrowRustFeaturizer
 
     monkeypatch.setattr(feature_port, "s2and_rust", ArrowRustModule)
@@ -507,7 +507,7 @@ def test_build_rust_featurizer_from_arrow_paths_requires_batch_indexes_by_defaul
             return cls("arrow")
 
     class ArrowRustModule:
-        __version__ = "0.51.0"
+        __version__ = runtime.min_supported_rust_extension_version_string()
         RustFeaturizer = ArrowRustFeaturizer
 
     monkeypatch.setattr(feature_port, "s2and_rust", ArrowRustModule)

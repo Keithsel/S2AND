@@ -36,6 +36,10 @@ def _skip_if_missing_or_lfs_pointer(paths: list[Path]) -> None:
         raise pytest.skip.Exception(f"Git LFS artifact(s) not materialized: {pointers}")
 
 
+def _cluster_partition(clusters: Mapping[str, list[str]]) -> frozenset[frozenset[str]]:
+    return frozenset(frozenset(signature_ids) for signature_ids in clusters.values() if signature_ids)
+
+
 def _resolve_manifest_path(dataset_root: Path, value: Any) -> str:
     raw_path = Path(str(value))
     candidates = [raw_path] if raw_path.is_absolute() else [dataset_root / raw_path, Path(PROJECT_ROOT_PATH) / raw_path]
@@ -203,3 +207,24 @@ def test_canonical_pubmed_large_block_arrow_subblocking_and_incremental_no_andda
     assert telemetry["raw_arrow_seed_component_count"] == 2
     assert result["clusters"]
     assert sync_calls == []
+
+    direct_arrow_paths = {**arrow_paths, "cluster_seeds": str(cluster_seeds_path)}
+    direct_result = cast(
+        dict[str, Any],
+        clusterer.predict_incremental_from_arrow_paths(
+            workload.block_signatures,
+            direct_arrow_paths,
+            prevent_new_incompatibilities=False,
+            batching_threshold=1,
+            runtime_context=build_runtime_context("large_block_arrow_runtime_direct_test", backend="rust"),
+            total_ram_bytes=1_000_000_000_000,
+        ),
+    )
+
+    direct_telemetry = cast(dict[str, Any], direct_result["incremental_linker_telemetry"])
+    assert _cluster_partition(cast(dict[str, list[str]], direct_result["clusters"])) == _cluster_partition(
+        cast(dict[str, list[str]], result["clusters"])
+    )
+    assert direct_result["incremental_linker_query_view"] == "raw_arrow"
+    assert direct_telemetry["arrow_promoted_incremental"] == 1
+    assert direct_telemetry["seed_setup_cluster_seeds_source"] == "arrow"

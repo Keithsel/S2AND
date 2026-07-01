@@ -21,7 +21,7 @@ from sklearn.preprocessing import MultiLabelBinarizer
 
 from s2and.arrow_inputs import require_arrow_artifacts
 from s2and.consts import _PACKAGE_DATA_DIR, SPECTER_DIM
-from s2and.incremental_linking.feature_block_arrow import read_arrow_batch_lookup_index_batch_indices
+from s2and.incremental_linking.feature_block_arrow import read_arrow_batch_lookup_index_batch_indices_for_request
 from s2and.text import (
     AFFILIATIONS_STOP_WORDS,
     compute_block,
@@ -795,7 +795,7 @@ def _read_arrow_rows_by_values(
     if not keep_values:
         return []
     batch_indices = sorted(
-        read_arrow_batch_lookup_index_batch_indices(
+        read_arrow_batch_lookup_index_batch_indices_for_request(
             path,
             index_path,
             key_column=key_column,
@@ -942,7 +942,7 @@ def _coauthor_blocks_by_paper_from_arrow(
     paper_authors_index_path = paths["paper_authors_batch_index"]
     keep_values = {str(value) for value in paper_ids}
     batch_indices = sorted(
-        read_arrow_batch_lookup_index_batch_indices(
+        read_arrow_batch_lookup_index_batch_indices_for_request(
             paper_authors_path,
             paper_authors_index_path,
             key_column="paper_id",
@@ -1029,7 +1029,7 @@ def _specter_embeddings_from_arrow(
     specter_index_path = paths[specter_index_key]
     keep_values = {str(value) for value in paper_ids}
     batch_indices = sorted(
-        read_arrow_batch_lookup_index_batch_indices(
+        read_arrow_batch_lookup_index_batch_indices_for_request(
             specter_path,
             specter_index_path,
             key_column="paper_id",

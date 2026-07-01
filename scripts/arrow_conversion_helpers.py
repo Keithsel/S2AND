@@ -193,7 +193,7 @@ def _feature_block_specter_from_anddata(
     if not include_specter:
         return (), None
     specter = getattr(dataset, "specter_embeddings", None)
-    if not specter:
+    if specter is None:
         return (), None
     paper_ids: list[str] = []
     vectors: list[np.ndarray] = []
@@ -215,5 +215,5 @@ def _feature_block_specter_from_anddata(
         paper_ids.append(str(paper.paper_id))
         vectors.append(array)
     if not vectors:
-        return (), None
+        return (), np.empty((0, 1), dtype=np.float32)
     return tuple(paper_ids), np.ascontiguousarray(np.vstack(vectors), dtype=np.float32)

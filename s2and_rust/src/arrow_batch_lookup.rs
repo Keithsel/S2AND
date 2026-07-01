@@ -42,8 +42,38 @@ struct ArrowBatchLookupIndex {
     record_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceValidationMode {
+    StrictFingerprint,
+    RequestTimeSourceSize,
+}
+
 impl ArrowBatchLookupIndex {
+    #[allow(dead_code)]
     fn open(path: &str, source_arrow_path: &str, key_column: &str) -> PyResult<Self> {
+        Self::open_with_source_validation(
+            path,
+            source_arrow_path,
+            key_column,
+            SourceValidationMode::StrictFingerprint,
+        )
+    }
+
+    fn open_for_request(path: &str, source_arrow_path: &str, key_column: &str) -> PyResult<Self> {
+        Self::open_with_source_validation(
+            path,
+            source_arrow_path,
+            key_column,
+            SourceValidationMode::RequestTimeSourceSize,
+        )
+    }
+
+    fn open_with_source_validation(
+        path: &str,
+        source_arrow_path: &str,
+        key_column: &str,
+        source_validation: SourceValidationMode,
+    ) -> PyResult<Self> {
         let bytes = fs::read(path)
             .map_err(|err| io_error_to_py("failed to read Arrow batch lookup index", path, err))?
             .into_boxed_slice();
@@ -94,13 +124,21 @@ impl ArrowBatchLookupIndex {
                 .try_into()
                 .expect("indexed source fingerprint slice has fixed length"),
         );
-        let source_fingerprint = source_file_fingerprint(source_arrow_path, source_size)?;
-        if indexed_source_size != source_size || indexed_source_fingerprint != source_fingerprint {
+        if indexed_source_size != source_size {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Arrow batch lookup index '{path}' is stale for '{source_arrow_path}': \
-                 indexed size/fingerprint=({indexed_source_size}, {indexed_source_fingerprint}) \
-                 current size/fingerprint=({source_size}, {source_fingerprint})"
+                 indexed size={indexed_source_size} current size={source_size}"
             )));
+        }
+        if source_validation == SourceValidationMode::StrictFingerprint {
+            let source_fingerprint = source_file_fingerprint(source_arrow_path, source_size)?;
+            if indexed_source_fingerprint != source_fingerprint {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Arrow batch lookup index '{path}' is stale for '{source_arrow_path}': \
+                     indexed size/fingerprint=({indexed_source_size}, {indexed_source_fingerprint}) \
+                     current size/fingerprint=({source_size}, {source_fingerprint})"
+                )));
+            }
         }
         let expected_len = ARROW_BATCH_LOOKUP_INDEX_HEADER_LEN
             .checked_add(
@@ -181,6 +219,14 @@ impl ArrowBatchLookupIndex {
     }
 }
 
+pub(crate) fn validate_arrow_batch_lookup_index(
+    path: &str,
+    source_arrow_path: &str,
+    key_column: &str,
+) -> PyResult<()> {
+    ArrowBatchLookupIndex::open(path, source_arrow_path, key_column).map(|_| ())
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct IndexedArrowReadStats {
     pub(crate) batches_read: usize,
@@ -196,7 +242,7 @@ pub(crate) fn read_indexed_arrow_batches(
     if keep_ids.is_empty() {
         return Ok((Vec::new(), IndexedArrowReadStats::default()));
     }
-    let index = ArrowBatchLookupIndex::open(index_path, path, key_column)?;
+    let index = ArrowBatchLookupIndex::open_for_request(index_path, path, key_column)?;
     let mut batch_indices: Vec<usize> =
         index.batch_indices_for_keys(keep_ids).into_iter().collect();
     batch_indices.sort_unstable();
@@ -306,6 +352,8 @@ mod tests {
                 Err(err) => err,
             };
         assert!(py_err_message(error).contains("is stale"));
+        ArrowBatchLookupIndex::open_for_request(index_path_str, &source_path_str, "signature_id")
+            .expect("request-time source-size validation should avoid full-file fingerprinting");
 
         fs::remove_dir_all(&temp_root).ok();
     }

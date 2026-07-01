@@ -1018,7 +1018,8 @@ pub(crate) fn has_impossible_year_conflict(
     let (Some(year_min), Some(year_max)) = (summary.year_min, summary.year_max) else {
         return false;
     };
-    query_year_value < year_min.saturating_sub(max_year_gap) || query_year_value > year_max.saturating_add(max_year_gap)
+    query_year_value < year_min.saturating_sub(max_year_gap)
+        || query_year_value > year_max.saturating_add(max_year_gap)
 }
 
 pub(crate) fn extract_retrieval_summary(
@@ -1040,7 +1041,9 @@ pub(crate) fn extract_retrieval_summary(
     let year_mean: Option<f64> = obj.getattr("year_mean")?.extract()?;
     let orcid_hashes = extract_orcid_hashes(&obj.getattr("orcid_values")?)?;
     let specter_centroid = extract_specter_vec(&obj.getattr("specter_centroid")?)?;
-    let specter_centroid_norm = specter_centroid.as_ref().map(|values| vector_norm_f32(values));
+    let specter_centroid_norm = specter_centroid
+        .as_ref()
+        .map(|values| vector_norm_f32(values));
     let exemplar_vectors = if include_exemplars {
         extract_specter_vec_list(&obj.getattr("exemplar_vectors")?)?
     } else {

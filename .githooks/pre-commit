@@ -17,6 +17,7 @@ VERSION_FILES=(
   "s2and/runtime.py"
   "README.md"
   "docs/development.md"
+  "s2and_rust/README.md"
   "uv.lock"
   "s2and_rust/Cargo.lock"
 )

@@ -36,6 +36,10 @@ def _skip_if_missing_or_lfs_pointer(paths: list[Path]) -> None:
         raise pytest.skip.Exception(f"Git LFS artifact(s) not materialized: {pointers}")
 
 
+def _cluster_partition(clusters: Mapping[str, Sequence[str]]) -> frozenset[frozenset[str]]:
+    return frozenset(frozenset(str(signature_id) for signature_id in signatures) for signatures in clusters.values())
+
+
 def _touch_eval_batch_indexes(dataset_root: Path, *, specter_stem: str = "specter") -> None:
     for index_name in (
         "signatures.signatures_batch_index.bin",
@@ -762,6 +766,24 @@ def test_pubmed_specter2_arrow_fixture_incremental_smoke_matches_expected_b3(
                 total_ram_bytes=1_000_000_000_000,
             ),
         )
+        if block_index == 0:
+            direct_result = cast(
+                dict[str, Any],
+                clusterer.predict_incremental_from_arrow_paths(
+                    list(block_signatures),
+                    {**arrow_paths, "cluster_seeds": str(cluster_seeds_path)},
+                    prevent_new_incompatibilities=False,
+                    batching_threshold=None,
+                    total_ram_bytes=1_000_000_000_000,
+                ),
+            )
+            assert _cluster_partition(
+                cast(Mapping[str, Sequence[str]], direct_result["clusters"])
+            ) == _cluster_partition(cast(Mapping[str, Sequence[str]], result["clusters"]))
+            direct_telemetry = cast(Mapping[str, Any], direct_result["incremental_linker_telemetry"])
+            assert direct_result["incremental_linker_query_view"] == "raw_arrow"
+            assert direct_telemetry["arrow_promoted_incremental"] == 1
+            assert direct_telemetry["seed_setup_cluster_seeds_source"] == "arrow"
         telemetry = cast(Mapping[str, Any], result["incremental_linker_telemetry"])
         query_count = len(block_signatures) - len(seed_signature_to_cluster)
         assert result["incremental_linker_query_view"] == "raw_arrow"

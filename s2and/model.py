@@ -57,6 +57,7 @@ from s2and.incremental_linking.feature_block import (
 from s2and.incremental_linking.feature_block import (
     read_cluster_seeds_arrow as _read_cluster_seeds_arrow_file,
 )
+from s2and.incremental_linking.feature_block_arrow import read_arrow_batch_lookup_index_batch_indices_for_request
 from s2and.incremental_linking.policy import (
     arrow_paths_have_name_counts_index as _arrow_paths_have_name_counts_index,
 )
@@ -791,22 +792,33 @@ def _cluster_seeds_require_from_arrow_paths(arrow_paths: Mapping[str, Any] | Non
     return _read_cluster_seeds_arrow(path)
 
 
-def _max_seed_cluster_id_from_seed_map(cluster_seeds_require: Mapping[Any, Any]) -> int:
-    """Return the next numeric cluster id after the supplied seed components."""
+def _seed_cluster_count_from_seed_map(cluster_seeds_require: Mapping[Any, Any]) -> int:
+    """Return the number of unique seed components in the supplied seed map."""
 
-    max_cluster_id = -1
-    for cluster_id in cluster_seeds_require.values():
-        try:
-            max_cluster_id = max(max_cluster_id, int(cluster_id))
-        except (TypeError, ValueError):
-            continue
-    return max_cluster_id + 1 if max_cluster_id >= 0 else 0
+    return len({str(cluster_id) for cluster_id in cluster_seeds_require.values()})
 
 
 def _optional_arrow_string(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _signature_batch_indices_for_request(
+    arrow_paths: Mapping[str, Any],
+    signatures_path: Path,
+    requested_signature_ids: Sequence[str],
+) -> tuple[int, ...]:
+    return tuple(
+        sorted(
+            read_arrow_batch_lookup_index_batch_indices_for_request(
+                signatures_path,
+                Path(str(arrow_paths["signatures_batch_index"])),
+                key_column="signature_id",
+                values=requested_signature_ids,
+            )
+        )
+    )
 
 
 def _load_arrow_incremental_signature_info(
@@ -843,7 +855,7 @@ def _load_arrow_incremental_signature_info(
                 "signatures Arrow is missing required columns for incremental metadata: " f"{missing_columns}"
             )
         signature_id_column_index = reader.schema.get_field_index("signature_id")
-        for batch_index in range(reader.num_record_batches):
+        for batch_index in _signature_batch_indices_for_request(arrow_paths, signatures_path, requested_signature_ids):
             batch = reader.get_batch(batch_index)
             signature_id_column = batch.column(signature_id_column_index)
             mask = pc.is_in(signature_id_column, value_set=value_set)
@@ -879,7 +891,11 @@ def _load_arrow_incremental_orcid_signature_info(
     arrow_paths: Mapping[str, Any],
     signature_ids: Iterable[Any],
 ) -> dict[str, _ArrowIncrementalSignatureInfo]:
-    """Load ORCID-only signature metadata for promoted incremental budget sizing."""
+    """Load ORCID-only seed metadata for promoted incremental budget sizing.
+
+    Missing seed signatures are skipped to match ANDData's missing-signature
+    ORCID behavior.
+    """
 
     requested_signature_ids = tuple(dict.fromkeys(str(signature_id) for signature_id in signature_ids))
     if not requested_signature_ids:
@@ -902,7 +918,7 @@ def _load_arrow_incremental_orcid_signature_info(
                 "signatures Arrow is missing required columns for incremental ORCID metadata: " f"{missing_columns}"
             )
         signature_id_column_index = reader.schema.get_field_index("signature_id")
-        for batch_index in range(reader.num_record_batches):
+        for batch_index in _signature_batch_indices_for_request(arrow_paths, signatures_path, requested_signature_ids):
             batch = reader.get_batch(batch_index)
             signature_id_column = batch.column(signature_id_column_index)
             mask = pc.is_in(signature_id_column, value_set=value_set)
@@ -925,9 +941,6 @@ def _load_arrow_incremental_orcid_signature_info(
                     author_info_first_normalized_without_apostrophe=None,
                     author_info_orcid=_optional_arrow_string(row.get("author_orcid")),
                 )
-    missing_signature_ids = [signature_id for signature_id in requested_signature_ids if signature_id not in signatures]
-    if missing_signature_ids:
-        raise ValueError(f"Arrow signatures are missing incremental ORCID signature ids: {missing_signature_ids[:10]}")
     return signatures
 
 
@@ -1378,15 +1391,17 @@ def _signature_first_for_rules(signature: Any) -> str:
 
 
 @lru_cache(maxsize=2)
-def _load_name_tuples_for_incremental_rules(name_tuples: str | None) -> set[tuple[str, str]]:
+def _load_name_tuples_for_incremental_rules(name_tuples: str | None) -> frozenset[tuple[str, str]]:
     if name_tuples == "filtered":
-        return _load_name_tuples_from_file("s2and_name_tuples_filtered.txt")
+        return frozenset(_load_name_tuples_from_file("s2and_name_tuples_filtered.txt"))
     if name_tuples is None:
-        return _load_name_tuples_from_file("s2and_name_tuples.txt")
+        return frozenset(_load_name_tuples_from_file("s2and_name_tuples.txt"))
     raise ValueError("name_tuples must be None, 'filtered', or a set of (first_a, first_b) tuples")
 
 
-def _name_tuples_for_incremental_rules(name_tuples: set[tuple[str, str]] | str | None) -> set[tuple[str, str]]:
+def _name_tuples_for_incremental_rules(
+    name_tuples: set[tuple[str, str]] | str | None,
+) -> set[tuple[str, str]] | frozenset[tuple[str, str]]:
     if isinstance(name_tuples, set):
         return name_tuples
     return _load_name_tuples_for_incremental_rules(name_tuples)
@@ -5867,7 +5882,7 @@ class Clusterer:
             cluster_seeds_require=explicit_cluster_seeds_require,
             cluster_seeds_disallow=cluster_seeds_disallow,
             altered_cluster_signatures=altered_cluster_signatures,
-            max_seed_cluster_id=_max_seed_cluster_id_from_seed_map(seed_signature_to_cluster),
+            max_seed_cluster_id=_seed_cluster_count_from_seed_map(seed_signature_to_cluster),
             signatures=signatures,
         )
         if require_name_counts_index:

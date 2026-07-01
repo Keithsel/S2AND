@@ -16,6 +16,7 @@ from s2and.featurizer import FeaturizationInfo
 from s2and.incremental_linking.feature_block import (
     read_incremental_query_signatures_arrow,
     write_altered_cluster_signatures_arrow,
+    write_arrow_batch_lookup_index,
     write_cluster_seed_disallows_arrow,
     write_cluster_seeds_arrow,
     write_name_counts_index,
@@ -784,7 +785,10 @@ def test_predict_incremental_from_arrow_paths_loads_seed_orcids_for_budget_floor
     assert captured["fanout"] == {"5": (1, 1)}
 
 
-def test_load_arrow_incremental_signature_info_scans_signatures_without_index(tmp_path: Path) -> None:
+def test_load_arrow_incremental_signature_info_uses_signature_batch_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import pyarrow as pa
 
     signatures_path = tmp_path / "signatures.arrow"
@@ -826,9 +830,35 @@ def test_load_arrow_incremental_signature_info_scans_signatures_without_index(tm
         with pa.ipc.new_file(sink, schema) as writer:
             for batch in batches:
                 writer.write_batch(batch)
+    index_path = tmp_path / "signatures.signatures_batch_index.bin"
+    write_arrow_batch_lookup_index(
+        signatures_path,
+        index_path,
+        key_column="signature_id",
+        table_name="signatures",
+    )
+
+    original_open_file = pa.ipc.open_file
+    read_batch_indices: list[int] = []
+
+    class CountingReader:
+        def __init__(self, reader: Any) -> None:
+            self._reader = reader
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._reader, name)
+
+        def get_batch(self, index: int) -> Any:
+            read_batch_indices.append(index)
+            return self._reader.get_batch(index)
+
+    def counting_open_file(source: Any) -> CountingReader:
+        return CountingReader(original_open_file(source))
+
+    monkeypatch.setattr(pa.ipc, "open_file", counting_open_file)
 
     signatures = model_module._load_arrow_incremental_signature_info(
-        {"signatures": str(signatures_path)},
+        {"signatures": str(signatures_path), "signatures_batch_index": str(index_path)},
         ["s2", "s3"],
     )
 
@@ -838,15 +868,70 @@ def test_load_arrow_incremental_signature_info_scans_signatures_without_index(tm
     assert signatures["s2"].author_info_last == "Ng"
     assert signatures["s2"].author_info_orcid == "0000-0002"
     assert signatures["s3"].paper_id is None
+    assert read_batch_indices == [1]
 
+    read_batch_indices.clear()
     orcid_signatures = model_module._load_arrow_incremental_orcid_signature_info(
-        {"signatures": str(signatures_path)},
+        {"signatures": str(signatures_path), "signatures_batch_index": str(index_path)},
         ["s2"],
     )
     assert set(orcid_signatures) == {"s2"}
     assert orcid_signatures["s2"].paper_id is None
     assert orcid_signatures["s2"].author_info_first is None
     assert orcid_signatures["s2"].author_info_orcid == "0000-0002"
+    assert read_batch_indices == [1]
+
+
+def test_load_arrow_incremental_orcid_signature_info_skips_missing_seed_ids(tmp_path: Path) -> None:
+    import pyarrow as pa
+
+    signatures_path = tmp_path / "signatures.arrow"
+    table = pa.table(
+        {
+            "signature_id": pa.array(["query"], type=pa.string()),
+            "author_orcid": pa.array(["0000-0000-0000-0001"], type=pa.string()),
+        }
+    )
+    with pa.OSFile(str(signatures_path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+    index_path = tmp_path / "signatures.signatures_batch_index.bin"
+    write_arrow_batch_lookup_index(
+        signatures_path,
+        index_path,
+        key_column="signature_id",
+        table_name="signatures",
+    )
+
+    assert (
+        model_module._load_arrow_incremental_orcid_signature_info(
+            {"signatures": str(signatures_path), "signatures_batch_index": str(index_path)},
+            ["stale_seed"],
+        )
+        == {}
+    )
+
+
+def test_seed_cluster_count_matches_anddata_cluster_count() -> None:
+    assert model_module._seed_cluster_count_from_seed_map({"s1": "7", "s2": "7", "s3": "9"}) == 2
+    assert model_module._seed_cluster_count_from_seed_map({"s1": "component_a", "s2": "component_b"}) == 2
+
+
+def test_cached_incremental_name_tuples_are_immutable(monkeypatch: pytest.MonkeyPatch) -> None:
+    model_module._load_name_tuples_for_incremental_rules.cache_clear()
+    monkeypatch.setattr(
+        model_module,
+        "_load_name_tuples_from_file",
+        lambda _filename: {("bill", "william")},
+    )
+    try:
+        name_tuples = model_module._load_name_tuples_for_incremental_rules("filtered")
+
+        assert name_tuples == frozenset({("bill", "william")})
+        assert model_module._load_name_tuples_for_incremental_rules("filtered") is name_tuples
+        assert not hasattr(name_tuples, "add")
+    finally:
+        model_module._load_name_tuples_for_incremental_rules.cache_clear()
 
 
 def test_predict_incremental_arrow_promoted_linker_cleans_up_temp_seed_context_on_failure(

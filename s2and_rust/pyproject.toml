@@ -7,7 +7,7 @@ name = "s2and-rust"
 version = "0.51.1"
 description = "Rust extension for s2and"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.12,<3.14"
 license = { text = "MIT" }
 authors = [{ name = "Sergey Feldman, Daniel King, Shivashankar Subramanian" }]
 
